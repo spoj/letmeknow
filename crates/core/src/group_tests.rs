@@ -4,6 +4,7 @@
 use super::*;
 use crate::provider::MemoryProvider;
 use lmk_proto::group::{CHAT, ChatMessage, REVISION, Service};
+use std::path::Path;
 use sha2::{Digest, Sha256};
 
 /// A membership service at `domain`, for logs no test reaches.
@@ -1385,6 +1386,44 @@ fn held_messages_open_in_ascending_order_past_the_window() {
     for (i, bytes) in batch.iter().enumerate() {
         assert_eq!(text(&w.m[1].open(bytes).unwrap()), format!("n{}", i + 1));
     }
+}
+
+/// A forgotten group leaves no key of its epochs in the database: openmls drops each epoch's key pairs as the next merges.
+#[test]
+fn a_forgotten_group_leaves_no_epoch_keys() {
+    use crate::provider::SqliteProvider;
+    let dir = std::env::temp_dir().join(format!("lmk-core-forget-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (path, other) = (dir.join("a.db"), dir.join("b.db"));
+    let mut a = Member::new(SqliteProvider::open(&path).unwrap(), "A");
+    let b = Member::new(SqliteProvider::open(&other).unwrap(), "B");
+    a.group = Some(Group::create(&a.provider, &a.session, &settings("Plan")).unwrap());
+    let kp = b.session.key_package(&b.provider).unwrap();
+    let cut = a.cut();
+    let commit = a.commit(Change { cut, add: vec![kp.clone()], how: Some(How::Invite), ..Change::default() });
+    let inner = a.open_inner(&commit.entry);
+    let admission = commit.admission.clone().unwrap();
+    let mut log = vec![commit.entry];
+    a.read(&log);
+    let mut b = Member { pos: 1, ..b };
+    b.join(&inner, &admission, 1, &kp);
+    for _ in 0..3 {
+        let cut = a.cut();
+        log.push(a.commit(Change { cut, ..Change::default() }).entry);
+        a.read(&log);
+        b.read(&log);
+    }
+    let keys = |path: &Path| -> i64 {
+        rusqlite::Connection::open(path).unwrap().query_row("SELECT COUNT(*) FROM openmls_epoch_keys_pairs", [], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(a.g().epoch(), 4);
+    assert!(keys(&path) > 0, "the current epoch's keys are stored");
+    assert!(keys(&other) > 0, "the joiner's current epoch's keys are stored");
+    a.group.take().unwrap().delete(&a.provider).unwrap();
+    b.group.take().unwrap().delete(&b.provider).unwrap();
+    assert_eq!((keys(&path), keys(&other)), (0, 0), "no epoch's keys stay, of the committer's or the joiner's");
+    drop((a, b));
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[path = "group_epoch_tests.rs"]
