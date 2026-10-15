@@ -25,7 +25,7 @@ use crate::{Event, Node, now};
 mod tests;
 
 const NO_IDENTITY: &str = "this device is on no identity";
-const LEFT_IDENTITY: &str = "this device left its identity: its identity group removed it, or the identity's directory expired. To join an identity again, take a device link from another of its devices (`identity invite`) and join with it (`identity join`); then add this device's sessions into their groups again. An expired identity has no device left to link from.";
+pub(crate) const LEFT_IDENTITY: &str = "this device left its identity: its identity group removed it, or the identity's directory expired. To join an identity again, take a device link from another of its devices (`identity invite`) and join with it (`identity join`); then add this device's sessions into their groups again. An expired identity has no device left to link from.";
 
 /// How long an add's invite is valid, in milliseconds: a week, for a browser opened now and then.
 pub const ADD_VALID: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -347,11 +347,8 @@ impl<P: Provider + Send + 'static> Identity<P> {
             }
             return Some(event);
         }
-        if let Event::Removed { group, kind, .. } = &event {
-            if kind != IDENTITY {
-                return Some(event);
-            }
-            return Some(Event::Warning { group: Some(group.clone()), text: LEFT_IDENTITY.into() });
+        if let Event::Removed { kind, .. } = &event {
+            return (kind != IDENTITY).then_some(event);
         }
         let Some(gid) = event.group().cloned() else { return Some(event) };
         if self.identity_of(&gid.0).is_none() {

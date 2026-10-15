@@ -11,6 +11,7 @@ use lmk_proto::Bytes;
 use lmk_proto::group::{IDENTITY, How, IdentityRef};
 
 use crate::held::delivered_key;
+use crate::identity::LEFT_IDENTITY;
 use crate::{Event, G, Inner, Member, State, device_key_key, get, reading, rec_key};
 
 const COMMIT_TRIES: u32 = 5;
@@ -208,13 +209,19 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// kept, which its records still show.
     pub(crate) fn gone(&self, gid: &[u8], by: Option<Member>) {
         let mut st = self.lock();
-        let Some(kind) = st.groups.get(gid).map(|g| g.mls.settings().kind) else { return };
+        let Some((kind, leaving)) = st.groups.get(gid).map(|g| (g.mls.settings().kind, g.rec.leaving)) else { return };
         let not_kept = match st.not_kept(gid) {
             Ok(not_kept) => not_kept,
             Err(error) => return self.warn(Some(gid), format!("{error:#}")),
         };
         match self.forget(&mut st, gid) {
-            Ok(()) => st.events.push(Event::Removed { group: Bytes(gid.to_vec()), kind, by, not_kept }),
+            Ok(()) => {
+                let warn = kind == IDENTITY && !leaving;
+                st.events.push(Event::Removed { group: Bytes(gid.to_vec()), kind, by, not_kept });
+                if warn {
+                    st.events.push(Event::Warning { group: Some(Bytes(gid.to_vec())), text: LEFT_IDENTITY.into() });
+                }
+            }
             Err(error) => self.warn(Some(gid), format!("{error:#}")),
         }
     }
