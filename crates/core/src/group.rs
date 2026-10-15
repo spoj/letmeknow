@@ -13,6 +13,7 @@ use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::signatures::Signer;
+use openmls_traits::storage::StorageProvider as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -486,9 +487,13 @@ impl Group {
         provider.put(&state_key(self.id()), &serde_json::to_vec(&self.state)?)
     }
 
-    /// Deletes the group's state, once this session has left it.
+    /// Deletes the group's state, once this session has left it. openmls keeps the key pairs of the epoch a removing
+    /// commit ends, so the previous epoch's go too.
     pub fn delete<P: Provider>(mut self, provider: &P) -> Result<()> {
-        self.mls.delete(provider.storage())?;
+        let storage = provider.storage();
+        self.mls.delete(storage)?;
+        let previous = GroupEpoch::from(self.epoch().saturating_sub(1));
+        storage.delete_encryption_epoch_key_pairs(self.mls.group_id(), &previous, self.own_index())?;
         provider.delete(&state_key(self.id()))
     }
 

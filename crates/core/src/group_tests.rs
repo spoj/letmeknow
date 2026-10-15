@@ -1388,7 +1388,8 @@ fn held_messages_open_in_ascending_order_past_the_window() {
     }
 }
 
-/// A forgotten group leaves no key of its epochs in the database: openmls drops each epoch's key pairs as the next merges.
+/// A forgotten group leaves no key of its epochs in the database: openmls drops each epoch's key pairs as the next merges,
+/// except those of the epoch a removing commit ends.
 #[test]
 fn a_forgotten_group_leaves_no_epoch_keys() {
     use crate::provider::SqliteProvider;
@@ -1419,9 +1420,16 @@ fn a_forgotten_group_leaves_no_epoch_keys() {
     assert_eq!(a.g().epoch(), 4);
     assert!(keys(&path) > 0, "the current epoch's keys are stored");
     assert!(keys(&other) > 0, "the joiner's current epoch's keys are stored");
+    let cut = a.cut();
+    let remove = a.index_of("B");
+    log.push(a.commit(Change { cut, remove: vec![remove], ..Change::default() }).entry);
+    a.read(&log);
+    b.read(&log);
+    assert!(!b.g().active(), "B is removed");
+    assert!(keys(&other) > 0, "openmls keeps the key pairs of the epoch the removing commit ends");
     a.group.take().unwrap().delete(&a.provider).unwrap();
     b.group.take().unwrap().delete(&b.provider).unwrap();
-    assert_eq!((keys(&path), keys(&other)), (0, 0), "no epoch's keys stay, of the committer's or the joiner's");
+    assert_eq!((keys(&path), keys(&other)), (0, 0), "no epoch's keys stay, of the committer's or the removed joiner's");
     drop((a, b));
     std::fs::remove_dir_all(dir).unwrap();
 }

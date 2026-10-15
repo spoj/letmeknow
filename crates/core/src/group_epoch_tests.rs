@@ -1,5 +1,4 @@
 use super::*;
-use openmls_traits::storage::StorageProvider as _;
 use tls_codec::Serialize as _;
 
 fn exports<P: Provider>(member: &Member<P>) -> ([u8; 32], [u8; 32], Vec<u8>) {
