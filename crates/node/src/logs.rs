@@ -24,7 +24,8 @@ use crate::{Event, Inner, MEMBER_WAIT, State, Work, get, hex, put};
 
 pub(crate) const NOT_FOLLOWED: &str = "this session does not follow that log";
 
-/// How often a session asks its services for the heads of the logs it follows, give or take a quarter.
+/// How often, at most, a session asks its services for the heads of the logs it follows: a random time between three
+/// quarters of it and all of it.
 const POLL: Duration = Duration::from_secs(2 * 60);
 
 /// The logs asked of one service, each with the length held.
@@ -305,7 +306,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         loop {
             self.ask_heads().await;
             let jitter = u64::from_be_bytes(lmk_proto::random::random::<8>()) % (POLL.as_millis() as u64 / 4);
-            sleep(POLL - POLL / 8 + Duration::from_millis(jitter)).await;
+            sleep(POLL - Duration::from_millis(jitter)).await;
         }
     }
 
