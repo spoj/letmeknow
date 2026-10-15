@@ -683,16 +683,18 @@ mod tests {
     }
 
     /// The target's store, built and read from a cold cache: 3.6M live logs and 44M expired references, which a year of
-    /// commits makes. Every poll asks each membership for its group's log and four directories it follows, each two
-    /// minutes, so a poll's lookups are 100,000 memberships times five over 120 seconds. Run with
+    /// commits makes. Each of 100,000 memberships asks every two minutes for its group's log and for four directories
+    /// it follows (an assumed average), so the bar is 100,000 times five over 120 seconds. Run with
     /// `cargo test --release -- --ignored heads_keep`.
     #[test]
-    #[ignore = "builds the target's store: minutes even in release"]
+    #[ignore = "builds the target's store: about 30 minutes in release"]
     fn heads_keep_the_target_rate_from_a_cold_cache() {
         const LIVE: u64 = 3_600_000;
         const EXPIRED: u64 = 44_000_000;
         const BAR: f64 = 100_000.0 * 5.0 / 120.0;
-        let (_dir, path) = state();
+        // On disk: a temporary directory in /tmp may be a RAM disk too small for the store.
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let path = dir.path().join("state");
         let store = Store::initialize(&path).unwrap();
         let capability = |i: u64| -> [u8; 32] { let mut c = [0; 32]; c[24..].copy_from_slice(&i.to_be_bytes()); c };
         let started = std::time::Instant::now();
@@ -700,13 +702,17 @@ mod tests {
             let mut db = store.db.lock().unwrap();
             for batch in (1..=LIVE + EXPIRED).collect::<Vec<_>>().chunks(100_000) {
                 let tx = db.transaction().unwrap();
-                for &i in batch {
-                    let log = store.log(&capability(i));
-                    if i <= LIVE {
-                        let state = seal(&log.key, &[&1u64.to_be_bytes()[..], &[0; 32]].concat());
-                        tx.execute("INSERT INTO anchors VALUES(?1,0,0,0,1,?2)", params![log.reference, state]).unwrap();
-                    } else {
-                        tx.execute("INSERT INTO expired VALUES(?)", [log.reference]).unwrap();
+                {
+                    let mut live = tx.prepare_cached("INSERT INTO anchors VALUES(?1,0,0,0,1,?2)").unwrap();
+                    let mut expired = tx.prepare_cached("INSERT INTO expired VALUES(?)").unwrap();
+                    for &i in batch {
+                        let log = store.log(&capability(i));
+                        if i <= LIVE {
+                            let state = seal(&log.key, &[&1u64.to_be_bytes()[..], &[0; 32]].concat());
+                            live.execute(params![log.reference, state]).unwrap();
+                        } else {
+                            expired.execute([log.reference]).unwrap();
+                        }
                     }
                 }
                 tx.commit().unwrap();
