@@ -1541,6 +1541,26 @@ async fn a_commit_reaches_a_member_with_no_peer_online_at_its_poll() {
     bob.node.shutdown().await.unwrap();
 }
 
+/// A session that follows an identity's directory applies its change at its poll, when no peer brings it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_directory_change_reaches_its_follower_at_the_poll() {
+    let relay = relay().await;
+    let alice = session(&relay, "Alice").await;
+    let mut bob = session(&relay, "Bob").await;
+    let (carol, laptop) = identity(&relay, &alice.node, relay.service.clone()).await;
+    bob.node.read_public(&carol).await.unwrap();
+    bob.until(|e| matches!(e, Event::Public { identity } if identity.0 == carol.id.0).then_some(())).await;
+    let tablet: [u8; 32] = lmk_core::random();
+    let mut writers: Vec<Bytes> = vec![lmk_core::device::public(&laptop).into(), lmk_core::device::public(&tablet).into()];
+    writers.sort();
+    let log = alice.node.read_public(&carol).await.unwrap();
+    publish(&relay, &alice.node, &carol, log.next(&laptop, writers.clone())).await;
+    bob.node.sync().await;
+    bob.until(|e| matches!(e, Event::Public { identity } if identity.0 == carol.id.0).then_some(())).await;
+    assert_eq!(bob.node.read_public(&carol).await.unwrap().writers, writers);
+    bob.node.shutdown().await.unwrap();
+}
+
 /// A poll asks each service once for every 256 logs followed there.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_poll_asks_each_service_once_for_every_256_logs() {
