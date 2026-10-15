@@ -1,4 +1,4 @@
-use std::{net::IpAddr, sync::{Arc, Mutex}};
+use std::{net::IpAddr, sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}}, time::Duration};
 
 use ed25519_dalek::{Signer, SigningKey};
 use lmk_membership::{
@@ -212,4 +212,32 @@ async fn a_page_that_does_not_chain_to_the_anchor_is_refused() {
     let client = ServeClient::for_service(tampered, &membership.wire("membership.example")).unwrap();
     let error = client.read(&capability, &anchor(&membership.key, &capability)).await.unwrap_err();
     assert!(error.is::<InvalidProof>() || error.is::<Forged>(), "{error}");
+}
+
+#[tokio::test]
+async fn at_most_four_requests_are_in_flight_to_a_service() {
+    let membership = Membership::new();
+    let post = membership.post();
+    let (now, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let slow: Post = {
+        let (now, peak) = (now.clone(), peak.clone());
+        Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| -> BoxFuture<anyhow::Result<Vec<u8>>> {
+            let (now, peak, post) = (now.clone(), peak.clone(), post.clone());
+            Box::pin(async move {
+                peak.fetch_max(now.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                now.fetch_sub(1, Ordering::SeqCst);
+                post(domain, route, body).await
+            })
+        })
+    };
+    let client = ServeClient::for_service(slow, &membership.wire("membership.example")).unwrap();
+    let tasks: Vec<_> = (0..10).map(|i| {
+        let client = client.clone();
+        tokio::spawn(async move { client.heads(&[Known(log(i), 0)]).await })
+    }).collect();
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+    assert_eq!(peak.load(Ordering::SeqCst), 4);
 }

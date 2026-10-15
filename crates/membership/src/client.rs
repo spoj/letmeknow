@@ -12,6 +12,7 @@ use lmk_proto::{
 };
 use n0_future::boxed::BoxFuture;
 use serde::{Serialize, de::DeserializeOwned};
+use tokio::sync::Semaphore;
 
 use crate::{Expired, Forged, Frontier, Refused, Unsupported, VerifiedPage, WrongDirectory, WrongLog};
 
@@ -64,6 +65,9 @@ pub async fn directory(resolve: &Resolve, service: &Service) -> Result<Directory
     Ok(directory)
 }
 
+/// Requests in flight to one service: the service answers a request beyond its own limit at once with a 503.
+const IN_FLIGHT: usize = 4;
+
 #[derive(Clone)]
 pub struct ServeClient(Arc<Inner>);
 
@@ -71,6 +75,7 @@ struct Inner {
     post: Post,
     domain: String,
     key: VerifyingKey,
+    slots: Semaphore,
     /// Once a route answered 404, the client stops: the service runs another minor, and asking again answers the same.
     stopped: OnceLock<Unsupported>,
 }
@@ -79,7 +84,7 @@ impl ServeClient {
     pub fn for_service(post: Post, service: &Service) -> Result<Self> {
         let Service::Serve { key, domain, .. } = service else { bail!("unsupported membership service") };
         let key = VerifyingKey::from_bytes(key.0.as_slice().try_into().context("a service key is 32 bytes")?).context("a service key")?;
-        Ok(Self(Arc::new(Inner { post, domain: domain.clone(), key, stopped: OnceLock::new() })))
+        Ok(Self(Arc::new(Inner { post, domain: domain.clone(), key, slots: Semaphore::new(IN_FLIGHT), stopped: OnceLock::new() })))
     }
 
     /// Posts a body to a route and answers its reply. A refusal or an expiry must be signed, and an expiry is of the one
@@ -88,6 +93,7 @@ impl ServeClient {
         if let Some(stopped) = self.0.stopped.get() {
             return Err(stopped.clone().into());
         }
+        let _slot = self.0.slots.acquire().await?;
         let reply = match (self.0.post)(self.0.domain.clone(), route, body.clone()).await {
             Ok(reply) => reply,
             Err(error) => {
