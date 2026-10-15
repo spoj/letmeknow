@@ -1,6 +1,6 @@
 //! The identity kind, built in: an identity's group, whose members are its devices, each with its own device key
 //! there, and whose settings carry the id of the identity's public log. A device certifies its sessions with its device
-//! key, and keeps the keys-only directory in step with the group, restating it twice a year for retention.
+//! key, keeps the keys-only directory in step with the group, and touches it at each of the group's commits for retention.
 //! Names are signed from committed private state, never published in the directory.
 //! Its held messages are adds, invites into groups for one device's sessions, which that device keeps until it takes
 //! them or they expire; its live ones tell which sessions each device runs, and the groups they are in.

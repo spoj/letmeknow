@@ -1187,7 +1187,7 @@ async fn devices_share_an_identity_list_their_devices_and_certify_their_sessions
     let bob = laptop_devices.create("Bob", membership.clone()).await.unwrap();
     lists(&laptop.node, &bob, &[laptop_devices.key().unwrap()]).await;
 
-    // A device link: the tablet joins with a key of its own, which the public log lists once the laptop restates the
+    // A device link: the tablet joins with a key of its own, which the public log lists once the laptop publishes the
     // list.
     let link = lmk_proto::links::Invite::parse(&laptop_devices.invite().await.unwrap()).unwrap();
     tablet_devices.join(&link).await.unwrap();
