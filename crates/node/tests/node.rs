@@ -2034,6 +2034,66 @@ fn a_joiner_whose_key_is_in_the_tree_of_a_lapsed_member_is_removed_before_its_ad
     });
 }
 
+/// An identity whose directory no commit touched in the retention ends for the chats its sessions are in: the members drop
+/// its session as a dropped device's, and remove it, and its device forgets the identity, telling so.
+#[test]
+fn an_untouched_directory_ends_its_identity_for_the_chats_its_sessions_are_in() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let (mut laptop, laptop_devices) = device(&relay, "laptop").await;
+        routed(&mut laptop, laptop_devices.clone());
+        let bob = laptop_devices.create("Bob", relay.service.clone()).await.unwrap();
+        lists(&laptop.node, &bob, &[laptop_devices.key().unwrap()]).await;
+        let mut alice = session(&relay, "Alice").await;
+        let chat = alice.node.create(settings(CHAT, &relay), None).unwrap();
+        let link = alice.node.invite(&chat.0, None, INVITE_VALID).await.unwrap();
+        laptop.node.join(&link, Some(laptop_devices.certify(&laptop.node.key().0).unwrap())).await.unwrap();
+        alice.checked(&chat, "laptop", true).await;
+
+        SHIFT.store(31 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        while relay.membership.expire().await {}
+        alice.node.sync().await;
+        alice.until(|e| matches!(&e, Event::Left { member, .. } if member.name == "laptop").then_some(())).await;
+        alice.until(|e| matches!(&e, Event::Revoked { removed, .. } if removed.iter().any(|m| m.name == "laptop")).then_some(())).await;
+        assert_eq!(alice.node.members(&chat.0).unwrap().len(), 1);
+
+        laptop.node.sync().await;
+        laptop.until(|e| matches!(&e, Event::Warning { text, .. } if text.contains("identity join")).then_some(())).await;
+        assert!(laptop_devices.identity().is_none());
+        laptop.node.shutdown().await.unwrap();
+        alice.node.shutdown().await.unwrap();
+    });
+}
+
+/// A single-device identity outlives the retention: its own commits keep its directory and its group's logs, and it has no
+/// other device to fall behind.
+#[test]
+fn a_single_device_identity_survives_the_retention_by_its_own_commits() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let (mut laptop, laptop_devices) = device(&relay, "laptop").await;
+        routed(&mut laptop, laptop_devices.clone());
+        let bob = laptop_devices.create("Bob", relay.service.clone()).await.unwrap();
+        lists(&laptop.node, &bob, &[laptop_devices.key().unwrap()]).await;
+        SHIFT.store(20 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        laptop_devices.rename("Robert").await.unwrap();
+        SHIFT.store(35 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        while relay.membership.expire().await {}
+        laptop.node.sync().await;
+        laptop.node.sync_members().await.unwrap();
+        assert_eq!(laptop_devices.identity().map(|(_, name)| name), Some("Robert".into()));
+        laptop.node.shutdown().await.unwrap();
+    });
+}
+
 /// A session on SQLite at `db`, which survives a restart.
 async fn stored(relay: &Relay, name: &str, db: &Path) -> Session<SqliteProvider> {
     stored_with(relay, name, db, relay.post()).await
