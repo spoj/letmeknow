@@ -108,7 +108,7 @@ impl Log {
 
 impl Epoch {
     /// The reference of the epoch's log at its service.
-    fn reference(&self) -> Result<[u8; 32]> {
+    pub(crate) fn reference(&self) -> Result<[u8; 32]> {
         Ok(head::reference(&authority(&self.service)?, &self.capability))
     }
 }
@@ -352,7 +352,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// The references among `logs`, each a service and a capability, that their services let go. They are asked for heads
     /// with no length, so each answers its expiry or its head, and only expiries are taken.
-    async fn let_go(&self, logs: Vec<(Service, [u8; 32])>) -> Vec<[u8; 32]> {
+    pub(crate) async fn let_go(&self, logs: Vec<(Service, [u8; 32])>) -> Vec<[u8; 32]> {
         let mut services: Vec<(Service, Vec<Known>)> = Vec::new();
         for (service, capability) in logs {
             match services.iter_mut().find(|(s, _)| *s == service) {
@@ -374,13 +374,13 @@ impl<P: Provider + Send + 'static> Inner<P> {
         gone
     }
 
-    /// Asks for the members' logs every `MEMBERS_POLL`, from now on.
+    /// Asks for the members' logs every `MEMBERS_POLL`, from an hour on.
     pub(crate) async fn ask_members_forever(self: Arc<Self>) {
         loop {
+            sleep(MEMBERS_POLL).await;
             if let Err(error) = self.ask_members().await {
                 self.report(&error);
             }
-            sleep(MEMBERS_POLL).await;
         }
     }
 

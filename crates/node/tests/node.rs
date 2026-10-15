@@ -1994,6 +1994,46 @@ fn a_device_missing_its_identitys_commits_past_the_retention_is_removed_and_told
     });
 }
 
+/// A member that left behind, by its log let go, comes back by invite with the key it had: that key is still in the tree
+/// until a commit of its own removes it, which comes before the Add that lets it in again.
+#[test]
+fn a_joiner_whose_key_is_in_the_tree_of_a_lapsed_member_is_removed_before_its_add() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let dir = folder("lapsed-rejoin");
+        let mut alice = stored(&relay, "Alice", &dir.join("alice.db")).await;
+        let bob = stored(&relay, "Bob", &dir.join("bob.db")).await;
+        let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+        bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+        bob.node.shutdown().await.unwrap();
+        alice.node.change_settings(&gid.0, |s| Settings { name: "Later".into(), ..s }).await.unwrap();
+        alice.node.shutdown().await.unwrap();
+
+        SHIFT.store(31 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        while relay.membership.expire().await {}
+        let mut bob = stored(&relay, "Bob", &dir.join("bob.db")).await;
+        bob.node.sync().await;
+        SHIFT.fetch_add(lmk_net::peers::WAIT + 60_000, std::sync::atomic::Ordering::Relaxed);
+        bob.node.sync().await;
+        bob.until(|e| matches!(&e, Event::Removed { group, .. } if *group == gid).then_some(())).await;
+        bob.node.shutdown().await.unwrap();
+
+        let mut alice = stored(&relay, "Alice", &dir.join("alice.db")).await;
+        let bob = stored(&relay, "Bob", &dir.join("bob.db")).await;
+        bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+        alice.until(|e| matches!(&e, Event::Left { member, .. } if member.name == "Bob").then_some(())).await;
+        alice.until(|e| matches!(&e, Event::Joined { member, .. } if member.name == "Bob").then_some(())).await;
+        assert_eq!(alice.node.members(&gid.0).unwrap().len(), 2);
+        alice.node.shutdown().await.unwrap();
+        bob.node.shutdown().await.unwrap();
+    });
+}
+
 /// A session on SQLite at `db`, which survives a restart.
 async fn stored(relay: &Relay, name: &str, db: &Path) -> Session<SqliteProvider> {
     stored_with(relay, name, db, relay.post()).await

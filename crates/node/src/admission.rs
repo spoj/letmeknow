@@ -288,6 +288,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if let Some(epoch) = logged {
             return self.admitted(&gid, epoch).await;
         }
+        self.remove_lapsed(&gid, &joiner.key.0).await?;
         admits(self.lock().group(&gid)?, &joiner, &rule)?;
         // Its identity's public log, read afresh, must list the device that certified it.
         if let Some(to) = &rule.to {
@@ -309,6 +310,24 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             admitted => admitted,
         }
+    }
+
+    /// Removes the member whose key a joiner brings, in a commit of its own, if the log of the epoch it is in was let go: a
+    /// member that was out past the retention, and not yet removed by the hourly check, must go before its key is added.
+    async fn remove_lapsed(self: &Arc<Self>, gid: &[u8], key: &[u8]) -> Result<()> {
+        let epoch = {
+            let st = self.lock();
+            let g = st.group(gid)?;
+            let at = g.rec.members.iter().find(|(member, _)| member.0 == key).map(|(_, at)| *at);
+            at.and_then(|at| g.rec.epochs.iter().find(|epoch| epoch.epoch == at).cloned())
+        };
+        let Some(epoch) = epoch else { return Ok(()) };
+        if !self.let_go(vec![(epoch.service.clone(), epoch.capability)]).await.contains(&epoch.reference()?) {
+            return Ok(());
+        }
+        let remove = |_: &State<P>, g: &G| Ok(g.mls.members().into_iter().find(|m| m.key == key).map(|m| Change { remove: vec![m.index], ..Change::default() }));
+        self.commit(gid, remove).await?;
+        Ok(())
     }
 
     /// Commits the Add, naming the invite the joiner came in by, and answers with its commit entry and the state of the
