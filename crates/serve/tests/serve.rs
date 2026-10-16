@@ -246,23 +246,6 @@ async fn membership_takes_appends_from_the_app_and_listed_origins_only() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn membership_counts_a_mapped_address_as_its_ipv4_address() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = dir.path().join("state");
-    let (mut config, cert) = configure(&state);
-    config.policy.appends_per_minute = 1;
-    let https = config.https_port;
-    let server = tokio::spawn(serve(config));
-    wait_for_https(https).await;
-
-    let first = https_raw("127.0.0.1", https, &cert, &post(APPEND, None, &append_json(1, b"a"))).await;
-    assert!(matches!(answer::<Appended>(&first), Answer::Ok(_)), "{first}");
-    let mapped = https_raw("::ffff:127.0.0.1", https, &cert, &post(APPEND, None, &append_json(1, b"b"))).await;
-    assert!(matches!(answer::<Appended>(&mapped), Answer::Refused { refusal: Refusal::Rate, .. }), "{mapped}");
-    server.abort();
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn stalled_handshakes_and_headers_are_dropped() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");

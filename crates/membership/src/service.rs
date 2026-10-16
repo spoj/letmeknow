@@ -431,6 +431,7 @@ mod tests {
         let admit = |from: &str| service.admit(from.parse().unwrap(), Route::Heads, 0);
         let held = admit("192.0.2.1").unwrap();
         assert!(admit("192.0.2.1").is_none());
+        assert!(admit("::ffff:192.0.2.1").is_none(), "a mapped address counts as its IPv4 address");
         assert!(admit("192.0.2.2").is_some());
         drop(held);
         assert!(admit("192.0.2.1").is_some());
