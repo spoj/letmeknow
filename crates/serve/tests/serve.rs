@@ -293,14 +293,14 @@ async fn an_answer_that_does_not_drain_closes_its_connection() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     let (config, cert) = configure(&state);
+    // Stored before the service starts: a slow runner's upload of it could outlast the service's body timeout.
+    let store = lmk_membership::store::Store::open(&state).unwrap();
+    store.append(&store.log(&[3; 32]), &[Bytes(vec![1; 1 << 20]), Bytes(vec![2; 1 << 20])], false).unwrap();
+    drop(store);
     let https = config.https_port;
     let server = tokio::spawn(serve(config));
     wait_for_https(https).await;
 
-    let entries = vec![Bytes(vec![1; 1 << 20]), Bytes(vec![2; 1 << 20])];
-    let append = serde_json::to_vec(&Append { capability: [3; 32], entries, public: false }).unwrap();
-    let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, None, &append)).await;
-    assert!(matches!(answer::<Appended>(&response), Answer::Ok(_)), "{response}");
     let read = post("/membership/1/read", None, &serde_json::to_vec(&Read { capability: [3; 32], after: 0 }).unwrap());
     let page = https_raw("127.0.0.1", https, &cert, &read).await.len();
 
