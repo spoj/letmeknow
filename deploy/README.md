@@ -24,9 +24,10 @@ Nothing carries over: it gets a new service, and the previous minor's sessions s
 
 ## A new service
 
-`serve` runs only on state that `serve --initialize` made. To make it, as the `letmeknow` user, into a directory that does not exist yet:
+`serve` runs only on state that `serve --initialize` of its own minor made, so a new minor's state is made before its release, by a binary built from `main` (`cargo build --release --target x86_64-unknown-linux-musl -p letmeknow`) and copied to the VPS. There, as root, into a directory that does not exist yet:
 
-    letmeknow serve --initialize --domain relay.letmeknow.dev --state /var/lib/letmeknow
+    ./letmeknow serve --initialize --domain relay.letmeknow.dev --state /var/lib/letmeknow.new
+    chown -R letmeknow: /var/lib/letmeknow.new
 
 It prints the new domain and public key: put the key in web/backend.json's directory and in crates/proto/src/links.rs, and release. The directory is what the service publishes at `/.well-known/letmeknow.json` once it runs; its `relay` names the domain. A new key is a new service: groups and identities of the old one do not move to it.
 
