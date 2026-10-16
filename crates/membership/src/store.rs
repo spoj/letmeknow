@@ -686,6 +686,7 @@ mod tests {
     /// commits makes. Each of 100,000 memberships asks every two minutes for its group's log and for four directories
     /// it follows (an assumed average), so the bar is 100,000 times five over 120 seconds. Run with
     /// `cargo test --release -- --ignored heads_keep`.
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "builds the target's store: about 30 minutes in release"]
     fn heads_keep_the_target_rate_from_a_cold_cache() {
@@ -745,7 +746,7 @@ mod tests {
         assert!(rate >= BAR, "{rate:.0} log lookups a second");
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn drop_cache(path: &Path) {
         use std::os::unix::io::AsRawFd;
         let file = fs::File::open(path).unwrap();
