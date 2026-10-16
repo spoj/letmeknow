@@ -697,7 +697,7 @@ async fn a_state_from_a_later_epoch_is_asked_again_once_passed() {
     let (gate, _reaching) = Gate::new(Some(&membership));
     let db = |name: &str| dir.join(format!("{name}.db"));
     let mut alice = stored(&relay, "Alice", &db("alice")).await;
-    let bob = stored_with(&relay, "Bob", &db("bob"), gate.post("Bob", relay.post())).await;
+    let bob = stored(&relay, "Bob", &db("bob")).await;
     let gid = alice.node.create(Settings { membership, ..settings(KIND, &relay) }, None).unwrap();
     let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
     let joining = {
@@ -709,15 +709,17 @@ async fn a_state_from_a_later_epoch_is_asked_again_once_passed() {
         _ => None,
     }).await.send(Some(b"the state".to_vec())).unwrap();
     joining.await.unwrap().unwrap();
-    let mut bob = bob;
 
-    // Bob cannot read the service while Alice commits, so it stays in the epoch it has.
-    gate.set(false);
+    // Bob is away while Alice commits, so no peer brings it her commits, and once back it cannot read the service: it
+    // stays in the epoch it has.
+    bob.node.shutdown().await.unwrap();
     alice.node.change_settings(&gid.0, |settings| Settings { name: "Renamed".into(), ..settings }).await.unwrap();
     let ahead = alice.node.epoch(&gid.0).unwrap();
     alice.node.change_settings(&gid.0, |settings| Settings { name: "Renamed again".into(), ..settings }).await.unwrap();
     let passed = alice.node.epoch(&gid.0).unwrap();
     alice.node.shutdown().await.unwrap();
+    gate.set(false);
+    let mut bob = stored_with(&relay, "Bob", &db("bob"), gate.post("Bob", relay.post())).await;
     let (alice_key, _) = member_of(&db("alice"));
     let mut hand = hand(&relay, alice_key, &bob.node).await;
     hand.send(&Frame::State { group: gid.clone(), epoch: ahead, link: Some(Bytes(vec![0; 64])) }).await;
