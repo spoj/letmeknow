@@ -914,8 +914,9 @@ try {
   const target = { store: "records", prefix: "lmk/web/message/", text: "survives the aborted background save" };
   await holdSave(laptop, target);
   ann.run("send", `--group=${invite.group}`, target.text);
-  // Ann's message reaches the laptop's session, restarted by the recovery above, in up to about 30 s (#77).
-  await laptop.waitForFunction(() => window.storageFault.phase === "held", null, { timeout: 60_000 });
+  // Ann's message reaches the laptop's session, restarted by the recovery above, once they connect again: Ann may keep her
+  // connection to its last run until that idles out, 30 s, and their redials back off (#77).
+  await laptop.waitForFunction(() => window.storageFault.phase === "held", null, { timeout: 120_000 });
   await laptop.evaluate(() => { window.storageFault.release = "abort"; });
   await laptop.getByRole("button", { name: "Retry saving and reload" }).waitFor();
   await follower.getByRole("button", { name: "Retry saving and reload" }).waitFor();
