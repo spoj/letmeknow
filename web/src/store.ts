@@ -5,7 +5,7 @@ let db: Promise<IDBDatabase> | undefined;
 function database(): Promise<IDBDatabase> {
   return db ??= new Promise((resolve, reject) => {
     // This version's own database: another version's is left as it is.
-    const request = indexedDB.open("lmk8", 1);
+    const request = indexedDB.open("lmk9", 1);
     request.onupgradeneeded = () => {
       request.result.createObjectStore("records");
       request.result.createObjectStore("files");
@@ -28,9 +28,9 @@ export async function has(): Promise<boolean> {
   return (await done((await database()).transaction("records").objectStore("records").count())) > 0;
 }
 
-/** Whether this browser keeps letmeknow 0.18's session, in its own database, which this version leaves as it is. */
+/** Whether this browser keeps letmeknow 0.19's session, in its own database, which this version leaves as it is. */
 export async function older(): Promise<boolean> {
-  return (await indexedDB.databases()).some(({ name }) => name === "lmk7");
+  return (await indexedDB.databases()).some(({ name }) => name === "lmk8");
 }
 
 /** The session's records, and the hashes of the files it keeps. */

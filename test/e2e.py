@@ -156,7 +156,7 @@ class Minor(Other):
     the next minor's, which it answers 404."""
 
     def route(self):
-        return self.path.replace("/membership/1/", "/membership/2/") if os.path.exists(ENV["LETMEKNOW_UPGRADED"]) else self.path
+        return self.path.replace("/membership/2/", "/membership/3/") if os.path.exists(ENV["LETMEKNOW_UPGRADED"]) else self.path
 
 
 def tls_server(handler, port=0):
@@ -223,7 +223,7 @@ def main():
 
         # An invite, and chat.
         invite = run("alice", "invite", "--name", "Plans")
-        check(invite["link"].startswith("https://letmeknow.dev/i#8.g.") and invite["kind"] == "chat", "invite gives a link to a new chat")
+        check(invite["link"].startswith("https://letmeknow.dev/i#9.g.") and invite["kind"] == "chat", "invite gives a link to a new chat")
         group = invite["group"]
         check("serve" in run("alice", "groups")[0]["membership"], "its log is on the local letmeknow serve")
         joined = run("bob", "join", invite["link"])
@@ -283,7 +283,7 @@ def main():
 
         # A device link: bob's tablet joins his identity.
         link = run("bob", "identity", "invite")["link"]
-        check("#8.d." in link, "identity invite gives a device link")
+        check("#9.d." in link, "identity invite gives a device link")
         tablet = Listener("tablet")
         listeners.append(tablet)
         check("device" in run("tablet", "identity", "join", link), "the tablet joins bob's identity")

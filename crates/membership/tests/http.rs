@@ -71,8 +71,8 @@ fn one(entry: &[u8]) -> Vec<Vec<u8>> { vec![entry.to_vec()] }
 #[tokio::test]
 async fn routes_answer_appends_reads_and_heads_with_signed_heads() {
     let http = Http::new(Policy::default());
-    assert!(Route::parse("/membership/2/append").is_none());
-    assert!(matches!(Route::parse("/membership/1/heads"), Some(Route::Heads)));
+    assert!(Route::parse("/membership/3/append").is_none());
+    assert!(matches!(Route::parse("/membership/2/heads"), Some(Route::Heads)));
     let Answer::Ok(appended) = http.post::<Appended>(Route::Append, "192.0.2.1", &append_body(7, &one(b"one"), false)).await else {
         panic!("append refused")
     };

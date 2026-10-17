@@ -253,7 +253,7 @@ async fn pair(world: &World, hold: Duration) -> (Agent, Agent, String) {
     let invite = alice.cmd(&["invite"]).await.unwrap();
     assert_eq!(keys(&invite), keys(&json!({ "link": 0, "group": 0, "kind": 0, "expires_in": 0 })));
     let link = invite["link"].as_str().unwrap();
-    assert!(link.starts_with("https://letmeknow.dev/i#8.g."));
+    assert!(link.starts_with("https://letmeknow.dev/i#9.g."));
     let joined = bob.cmd(&["join", link]).await.unwrap();
     assert_eq!(joined["group"], invite["group"]);
     assert_eq!(joined["members"].as_array().unwrap().len(), 2);
@@ -736,7 +736,7 @@ fn a_device_is_on_one_identity_which_lists_and_loses_devices() {
         assert_eq!(listed["devices"][0]["you"], true);
         assert_eq!(listed["name"], "Alice Smith");
         let invite = alice.cmd(&["identity", "invite"]).await.unwrap();
-        assert!(invite["link"].as_str().unwrap().contains("#8.d."));
+        assert!(invite["link"].as_str().unwrap().contains("#9.d."));
         let phone = world.start("phone", HOUR).await;
         let refused = phone.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap_err().to_string();
         assert!(refused.contains("letmeknow identity join <link>"), "{refused}");
@@ -1251,7 +1251,8 @@ fn a_home_of_another_format_is_refused_and_names_its_release() {
         for (format, names, run) in [
             ("5", "letmeknow 0.16", "@letmeknow/cli@0.16"),
             ("7", "letmeknow 0.18", "@letmeknow/cli@0.18"),
-            ("9", "a newer letmeknow", "@letmeknow/cli@latest"),
+            ("8", "letmeknow 0.19", "@letmeknow/cli@0.19"),
+            ("10", "a newer letmeknow", "@letmeknow/cli@latest"),
         ] {
             let home = world.root.path().join(format!("format-{format}"));
             std::fs::create_dir_all(&home).unwrap();
@@ -1270,12 +1271,12 @@ fn a_home_of_another_format_is_refused_and_names_its_release() {
 fn ready_names_a_newer_minor_version_and_the_command_to_run_it() {
     local(async {
         let world = world("newer").await;
-        let newer = registry(r#"{"dist-tags":{"latest":"0.20.0"}}"#, Duration::ZERO).await;
+        let newer = registry(r#"{"dist-tags":{"latest":"0.21.0"}}"#, Duration::ZERO).await;
         let alice = world.launch(Config { registry: newer, ..world.config("alice", "alice") }, usize::MAX).await;
         let home = world.root.path().join("alice");
-        assert_eq!(alice.ready["newer"], "0.20.0");
-        assert_eq!(alice.ready["update"], format!("LETMEKNOW_HOME={} npx -y @letmeknow/cli@0.20 --session alice listen", home.display()));
-        let same = registry(r#"{"dist-tags":{"latest":"0.19.4"}}"#, Duration::ZERO).await;
+        assert_eq!(alice.ready["newer"], "0.21.0");
+        assert_eq!(alice.ready["update"], format!("LETMEKNOW_HOME={} npx -y @letmeknow/cli@0.21 --session alice listen", home.display()));
+        let same = registry(r#"{"dist-tags":{"latest":"0.20.4"}}"#, Duration::ZERO).await;
         let bob = world.launch(Config { registry: same, ..world.config("bob", "bob") }, usize::MAX).await;
         assert!(bob.ready.get("newer").is_none(), "{}", bob.ready);
     });
@@ -1287,7 +1288,7 @@ fn ready_names_a_newer_minor_version_and_the_command_to_run_it() {
 fn a_slow_registry_leaves_ready_without_a_notice() {
     local(async {
         let world = world("slow").await;
-        let slow = registry(r#"{"dist-tags":{"latest":"0.20.0"}}"#, Duration::from_secs(60)).await;
+        let slow = registry(r#"{"dist-tags":{"latest":"0.21.0"}}"#, Duration::from_secs(60)).await;
         let started = std::time::Instant::now();
         let alice = world.launch(Config { registry: slow, ..world.config("alice", "alice") }, usize::MAX).await;
         assert!(alice.ready.get("newer").is_none(), "{}", alice.ready);

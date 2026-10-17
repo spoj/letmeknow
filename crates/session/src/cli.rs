@@ -231,7 +231,7 @@ fn hyphens(command: clap::Command) -> clap::Command {
 pub fn home_dir(home: Option<PathBuf>) -> Result<PathBuf> {
     match home {
         Some(home) => Ok(home),
-        None => Ok(dirs::data_local_dir().context("no local data directory")?.join("letmeknow-v8")),
+        None => Ok(dirs::data_local_dir().context("no local data directory")?.join("letmeknow-v9")),
     }
 }
 

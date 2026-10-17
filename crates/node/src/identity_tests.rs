@@ -44,7 +44,7 @@ impl Authority {
         Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
             let (authority, base) = (authority.clone(), base.clone());
             Box::pin(async move {
-                if route == "/membership/1/read" {
+                if route == "/membership/2/read" {
                     let Read { capability, after } = serde_json::from_slice(&body)?;
                     let log = authority.log(&capability).reference;
                     let gate = {

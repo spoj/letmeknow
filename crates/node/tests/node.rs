@@ -1067,7 +1067,7 @@ async fn a_contradiction_is_reported_once() {
             let (forging, base, key) = (forging.clone(), base.clone(), key.clone());
             Box::pin(async move {
                 let answer = base(domain, route, body).await?;
-                if route != "/membership/1/read" || !forging.load(std::sync::atomic::Ordering::Relaxed) { return Ok(answer) }
+                if route != "/membership/2/read" || !forging.load(std::sync::atomic::Ordering::Relaxed) { return Ok(answer) }
                 let Answer::<Page>::Ok(mut page) = serde_json::from_slice(&answer)? else { return Ok(answer) };
                 page.head = Head::sign(&key, &page.head.log_ref, page.head.length, [0; 32], page.head.time);
                 Ok(serde_json::to_vec(&Answer::Ok(page))?)
@@ -1588,7 +1588,7 @@ async fn a_poll_asks_each_service_once_for_every_256_logs() {
     let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
     let (counting, post) = (asked.clone(), relay.post());
     let alice = session_with(&relay, "Alice", Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
-        if route == "/membership/1/heads" {
+        if route == "/membership/2/heads" {
             let heads: lmk_proto::membership::Heads = serde_json::from_slice(&body).unwrap();
             counting.lock().unwrap().push((domain.clone(), heads.logs.len()));
         }

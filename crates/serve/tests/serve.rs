@@ -179,7 +179,7 @@ async fn directory_names_the_relays_given() {
 }
 
 const APP: &str = "https://letmeknow.dev";
-const APPEND: &str = "/membership/1/append";
+const APPEND: &str = "/membership/2/append";
 
 fn append_json(capability: u8, entry: &[u8]) -> Vec<u8> {
     serde_json::to_vec(&Append { capability: [capability; 32], entries: vec![Bytes(entry.to_vec())], public: false }).unwrap()
@@ -215,7 +215,7 @@ async fn membership_takes_appends_from_the_app_and_listed_origins_only() {
     let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, Some("https://evil.example"), &append_json(8, b"x"))).await;
     assert!(response.starts_with("HTTP/1.1 403"), "{response}");
     let read = serde_json::to_vec(&Read { capability: [8; 32], after: 0 }).unwrap();
-    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/1/read", None, &read)).await;
+    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/2/read", None, &read)).await;
     let Answer::Ok(page) = answer::<Page>(&response) else { panic!("{response}") };
     assert!(page.entries.is_empty(), "a page of another origin appended");
 
@@ -231,11 +231,11 @@ async fn membership_takes_appends_from_the_app_and_listed_origins_only() {
     let response = https_raw("127.0.0.1", https, &cert, preflight(APPEND, "https://evil.example").as_bytes()).await;
     assert!(response.starts_with("HTTP/1.1 403"), "{response}");
 
-    let response = https_raw("127.0.0.1", https, &cert, b"GET /membership/1/read HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await;
+    let response = https_raw("127.0.0.1", https, &cert, b"GET /membership/2/read HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await;
     assert!(response.starts_with("HTTP/1.1 405"), "{response}");
-    let response = https_raw("127.0.0.1", https, &cert, preflight("/membership/2/append", APP).as_bytes()).await;
+    let response = https_raw("127.0.0.1", https, &cert, preflight("/membership/3/append", APP).as_bytes()).await;
     assert!(response.starts_with("HTTP/1.1 204") && response.to_lowercase().contains(&format!("access-control-allow-origin: {APP}")), "{response}");
-    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/2/append", Some(APP), &append_json(7, b"x"))).await;
+    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/3/append", Some(APP), &append_json(7, b"x"))).await;
     assert!(response.starts_with("HTTP/1.1 404") && response.to_lowercase().contains(&format!("access-control-allow-origin: {APP}")), "{response}");
 
     let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, None, b"not json")).await;
@@ -301,7 +301,7 @@ async fn an_answer_that_does_not_drain_closes_its_connection() {
     let server = tokio::spawn(serve(config));
     wait_for_https(https).await;
 
-    let read = post("/membership/1/read", None, &serde_json::to_vec(&Read { capability: [3; 32], after: 0 }).unwrap());
+    let read = post("/membership/2/read", None, &serde_json::to_vec(&Read { capability: [3; 32], after: 0 }).unwrap());
     let page = https_raw("127.0.0.1", https, &cert, &read).await.len();
 
     let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
@@ -376,9 +376,9 @@ async fn the_journal_holds_no_addresses_keys_or_capabilities() {
     let append = post(APPEND, Some(APP), &append_json(7, b"one"));
     assert!(https_raw("127.0.0.1", https, &cert, &append).await.starts_with("HTTP/1.1 200"));
     let read = serde_json::to_vec(&Read { capability, after: 0 }).unwrap();
-    assert!(https_raw("127.0.0.1", https, &cert, &post("/membership/1/read", Some(APP), &read)).await.starts_with("HTTP/1.1 200"));
+    assert!(https_raw("127.0.0.1", https, &cert, &post("/membership/2/read", Some(APP), &read)).await.starts_with("HTTP/1.1 200"));
     let heads = serde_json::to_vec(&Heads { logs: vec![Known(capability, 0)] }).unwrap();
-    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/1/heads", Some(APP), &heads)).await;
+    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/2/heads", Some(APP), &heads)).await;
     let Answer::<Moved>::Ok(moved) = answer(&response) else { panic!("{response}") };
     assert_eq!(moved.heads.len(), 1);
     let public = serde_json::to_vec(&Append { capability: [9; 32], entries: vec![Bytes(vec![0; 17 << 10])], public: true }).unwrap();
@@ -414,9 +414,9 @@ async fn the_journal_holds_no_addresses_keys_or_capabilities() {
     let store = lmk_membership::store::Store::open(&state).unwrap();
     while store.expire(i64::MAX as u64).unwrap() {}
     drop(store);
-    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/1/read", Some(APP), &read)).await;
+    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/2/read", Some(APP), &read)).await;
     assert!(matches!(answer::<Page>(&response), Answer::Expired { .. }), "{response}");
-    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/1/heads", Some(APP), &heads)).await;
+    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/2/heads", Some(APP), &heads)).await;
     assert!(matches!(answer::<Moved>(&response), Answer::Ok(moved) if moved.expired.len() == 1), "{response}");
     router.shutdown().await.unwrap();
     server.abort();
