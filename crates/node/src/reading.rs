@@ -142,7 +142,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             return Ok(false);
         }
         let log = st.next_log(gid, position)?;
-        self.work.send(Work::Read(log)).ok();
+        self.work.send(Work::Entered(log)).ok();
         let g = st.group_mut(gid)?;
         let (early, later): (Vec<_>, Vec<_>) = std::mem::take(&mut g.early).into_iter().partition(|(_, ciphertext)| core::claim(ciphertext).is_ok_and(|(_, epoch)| epoch == current));
         g.early = later;

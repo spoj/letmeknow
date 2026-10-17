@@ -233,8 +233,8 @@ fn later() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + LATER.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// A commit of an identity's group touches its directory, so the directory outlives the retention, and one nobody commits
-/// to does not. Every thread of the runtime reads the moved clock.
+/// A device online touches its identity's directory every hour, so the directory outlives the retention, and one whose
+/// device is gone does not. Every thread of the runtime reads the moved clock.
 #[test]
 fn a_commit_touches_its_identitys_directory_past_the_retention() {
     let runtime = tokio::runtime::Builder::new_multi_thread().on_thread_start(|| lmk_proto::clock::set(later)).enable_all().build().unwrap();
@@ -255,16 +255,13 @@ async fn touched_directory_outlives_retention() {
     let (other, other_devices) = stored_device(&relay, "other-canary", &db("other")).await;
     let untouched = other_devices.create("untouched", relay.service.clone()).await.unwrap();
     other.node.shutdown().await.unwrap();
-    let gid = devices_group(&laptop.node);
     LATER.store(5 * DAY, std::sync::atomic::Ordering::Relaxed);
-    let epoch = laptop.node.epoch(&gid.0).unwrap();
-    laptop_devices.rename("renamed-canary").await.unwrap();
-    assert!(laptop.node.epoch(&gid.0).unwrap() > epoch, "the rename commits, and so touches the directory");
+    laptop.node.open_logs().await;
     LATER.store(9 * DAY, std::sync::atomic::Ordering::Relaxed);
     while relay.membership.expire().await {}
     let reader = ServeClient::for_service(relay.post(), &touched.membership).unwrap();
     let logs = [touched.id.0, untouched.id.0].map(|id| lmk_proto::membership::Known(lmk_proto::public::address(&id), u64::MAX));
     let answers = reader.heads(&logs).await.unwrap();
-    assert!(answers[0].is_ok(), "the commit moved the directory's day, so the retention keeps it");
-    assert!(answers[1].is_err(), "the control: a directory whose device is gone, and nobody committed to, expires");
+    assert!(answers[0].is_ok(), "the touch moved the directory's day, so the retention keeps it");
+    assert!(answers[1].is_err(), "the control: a directory whose device is gone expires");
 }

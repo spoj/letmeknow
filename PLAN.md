@@ -75,7 +75,7 @@ For: a session resumes within seven days, and nothing in use lapses.
 - Tests, on a shifted clock: a member away six days resumes; one whose group commits just after it leaves, and that stays away past the retention, is removed; a device away past the retention while another goes on leaves its identity.
 - Docs: README's `--retention` default and its storage figure; SKILL's resume window.
 
-## 9. Quiet groups and idle identities end
+## 9. Quiet groups and idle identities end (done)
 
 For: a group with nobody online for about seven days ends, and so does an identity with no device online; a session away up to seven days resumes, in a quiet group too.
 
@@ -83,7 +83,7 @@ Today the service records a group log at its first entry and lets it go a retent
 
 - The service opens a group log on an empty append, which it refuses today: an open records an empty log with today as its `opened` day, or moves an empty log's `opened` to today. It changes nothing once the log has an entry, and is refused for a directory and for a log that went.
 - A log's first entry sets `opened` to its day, so an absent member keeps a full retention from the commit it missed.
-- While online, a member opens its current epoch's log as it enters the epoch and every hour after, and a device touches its directory every hour, in one request per service. A log's clock thus starts at most an hour before its last member or device went offline. These touches replace the touch at each identity commit.
+- While online, a member opens its current epoch's log as it enters the epoch and every hour after, and a device touches its directory every hour, one request per log: a few requests per session an hour. A log's clock thus starts at most an hour before its last member or device went offline. These touches replace the touch at each identity commit.
 - Members need nothing new: one whose current log went leaves after `WAIT`, as one that missed commits does (`lapse` in `crates/node/src/logs.rs`); a device whose directory went leaves its identity, as today.
 - The retention counts only time the service runs. Each expiry pass records its day; at a start, before its first pass, live logs' days move on by the days since that record, plus one, as days are whole.
 - Tests: the last member goes offline 23 hours after its group's last commit and comes back six and a half days later to the group; a group nobody is online in for longer than the retention ends for each member as it comes back, replacing the test above; a device last online 23 hours after its identity's last commit keeps its identity six and a half days later; in the store, an open creates or moves only an empty log and is refused for a directory and for a log that went, and a first entry sets `opened`; a service stopped for longer than the retention lets no log go at its start that was live when it stopped.

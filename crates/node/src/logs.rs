@@ -30,6 +30,8 @@ pub(crate) const NOT_FOLLOWED: &str = "this session does not follow that log";
 const POLL: Duration = Duration::from_secs(2 * 60);
 /// How often the logs members are behind in are asked of their services: a member whose log its service let go is removed.
 const MEMBERS_POLL: Duration = Duration::from_secs(60 * 60);
+/// How often a session opens its groups' logs and touches its identities' directories.
+const OPEN: Duration = Duration::from_secs(60 * 60);
 
 /// The logs asked of one service, each with the length held.
 type Asked = (Service, Vec<(Vec<u8>, Known)>);
@@ -372,6 +374,44 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
         }
         gone
+    }
+
+    /// Opens a group's log: the service keeps it a retention from its last open while it is empty, so a group whose
+    /// members were all away that long ends.
+    pub(crate) async fn open(&self, id: &[u8]) -> Result<()> {
+        let (service, capability) = {
+            let st = self.lock();
+            (st.log(id)?.service.clone(), st.capability(id)?)
+        };
+        self.clients.client(&service)?.append(&capability, &[], false).await.map(drop)
+    }
+
+    /// Opens the current log of each group this session is in, and touches the directory of each identity whose group it
+    /// is in, as every `OPEN` does: a log's retention thus starts at most an hour before its last member went offline.
+    pub(crate) async fn open_logs(self: &Arc<Self>) {
+        let (logs, identities): (Vec<Vec<u8>>, Vec<Vec<u8>>) = {
+            let st = self.lock();
+            let active = || st.groups.iter().filter(|(_, g)| g.mls.active());
+            (active().map(|(_, g)| g.rec.log.0.clone()).collect(), active().filter(|(_, g)| g.mls.settings().kind == IDENTITY).map(|(gid, _)| gid.clone()).collect())
+        };
+        for log in logs {
+            if let Err(error) = self.open(&log).await {
+                self.report(&error);
+            }
+        }
+        for gid in identities {
+            if let Err(error) = self.touch_directory(&gid).await {
+                self.report(&error);
+            }
+        }
+    }
+
+    /// Opens the logs every `OPEN`, from now on.
+    pub(crate) async fn open_forever(self: Arc<Self>) {
+        loop {
+            self.open_logs().await;
+            sleep(OPEN).await;
+        }
     }
 
     /// Asks for the members' logs every `MEMBERS_POLL`, from an hour on.

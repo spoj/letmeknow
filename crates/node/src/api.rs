@@ -81,6 +81,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             let mls = Group::create(&st.provider, &st.session, &settings)?;
             st.add_group(mls, Rec::default())?
         };
+        self.inner.work.send(Work::Entered(self.log(&gid)?.0)).ok();
         Ok(Bytes(gid))
     }
 
@@ -100,6 +101,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             st.device_keys.insert(gid.clone(), (seed, session));
             (gid, IdentityRef { id: Bytes(id.to_vec()), membership: settings.membership }, first)
         };
+        self.inner.work.send(Work::Entered(self.log(&gid)?.0)).ok();
         let address = lmk_proto::public::address(&identity.id.0);
         if let Err(error) = self.inner.clients.client(&identity.membership)?.append(&address, &[first], true).await {
             self.leave(&gid)?;
@@ -327,13 +329,18 @@ impl<P: Provider + Send + 'static> Node<P> {
         self.inner.ask_members().await
     }
 
+    /// Opens the groups' current logs and touches the identities' directories, as every hour does.
+    pub async fn open_logs(&self) {
+        self.inner.open_logs().await
+    }
+
     /// An identity's public log, read from its service now.
     pub async fn read_public(&self, identity: &IdentityRef) -> Result<PublicLog> {
         self.inner.read_public(identity).await
     }
 
     /// Publishes an intent derived after reading `predecessor`, never rebasing it onto a later directory. Unchanged
-    /// writers publish nothing: each commit of the identity group touches the directory instead.
+    /// writers publish nothing: each device touches the directory every hour instead.
     pub async fn publish(&self, gid: &[u8], predecessor: &PublicLog, mut writers: Vec<Bytes>) -> Result<PublicLog> {
         writers.sort();
         writers.dedup();

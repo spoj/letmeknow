@@ -148,6 +148,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         self.spawn(self.clone().send_out(outbox));
         self.spawn(self.clone().ask_heads_forever());
         self.spawn(self.clone().ask_members_forever());
+        self.spawn(self.clone().open_forever());
         let mut st = self.lock();
         let public: Vec<Bytes> = st.logs.values().filter_map(|log| match &log.of {
             logs::Of::Public(id) => Some(id.clone()),
@@ -289,9 +290,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
         while let Some(item) = work.recv().await {
             match item {
                 Work::Applied { group, by, added, how, removed, settings, gone } => self.applied(&group, by, added, how, removed, settings, gone).await,
-                Work::Read(log) => {
+                Work::Entered(log) => {
                     let node = self.clone();
                     self.spawn(async move {
+                        if let Err(error) = node.open(&log).await {
+                            tracing::debug!("opening log {}: {error:#}", hex(&log));
+                        }
                         if let Err(error) = node.read(&log).await {
                             tracing::debug!("reading log {}: {error:#}", hex(&log));
                         }

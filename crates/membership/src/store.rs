@@ -125,7 +125,7 @@ impl Store {
         db.execute_batch(
             "BEGIN IMMEDIATE;
              CREATE TABLE metadata (id INTEGER PRIMARY KEY CHECK(id=1), format INTEGER NOT NULL,
-                 authority BLOB NOT NULL CHECK(length(authority)=32), public_bytes INTEGER NOT NULL);
+                 authority BLOB NOT NULL CHECK(length(authority)=32), public_bytes INTEGER NOT NULL, passed INTEGER NOT NULL);
              CREATE TABLE totals (day INTEGER PRIMARY KEY, entries INTEGER NOT NULL, bytes INTEGER NOT NULL);
              CREATE TABLE anchors (reference BLOB PRIMARY KEY CHECK(length(reference)=32), public INTEGER NOT NULL,
                  opened INTEGER NOT NULL, day INTEGER NOT NULL, bytes INTEGER NOT NULL, sealed BLOB NOT NULL) WITHOUT ROWID;
@@ -138,7 +138,7 @@ impl Store {
              CREATE VIEW logs AS SELECT reference,public,day FROM anchors;
              CREATE VIEW entries AS SELECT reference,position FROM records;",
         )?;
-        db.execute("INSERT INTO metadata VALUES(1,?,?,0)", params![FORMAT, key.verifying_key().as_bytes()])?;
+        db.execute("INSERT INTO metadata VALUES(1,?,?,0,?)", params![FORMAT, key.verifying_key().as_bytes(), now() / DAY_MS])?;
         db.execute_batch("COMMIT; PRAGMA wal_checkpoint(TRUNCATE);")?;
         sync_dir(state)?;
         let mut ready = options.open(state.join("membership.ready"))?;
@@ -159,12 +159,21 @@ impl Store {
         let guards: u32 = check.query_row("SELECT count(*) FROM sqlite_schema WHERE type='view' AND name IN ('logs','entries')", [], |r| r.get(0))?;
         ensure!(guards == 2, "incompatible membership schema");
         drop(check);
-        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        let mut db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         db.busy_timeout(std::time::Duration::from_millis(250))?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "FULL")?;
         db.pragma_update(None, "fullfsync", true)?;
         db.pragma_update(None, "secure_delete", true)?;
+        // The retention counts only days the service runs: live logs' days move on by those since the last expiry pass,
+        // and one more, as days are whole.
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (passed, today): (u64, u64) = (tx.query_row("SELECT passed FROM metadata", [], |r| r.get(0))?, now() / DAY_MS);
+        if today > passed {
+            tx.execute("UPDATE anchors SET opened=opened+?1, day=day+?1", [today - passed + 1])?;
+            tx.execute("UPDATE metadata SET passed=?", [today])?;
+        }
+        tx.commit()?;
         Ok(Self { db: Mutex::new(db), key, wal: state.join("membership.db-wal"), disk: DISK_BYTES })
     }
 
@@ -178,14 +187,20 @@ impl Store {
         Head::sign(&self.key, log_ref, length, hash, now())
     }
 
+    /// Appends entries to a log. None opens a group log: it records an empty log, or moves an empty log's `opened` day
+    /// to today, and changes nothing once the log has an entry. A log's first entry sets `opened` to its day.
     pub fn append(&self, log: &Log, entries: &[Bytes], public: bool) -> Result<(Appended, u64)> {
         ensure!(membership::valid_append(entries), Refused("size".into()));
+        ensure!(!public || !entries.is_empty(), Refused("policy".into()));
         let bytes = entries.iter().map(|e| e.0.len() as u64).sum::<u64>();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let live = tip(&tx, log)?;
         let (length, mut hash, stored) = live.unwrap_or((0, head::start(self.key.verifying_key().as_bytes(), &log.reference), public));
         ensure!(stored == public, Refused("policy".into()));
+        if entries.is_empty() && length > 0 {
+            return Ok((Appended { position: length + 1, head: self.sign(&log.reference, length, hash) }, 0));
+        }
         ensure!(used(&tx, &self.wal)? + bytes <= self.disk, Refused("quota".into()));
         if public {
             let public_bytes: u64 = tx.query_row("SELECT public_bytes FROM metadata", [], |r| r.get(0))?;
@@ -202,11 +217,13 @@ impl Store {
         let state = seal(&log.key, &[&end.to_be_bytes()[..], &hash].concat());
         tx.execute(
             "INSERT INTO anchors VALUES(?1,?2,?3,?3,?4,?5) ON CONFLICT(reference) DO UPDATE
-             SET sealed=?5, day=?3, bytes=bytes+?4",
-            params![log.reference, public, day, bytes, state],
+             SET sealed=?5, day=?3, bytes=bytes+?4, opened=CASE WHEN ?6 THEN ?3 ELSE opened END",
+            params![log.reference, public, day, bytes, state, length == 0],
         )?;
-        tx.execute("INSERT INTO totals VALUES(?1,?2,?3) ON CONFLICT(day) DO UPDATE SET entries=entries+?2,bytes=bytes+?3",
-            params![day, entries.len() as u64, bytes])?;
+        if !entries.is_empty() {
+            tx.execute("INSERT INTO totals VALUES(?1,?2,?3) ON CONFLICT(day) DO UPDATE SET entries=entries+?2,bytes=bytes+?3",
+                params![day, entries.len() as u64, bytes])?;
+        }
         tx.commit()?;
         Ok((Appended { position: length + 1, head: self.sign(&log.reference, end, hash) }, entries.len() as u64))
     }
@@ -253,6 +270,11 @@ impl Store {
         Ok(tip(&self.db.lock().unwrap(), log)?.map_or(0, |(length, _, _)| length))
     }
 
+    /// Whether the store records a log, empty or not; an error if it let it go.
+    pub fn records(&self, log: &Log) -> Result<bool> {
+        Ok(tip(&self.db.lock().unwrap(), log)?.is_some())
+    }
+
     /// The heads of the logs whose length differs from the one given, and the references of those that expired.
     pub fn moved(&self, logs: &[(Log, u64)]) -> Result<(Vec<Head>, Vec<[u8; 32]>)> {
         let db = self.db.lock().unwrap();
@@ -288,9 +310,9 @@ impl Store {
         Ok(Stats { days })
     }
 
-    /// One bounded pass of expiry, then a truncating checkpoint of the WAL. A group's log goes once its first entry's day
-    /// is before `before_day`, a directory's once its last append's is; a log that goes keeps only its reference. Returns
-    /// whether more is left for another pass.
+    /// One bounded pass of expiry, then a truncating checkpoint of the WAL, recording its day. A group's log goes once its
+    /// `opened` day is before `before_day`, a directory's once its last append's is; a log that goes keeps only its
+    /// reference. Returns whether more is left for another pass.
     pub fn expire(&self, before_day: u64) -> Result<bool> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -309,6 +331,7 @@ impl Store {
         }
         let more = reap(&tx)?;
         tx.execute("DELETE FROM totals WHERE day<?", [(now() / DAY_MS).saturating_sub(STATS_DAYS)])?;
+        tx.execute("UPDATE metadata SET passed=?", [now() / DAY_MS])?;
         tx.commit()?;
         db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
         Ok(more || logs.len() == MARK_LOGS)
@@ -435,6 +458,62 @@ mod tests {
         assert_eq!(store.moved(&[(log.clone(), 0), (store.log(&[8; 32]), 0)]).unwrap(), (vec![], vec![log.reference]));
         assert_eq!(store.moved(&[(store.log(&[8; 32]), 0)]).unwrap(), (vec![], vec![]));
         assert_eq!(store.moved(&[(store.log(&[8; 32]), 1)]).unwrap().0.len(), 1);
+    }
+
+    fn opened(store: &Store, log: &Log) -> u64 {
+        store.db.lock().unwrap().query_row("SELECT opened FROM anchors WHERE reference=?", [log.reference], |r| r.get(0)).unwrap()
+    }
+
+    fn refusal(result: Result<(Appended, u64)>) -> String {
+        result.unwrap_err().downcast::<Refused>().unwrap().0
+    }
+
+    #[test]
+    fn an_open_records_or_moves_only_an_empty_group_log() {
+        let (_dir, path) = state();
+        let store = Store::initialize(&path).unwrap();
+        let (group, directory, gone) = (store.log(&[1; 32]), store.log(&[2; 32]), store.log(&[3; 32]));
+        on(10);
+        let open = store.append(&group, &[], false).unwrap().0;
+        assert_eq!((open.position, open.head.length, opened(&store, &group)), (1, 0, 10), "an open records an empty log");
+        store.append(&gone, &[], false).unwrap();
+        on(12);
+        store.append(&group, &[], false).unwrap();
+        assert_eq!(opened(&store, &group), 12, "and moves an empty log's day");
+        on(13);
+        store.append(&group, &[Bytes(b"commit".to_vec())], false).unwrap();
+        assert_eq!(opened(&store, &group), 13, "a first entry sets the day");
+        on(15);
+        let open = store.append(&group, &[], false).unwrap().0;
+        assert_eq!((open.position, open.head.length, opened(&store, &group)), (2, 1, 13), "an open changes nothing past it");
+        assert_eq!(store.db.lock().unwrap().query_row("SELECT sum(entries) FROM totals", [], |r| r.get::<_, u64>(0)).unwrap(), 1);
+
+        store.append(&directory, &[Bytes(b"entry".to_vec())], true).unwrap();
+        assert_eq!(refusal(store.append(&directory, &[], true)), "policy");
+        assert_eq!(refusal(store.append(&directory, &[], false)), "policy");
+        store.expire(11).unwrap();
+        assert!(store.append(&gone, &[], false).unwrap_err().is::<Expired>(), "a log that went is not opened again");
+        assert!(store.records(&group).unwrap());
+    }
+
+    #[test]
+    fn a_service_stopped_past_the_retention_lets_no_live_log_go_at_its_start() {
+        let (_dir, path) = state();
+        let store = Store::initialize(&path).unwrap();
+        let (group, directory) = (store.log(&[1; 32]), store.log(&[2; 32]));
+        on(10);
+        store.append(&group, &[], false).unwrap();
+        store.append(&directory, &[Bytes(b"entry".to_vec())], true).unwrap();
+        store.expire(3).unwrap();
+        drop(store);
+        on(30);
+        let store = Store::open(&path).unwrap();
+        store.expire(30 - 7).unwrap();
+        assert!(store.records(&group).unwrap() && store.records(&directory).unwrap(), "the retention counts the days it ran");
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        store.expire(32).unwrap();
+        assert!(store.records(&group).is_err() && store.records(&directory).is_err(), "a start on the day of the last pass moves nothing");
     }
 
     #[test]

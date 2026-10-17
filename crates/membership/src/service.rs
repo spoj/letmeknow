@@ -334,13 +334,15 @@ impl Service {
             ensure!(!public || budgets.public_appends.fits(at, &per_log, count), Refused("rate".into()));
             budgets.new_logs.fits(at, sources, 1) && (!public || budgets.new_public_logs.fits(at, sources, 1))
         };
-        let (appended, stored) = self.work({ let log = log.clone(); move |inner| {
-            ensure!(may_start || inner.store.length(&log)? > 0, Refused("rate".into()));
-            inner.store.append(&log, &entries, public)
+        let (appended, stored, started) = self.work({ let log = log.clone(); move |inner| {
+            let started = !inner.store.records(&log)?;
+            ensure!(may_start || !started, Refused("rate".into()));
+            let (appended, stored) = inner.store.append(&log, &entries, public)?;
+            Ok((appended, stored, started))
         } }).await?;
         let mut budgets = self.0.budgets.lock().unwrap();
         if public { budgets.public_appends.charge(at, &per_log, stored); }
-        if appended.position == 1 {
+        if started {
             budgets.new_logs.charge(at, sources, 1);
             if public { budgets.new_public_logs.charge(at, sources, 1); }
         }

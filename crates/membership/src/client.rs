@@ -118,15 +118,16 @@ impl ServeClient {
         }
     }
 
+    /// Appends entries to a log; none opens a group log, as `Store::append` says.
     pub async fn append(&self, capability: &[u8; 32], entries: &[Vec<u8>], public: bool) -> Result<Appended> {
-        ensure!(!entries.is_empty() && entries.len() <= membership::APPEND_ROWS
+        ensure!(entries.len() <= membership::APPEND_ROWS
             && entries.iter().all(|e| !e.is_empty() && e.len() <= membership::MAX_ENTRY)
             && entries.iter().map(Vec::len).sum::<usize>() <= membership::APPEND_BYTES, Refused("size".into()));
         let sent = clock::now();
         let body = json(&Append { capability: *capability, entries: entries.iter().cloned().map(Bytes).collect(), public })?;
         let appended: Appended = self.request("/membership/2/append", body, Some(head::reference(self.0.key.as_bytes(), capability))).await?;
         Frontier::empty(*self.0.key.as_bytes(), head::reference(self.0.key.as_bytes(), capability)).check(&appended.head, None)?;
-        ensure!(appended.position > 0 && appended.position.checked_add(entries.len() as u64 - 1) == Some(appended.head.length), crate::InvalidProof);
+        ensure!(appended.position > 0 && appended.position.checked_add(entries.len() as u64) == Some(appended.head.length + 1), crate::InvalidProof);
         record_time(sent, &appended.head)?;
         Ok(appended)
     }

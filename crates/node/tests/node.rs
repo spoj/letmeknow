@@ -1483,6 +1483,7 @@ fn on_clock(clock: fn() -> u64, test: impl std::future::Future<Output = ()>) {
 }
 
 const DAY_MS: u64 = 24 * 3600 * 1000;
+const HOUR_MS: u64 = 3600 * 1000;
 
 /// The records of who added whom keep the group's members, the joins of the last H and those whose invites still admit:
 /// a member removed longer than H ago leaves none.
@@ -1549,6 +1550,7 @@ fn a_member_in_an_epoch_the_service_let_go_is_removed_by_the_others() {
         assert_eq!(alice.node.members(&gid.0).unwrap().len(), 2, "the log Bob is in is not gone yet");
 
         SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        alice.node.open_logs().await;
         while relay.membership.expire().await {}
         alice.node.sync_members().await.unwrap();
         alice.until(|e| matches!(e, Event::Left { member, .. } if member.name == "Bob").then_some(())).await;
@@ -1625,30 +1627,77 @@ fn a_member_whose_log_the_service_let_go_leaves_when_no_peer_brings_it_within_wa
     });
 }
 
-/// A group nobody commits to for longer than the retention is not left: its current log is empty, and empty logs do not
-/// expire.
+/// A group nobody is online in for longer than the retention ends for each member as it comes back: its current log,
+/// which they opened last as they went, is gone.
 #[test]
-fn a_group_quiet_past_the_retention_survives() {
+fn a_group_nobody_is_online_in_past_the_retention_ends() {
     static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     fn shifted() -> u64 {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
     }
     on_clock(shifted, async {
         let relay = relay().await;
-        let mut alice = session(&relay, "Alice").await;
-        let mut bob = session(&relay, "Bob").await;
+        let dir = folder("quiet-group");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = |name: &str| dir.join(format!("{name}.db"));
+        let mut alice = stored(&relay, "Alice", &db("alice")).await;
+        let bob = stored(&relay, "Bob", &db("bob")).await;
         let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
         bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-        SHIFT.store(60 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
-        while relay.membership.expire().await {}
-        for node in [&alice.node, &bob.node] {
-            node.sync().await;
-            node.sync_members().await.unwrap();
+        for session in [alice, bob] {
+            session.node.open_logs().await;
+            session.node.shutdown().await.unwrap();
         }
-        assert_eq!((alice.node.members(&gid.0).unwrap().len(), bob.node.members(&gid.0).unwrap().len()), (2, 2));
-        alice.node.send(&gid.0, &message("after the pause"), None).unwrap();
-        bob.until(|e| matches!(e, Event::Message(message) if message.payload["content"] == "after the pause").then_some(())).await;
+
+        SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        while relay.membership.expire().await {}
+        for name in ["alice", "bob"] {
+            let mut member = stored(&relay, name, &db(name)).await;
+            member.node.sync().await;
+            SHIFT.fetch_add(lmk_net::peers::WAIT + 60_000, std::sync::atomic::Ordering::Relaxed);
+            member.node.sync().await;
+            member.until(|e| matches!(&e, Event::Removed { group, by: None, .. } if *group == gid).then_some(())).await;
+            assert!(member.node.groups().is_empty());
+            member.node.shutdown().await.unwrap();
+        }
+    });
+}
+
+/// The last member to go offline, 23 hours after its group's last commit, comes back to the group six and a half days
+/// later: it opened the group's log every hour while it was online.
+#[test]
+fn a_group_whose_last_member_went_a_day_after_its_last_commit_lives_six_and_a_half_days() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let dir = folder("last-member");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = |name: &str| dir.join(format!("{name}.db"));
+        let mut alice = stored(&relay, "Alice", &db("alice")).await;
+        let bob = stored(&relay, "Bob", &db("bob")).await;
+        let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+        bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+        bob.node.shutdown().await.unwrap();
+        drop(bob);
+        SHIFT.store(23 * HOUR_MS, std::sync::atomic::Ordering::Relaxed);
+        alice.node.open_logs().await;
+        alice.node.shutdown().await.unwrap();
+        drop(alice);
+
+        SHIFT.store(23 * HOUR_MS + 13 * DAY_MS / 2, std::sync::atomic::Ordering::Relaxed);
+        while relay.membership.expire().await {}
+        let alice = stored(&relay, "Alice", &db("alice")).await;
+        let mut bob = stored(&relay, "Bob", &db("bob")).await;
+        alice.node.sync().await;
+        SHIFT.fetch_add(lmk_net::peers::WAIT + 60_000, std::sync::atomic::Ordering::Relaxed);
+        alice.node.sync().await;
+        alice.node.send(&gid.0, &message("still here"), None).unwrap();
+        bob.until(|e| matches!(e, Event::Message(m) if m.payload == message("still here")).then_some(())).await;
         alice.node.shutdown().await.unwrap();
         bob.node.shutdown().await.unwrap();
     });
@@ -1656,7 +1705,7 @@ fn a_group_quiet_past_the_retention_survives() {
 
 /// A device that missed its identity's commits past the retention is revoked: the identity's other device removes it from
 /// the identity group, which drops it from the directory, so its sessions leave the chats they are in, and it is told. The
-/// device in use carries on, its identity's directory kept by its commits.
+/// device in use carries on, its identity's directory kept by its touches.
 #[test]
 fn a_device_missing_its_identitys_commits_past_the_retention_is_revoked_and_told() {
     static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1698,6 +1747,7 @@ fn a_device_missing_its_identitys_commits_past_the_retention_is_revoked_and_told
         SHIFT.store(5 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         laptop_devices.rename("Again").await.unwrap();
         SHIFT.store(9 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        laptop.node.open_logs().await;
         while relay.membership.expire().await {}
         laptop.node.sync_members().await.unwrap();
         laptop.until(|e| matches!(e, Event::Left { member, .. } if member.name == "phone").then_some(())).await;
@@ -1741,9 +1791,9 @@ fn a_joiner_whose_key_is_in_the_tree_of_a_lapsed_member_is_removed_before_its_ad
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
         bob.node.shutdown().await.unwrap();
         alice.node.change_settings(&gid.0, |s| Settings { name: "Later".into(), ..s }).await.unwrap();
-        alice.node.shutdown().await.unwrap();
 
         SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        alice.node.open_logs().await;
         while relay.membership.expire().await {}
         let mut bob = stored(&relay, "Bob", &dir.join("bob.db")).await;
         bob.node.sync().await;
@@ -1752,7 +1802,6 @@ fn a_joiner_whose_key_is_in_the_tree_of_a_lapsed_member_is_removed_before_its_ad
         bob.until(|e| matches!(&e, Event::Removed { group, .. } if *group == gid).then_some(())).await;
         bob.node.shutdown().await.unwrap();
 
-        let mut alice = stored(&relay, "Alice", &dir.join("alice.db")).await;
         let bob = stored(&relay, "Bob", &dir.join("bob.db")).await;
         bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
         alice.until(|e| matches!(&e, Event::Left { member, .. } if member.name == "Bob").then_some(())).await;
@@ -1763,7 +1812,7 @@ fn a_joiner_whose_key_is_in_the_tree_of_a_lapsed_member_is_removed_before_its_ad
     });
 }
 
-/// An identity whose directory no commit touched in the retention ends for the chats its sessions are in: the members drop
+/// An identity whose directory no device touched in the retention ends for the chats its sessions are in: the members drop
 /// its session as a dropped device's, and remove it, and its device forgets the identity, telling so.
 #[test]
 fn an_untouched_directory_ends_its_identity_for_the_chats_its_sessions_are_in() {
@@ -1784,6 +1833,7 @@ fn an_untouched_directory_ends_its_identity_for_the_chats_its_sessions_are_in() 
         alice.checked(&chat, "laptop", true).await;
 
         SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        alice.node.open_logs().await;
         while relay.membership.expire().await {}
         alice.node.sync().await;
         alice.until(|e| matches!(&e, Event::Left { member, .. } if member.name == "laptop").then_some(())).await;
@@ -1826,10 +1876,10 @@ async fn a_device_that_leaves_its_identity_is_removed_without_a_warning() {
     laptop.node.shutdown().await.unwrap();
 }
 
-/// A single-device identity outlives the retention: its own commits keep its directory and its group's logs, and it has no
-/// other device to fall behind.
+/// A device last online 23 hours after its identity's last commit keeps its identity six and a half days later: it
+/// touched its directory, and opened its identity group's log, every hour.
 #[test]
-fn a_single_device_identity_survives_the_retention_by_its_own_commits() {
+fn a_device_last_online_a_day_after_its_identitys_last_commit_keeps_it_six_and_a_half_days() {
     static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     fn shifted() -> u64 {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
@@ -1840,13 +1890,15 @@ fn a_single_device_identity_survives_the_retention_by_its_own_commits() {
         routed(&mut laptop, laptop_devices.clone());
         let bob = laptop_devices.create("Bob", relay.service.clone()).await.unwrap();
         lists(&laptop.node, &bob, &[laptop_devices.key().unwrap()]).await;
-        SHIFT.store(5 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
-        laptop_devices.rename("Robert").await.unwrap();
-        SHIFT.store(9 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        SHIFT.store(23 * HOUR_MS, std::sync::atomic::Ordering::Relaxed);
+        laptop.node.open_logs().await;
+        SHIFT.store(23 * HOUR_MS + 13 * DAY_MS / 2, std::sync::atomic::Ordering::Relaxed);
         while relay.membership.expire().await {}
         laptop.node.sync().await;
+        SHIFT.fetch_add(lmk_net::peers::WAIT + 60_000, std::sync::atomic::Ordering::Relaxed);
+        laptop.node.sync().await;
         laptop.node.sync_members().await.unwrap();
-        assert_eq!(laptop_devices.identity().map(|(_, name)| name), Some("Robert".into()));
+        assert_eq!(laptop_devices.identity().map(|(_, name)| name), Some("Bob".into()));
         laptop.node.shutdown().await.unwrap();
     });
 }

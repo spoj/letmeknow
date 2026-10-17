@@ -517,8 +517,9 @@ pub(crate) enum Work {
         settings: bool,
         gone: bool,
     },
-    /// A group's new log, read once from its service, so that its peers' entries are taken.
-    Read(Vec<u8>),
+    /// A group's new log: opened, so that the service keeps it a retention from now, and read once, so that its peers'
+    /// entries are taken.
+    Entered(Vec<u8>),
     /// A group's duties to run.
     Duties(Vec<u8>),
     /// A group this session is out of, by no one's commit.

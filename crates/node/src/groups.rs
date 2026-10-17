@@ -61,19 +61,15 @@ impl<P: Provider + Send + 'static> Inner<P> {
             self.caught_up(gid).await?;
             // The one commit of this session's that can apply is the one it posted.
             if built.as_ref() == Some(&entry) && self.lock().group(gid)?.rec.committed == epoch + 1 {
-                let identity = self.lock().group(gid)?.mls.settings().kind == IDENTITY;
-                if identity && let Err(error) = self.touch_directory(gid).await {
-                    self.warn(Some(gid), format!("touching the directory: {error:#}"));
-                }
                 return Ok(Some(epoch));
             }
         }
         bail!("the group kept changing over {COMMIT_TRIES} tries; try again")
     }
 
-    /// Touches the directory of an identity group, which this device commits in: its last entry again, which its service
-    /// keeps for another retention instead of storing it. The directory is read first, so that its last entry is held.
-    async fn touch_directory(&self, gid: &[u8]) -> Result<()> {
+    /// Touches the directory of an identity group: its last entry again, which its service keeps for another retention
+    /// instead of storing it. The directory is read first, so that its last entry is held.
+    pub(crate) async fn touch_directory(&self, gid: &[u8]) -> Result<()> {
         let identity = {
             let st = self.lock();
             let settings = st.group(gid)?.mls.settings();
