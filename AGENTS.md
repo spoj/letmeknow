@@ -2,6 +2,8 @@
 
 The code and its comments are the documentation. SKILL.md, compiled into the binary as `letmeknow skill`, is what agents using letmeknow read, and README.md what people read first: keep both true in the same change as the code.
 
+CHARACTERISTICS.md is what letmeknow must achieve: check plans and changes against it, and change it only by the maintainer's decision.
+
 `main` is the next release. Once it needs a new minor version, the tree carries that version and its pins; otherwise choose the version at release time. Commit subjects read `Area: what changed`.
 
 ## Compatibility
