@@ -1,10 +1,10 @@
 # Plan: 0.20, for agents
 
-Draft 6. Each step makes a line of CHARACTERISTICS.md true, or cheaper to keep true. All of it is 0.20, a new minor on a new service where nothing carries over: step 1 flips the switches, so that `main` carries 0.20 from the start, and steps 1 to 8 make 0.20.0. Step 9 can follow as a 0.20 patch. The plan goes when its last step ships.
+Draft 6. Each step makes a line of CHARACTERISTICS.md true, or cheaper to keep true. All of it is 0.20, a new minor on a new service where nothing carries over: step 1 flips the switches, so that `main` carries 0.20 from the start, and steps 1 to 9 make 0.20.0. Step 10 can follow as a 0.20 patch. The plan goes when its last step ships.
 
 ## 1. 0.20: every switch flips
 
-- Version 0.20.0, and `@letmeknow/cli@0.20` wherever `test/pins.py` looks; ALPN `letmeknow/5`; membership routes `/membership/2/`; group `PROTOCOL` 9 at `REVISION` 0; invite links version 9, refusing 8's as 0.19's, with `test/e2e.py`'s expected link; home `letmeknow-v9`, whose `format` file says 9 and refuses 8's as 0.19's; the service store's `FORMAT` 5.
+- Version 0.20.0, and `@letmeknow/cli@0.20` wherever `test/pins.py` looks; ALPN `letmeknow/5`; membership routes `/membership/2/`; group `PROTOCOL` 9 at `REVISION` 0; invite links version 9, refusing 8's as 0.19's, with `test/e2e.py`'s expected link; home `letmeknow-v9`, whose `format` file says 9 and refuses 8's as 0.19's; the service store's `FORMAT` 5, with the column step 9 adds.
 - A new service with a new key, in `crates/proto/src/links.rs` and the backend's configuration, as deploy/README's "A new minor" says.
 - README and SKILL say that 0.19's groups and identities do not carry over.
 - Tests: a 0.19 link and a 0.19 home are refused, each with its text.
@@ -72,15 +72,27 @@ For: "Who will read this?" exact, with step 4: today a doc or table hands every 
 
 ## 8. A week's retention
 
-For: a session resumes within six days, and nothing in use lapses.
+For: a session resumes within seven days, and nothing in use lapses.
 
 - `serve --retention` and `Policy`'s `retention_days` default to 7 days, today's floor, instead of 30. Group logs and directories keep sharing it, so each lives seven to eight days past its clock, counted in whole UTC days. A service may still choose longer.
-- A directory's clock moves only at its identity's commits, up to T apart, so it can start a day before the identity's last device went offline: a session speaking as an identity resumes within six days, and an identity with no device online ends six to eight days later.
 - T stays 24 hours, far inside it, and H stays 7 days: as long as a member can surely be away. One away longer that is still a member finds its gaps told, as `not_kept`.
 - Tests, on a shifted clock: a member away six days resumes; one whose group commits just after it leaves, and that stays away past the retention, is removed; a device away past the retention while another goes on leaves its identity.
 - Docs: README's `--retention` default and its storage figure; SKILL's resume window.
 
-## 9. Freshness passed between peers (0.20 patch, after step 5's measurement)
+## 9. Quiet groups and idle identities end
+
+For: a group with nobody online for about seven days ends, and so does an identity with no device online; a session away up to seven days resumes, in a quiet group too.
+
+Today the service records a group log at its first entry and lets it go a retention after that entry's day (`opened`). An epoch's log stays empty until the commit that ends the epoch, so a group nobody commits to never goes (`a_group_quiet_past_the_retention_survives`). A directory's day moves only at its identity's commits, up to T apart, so an identity's clock can start a day before its last device went offline.
+
+- The service opens a group log on an empty append, which it refuses today: an open records an empty log with today as its `opened` day, or moves an empty log's `opened` to today. It changes nothing once the log has an entry, and is refused for a directory and for a log that went.
+- A log's first entry sets `opened` to its day, so an absent member keeps a full retention from the commit it missed.
+- While online, a member opens its current epoch's log as it enters the epoch and every hour after, and a device touches its directory every hour, in one request per service. A log's clock thus starts at most an hour before its last member or device went offline. These touches replace the touch at each identity commit.
+- Members need nothing new: one whose current log went leaves after `WAIT`, as one that missed commits does (`lapse` in `crates/node/src/logs.rs`); a device whose directory went leaves its identity, as today.
+- The retention counts only time the service runs. Each expiry pass records its day; at a start, before its first pass, live logs' days move on by the days since that record, plus one, as days are whole.
+- Tests: the last member goes offline 23 hours after its group's last commit and comes back six and a half days later to the group; a group nobody is online in for longer than the retention ends for each member as it comes back, replacing the test above; a device last online 23 hours after its identity's last commit keeps its identity six and a half days later; in the store, an open creates or moves only an empty log and is refused for a directory and for a log that went, and a first entry sets `opened`; a service stopped for longer than the retention lets no log go at its start that was live when it stopped.
+
+## 10. Freshness passed between peers (0.20 patch, after step 5's measurement)
 
 For: members serve one another, and the service is asked only for what needs its authority, when no member can vouch for it.
 
@@ -95,7 +107,7 @@ Today every online session asks its service about every log it follows each 90 t
 ## Held without a step
 
 - Used keys and shown text cannot be recovered: `a_forgotten_group_leaves_no_epoch_keys` (`crates/core/src/group_tests.rs`), `text_shown_or_left_behind_stays_in_no_file` (`crates/session/src/tests.rs`).
-- Identities stay as 0.19 has them: an identity is its group of devices, and its directory is that group's public roster, written by its members (`Identity::duties`). A device that lapses from the group is revoked.
+- Identities stay as 0.19 has them, but for step 9's touches: an identity is its group of devices, and its directory is that group's public roster, written by its members (`Identity::duties`). A device that lapses from the group is revoked.
 - T, at 24 hours.
 
 ## Dropped from draft 2
@@ -105,4 +117,3 @@ Today every online session asks its service about every log it follows each 90 t
 - Bounded peer `Entries`: a group log holds one epoch's commits, and a directory only its device changes; neither nears 16 MiB.
 - Expiring group-log references: a service lives one minor, and at the reference load they grow by under 10 GB a year.
 - Live relays: nothing above needs them, and a relay change reaches sessions as they restart.
-- Ending quiet groups (draft 5's step 9): at a week's retention a quiet group costs the service nothing, and a quiet group of people dissolves anyway once their identities end.
