@@ -41,7 +41,8 @@ assumptions are rough:
 - **Memberships held at once** are the new ones times the days until each is removed, the lease below: about 3,000,000
   at today's 30 days, 700,000 at 7 and 100,000 at one. A group gathers stale members at the rate sessions join it,
   each named in every commit's cut and carried in every Welcome (about 1.7 KB a member): one that 100 sessions a day
-  join fills its 128 places within 2 days whatever the lease, unless they leave as they stop.
+  join holds about 100 stale members even at a one-day lease, and fills its 128 places at any longer one, unless they
+  leave as they stop.
 - **Expired references** grow by under 1 GB a month; their expiry (0.20's C) is due once a service outlives its minor
   (Decide: continuity).
 
