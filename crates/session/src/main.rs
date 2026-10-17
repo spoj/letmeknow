@@ -82,7 +82,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let qr = matches!(
                 request,
                 Request::Client(
-                    lmk_client::Request::Invite { qr: true, .. } | lmk_client::Request::Identity { op: lmk_client::IdentityOp::Invite { qr: true } }
+                    letmeknow::client::Request::Invite { qr: true, .. } | letmeknow::client::Request::Identity { op: letmeknow::client::IdentityOp::Invite { qr: true } }
                 )
             );
             let answer = call(&home, &session, request).await?;

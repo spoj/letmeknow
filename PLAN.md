@@ -55,7 +55,6 @@ For: portability, now Linux, macOS, Windows and Android (Termux); one client; on
 - Gone: `crates/web`, `web/`, the browser half of `test/e2e.py`, the release's `frontend` job and asset, the wasm32 builds and gates, the membership service's `--origin`, CORS answers and hidden `--public-logs` (a request with an `Origin` is refused), and the seams only the page needed: `Config.durable`, the net's `Disk`, `MemoryProvider`'s save tracking, the wasm `spawn`. `Node::send` and `leave` no longer wait, so they are no longer async.
 - `deploy/backend.json` is what the release packages and `deploy/deploy.sh` checks the service against; a test holds it to the service built into `links.rs`.
 - letmeknow.dev serves `site/`, published from a tag by pages.yml: what letmeknow is, and for an invite link the commands that join with it. Its service worker takes the old app's place, deletes its caches and databases, and unregisters.
-- Left for the fold of `lmk-client` into the session, after step 7: the client's configuration on the device's own node (`Client::event`'s `Access::Here` branch, `take_adds`, crates/client/tests' harness).
 
 ## 7. No docs or tables (done)
 
@@ -88,14 +87,14 @@ Today the service records a group log at its first entry and lets it go a retent
 - The retention counts only time the service runs. Each expiry pass records its day; at a start, before its first pass, live logs' days move on by the days since that record, plus one, as days are whole.
 - Tests: the last member goes offline 23 hours after its group's last commit and comes back six and a half days later to the group; a group nobody is online in for longer than the retention ends for each member as it comes back, replacing the test above; a device last online 23 hours after its identity's last commit keeps its identity six and a half days later; in the store, an open creates or moves only an empty log and is refused for a directory and for a log that went, and a first entry sets `opened`; a service stopped for longer than the retention lets no log go at its start that was live when it stopped.
 
-## 10. One crate for the session (0.20 patch)
+## 10. One crate for the session (done, 0.20.1)
 
 For: the session is one program, not a browser's client inside an agent's process.
 
 The `lmk-client` crate held what the browser and the agent's session shared. Native only, it is part of the session.
 
 - Fold `crates/client` into `crates/session`, and delete its single-node paths, which only the browser took: `Client::event`'s `Access::Here` branch, `take_adds` and its `taking` lock, and the harness of `crates/client/tests/client.rs`, whose tests move to the session's where they test something the session's do not.
-- The node tests' `device()` helper, a device node used as a session, goes the same way where nothing native needs it.
+- The node tests' device nodes that joined chats as their own sessions give the chats to session nodes the devices certify, as natively; `device()` stays for the device's own node.
 
 ## 11. Freshness passed between peers (0.20 patch, after step 5's measurement)
 

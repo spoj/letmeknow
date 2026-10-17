@@ -1734,28 +1734,34 @@ fn a_device_missing_its_identitys_commits_past_the_retention_is_revoked_and_told
         phone_devices.join(&link).await.unwrap();
         let gid = devices_group(&laptop.node);
         laptop.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-        let chat = laptop.node.create(settings(CHAT, &relay), None).unwrap();
-        let invite = laptop.node.invite(&chat.0, None, INVITE_VALID).await.unwrap();
-        phone.node.join(&invite, Some(phone_devices.certify(&phone.node.key().0).unwrap())).await.unwrap();
-        laptop.until(|e| matches!(&e, Event::Joined { group, member, .. } if *group == chat && member.name == "phone").then_some(())).await;
+        // The chat is between the devices' sessions, which their devices certify.
+        let mut agent = session(&relay, "laptop").await;
+        let phone_agent = session(&relay, "phone").await;
+        let chat = agent.node.create(settings(CHAT, &relay), None).unwrap();
+        let invite = agent.node.invite(&chat.0, None, INVITE_VALID).await.unwrap();
+        phone_agent.node.join(&invite, Some(phone_devices.certify(&phone_agent.node.key().0).unwrap())).await.unwrap();
+        agent.until(|e| matches!(&e, Event::Joined { group, member, .. } if *group == chat && member.name == "phone").then_some(())).await;
         // The duties read the directory, which the phone follows from then on. The phone is away before the commit that
         // moves the group on, so that it never reaches the epoch the laptop's later commits are in.
         phone_devices.duties(&gid.0).await.unwrap();
         phone.node.shutdown().await.unwrap();
-        drop((phone, phone_devices));
+        phone_agent.node.shutdown().await.unwrap();
+        drop((phone, phone_devices, phone_agent));
         laptop_devices.rename("Renamed").await.unwrap();
 
         SHIFT.store(5 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         laptop_devices.rename("Again").await.unwrap();
         SHIFT.store(9 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         laptop.node.open_logs().await;
+        agent.node.open_logs().await;
         while relay.membership.expire().await {}
         laptop.node.sync_members().await.unwrap();
         laptop.until(|e| matches!(e, Event::Left { member, .. } if member.name == "phone").then_some(())).await;
         assert_eq!(laptop.node.members(&gid.0).unwrap().len(), 1);
         lists(&laptop.node, &identity, &[laptop_devices.key().unwrap()]).await;
-        laptop.until(|e| matches!(&e, Event::Revoked { group, removed, .. } if *group == chat && removed.iter().any(|m| m.name == "phone")).then_some(())).await;
-        assert_eq!(laptop.node.members(&chat.0).unwrap().len(), 1, "the phone's session left the chat");
+        agent.node.sync().await;
+        agent.until(|e| matches!(&e, Event::Revoked { group, removed, .. } if *group == chat && removed.iter().any(|m| m.name == "phone")).then_some(())).await;
+        assert_eq!(agent.node.members(&chat.0).unwrap().len(), 1, "the phone's session left the chat");
         assert!(laptop_devices.identity().is_some(), "the device in use keeps its identity");
 
         let (mut phone, phone_devices) = start("phone").await;
@@ -1771,6 +1777,7 @@ fn a_device_missing_its_identitys_commits_past_the_retention_is_revoked_and_told
         assert!(phone_devices.identity().is_none());
         phone.node.shutdown().await.unwrap();
         laptop.node.shutdown().await.unwrap();
+        agent.node.shutdown().await.unwrap();
     });
 }
 
@@ -1830,7 +1837,8 @@ fn an_untouched_directory_ends_its_identity_for_the_chats_its_sessions_are_in() 
         let mut alice = session(&relay, "Alice").await;
         let chat = alice.node.create(settings(CHAT, &relay), None).unwrap();
         let link = alice.node.invite(&chat.0, None, INVITE_VALID).await.unwrap();
-        laptop.node.join(&link, Some(laptop_devices.certify(&laptop.node.key().0).unwrap())).await.unwrap();
+        let agent = session(&relay, "laptop").await;
+        agent.node.join(&link, Some(laptop_devices.certify(&agent.node.key().0).unwrap())).await.unwrap();
         alice.checked(&chat, "laptop", true).await;
 
         SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
@@ -1844,8 +1852,9 @@ fn an_untouched_directory_ends_its_identity_for_the_chats_its_sessions_are_in() 
         laptop.node.sync().await;
         laptop.until(|e| matches!(&e, Event::Warning { text, .. } if text.contains("identity join")).then_some(())).await;
         assert!(laptop_devices.identity().is_none());
-        laptop.node.shutdown().await.unwrap();
-        alice.node.shutdown().await.unwrap();
+        for node in [&laptop.node, &agent.node, &alice.node] {
+            node.shutdown().await.unwrap();
+        }
     });
 }
 

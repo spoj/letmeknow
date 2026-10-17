@@ -1,6 +1,6 @@
 //! What the agent reads, made short: it pays for every character.
 
-use lmk_client::shown;
+use crate::client::shown;
 use serde_json::Value;
 
 /// How many characters of a message id show; commands take any unique beginning of one.
@@ -12,7 +12,7 @@ pub fn compact(value: &mut Value) {
     match value {
         Value::Object(map) if map.contains_key("fp") && map.contains_key("name") => *value = Value::String(shown(value)),
         Value::Object(map) => {
-            if map.get("membership").is_some_and(|service| *service == serde_json::json!(lmk_client::letmeknow_dev())) {
+            if map.get("membership").is_some_and(|service| *service == serde_json::json!(crate::client::letmeknow_dev())) {
                 map.remove("membership");
             }
             for (key, v) in map.iter_mut() {
@@ -78,7 +78,7 @@ mod tests {
             "direct": false,
             "content": "hi \"there\"",
             "ids": ["b".repeat(64)],
-            "settings": { "name": "", "carry": false, "membership": lmk_client::letmeknow_dev() },
+            "settings": { "name": "", "carry": false, "membership": crate::client::letmeknow_dev() },
             "members": [
                 { "fp": "f2", "name": "Bob · phone", "identity": { "id": "j", "name": "Bob", "how": "unknown" } },
                 { "fp": "f3", "name": "f3", "identity": { "id": "i", "name": "Ann", "how": "self", "error": "not on its list" } }

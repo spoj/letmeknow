@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use lmk_core::device::Device;
 use lmk_core::provider::Provider;
-use lmk_node::identity::{ADD_VALID, Add, Identity, Pending, Presence, SessionGroup};
+use lmk_node::identity::{ADD_VALID, Add, Identity, Presence, SessionGroup};
 use lmk_node::{Event, Heard, INVITE_VALID, Member, Message, Node};
 use lmk_proto::Bytes;
 use lmk_proto::group::{Attachment, CHAT, Certificate, ChatMessage, IDENTITY, How, IdentityRef, PROTOCOL, Service, Settings, UPDATE};
@@ -255,8 +255,6 @@ struct Inner<P> {
     access: Mutex<Access<P>>,
     state: Mutex<State>,
     events: mpsc::UnboundedSender<ClientEvent>,
-    /// Held while a pass takes the adds for this device.
-    taking: tokio::sync::Mutex<()>,
     refreshing: tokio::sync::Mutex<()>,
     /// The events of the groups `added` is joining, held until it tells of the join, which so comes first.
     adding: Mutex<HashMap<Bytes, Vec<ClientEvent>>>,
@@ -282,7 +280,6 @@ impl<P: Provider + Send + 'static> Client<P> {
             access: Mutex::new(access),
             state: Mutex::default(),
             events,
-            taking: tokio::sync::Mutex::new(()),
             refreshing: tokio::sync::Mutex::new(()),
             adding: Mutex::default(),
         };
@@ -482,23 +479,6 @@ impl<P: Provider + Send + 'static> Client<P> {
             self.inner.events.send(event).ok();
         }
         joined
-    }
-
-    /// Joins the groups of the adds for this device, where this client's node is the device's own: as
-    /// they come, and as it starts, one pass at a time. An add that fails stays, until it expires.
-    pub async fn take_adds(&self) {
-        let _taking = self.inner.taking.lock().await;
-        let Access::Here(devices) = self.access() else { return };
-        let pending = match devices.adds() {
-            Ok(pending) => pending,
-            Err(error) => return self.warn(None, format!("reading the adds for this device: {error:#}")),
-        };
-        for Pending { id, by, add } in pending {
-            let taken = self.added(&add.link, &add.group, &by).await.and_then(|_| devices.take(&id, add.expires));
-            if let Err(error) = taken {
-                self.warn(None, format!("joining a group your device {by} added this one to: {error:#}"));
-            }
-        }
     }
 
     async fn join(&self, link: String) -> Result<Value> {
@@ -747,33 +727,8 @@ impl<P: Provider + Send + 'static> Client<P> {
 
     // Events.
 
-    /// Takes an event of this client's node. Where the device's node is this node too, the devices
-    /// kind takes its groups' events first.
+    /// Takes an event of this client's node.
     pub async fn event(&self, event: Event) {
-        let event = match self.access() {
-            Access::Here(devices) => {
-                let Some(event) = devices.on(event) else { return };
-                if let Some(changed) = Self::devices_changed(&devices, &event) {
-                    let client = self.clone();
-                    n0_future::task::spawn(async move {
-                        for error in client.refresh_identity().await {
-                            client.warn(None, format!("refreshing identity claims: {error:#}"));
-                        }
-                    });
-                    return self.emit(changed);
-                }
-                if let Event::Message(message) = &event
-                    && devices.identity_of(&message.group.0).is_some()
-                {
-                    // A join waits on events.
-                    let client = self.clone();
-                    n0_future::task::spawn(async move { client.take_adds().await });
-                    return;
-                }
-                event
-            }
-            Access::Elsewhere(_) => event,
-        };
         let group = event.group().cloned();
         if let Err(error) = self.on(event).await {
             self.warn(group.as_ref(), format!("{error:#}"));

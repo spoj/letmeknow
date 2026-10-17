@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod client;
 pub mod policy;
 pub mod session;
 pub mod short;
@@ -321,10 +322,10 @@ pub async fn remove(config: session::Config, home: &Path, network: Network) -> R
                 break;
             }
         }
-        let groups = cli::call(home, &handle, cli::Request::Client(lmk_client::Request::Groups)).await?;
+        let groups = cli::call(home, &handle, cli::Request::Client(crate::client::Request::Groups)).await?;
         let mut waiting = Vec::new();
         for group in groups.as_array().context("groups are a list")? {
-            let leave = lmk_client::Request::Leave { group: group["group"].as_str().map(str::to_owned), end: false };
+            let leave = crate::client::Request::Leave { group: group["group"].as_str().map(str::to_owned), end: false };
             if cli::call(home, &handle, cli::Request::Client(leave)).await?["pending"] == true {
                 waiting.push((group["group"].clone(), group["name"].clone()));
             }

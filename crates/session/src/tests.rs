@@ -7,7 +7,6 @@ use lmk_proto::directory::Directory;
 use lmk_serve::{Certificate, ServeConfig};
 use lmk_testing::{Relay, relay};
 use n0_future::boxed::BoxFuture;
-use rustls_pki_types::CertificateDer;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
@@ -41,8 +40,11 @@ async fn world(test: &str) -> World {
     let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).with_test_writer().try_init();
     let relay = relay().await;
     let root = tempfile::Builder::new().prefix(&format!("lmk-session-{test}-")).tempdir().unwrap();
-    let (domain, key, cert) = service(&root.path().join("service")).await;
-    let ca = iroh::tls::CaTlsConfig::custom_roots([relay.cert.clone(), cert]);
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    std::fs::write(root.path().join("cert.pem"), certified.cert.pem()).unwrap();
+    std::fs::write(root.path().join("key.pem"), certified.signing_key.serialize_pem()).unwrap();
+    let (domain, key) = service(root.path(), "service", &tokio::runtime::Handle::current()).await;
+    let ca = iroh::tls::CaTlsConfig::custom_roots([relay.cert.clone(), certified.cert.der().clone()]);
     let network = crate::Network::new(root.path(), &[relay.url.to_string()], ca).unwrap();
     World { _relay: relay, network, root, domain, key }
 }
@@ -59,20 +61,17 @@ fn free_port() -> u16 {
     }
 }
 
-/// A membership service run by `serve` in `state`, at a localhost domain of its own with a certificate of its own: its
-/// domain, its key in hex, and its certificate.
-async fn service(state: &Path) -> (String, String, CertificateDer<'static>) {
-    let mut config = ServeConfig::new("localhost", state);
+/// A membership service run by `serve` on `runtime`, its state in `root`'s directory `name`, at a localhost domain of its
+/// own with `root`'s certificate: its domain and its key in hex.
+async fn service(root: &Path, name: &str, runtime: &tokio::runtime::Handle) -> (String, String) {
+    let mut config = ServeConfig::new("localhost", root.join(name));
     (config.https_port, config.qad_port) = (free_port(), free_port());
     config.http_port = Some(free_port());
     config.policy.appends_per_minute = u32::MAX;
     let lmk_proto::group::Service::Serve { key, .. } = config.initialize().unwrap() else { unreachable!() };
-    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    std::fs::write(state.join("cert.pem"), certified.cert.pem()).unwrap();
-    std::fs::write(state.join("key.pem"), certified.signing_key.serialize_pem()).unwrap();
-    config.certificate = Certificate::Files { chain: state.join("cert.pem"), key: state.join("key.pem") };
+    config.certificate = Certificate::Files { chain: root.join("cert.pem"), key: root.join("key.pem") };
     let (domain, https) = (config.domain(), config.https_port);
-    let mut serving = tokio::spawn(lmk_serve::serve(config));
+    let mut serving = runtime.spawn(lmk_serve::serve(config));
     let listening = async {
         while std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, https)).is_err() {
             if serving.is_finished() {
@@ -82,7 +81,7 @@ async fn service(state: &Path) -> (String, String, CertificateDer<'static>) {
         }
     };
     tokio::time::timeout(WAIT, listening).await.expect("the service listens");
-    (domain, hex::encode(key.0), certified.cert.der().clone())
+    (domain, hex::encode(key.0))
 }
 
 struct Agent {
@@ -702,6 +701,108 @@ fn a_device_is_on_one_identity_which_lists_and_loses_devices() {
     });
 }
 
+/// A device that makes its identity after joining a group stays anonymous there, and speaks as the identity in the groups
+/// it joins after.
+#[test]
+fn an_identity_made_late_speaks_only_in_later_groups() {
+    local(async {
+        let world = world("late-identity").await;
+        let alice = world.start("alice", HOUR).await;
+        let old = alice.cmd(&["invite", "--name", "anonymous"]).await.unwrap();
+        alice.cmd(&["identity", "create", "Ann"]).await.unwrap();
+        let new = alice.cmd(&["invite", "--name", "certified"]).await.unwrap();
+        let [old, new] = [old, new].map(|made| format!("--group={}", made["group"].as_str().unwrap()));
+        let certified = until(|| async { alice.cmd(&["members", &new]).await.unwrap() }, |m| m["members"][0]["identity"]["name"] == "Ann").await;
+        assert_eq!(certified["members"][0]["identity"]["how"], "self");
+        assert!(alice.cmd(&["members", &old]).await.unwrap()["members"][0]["identity"].is_null());
+    });
+}
+
+/// Two identities whose names collide, seen in one group, show each with its id and the other's, and a name either
+/// answers to addresses neither.
+#[test]
+fn colliding_identities_show_their_ids_and_answer_to_neither_name_alone() {
+    local(async {
+        let world = world("colliding").await;
+        let host = world.start("host", HOUR).await;
+        let mut reader = world.start("reader", HOUR).await;
+        let invite = host.cmd(&["invite"]).await.unwrap();
+        let group = format!("--group={}", invite["group"].as_str().unwrap());
+        let mut anns = Vec::new();
+        for (handle, name) in [("phone", "Ann"), ("desk", "ann")] {
+            let member = world.start(handle, HOUR).await;
+            member.cmd(&["identity", "create", name]).await.unwrap();
+            let link = host.cmd(&["invite", &group]).await.unwrap();
+            member.cmd(&["join", link["link"].as_str().unwrap()]).await.unwrap();
+            anns.push(member);
+        }
+        let link = host.cmd(&["invite", &group]).await.unwrap();
+        reader.cmd(&["join", link["link"].as_str().unwrap()]).await.unwrap();
+        let claims = |members: &Value| members["members"].as_array().unwrap().iter().filter(|m| m["identity"]["observed"].is_object()).cloned().collect::<Vec<_>>();
+        let members = until(|| async { reader.cmd(&["members", &group]).await.unwrap() }, |m| claims(m).len() == 2).await;
+        let claims = claims(&members);
+        for claim in &claims {
+            let other = claims.iter().find(|other| other["identity"]["id"] != claim["identity"]["id"]).unwrap();
+            assert_eq!(claim["identity"]["observed"]["other_ids"], json!([other["identity"]["id"]]), "{claim}");
+            assert!(claim["name"].as_str().unwrap().contains('['), "{claim}");
+        }
+        let refused = reader.cmd(&["send", "--to", "Ann", "which one?"]).await.unwrap_err().to_string();
+        assert!(refused.contains("could be any"), "{refused}");
+        let status = reader.cmd(&["status"]).await.unwrap().to_string();
+        assert!(claims.iter().all(|claim| status.contains(claim["identity"]["id"].as_str().unwrap())), "{status}");
+        reader.printed().await;
+    });
+}
+
+/// A device that leaves its identity while another device stays on it leaves the groups it speaks as the identity in, and
+/// the identity goes on, listing the other device alone.
+#[test]
+fn a_device_leaves_its_identity_while_another_stays_on_it() {
+    local(async {
+        let world = world("leaves-identity").await;
+        let alice = world.start("alice", HOUR).await;
+        let laptop = world.start("laptop", HOUR).await;
+        let tablet = world.start("tablet", HOUR).await;
+        laptop.cmd(&["identity", "create", "Bob"]).await.unwrap();
+        let link = laptop.cmd(&["identity", "invite"]).await.unwrap();
+        tablet.cmd(&["identity", "join", link["link"].as_str().unwrap()]).await.unwrap();
+        let chat = alice.cmd(&["invite"]).await.unwrap();
+        tablet.cmd(&["join", chat["link"].as_str().unwrap()]).await.unwrap();
+        let left = tablet.cmd(&["identity", "leave"]).await.unwrap();
+        assert_eq!(left["left"], json!([chat["group"]]), "{left}");
+        assert!(left["ended"].is_null(), "the identity goes on: {left}");
+        until(|| async { alice.cmd(&["members"]).await.unwrap() }, |m| m["members"].as_array().unwrap().len() == 1).await;
+        let listed = until(|| async { laptop.cmd(&["identity", "list"]).await.unwrap() }, |l| l["devices"].as_array().unwrap().len() == 1).await;
+        assert_eq!(listed["devices"][0]["you"], true);
+        assert!(tablet.cmd(&["identity", "list"]).await.unwrap()["identity"].is_null(), "the tablet is on no identity");
+    });
+}
+
+/// A group whose service is gone holds up refreshing none of the device's claims in the others: a rename reaches the
+/// rest, and the group that cannot take it is warned of.
+#[test]
+fn a_group_whose_service_is_gone_holds_up_no_other_claims_refresh() {
+    local(async {
+        let world = world("refresh").await;
+        // Shut down with its runtime, the service drops its connections too.
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let (spare, _) = service(world.root.path(), "spare", runtime.handle()).await;
+        let observer = world.start("observer", HOUR).await;
+        let elsewhere = world.launch(Config { membership: spare, ..world.config("elsewhere", "elsewhere") }, usize::MAX).await;
+        let mut phone = world.start("phone", HOUR).await;
+        phone.cmd(&["identity", "create", "Ann"]).await.unwrap();
+        for host in [&observer, &elsewhere] {
+            let invite = host.cmd(&["invite"]).await.unwrap();
+            phone.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
+        }
+        runtime.shutdown_background();
+        phone.cmd(&["identity", "rename", "Ann Lee"]).await.unwrap();
+        let renamed = |members: &Value| members["members"].as_array().unwrap().iter().any(|m| m["identity"]["name"] == "Ann Lee");
+        assert!(renamed(&until(|| async { observer.cmd(&["members"]).await.unwrap() }, renamed).await));
+        while !phone.expect("warning").await["text"].as_str().unwrap().contains("refreshing identity claims") {}
+    });
+}
+
 /// A member shows as its identity and its device, with its handle where another session of its device is in the group,
 /// and answers to any of them: another person's identity's name too.
 #[test]
@@ -983,7 +1084,7 @@ fn a_session_goes_on_while_a_join_waits() {
         let mut invite = lmk_proto::links::Invite::parse(&link).unwrap();
         invite.members[0] = *iroh::SecretKey::generate().public().as_bytes();
         let (home, handle) = (bob.home.clone(), bob.handle.clone());
-        let join = lmk_client::Request::Join { target: invite.link() };
+        let join = crate::client::Request::Join { target: invite.link() };
         let joining = tokio::task::spawn_local(async move { crate::cli::call(&home, &handle, Request::Client(join)).await });
         tokio::time::sleep(Duration::from_millis(500)).await;
         let started = std::time::Instant::now();

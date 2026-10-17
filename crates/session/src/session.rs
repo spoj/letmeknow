@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use lmk_client::{Access, BoxFuture, Chat, Client, ClientEvent, DeviceState, File, Missing, Remote, message_id};
+use crate::client::{Access, BoxFuture, Chat, Client, ClientEvent, DeviceState, File, Missing, Remote, message_id};
 use lmk_core::device::Device;
 use lmk_core::provider::SqliteProvider;
 use lmk_node::identity::{Identity, Pending, Presence, SessionGroup};
@@ -82,7 +82,7 @@ impl Remote for Published {
         }
     }
 
-    fn request(&self, request: lmk_client::Request) -> BoxFuture<Result<Value>> {
+    fn request(&self, request: crate::client::Request) -> BoxFuture<Result<Value>> {
         let endpoint = self.0.join("device-endpoint");
         Box::pin(async move {
             let channel = crate::cli::connect(&endpoint)
@@ -171,7 +171,7 @@ impl Session {
         membership: Service,
     ) -> Result<Self> {
         let device = Device::load(&home.join("device.json"))?;
-        let client_config = lmk_client::Config { device, membership };
+        let client_config = crate::client::Config { device, membership };
         let access = Access::Elsewhere(Arc::new(Published(home.to_path_buf())));
         let (client, told) = Client::new(node, client_config, access);
         let device_lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(home.join("device.lock"))?;
@@ -488,7 +488,7 @@ impl Session {
                 let count: usize = messages.iter().map(|lost| lost.seqs.len()).sum();
                 item["text"] = json!(format!(
                     "{} could not read {count} of your messages; send again, with --reply-to <id>, any that still matters",
-                    lmk_client::shown(&item["member"]),
+                    crate::client::shown(&item["member"]),
                 ));
             }
             let wake = wakes(&item, |id| self.mine(id));

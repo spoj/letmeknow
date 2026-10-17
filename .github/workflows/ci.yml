@@ -32,7 +32,7 @@ jobs:
           rustup target add aarch64-linux-android
           ndk=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
           CC_aarch64_linux_android=$ndk/aarch64-linux-android24-clang AR_aarch64_linux_android=$ndk/llvm-ar \
-            cargo check -p lmk-client -p letmeknow --target aarch64-linux-android
+            cargo check -p letmeknow --target aarch64-linux-android
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

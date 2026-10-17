@@ -2462,7 +2462,6 @@ dependencies = [
  "gethostname",
  "hex",
  "iroh",
- "lmk-client",
  "lmk-core",
  "lmk-membership",
  "lmk-node",
@@ -2480,6 +2479,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
  "tracing-subscriber",
@@ -2773,25 +2773,6 @@ name = "litemap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
-
-[[package]]
-name = "lmk-client"
-version = "0.20.0"
-dependencies = [
- "anyhow",
- "base64 0.23.1",
- "clap",
- "hex",
- "lmk-core",
- "lmk-node",
- "lmk-proto",
- "lmk-testing",
- "n0-future",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tokio",
-]
 
 [[package]]
 name = "lmk-core"

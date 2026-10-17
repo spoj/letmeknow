@@ -167,7 +167,7 @@ pub enum Request {
     Added { link: String, group: lmk_proto::Bytes, device: String },
     #[command(flatten)]
     #[serde(untagged)]
-    Client(lmk_client::Request),
+    Client(crate::client::Request),
 }
 
 /// Where a running session process accepts requests: a localhost port guarded by a token.
@@ -321,7 +321,7 @@ async fn answer(stream: TcpStream, token: String, inbound: mpsc::UnboundedSender
 /// Sends a request to the running session and returns its answer: made short, but for `members`. Files the request
 /// names are read here: the session process runs elsewhere.
 pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Value> {
-    if let Request::Client(lmk_client::Request::Join { target, .. }) = &request {
+    if let Request::Client(crate::client::Request::Join { target, .. }) = &request {
         ensure!(
             !Invite::parse(target.trim()).is_ok_and(|invite| invite.device),
             "that is a device link, which adds this device to an identity: to do that, run `letmeknow identity join <link>`"
@@ -331,11 +331,11 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
     match request {
         Request::IdentityJoin { link } => {
             ensure!(Invite::parse(link.trim())?.device, "that is not a device link; `identity invite` makes them");
-            request = Request::Client(lmk_client::Request::Join { target: link })
+            request = Request::Client(crate::client::Request::Join { target: link })
         }
         Request::Status { group } => {
             only = Some(group);
-            request = Request::Client(lmk_client::Request::Status);
+            request = Request::Client(crate::client::Request::Status);
         }
         _ => {}
     }
@@ -360,7 +360,7 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
             std::io::stdin().read_to_string(text)?;
         }
     }
-    let full = matches!(request, Request::Client(lmk_client::Request::Members { .. }));
+    let full = matches!(request, Request::Client(crate::client::Request::Members { .. }));
     let channel = connect(&session_dir(home, session)?.join("endpoint"))
         .await
         .with_context(|| format!("session {session} is not running; start it with `letmeknow --session {session} listen`"))?;

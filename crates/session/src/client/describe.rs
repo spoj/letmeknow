@@ -6,7 +6,7 @@ use lmk_proto::group::{How, IdentityRef};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::fp;
+use super::fp;
 
 /// A member, or only the iroh key of an endpoint that is not one.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,7 +83,7 @@ impl Describer {
                     m.key != member.key && m.device_name == member.device_name && m.identity.as_ref().is_some_and(|c| c.identity.id == known.id)
                 });
                 let collision = known.observed.as_ref().is_some_and(|o| !o.other_ids.is_empty());
-                let name = if collision { format!("{} [{}]", known.name, &crate::b64(&known.id.0)[..8]) } else { known.name.clone() };
+                let name = if collision { format!("{} [{}]", known.name, &super::b64(&known.id.0)[..8]) } else { known.name.clone() };
                 if twin && !member.name.is_empty() {
                     format!("{} · {} ({})", name, member.device_name, member.name)
                 } else {
@@ -166,7 +166,7 @@ mod tests {
 
     fn member(handle: &str, key: u8, identity: Option<(u8, &str)>) -> Member {
         let identity = identity.map(|(id, claimed)| Claim {
-            identity: IdentityRef { id: Bytes(vec![id]), membership: crate::letmeknow_dev() },
+            identity: IdentityRef { id: Bytes(vec![id]), membership: super::super::letmeknow_dev() },
             name: claimed.into(),
             error: None,
             observed: Some(Observation { names: vec![claimed.into()], other_ids: vec![] }),
@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn a_member_shows_as_its_identity_and_device_and_its_handle_where_another_shows_so_too() {
-        let own = IdentityRef { id: Bytes(vec![10]), membership: crate::letmeknow_dev() };
+        let own = IdentityRef { id: Bytes(vec![10]), membership: super::super::letmeknow_dev() };
         let mut eve = member("eve", 5, Some((20, "Robert")));
         eve.identity.as_mut().unwrap().error = Some("its device is not on the identity's list".into());
         let describer = Describer {
@@ -206,7 +206,7 @@ mod tests {
         assert_eq!(claude["identity"], json!({ "id": "Cg", "name": "Ann Smith", "how": "self", "observed": { "names": ["Ann Smith"], "other_ids": [] } }));
         assert_eq!((&claude["name"], &claude["you"]), (&json!("Ann Smith · laptop (claude)"), &json!(true)));
         let bob = shown(&describer.members[1]);
-        assert_eq!(bob, json!({ "name": "Robert · laptop", "fp": crate::fp(&[2]), "device": "laptop", "identity": { "id": "FA", "name": "Robert", "how": "observed", "observed": { "names": ["Robert"], "other_ids": [] } } }));
+        assert_eq!(bob, json!({ "name": "Robert · laptop", "fp": super::super::fp(&[2]), "device": "laptop", "identity": { "id": "FA", "name": "Robert", "how": "observed", "observed": { "names": ["Robert"], "other_ids": [] } } }));
         let (dan, eve) = (shown(&describer.members[3]), shown(&describer.members[4]));
         assert_eq!((&dan["name"], &eve["name"]), (&dan["fp"], &eve["fp"]), "no identity, or one that failed the check: a fingerprint");
         assert!(["ANN", "claude", "Laptop"].iter().all(|name| answers(&claude, name)) && answers(&bob, "robert") && answers(&dan, "dan"));

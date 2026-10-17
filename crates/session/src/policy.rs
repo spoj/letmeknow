@@ -1,7 +1,7 @@
 //! The delivery policy. Printing wakes the agent, so only what concerns this session prints at once; the rest waits,
 //! then prints in order just before the next thing that wakes it, after its next command, or once `--hold` runs out.
 
-use lmk_client::answers;
+use crate::client::answers;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
