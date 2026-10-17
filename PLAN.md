@@ -10,7 +10,7 @@ Today one node-wide lock (`Inner.committing`, `crates/node/src/lib.rs`) is held 
 
 - Each group has its own commit lock.
 - An admission answers a joiner retrying after a lost answer (`logged_commit`) before it waits on `caught_up`.
-- An admission into a group that is itself waiting for kept messages still waits for them, up to `WAIT`: links into such a group miss the 10 seconds.
+- Accepted for now: an admission into a group that is itself waiting for kept messages still waits for them, up to `WAIT`, so links into such a group miss the 10 seconds.
 - Test: while group A's commit waits in `caught_up`, a commit in group B and an admission retry in A complete.
 
 ## 2. History forgotten (0.19 patch)
