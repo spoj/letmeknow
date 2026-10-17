@@ -11,7 +11,7 @@ pub const DOMAIN: &str = "relay.letmeknow.dev";
 /// letmeknow.dev's relay, which links leave out.
 pub const RELAY: &str = "https://relay.letmeknow.dev";
 /// letmeknow.dev's membership service key, hex. Its routes are at `DOMAIN`.
-pub const MEMBERSHIP_KEY: &str = "bebfbee1404f5acad187f690e792d3d38c77249bdac0242344ac3ed3b7b658bd";
+pub const MEMBERSHIP_KEY: &str = "d732776edca30c1026c8751efd7e39bf618ac54e83b4f1b794d1af4b063dbfa7";
 
 /// `https://letmeknow.dev/i#9.<g|d>.<secret>.<domain>.<member>[.<member>...]`, every field after the kind in unpadded
 /// base64url: the domain is the group's service's, and each member is its iroh key.

@@ -1,8 +1,8 @@
 # Plan: 0.20, for agents
 
-Draft 6. Each step makes a line of CHARACTERISTICS.md true, or cheaper to keep true. All of it is 0.20, a new minor on a new service where nothing carries over: step 1 flips the switches, so that `main` carries 0.20 from the start, and steps 1 to 9 make 0.20.0. Step 10 can follow as a 0.20 patch. The plan goes when its last step ships.
+Draft 6. Each step makes a line of CHARACTERISTICS.md true, or cheaper to keep true. All of it is 0.20, a new minor on a new service where nothing carries over: step 1 flips the switches, so that `main` carries 0.20 from the start, and steps 1 to 9 make 0.20.0. Steps 10 and 11 follow as 0.20 patches. The plan goes when its last step ships.
 
-## 1. 0.20: every switch flips
+## 1. 0.20: every switch flips (done)
 
 - Version 0.20.0, and `@letmeknow/cli@0.20` wherever `test/pins.py` looks; ALPN `letmeknow/5`; membership routes `/membership/2/`; group `PROTOCOL` 9 at `REVISION` 0; invite links version 9, refusing 8's as 0.19's, with `test/e2e.py`'s expected link; home `letmeknow-v9`, whose `format` file says 9 and refuses 8's as 0.19's; the service store's `FORMAT` 5, with the column step 9 adds.
 - A new service with a new key, in `crates/proto/src/links.rs` and the backend's configuration, as deploy/README's "A new minor" says.
@@ -88,7 +88,16 @@ Today the service records a group log at its first entry and lets it go a retent
 - The retention counts only time the service runs. Each expiry pass records its day; at a start, before its first pass, live logs' days move on by the days since that record, plus one, as days are whole.
 - Tests: the last member goes offline 23 hours after its group's last commit and comes back six and a half days later to the group; a group nobody is online in for longer than the retention ends for each member as it comes back, replacing the test above; a device last online 23 hours after its identity's last commit keeps its identity six and a half days later; in the store, an open creates or moves only an empty log and is refused for a directory and for a log that went, and a first entry sets `opened`; a service stopped for longer than the retention lets no log go at its start that was live when it stopped.
 
-## 10. Freshness passed between peers (0.20 patch, after step 5's measurement)
+## 10. One crate for the session (0.20 patch)
+
+For: the session is one program, not a browser's client inside an agent's process.
+
+The `lmk-client` crate held what the browser and the agent's session shared. Native only, it is part of the session.
+
+- Fold `crates/client` into `crates/session`, and delete its single-node paths, which only the browser took: `Client::event`'s `Access::Here` branch, `take_adds` and its `taking` lock, and the harness of `crates/client/tests/client.rs`, whose tests move to the session's where they test something the session's do not.
+- The node tests' `device()` helper, a device node used as a session, goes the same way where nothing native needs it.
+
+## 11. Freshness passed between peers (0.20 patch, after step 5's measurement)
 
 For: members serve one another, and the service is asked only for what needs its authority, when no member can vouch for it.
 
