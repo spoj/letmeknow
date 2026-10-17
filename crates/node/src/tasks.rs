@@ -48,7 +48,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             events,
             work,
             outbox,
-            committing: tokio::sync::Mutex::new(()),
+            committing: Mutex::default(),
             advanced: tokio::sync::Notify::new(),
             heard: tokio::sync::Notify::new(),
             passing: Mutex::default(),

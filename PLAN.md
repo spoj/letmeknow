@@ -9,7 +9,7 @@ Draft 6. Each step makes a line of CHARACTERISTICS.md true, or cheaper to keep t
 - README and SKILL say that 0.19's groups and identities do not carry over.
 - Tests: a 0.19 link and a 0.19 home are refused, each with its text.
 
-## 2. One commit lock per group
+## 2. One commit lock per group (done)
 
 For: a link makes a member within 10 seconds while the inviter is online.
 

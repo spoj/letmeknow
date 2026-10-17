@@ -2206,6 +2206,40 @@ async fn a_joiner_whose_answer_was_lost_is_admitted_by_the_committers_answer() {
     assert_eq!(bob.node.members(&gid.0).unwrap().len(), 2);
 }
 
+/// While a commit in one group waits to read its log, a commit in another group completes, and so does a joiner's ask
+/// again in the first, whose Add this session applied and whose answer was lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_waiting_in_one_group_holds_up_no_other() {
+    let relay = relay().await;
+    let dir = folder("commit-locks");
+    let (slow, _service) = served(&relay, &dir).await;
+    let (gate, mut reaching) = Gate::new(Some(&slow));
+    let (late, mut landing, post) = late_append(gate.post("Alice", relay.post()), Duration::from_secs(5));
+    let alice = session_with(&relay, "Alice", post).await;
+    let bob = session(&relay, "Bob").await;
+    let a = alice.node.create(Settings { membership: slow, ..settings(CHAT, &relay) }, None).unwrap();
+    let b = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    let link = alice.node.invite(&a.0, None, INVITE_VALID).await.unwrap();
+    late.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (node, first) = (bob.node.clone(), link.clone());
+    let joining = tokio::spawn(async move { node.join(&first, None).await });
+    tokio::time::timeout(WAIT, landing.recv()).await.unwrap().unwrap();
+    joining.abort();
+    eventually("Alice applied the Add", || alice.node.members(&a.0).unwrap().len() == 2).await;
+
+    gate.set(false);
+    let (node, waits) = (alice.node.clone(), a.clone());
+    let rename = |name: &str| { let name = name.to_owned(); move |s: Settings| Settings { name: name.clone(), ..s } };
+    let waiting = tokio::spawn(async move { node.change_settings(&waits.0, rename("Waiting")).await });
+    assert_eq!(tokio::time::timeout(WAIT, reaching.recv()).await.unwrap().unwrap(), "Alice");
+    tokio::time::timeout(Duration::from_secs(20), alice.node.change_settings(&b.0, rename("Free"))).await.expect("B commits").unwrap();
+    let (joined, _) = tokio::time::timeout(Duration::from_secs(20), bob.node.join(&link, None)).await.expect("the ask again is answered").unwrap();
+    assert_eq!(joined, a);
+    assert!(!waiting.is_finished());
+    gate.set(true);
+    tokio::time::timeout(WAIT, waiting).await.unwrap().unwrap().unwrap();
+}
+
 /// A joiner's first ask outlasts its wait, while the committer is busy answering: the joiner asks again, and the committer
 /// answers with the Add it kept, adding the joiner once.
 #[tokio::test(flavor = "multi_thread")]

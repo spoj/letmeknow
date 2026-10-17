@@ -544,7 +544,8 @@ pub(crate) struct Inner<P> {
     work: mpsc::UnboundedSender<Work>,
     /// Peer output and client events from steps, in order.
     outbox: mpsc::UnboundedSender<(Vec<Out>, Vec<Event>)>,
-    committing: tokio::sync::Mutex<()>,
+    /// Each group's commit lock, held while one of its commits is built, posted and read back.
+    committing: Mutex<HashMap<Vec<u8>, Arc<tokio::sync::Mutex<()>>>>,
     /// Woken whenever a group's log is read further, for commits waiting to reach its head.
     advanced: tokio::sync::Notify,
     /// Woken whenever a peer's summary is heard.

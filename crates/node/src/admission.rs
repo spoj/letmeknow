@@ -257,7 +257,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let hash = Bytes(Sha256::digest(&secret.0).to_vec());
         let found = self.lock().groups.iter().find_map(|(gid, g)| Some((gid.clone(), g.rec.invites.iter().find(|rule| rule.hash == hash)?.clone())));
         let (gid, rule) = found.context(UNKNOWN)?;
-        // A joiner the log shows added, whose answer was lost, asks again with the same KeyPackage.
+        // A joiner the log shows added, whose answer was lost, asks again with the same KeyPackage: it is answered at once
+        // if this session applied the Add, else once it caught up.
+        let logged = self.lock().logged_commit(&gid, &key_package.0)?;
+        if let Some(epoch) = logged {
+            return self.admitted(&gid, epoch);
+        }
         self.caught_up(&gid).await?;
         let logged = self.lock().logged_commit(&gid, &key_package.0)?;
         if let Some(epoch) = logged {

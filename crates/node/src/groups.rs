@@ -23,7 +23,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// posted before, which the log may or may not have taken, as when the service's answer was lost, is posted again
     /// first: only the service's refusal drops it.
     pub(crate) async fn commit(&self, gid: &[u8], change: impl Fn(&State<P>, &G) -> Result<Option<Change>>) -> Result<Option<u64>> {
-        let _committing = self.committing.lock().await;
+        let lock = self.committing.lock().unwrap().entry(gid.to_vec()).or_default().clone();
+        let _committing = lock.lock().await;
         let mut built = None;
         for _ in 0..COMMIT_TRIES {
             self.caught_up(gid).await?;
@@ -153,6 +154,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         st.provider.delete(&rec_key(gid))?;
         st.provider.delete(&device_key_key(gid))?;
         st.device_keys.remove(gid);
+        self.committing.lock().unwrap().remove(gid);
         g.mls.delete(&st.provider)?;
         st.save_groups()?;
         st.scrub = true;
