@@ -358,14 +358,15 @@ async fn a_join_survives_an_unresolved_link_domain() {
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
 }
 
-/// Posts through `post`, except the next append once `late` is set: it lands, is told on the channel, and is answered
-/// `after` later.
+/// Posts through `post`, except the next append of entries once `late` is set, which opens of logs do not take: it
+/// lands, is told on the channel, and is answered `after` later.
 fn late_append(post: Post, after: Duration) -> (Arc<std::sync::atomic::AtomicBool>, UnboundedReceiver<()>, Post) {
     let late = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (landed, landing) = tokio::sync::mpsc::unbounded_channel();
     let armed = late.clone();
     let post: Post = Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
-        let late = route.ends_with("/append") && armed.swap(false, std::sync::atomic::Ordering::SeqCst);
+        let entries = serde_json::from_slice::<Value>(&body).is_ok_and(|append| append["entries"].as_array().is_some_and(|entries| !entries.is_empty()));
+        let late = route.ends_with("/append") && entries && armed.swap(false, std::sync::atomic::Ordering::SeqCst);
         let (post, landed) = (post.clone(), landed.clone());
         Box::pin(async move {
             let answer = post(domain, route, body).await;
