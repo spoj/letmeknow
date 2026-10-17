@@ -13,7 +13,8 @@
 
 **Latency and availability**
 - A link makes a member within 10 s while the inviter is online. Messages between online members arrive within 5 s at p99.
-- A session away up to a day resumes; one away longer, while its group went on, is removed. A device away longer than a day, while its identity went on, leaves it, and an identity ends a day after its last device was online.
+- A session away up to two days resumes; one away longer, while its group went on, is removed, and a device away longer, while its identity went on, leaves it.
+- A group with nobody online for about two days ends, and so does an identity with no device online. Two days means 48 to 72 hours, and nothing in use lapses, even with clocks hours off.
 - The service holds no messages: missed ones come from members online, so a group that must stay reachable keeps an always-on member.
 - With the service down, chat goes on among online members and membership changes wait. Delivery is causal, and every gap is told.
 
