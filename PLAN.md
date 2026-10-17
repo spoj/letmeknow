@@ -1,8 +1,15 @@
 # Plan: 0.20, for agents
 
-Draft 5, after review. Each step makes a line of CHARACTERISTICS.md true, or cheaper to keep true. Steps 1 to 4 change no format and ship as 0.19 patches. Steps 5 to 9 make 0.20.0 together, on a new service where nothing carries over: they take away what 0.19's users rely on, or change the service's store and routes. Step 10 can follow as a 0.20 patch. The plan goes when its last step ships.
+Draft 6. Each step makes a line of CHARACTERISTICS.md true, or cheaper to keep true. All of it is 0.20, a new minor on a new service where nothing carries over: step 1 flips the switches, so that `main` carries 0.20 from the start, and steps 1 to 9 make 0.20.0. Step 10 can follow as a 0.20 patch. The plan goes when its last step ships.
 
-## 1. One commit lock per group (0.19 patch)
+## 1. 0.20: every switch flips
+
+- Version 0.20.0, and `@letmeknow/cli@0.20` wherever `test/pins.py` looks; ALPN `letmeknow/5`; membership routes `/membership/2/`; group `PROTOCOL` 9 at `REVISION` 0; invite links version 9, refusing 8's as 0.19's, with `test/e2e.py`'s expected link; home `letmeknow-v9`, whose `format` file says 9 and refuses 8's as 0.19's; the service store's `FORMAT` 5, with the column step 9 adds.
+- A new service with a new key, in `crates/proto/src/links.rs` and the backend's configuration, as deploy/README's "A new minor" says.
+- README and SKILL say that 0.19's groups and identities do not carry over.
+- Tests: a 0.19 link and a 0.19 home are refused, each with its text.
+
+## 2. One commit lock per group
 
 For: a link makes a member within 10 seconds while the inviter is online.
 
@@ -13,17 +20,17 @@ Today one node-wide lock (`Inner.committing`, `crates/node/src/lib.rs`) is held 
 - Accepted for now: an admission into a group that is itself waiting for kept messages still waits for them, up to `WAIT`, so links into such a group miss the 10 seconds.
 - Test: while group A's commit waits in `caught_up`, a commit in group B and an admission retry in A complete.
 
-## 2. History forgotten (0.19 patch)
+## 3. History forgotten
 
 For: a session's state grows with its current groups, never with its history.
 
 Today a group's state keeps an `Added` record, with credentials and certificates, for every join it saw, and rewrites them all at each commit: a group that 100 sessions join a day gathers 36,000 a year. The session's `taken` and `attachments` tables (`crates/session/src/store.rs`) keep a row for every message and attachment taken in, until the group is left.
 
-- An `Added` record stays while its member is in the group, while its invite can still be used, or for H after the join, so that a `Control::Invite` arriving late still finds its invite used. Records gain the time of their join; this is local state only.
+- An `Added` record stays while its member is in the group, while its invite can still be used, or for H after the join, so that a `Control::Invite` arriving late still finds its invite used. Records gain the time of their join.
 - `taken` rows and `attachments` rows go H after their message; an attachment's private copy goes with its row. SKILL says how long copies last.
 - Tests: removed members' records go after H, while current members', recent ones and those of usable invites stay; a group's saved state and the session's tables after K messages, joins and leaves do not grow with K.
 
-## 3. Messages stay with the members they were sent to (0.19 patch)
+## 4. Messages stay with the members they were sent to
 
 For: "Who will read this?" has an exact answer: the group's members when it was sent.
 
@@ -32,7 +39,7 @@ Today `reseal` (`crates/node/src/sending.rs`) seals a sender's messages past its
 - No member sends a joiner, as a reseal or as an answer, a message sent before it joined. A joiner that a later message names such a message to sees it as `missing`, as any message it cannot get.
 - Test: a message sent while an Add is in flight never reaches the joiner.
 
-## 4. Polls on kept connections (0.19 patch)
+## 5. Polls on kept connections
 
 For: the service's egress, within 1 TB a month.
 
@@ -40,14 +47,7 @@ A poll on a new TLS connection takes about 3.3 KB of egress, and on a kept one a
 
 - A running session's polls reuse one connection to its service; the server keeps an idle connection longer than `POLL`.
 - Test: a session polling through several `POLL`s makes one TLS handshake at the service.
-- Measure egress per poll at letmeknow.dev before and after, and with it the delivery time between online members at p99, which no test measures yet.
-
-## 5. 0.20: every switch flips
-
-- Version 0.20.0, and `@letmeknow/cli@0.20` wherever `test/pins.py` looks; ALPN `letmeknow/5`; membership routes `/membership/2/`; group `PROTOCOL` 9 at `REVISION` 0; invite links version 9, refusing 8's as 0.19's, with `test/e2e.py`'s expected link; home `letmeknow-v9`, whose `format` file says 9 and refuses 8's as 0.19's; the service store's `FORMAT` 5, with the column step 9 adds.
-- A new service with a new key, in `crates/proto/src/links.rs` and the backend's configuration, as deploy/README's "A new minor" says.
-- README and SKILL say that 0.19's groups and identities do not carry over.
-- Tests: a 0.19 link and a 0.19 home are refused, each with its text.
+- Measure egress per poll at letmeknow.dev, on 0.19's service before and on 0.20's after, and with it the delivery time between online members at p99, which no test measures yet.
 
 ## 6. No browser
 
@@ -62,7 +62,7 @@ For: portability, now Linux, macOS, Windows and Android (Termux); one client; on
 
 ## 7. No docs or tables
 
-For: "Who will read this?" exact, with step 3: today a doc or table hands every joiner its whole state, written before it joined.
+For: "Who will read this?" exact, with step 4: today a doc or table hands every joiner its whole state, written before it joined.
 
 - Goes: `crates/kinds`, with its yrs dependency, its binaries in the release and its CI check; kinds' plugins and their hosting (`crates/session/src/kinds.rs`, `kinds::discover`, the client's `Plugins`); `Leaf.kinds` and the admission's check of it; the kind state handed to a joiner and to a member found behind (`crates/node/src/kind.rs`, `Frame::State`, state links, `STATE_LABEL`, `Admitted.doc`); `invite --kind`, `join <link> [file]`, `doc attach`, `edited`, the `letmeknow <kind>` commands, and `test/e2e.py`'s doc path.
 - `logged_commit` knows its own Adds by `commit_key`, not by the state's `admitted_key`.
@@ -93,7 +93,7 @@ Today the service records a group log at its first entry and lets it go a retent
 - The retention counts only time the service runs. Each expiry pass records its day; at a start, before its first pass, live logs' days move on by the days since that record, plus one, as days are whole.
 - Tests: the last member goes offline 23 hours after its group's last commit and comes back 46 hours later to the group; a group nobody is online in for longer than the retention ends for each member as it comes back, replacing the test above; a device last online 23 hours after its identity's last commit keeps its identity 46 hours later; in the store, an open creates or moves only an empty log and is refused for a directory and for a log that went, and a first entry sets `opened`; a service stopped for longer than the retention lets no log go at its start that was live when it stopped.
 
-## 10. Freshness passed between peers (0.20 patch, after step 4's measurement)
+## 10. Freshness passed between peers (0.20 patch, after step 5's measurement)
 
 For: members serve one another, and the service is asked only for what needs its authority, when no member can vouch for it.
 
