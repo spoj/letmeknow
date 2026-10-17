@@ -401,18 +401,18 @@ impl<P: Provider> State<P> {
         Ok(())
     }
 
-    /// The answer to a member's `want`: the sealings it can open, in its epoch or the one before, and not before it
-    /// joined. One the gate does not admit gets nothing, so its asker moves on.
+    /// The answer to a member's `want`: the sealings it can open, in its epoch or the one before, of messages sent since
+    /// it joined. One the gate does not admit gets nothing, so its asker moves on.
     fn answer(&mut self, gid: &[u8], peer: EndpointId, epoch: u64, wants: &[Seqs]) -> Result<Frame> {
         let group = Bytes(gid.to_vec());
         let admitted = self.admitted(gid, &peer);
+        let joined = self.joined_of(gid, &peer);
         let g = self.group(gid)?;
-        let joined = self.in_leaf(gid, &peer).and_then(|m| g.mls.joined(&m.key)).unwrap_or(u64::MAX);
         let held: Vec<Seqs> = if admitted { g.rec.authors.iter().filter_map(|a| a.seqs(&a.servable)).collect() } else { Vec::new() };
         let sealing = |key: &Bytes, joined_: u64, seq: u64| {
             let record = self.record_at(gid, &key.0, joined_, seq).ok()??;
             let (sealed, ciphertext) = record.sealing?;
-            (sealed + 1 >= epoch && sealed <= epoch && sealed >= joined).then_some(ciphertext.0)
+            (sealed + 1 >= epoch && sealed <= epoch && record.header.epoch >= joined).then_some(ciphertext.0)
         };
         Ok(peers::answer(group, wants, &held, sealing))
     }
@@ -671,7 +671,8 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok(self.members(gid)?.into_iter().filter(away).collect())
     }
 
-    /// This session's held messages no other member holds yet: they need this session until one does. Their ids and payloads.
+    /// This session's held messages no other member that may have them holds yet: they need this session until one does.
+    /// Their ids and payloads.
     pub fn only_here(&self, gid: &[u8]) -> Result<Vec<(Bytes, serde_json::Value)>> {
         let st = self.inner.lock();
         let g = st.group(gid)?;
@@ -679,7 +680,9 @@ impl<P: Provider + Send + 'static> Node<P> {
         let Some(mine) = g.current(me) else { return Ok(Vec::new()) };
         let mut unkept = Vec::new();
         for seq in mine.cut + 1..=mine.last() {
-            if let Some(record) = st.record_at(gid, me, mine.joined, seq)? && st.holders_of(gid, seq)?.is_empty() {
+            if let Some(record) = st.record_at(gid, me, mine.joined, seq)?
+                && st.unheld(gid, &record)?
+            {
                 unkept.push((record.id, record.header.payload));
             }
         }

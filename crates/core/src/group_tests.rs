@@ -39,7 +39,8 @@ pub(crate) struct Member<P: Provider = MemoryProvider> {
     /// Next log position to read (0-based here).
     pub pos: usize,
     /// The ids of the held messages this member sent, in seq order.
-    sent: Vec<[u8; 32]>,
+    /// Its held messages' ids, with the epochs it sent them in.
+    sent: Vec<([u8; 32], u64)>,
 }
 
 impl<P: Provider> Member<P> {
@@ -86,13 +87,14 @@ impl<P: Provider> Member<P> {
             author: Bytes(self.session.key().to_vec()),
             joined: group.joined(self.session.key()).unwrap(),
             seq: self.sent.len() as u64 + 1,
-            prev: self.sent.last().map(|id| Bytes(id.to_vec())),
+            epoch: group.epoch(),
+            prev: self.sent.last().map(|(id, epoch)| (Bytes(id.to_vec()), *epoch)),
             deps: vec![],
             reply_to: None,
             payload: message(text),
         };
         let plaintext = header.encode();
-        self.sent.push(held::id(&plaintext));
+        self.sent.push((held::id(&plaintext), group.epoch()));
         self.seal(&plaintext)
     }
 
@@ -235,7 +237,7 @@ fn refusable(good: &[Ref], a: &[u8], b: &[u8]) -> Vec<(Vec<Ref>, &'static str)> 
 
 /// A header from `m` in `group`, as its first message would be, but for the membership it claims.
 fn header(m: &Member, group: &[u8], joined: u64) -> Header {
-    Header { group: Bytes(group.to_vec()), author: Bytes(m.session.key().to_vec()), joined, seq: 1, prev: None, deps: vec![], reply_to: None, payload: message("forged") }
+    Header { group: Bytes(group.to_vec()), author: Bytes(m.session.key().to_vec()), joined, seq: 1, epoch: joined, prev: None, deps: vec![], reply_to: None, payload: message("forged") }
 }
 
 fn live(m: &Member, payload: &serde_json::Value) -> Vec<u8> {
@@ -1134,7 +1136,7 @@ fn cuts_advance_and_refuse_what_rules_refuse() {
     let commit = w.m[0].commit(Change { cut: cut.clone(), add: vec![kp_d], how: Some(How::Invite), remove: vec![c_index], ..Change::default() });
     w.post(commit.entry);
     let mut expected: Vec<Ref> = cut.iter().filter(|r| r.key.0 != c).cloned().collect();
-    expected.push(Ref { key: Bytes(d), joined: next, seq: 0, id: Bytes::default() });
+    expected.push(Ref { key: Bytes(d), joined: next, seq: 0, id: Bytes::default(), epoch: 0 });
     expected.sort();
     let read = w.read(&[0, 1, 2]);
     assert_eq!(applied(&read[1][0]).cut, cut);
@@ -1199,7 +1201,7 @@ fn a_joiner_starts_at_the_commits_cut() {
     let pos = w.post(commit.entry);
     w.read(&[0, 1]);
     let mut expected = cut;
-    expected.push(Ref { key: Bytes(c), joined: next, seq: 0, id: Bytes::default() });
+    expected.push(Ref { key: Bytes(c), joined: next, seq: 0, id: Bytes::default(), epoch: 0 });
     expected.sort();
 
     let Entry { commit: bytes, .. } = Entry::parse(&inner).unwrap();

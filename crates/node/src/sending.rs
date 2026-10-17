@@ -3,6 +3,7 @@
 //! seals it again in each epoch until then, once it is at the head of its log.
 
 use anyhow::{Context, Result, ensure};
+use iroh::EndpointId;
 use lmk_core::group::{FRAMING, MAX_MESSAGE};
 use lmk_core::provider::Provider;
 use lmk_net::peers::ANSWER;
@@ -37,6 +38,15 @@ impl<P: Provider> State<P> {
         Ok(self.online_summaries(gid)?.into_iter().filter(holds).map(|summary| summary.member.clone()).collect())
     }
 
+    /// Whether this session's message waits for another member to hold it: some other member joined by the epoch it was
+    /// sent in, and none connected shows it held. One sent before the others joined is no one else's to have.
+    pub(crate) fn unheld(&self, gid: &[u8], record: &Record) -> Result<bool> {
+        let g = self.group(gid)?;
+        let me = self.me(gid);
+        let entitled = g.mls.members().iter().any(|m| m.key != me && g.mls.joined(&m.key).is_some_and(|joined| joined <= record.header.epoch));
+        Ok(entitled && self.holders_of(gid, record.header.seq)?.is_empty())
+    }
+
     /// What this session lacks of what the last commit kept, and of the seqs past the cut of each other membership that
     /// connected members show sealed in this epoch, unless this session holds them sealed in this epoch: what an update
     /// fetches before it commits.
@@ -49,7 +59,7 @@ impl<P: Provider> State<P> {
             let Some(author) = g.author(&cut.key.0, cut.joined) else { continue };
             let listed = online.iter().flat_map(|summary| &summary.sealed).filter(|sealed| sealed.key == cut.key && sealed.joined == cut.joined).fold(Ranges::default(), |all, sealed| all.union(&sealed.seqs));
             let sealed: Ranges = author.sealed.iter().filter(|(_, sealed)| **sealed == epoch).map(|(seq, _)| *seq).collect();
-            let lacking = listed.intersection(&Ranges::range(cut.seq + 1, u64::MAX)).difference(&sealed).difference(&author.lost);
+            let lacking = listed.intersection(&Ranges::range(cut.seq.max(author.baseline) + 1, u64::MAX)).difference(&sealed).difference(&author.lost);
             fetch.extend(author.seqs(&lacking));
         }
         Ok(fetch)
@@ -81,9 +91,15 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if let Some(reply_to) = reply_to {
             ensure!(st.record(gid, reply_to)?.is_some_and(|record| record.delivered.is_some()), "reply_to names no message delivered here");
         }
+        // A message a cut kept may be gone after H; the cut names it.
+        let kept = g.mls.cut().iter().find(|r| r.key.0 == me && r.joined == joined).context("its own cut")?;
         let prev = match seq {
             1 => None,
-            _ => Some(st.id_at(gid, &me, joined, seq - 1)?.context("this session's previous message")?),
+            _ if kept.seq == seq - 1 => Some((kept.id.clone(), kept.epoch)),
+            _ => {
+                let prev = st.record_at(gid, &me, joined, seq - 1)?.context("this session's previous message")?;
+                Some((prev.id, prev.header.epoch))
+            }
         };
         let control = lmk_proto::group::Control::TYPES.contains(&lmk_proto::group::type_of(payload));
         let deps = if control || st.group(gid)?.mls.settings().kind == lmk_proto::group::IDENTITY { Vec::new() } else { st.deps(gid)? };
@@ -92,6 +108,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             author: Bytes(me.clone()),
             joined,
             seq,
+            epoch: st.group(gid)?.mls.epoch(),
             prev,
             deps,
             reply_to: reply_to.map(|id| Bytes(id.to_vec())),
@@ -125,8 +142,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
         Ok(id)
     }
 
-    /// Seals this session's messages past its cut again in the current epoch, in seq order, and pushes them in frames:
-    /// once per epoch, at the head of its log, once the log has been read.
+    /// Seals this session's messages past its cut again in the current epoch, in seq order, and pushes them in frames,
+    /// to each member that joined before they were sent: once per epoch, at the head of its log, once the log has been
+    /// read.
     pub(crate) fn reseal(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
         let g = st.group(gid)?;
         let epoch = g.mls.epoch();
@@ -146,13 +164,17 @@ impl<P: Provider + Send + 'static> Inner<P> {
             g.author_mut(&me, mine.joined).unwrap().sealed.insert(seq, epoch);
             record.sealing = Some((epoch, Bytes(ciphertext.clone())));
             st.store(gid, &record)?;
-            items.push(Bytes(ciphertext));
+            items.push((record.header.epoch, Bytes(ciphertext)));
         }
         let g = st.group_mut(gid)?;
         g.rec.resealed = epoch;
         g.changed |= !items.is_empty();
-        for items in frames(items) {
-            st.broadcast(gid, Frame::Held { group: Bytes(gid.to_vec()), items, answers: None });
+        for peer in st.peers.neighbours(&Bytes(gid.to_vec())) {
+            let peer = EndpointId::from_bytes(&peer)?;
+            let joined = st.joined_of(gid, &peer);
+            for items in frames(items.iter().filter(|(sent, _)| *sent >= joined).map(|(_, item)| item.clone()).collect()) {
+                st.emit(gid, peer, Frame::Held { group: Bytes(gid.to_vec()), items, answers: None });
+            }
         }
         st.save(gid)
     }

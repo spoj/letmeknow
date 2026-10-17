@@ -183,6 +183,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
             if g.author(&r.key.0, r.joined).is_none() {
                 g.rec.authors.push(Author::new(r.key.clone(), r.joined, 0));
             }
+            // What a cut keeps of a membership was all sent before this session joined, or all after.
+            if own.is_some_and(|own| r.epoch < own) {
+                g.before(&r.key.0, r.joined, r.seq);
+            }
             let author = g.author_mut(&r.key.0, r.joined).unwrap();
             let kept = Ranges::range(author.cut.max(author.baseline) + 1, r.seq);
             if r.key.0 == me && Some(r.joined) == own {

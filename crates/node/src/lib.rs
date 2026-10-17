@@ -771,6 +771,12 @@ impl<P: Provider> State<P> {
         members.into_iter().find(|m| m.leaf.as_ref().is_some_and(|leaf| leaf.key.0 == peer.as_bytes()))
     }
 
+    /// The epoch the membership of a peer's member began in: what was sent before it is not the peer's to have; nothing
+    /// is, of a peer that is not a member.
+    fn joined_of(&self, gid: &[u8], peer: &EndpointId) -> u64 {
+        self.in_leaf(gid, peer).and_then(|m| self.groups.get(gid)?.mls.joined(&m.key)).unwrap_or(u64::MAX)
+    }
+
     /// Whether this session serves a peer a group: it is a member and, speaking as an identity, its device is on the
     /// identity's list.
     fn serves(&self, gid: &[u8], peer: &EndpointId) -> bool {

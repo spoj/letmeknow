@@ -17,9 +17,11 @@ pub struct Header {
     pub joined: u64,
     /// The membership's count of held messages in the group: 1, 2, 3, … across epochs.
     pub seq: u64,
-    /// The id of the membership's message at `seq - 1`; none at seq 1.
+    /// The epoch its author sent it in: members never pass it to a member that joined later.
+    pub epoch: u64,
+    /// The id of the membership's message at `seq - 1`, and the epoch that one was sent in; none at seq 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prev: Option<Bytes>,
+    pub prev: Option<(Bytes, u64)>,
     /// The frontier of what the author's client had shown: at most one message per membership, none the author's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deps: Vec<Ref>,
@@ -29,28 +31,29 @@ pub struct Header {
     pub payload: Value,
 }
 
-/// A message by its author's membership and seq, and its id; in a cut, a membership's seq and the id there, empty at
-/// seq 0. Carried as `[key, joined, seq, id]`.
+/// A message by its author's membership and seq, its id, and the epoch it was sent in; in a cut, a membership's seq and
+/// the id there, empty with epoch 0 at seq 0. Carried as `[key, joined, seq, id, epoch]`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "Vec<Value>", into = "(Bytes, u64, u64, Bytes)")]
+#[serde(try_from = "Vec<Value>", into = "(Bytes, u64, u64, Bytes, u64)")]
 pub struct Ref {
     pub key: Bytes,
     pub joined: u64,
     pub seq: u64,
     pub id: Bytes,
+    pub epoch: u64,
 }
 
 impl TryFrom<Vec<Value>> for Ref {
     type Error = serde_json::Error;
     fn try_from(values: Vec<Value>) -> serde_json::Result<Self> {
-        let (key, joined, seq, id) = leading(values, 4)?;
-        Ok(Ref { key, joined, seq, id })
+        let (key, joined, seq, id, epoch) = leading(values, 5)?;
+        Ok(Ref { key, joined, seq, id, epoch })
     }
 }
 
-impl From<Ref> for (Bytes, u64, u64, Bytes) {
+impl From<Ref> for (Bytes, u64, u64, Bytes, u64) {
     fn from(r: Ref) -> Self {
-        (r.key, r.joined, r.seq, r.id)
+        (r.key, r.joined, r.seq, r.id, r.epoch)
     }
 }
 
@@ -120,8 +123,9 @@ mod tests {
             author: Bytes(vec![9; 32]),
             joined: 3,
             seq: 2,
-            prev: Some(Bytes(vec![4; 32])),
-            deps: vec![Ref { key: Bytes(vec![5; 32]), joined: 0, seq: 7, id: Bytes(vec![6; 32]) }],
+            epoch: 4,
+            prev: Some((Bytes(vec![4; 32]), 3)),
+            deps: vec![Ref { key: Bytes(vec![5; 32]), joined: 0, seq: 7, id: Bytes(vec![6; 32]), epoch: 2 }],
             reply_to: None,
             payload: json!({ "type": "message", "content": "hi" }),
         }
@@ -140,16 +144,16 @@ mod tests {
 
     #[test]
     fn tuples_ignore_what_later_releases_append() {
-        let dep: Ref = serde_json::from_str(r#"["BQ",0,7,"Bg",{"later":1}]"#).unwrap();
-        assert_eq!(dep, Ref { key: Bytes(vec![5]), joined: 0, seq: 7, id: Bytes(vec![6]) });
+        let dep: Ref = serde_json::from_str(r#"["BQ",0,7,"Bg",2,{"later":1}]"#).unwrap();
+        assert_eq!(dep, Ref { key: Bytes(vec![5]), joined: 0, seq: 7, id: Bytes(vec![6]), epoch: 2 });
         let claim: Claim = serde_json::from_str(r#"["CQ",3,2,"more"]"#).unwrap();
         assert_eq!(claim, Claim { key: Bytes(vec![9]), joined: 3, seq: 2 });
-        assert!(serde_json::from_str::<Ref>(r#"["BQ",0,7]"#).is_err(), "too few");
+        assert!(serde_json::from_str::<Ref>(r#"["BQ",0,7,"Bg"]"#).is_err(), "too few");
     }
 
     #[test]
     fn malformed_headers_are_refused() {
-        let me = Ref { key: Bytes(vec![9; 32]), joined: 3, seq: 1, id: Bytes(vec![1; 32]) };
+        let me = Ref { key: Bytes(vec![9; 32]), joined: 3, seq: 1, id: Bytes(vec![1; 32]), epoch: 3 };
         let cases = [
             Header { prev: None, ..header() },
             Header { seq: 1, ..header() },

@@ -405,7 +405,7 @@ impl Group {
             .build();
         let id = GroupId::from_slice(&crate::random::<16>());
         let mls = MlsGroup::new_with_group_id(provider, &session.signer, &config, id, session.with_key())?;
-        let cut = vec![Ref { key: Bytes(session.key().to_vec()), joined: 0, seq: 0, id: Bytes::default() }];
+        let cut = vec![Ref { key: Bytes(session.key().to_vec()), joined: 0, seq: 0, id: Bytes::default(), epoch: 0 }];
         let group = Group { state: State { cut, ..State::default() }, mls };
         group.save(provider)?;
         Ok(group)
@@ -454,7 +454,7 @@ impl Group {
             ensure!(aad.cut.windows(2).all(|pair| pair[0].key < pair[1].key) && aad.cut.iter().all(well_formed), "a malformed cut");
             let cut = mls.members().map(|m| {
                 let found = aad.cut.iter().find(|r| r.key.0 == m.signature_key).cloned();
-                found.unwrap_or(Ref { key: Bytes(m.signature_key), joined: epoch, seq: 0, id: Bytes::default() })
+                found.unwrap_or(Ref { key: Bytes(m.signature_key), joined: epoch, seq: 0, id: Bytes::default(), epoch: 0 })
             });
             let mut cut: Vec<Ref> = cut.collect();
             cut.sort();
@@ -792,7 +792,7 @@ impl Group {
         }
         let epoch = self.epoch();
         let mut cut: Vec<Ref> = applied.cut.iter().filter(|r| members.iter().any(|m| m.key == r.key.0)).cloned().collect();
-        cut.extend(applied.added.iter().map(|m| Ref { key: Bytes(m.key.clone()), joined: epoch, seq: 0, id: Bytes::default() }));
+        cut.extend(applied.added.iter().map(|m| Ref { key: Bytes(m.key.clone()), joined: epoch, seq: 0, id: Bytes::default(), epoch: 0 }));
         cut.sort();
         self.state.cut = cut;
         self.state.ended = applied.cut.clone();
@@ -990,7 +990,7 @@ fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad, 
     ensure!(named, "a cut that does not name each member once, in order, at its membership");
     for (new, old) in aad.cut.iter().zip(cut) {
         ensure!(well_formed(new), "a cut whose id does not fit its seq");
-        ensure!(new.seq > old.seq || (new.seq == old.seq && new.id == old.id), "a cut below the last");
+        ensure!(new.seq > old.seq || (new.seq == old.seq && new.id == old.id && new.epoch == old.epoch), "a cut below the last");
         ensure!(new.seq - old.seq <= MAX_CUT_STEP, "a cut too far past the last");
     }
     let old = settings_of(group.extensions())?;

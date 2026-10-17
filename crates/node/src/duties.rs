@@ -44,24 +44,24 @@ pub(crate) fn next_update(updated: u64, update: u32, key: &[u8]) -> u64 {
 
 impl<P: Provider> State<P> {
     /// The cut a commit this session builds now carries: per member of the epoch, from the cut state on, each seq it
-    /// holds sealed in the current epoch whose `prev` chains to the last; its own only as far as another member's
-    /// summary shows held.
+    /// holds sealed in the current epoch whose `prev` chains to the last; its own only as far as another member that
+    /// may have them holds them.
     pub(crate) fn cut_for(&self, gid: &[u8]) -> Result<Vec<Ref>> {
         let g = self.group(gid)?;
         let (epoch, me) = (g.mls.epoch(), self.me(gid));
         let mut cut = Vec::new();
         for r in g.mls.cut() {
-            let (mut seq, mut id) = (r.seq, r.id.clone());
-            while seq < r.seq + MAX_CUT_STEP {
-                let Some(record) = self.record_at(gid, &r.key.0, r.joined, seq + 1)? else { break };
+            let mut kept = r.clone();
+            while kept.seq < r.seq + MAX_CUT_STEP {
+                let Some(record) = self.record_at(gid, &r.key.0, r.joined, kept.seq + 1)? else { break };
                 let sealed = record.sealing.as_ref().is_some_and(|(sealed, _)| *sealed == epoch);
-                let chained = record.header.prev.as_ref() == (seq > 0).then_some(&id);
-                if !sealed || !chained || (r.key.0 == me && self.holders_of(gid, seq + 1)?.is_empty()) {
+                let chained = record.header.prev.as_ref().map(|(id, _)| id) == (kept.seq > 0).then_some(&kept.id);
+                if !sealed || !chained || (r.key.0 == me && self.unheld(gid, &record)?) {
                     break;
                 }
-                (seq, id) = (seq + 1, record.id);
+                kept = Ref { seq: kept.seq + 1, id: record.id, epoch: record.header.epoch, ..kept };
             }
-            cut.push(Ref { key: r.key.clone(), joined: r.joined, seq, id });
+            cut.push(kept);
         }
         Ok(cut)
     }

@@ -222,6 +222,13 @@ impl G {
         self.author(key, self.mls.joined(key)?)
     }
 
+    /// Puts a membership's seqs through `seq`, sent before this session joined, behind its baseline: not its to have.
+    pub(crate) fn before(&mut self, key: &[u8], joined: u64, seq: u64) {
+        let Some(author) = self.author_mut(key, joined) else { return };
+        author.baseline = author.baseline.max(seq);
+        author.known = author.known.max(seq);
+    }
+
     /// Seqs that became known: not asked for until `HOLD_OFF` passed, as their pushes are likely on the way.
     pub(crate) fn learn(&mut self, key: &[u8], joined: u64, seq: u64, now: u64) {
         let Some(author) = self.author_mut(key, joined) else { return };
@@ -332,7 +339,7 @@ impl<P: Provider> State<P> {
         for author in g.rec.authors.iter().filter(|a| !(a.key.0 == me && Some(a.joined) == g.mls.joined(me))) {
             let Some(&(_, seq)) = author.shown.ranges().last() else { continue };
             if let Some(record) = self.record_at(gid, &author.key.0, author.joined, seq)? {
-                candidates.push((lmk_proto::held::Ref { key: author.key.clone(), joined: author.joined, seq, id: record.id.clone() }, record));
+                candidates.push((lmk_proto::held::Ref { key: author.key.clone(), joined: author.joined, seq, id: record.id.clone(), epoch: record.header.epoch }, record));
             }
         }
         let covered = |dep: &lmk_proto::held::Ref| candidates.iter().any(|(other, record)| other != dep && record.after(&dep.key, dep.joined, dep.seq));
@@ -342,7 +349,8 @@ impl<P: Provider> State<P> {
 
 impl<P: Provider + Send + 'static> Inner<P> {
     /// Takes held ciphertexts a peer sent, or that came early: opens what is in order, keeps a while what is not,
-    /// passes on what it opened unless they answered this session's `want`, and delivers what is ready.
+    /// passes on what it opened unless they answered this session's `want`, to members that joined before it was sent,
+    /// and delivers what is ready.
     pub(crate) fn take(&self, st: &mut State<P>, gid: &[u8], from: Option<EndpointId>, ciphertexts: Vec<Vec<u8>>, forward: bool) -> Result<()> {
         let mut opened = Vec::new();
         for ciphertext in ciphertexts {
@@ -353,8 +361,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if forward && !opened.is_empty() && !st.peers.full_mesh(&group) {
             for peer in st.peers.neighbours(&group) {
                 let peer = EndpointId::from_bytes(&peer)?;
-                if Some(peer) != from {
-                    let items = opened.iter().map(|ciphertext| Bytes(ciphertext.clone())).collect();
+                let joined = st.joined_of(gid, &peer);
+                let items: Vec<Bytes> = opened.iter().filter(|(_, sent)| *sent >= joined).map(|(ciphertext, _)| Bytes(ciphertext.clone())).collect();
+                if Some(peer) != from && !items.is_empty() {
                     st.emit(gid, peer, Frame::Held { group: group.clone(), items, answers: None });
                 }
             }
@@ -366,8 +375,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
         Ok(())
     }
 
-    /// Takes one ciphertext; the ciphertext, if it opened.
-    fn take_one(&self, st: &mut State<P>, gid: &[u8], from: Option<EndpointId>, ciphertext: Vec<u8>) -> Result<Option<Vec<u8>>> {
+    /// Takes one ciphertext; the ciphertext and the epoch its message was sent in, if it opened.
+    fn take_one(&self, st: &mut State<P>, gid: &[u8], from: Option<EndpointId>, ciphertext: Vec<u8>) -> Result<Option<(Vec<u8>, u64)>> {
         let now = st.tick();
         let g = st.group_mut(gid)?;
         let hash: [u8; 32] = Sha256::digest(&ciphertext).into();
@@ -408,7 +417,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Opens the unopened ciphertexts that are now in order, within the window and the buckets.
-    fn open_unopened(&self, st: &mut State<P>, gid: &[u8], opened: &mut Vec<Vec<u8>>) -> Result<()> {
+    fn open_unopened(&self, st: &mut State<P>, gid: &[u8], opened: &mut Vec<(Vec<u8>, u64)>) -> Result<()> {
         loop {
             let now = st.tick();
             let g = st.group_mut(gid)?;
@@ -436,9 +445,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
         Ok(())
     }
 
-    /// Opens a ciphertext and keeps its message, or its newer sealing of a message not kept yet; the ciphertext, if
-    /// either.
-    fn open_one(&self, st: &mut State<P>, gid: &[u8], ciphertext: Vec<u8>) -> Result<Option<Vec<u8>>> {
+    /// Opens a ciphertext and keeps its message, or its newer sealing of a message not kept yet; the ciphertext and the
+    /// epoch its message was sent in, if either.
+    fn open_one(&self, st: &mut State<P>, gid: &[u8], ciphertext: Vec<u8>) -> Result<Option<(Vec<u8>, u64)>> {
         let now = st.tick();
         let g = st.groups.get_mut(gid).context("this session is not in that group")?;
         let opened = match g.mls.open(&st.provider, &ciphertext) {
@@ -469,7 +478,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 if st.group(gid)?.rec.leaves.iter().any(|(key, joined, _)| *key == h.author && *joined == h.joined) {
                     self.work.send(Work::Duties(gid.to_vec())).ok();
                 }
-                return Ok(Some(ciphertext));
+                return Ok(Some((ciphertext, h.epoch)));
             }
             Some(_) => {
                 self.warn(Some(gid), format!("{} sent two held messages as its seq {}: this session keeps the first", crate::fp(&h.author.0), h.seq));
@@ -479,12 +488,22 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         if h.seq > 1
             && let Some(prev) = st.id_at(gid, &h.author.0, h.joined, h.seq - 1)?
-            && Some(&prev) != h.prev.as_ref()
+            && Some(&prev) != h.prev.as_ref().map(|(id, _)| id)
         {
             self.warn(Some(gid), format!("{} sent a held message whose prev is not its seq {}: this session keeps the first", crate::fp(&h.author.0), h.seq - 1));
             return Ok(None);
         }
+        let me = st.me(gid).to_vec();
         let g = st.group_mut(gid)?;
+        let own = g.mls.joined(&me).context("a member of its group")?;
+        if let Some((_, sent)) = &h.prev
+            && *sent < own
+        {
+            g.before(&h.author.0, h.joined, h.seq - 1);
+        }
+        for dep in h.deps.iter().filter(|dep| dep.epoch < own) {
+            g.before(&dep.key.0, dep.joined, dep.seq);
+        }
         g.learn(&h.author.0, h.joined, h.seq.saturating_sub(1), now);
         for dep in &h.deps {
             g.learn(&dep.key.0, dep.joined, dep.seq, now);
@@ -500,7 +519,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let record = Record { id: Bytes(id.to_vec()), header: h, plaintext: None, sealing: Some((opened.epoch, Bytes(ciphertext.clone()))), opened: now, released: false, delivered: None };
         st.store(gid, &record)?;
         self.control(st, gid, &record.header)?;
-        Ok(Some(ciphertext))
+        Ok(Some((ciphertext, record.header.epoch)))
     }
 
     /// A ciphertext of a kept seq that is too old to open: no sealing of it can come that opens, so it is lost.

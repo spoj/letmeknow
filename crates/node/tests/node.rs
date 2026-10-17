@@ -1259,6 +1259,37 @@ async fn each_commit_moves_the_group_to_its_new_epochs_log() {
     }
 }
 
+/// A message sent while an Add is in flight, which its author seals again in the joiner's epoch, never reaches the
+/// joiner; the author's next message reaches it at once, missing nothing: what was sent before a member joined is not
+/// its to have.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_sent_while_an_add_is_in_flight_never_reaches_the_joiner() {
+    let relay = relay().await;
+    let mut alice = session(&relay, "Alice").await;
+    let mut bob = session(&relay, "Bob").await;
+    let mut carol = session(&relay, "Carol").await;
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    alice.node.send(&gid.0, &message("before Carol"), None).unwrap();
+    carol.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    let after = alice.node.send(&gid.0, &message("after Carol"), None).unwrap();
+    let got = carol.until(|e| match e {
+        Event::Message(m) if m.id == after => Some(m),
+        _ => None,
+    }).await;
+    assert!(got.missing.is_empty(), "{got:?}");
+    let held: Vec<Value> = carol.node.messages(&gid.0).unwrap().into_iter().map(|m| m.payload).collect();
+    assert_eq!(held, [message("after Carol")]);
+    for text in ["before Carol", "after Carol"] {
+        bob.until(|e| matches!(e, Event::Message(m) if m.payload == message(text)).then_some(())).await;
+    }
+    for session in [&alice, &bob, &carol] {
+        session.node.shutdown().await.unwrap();
+    }
+}
+
 /// Two members that leave at once: one's removal of the other wins, and the one left alone forgets the group.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_leaver_left_alone_forgets_the_group() {
@@ -2483,7 +2514,8 @@ async fn three_members_chat_in_causal_order() {
     })
     .await;
     bob.node.shutdown().await.unwrap();
-    assert_eq!(deps_of(&db("bob"), &gid, &b1), [lmk_proto::held::Ref { key: alice.node.key(), joined: 0, seq: 3, id: a1.clone() }]);
+    let sent = record(&db("bob"), &gid, &a1)["header"]["epoch"].as_u64().unwrap();
+    assert_eq!(deps_of(&db("bob"), &gid, &b1), [lmk_proto::held::Ref { key: alice.node.key(), joined: 0, seq: 3, id: a1.clone(), epoch: sent }]);
     assert_eq!(deps_of(&db("bob"), &gid, &b2), deps_of(&db("bob"), &gid, &b1), "b2 depends on a1 still: a2 was not shown");
     carol.node.shutdown().await.unwrap();
     alice.node.shutdown().await.unwrap();
@@ -2611,7 +2643,8 @@ async fn a_commit_keeps_what_an_online_member_holds() {
         Event::Message(message) => Some(message.seq),
         _ => None,
     }).await;
-    eventually("Alice hears that Bob holds her messages up to one", || alice.node.heard(&gid.0).unwrap().iter().any(|h| h.member.key == bob_key && (1..=seq).all(|q| h.held.iter().any(|s| s.key == alice_key && s.seqs.contains(q))))).await;
+    // Her seq 1, Bob's invite, was sent before he joined: it is not his to have.
+    eventually("Alice hears that Bob holds her messages up to one", || alice.node.heard(&gid.0).unwrap().iter().any(|h| h.member.key == bob_key && (2..=seq).all(|q| h.held.iter().any(|s| s.key == alice_key && s.seqs.contains(q))))).await;
     dave.node.shutdown().await.unwrap();
     let m2 = alice.node.send(&gid.0, &message("two"), None).unwrap();
     bob.until(|e| matches!(e, Event::Message(message) if message.id == m2).then_some(())).await;
@@ -2895,28 +2928,27 @@ async fn a_holder_keeps_the_removed_members_last_kept_message() {
     alice.node.shutdown().await.unwrap();
 }
 
-/// A joiner starts at the cut of the commit that added it: a message its sender sent before the Add, which no cut kept,
-/// the sender seals again after the Add, and the joiner takes it, then takes what is sent after it joined.
+/// What a member sends while alone in its group is no one else's: it needs no holder, and a joiner takes only what is
+/// sent after it joined, past the next commit too.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_joiner_takes_what_was_unkept_at_its_add_and_what_follows() {
+async fn what_a_member_sends_alone_needs_no_holder_and_reaches_no_joiner() {
     let relay = relay().await;
     let mut alice = session(&relay, "Alice").await;
     let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
-    let before = alice.node.send(&gid.0, &message("before Bob"), None).unwrap();
+    alice.node.send(&gid.0, &message("before Bob"), None).unwrap();
+    assert!(alice.node.only_here(&gid.0).unwrap().is_empty());
     let mut bob = session(&relay, "Bob").await;
     bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     let after = alice.node.send(&gid.0, &message("after Bob"), None).unwrap();
-    // Alice's invite took seq 2: before is seq 1, after seq 3. Bob may take after first, given up on before, which then comes late.
-    let mut taken = Vec::new();
-    while taken.len() < 2 {
-        taken.push(bob.until(|e| match e {
-            Event::Message(message) => Some((message.id, message.seq)),
-            _ => None,
-        }).await);
-    }
-    taken.sort_by_key(|(_, seq)| *seq);
-    assert_eq!(taken, [(before, 1), (after, 3)]);
+    // Alice's invite took seq 2: before is seq 1, after seq 3.
+    let got = bob.until(|e| match e {
+        Event::Message(m) => Some(m),
+        _ => None,
+    }).await;
+    assert_eq!((got.id, got.seq, got.missing.is_empty()), (after, 3, true));
+    alice.node.change_settings(&gid.0, |s| Settings { name: "Kept".into(), ..s }).await.unwrap();
+    assert!(bob.node.messages(&gid.0).unwrap().iter().all(|m| m.payload != message("before Bob")));
     alice.node.shutdown().await.unwrap();
     bob.node.shutdown().await.unwrap();
 }
@@ -2942,6 +2974,7 @@ async fn missed_commits(test: &str) -> (Vec<u64>, Vec<u64>) {
     let alice_key = alice.node.key();
 
     // The two invites took seqs 1 and 2; Alice's messages are 3 and 4, each held by Bob before the rename that keeps it.
+    // Seq 1, Bob's invite, was sent before he joined: it is not his to have.
     let mut sent = Vec::new();
     for text in ["a1", "a2"] {
         alice.node.send(&gid.0, &message(text), None).unwrap();
@@ -2950,7 +2983,7 @@ async fn missed_commits(test: &str) -> (Vec<u64>, Vec<u64>) {
             _ => None,
         }).await;
         sent.push(seq);
-        eventually("Alice hears that Bob holds her messages up to it", || alice.node.heard(&gid.0).unwrap().iter().any(|h| h.member.name == "Bob" && (1..=seq).all(|q| h.held.iter().any(|s| s.key == alice_key && s.seqs.contains(q))))).await;
+        eventually("Alice hears that Bob holds her messages up to it", || alice.node.heard(&gid.0).unwrap().iter().any(|h| h.member.name == "Bob" && (2..=seq).all(|q| h.held.iter().any(|s| s.key == alice_key && s.seqs.contains(q))))).await;
         alice.node.change_settings(&gid.0, |s| Settings { name: text.into(), ..s }).await.unwrap();
     }
     alice.node.change_settings(&gid.0, |s| Settings { name: "last".into(), ..s }).await.unwrap();
@@ -3176,6 +3209,7 @@ async fn a_member_back_takes_more_than_a_thousand_messages_of_one_sender() {
     let mut prev: Bytes = serde_json::from_slice(&invite).unwrap();
     let mut group = lmk_core::group::Group::load(&provider, &gid.0).unwrap();
     let invite_plaintext: Bytes = serde_json::from_value(record(&db("alice"), &gid, &prev)["plaintext"].clone()).unwrap();
+    let mut sent = record(&db("alice"), &gid, &prev)["header"]["epoch"].as_u64().unwrap();
     let mut ciphertexts = vec![Bytes(group.seal(&provider, &session, &invite_plaintext.0).unwrap())];
     let mut ids = Vec::new();
     for seq in 2..=MESSAGES + 1 {
@@ -3184,14 +3218,15 @@ async fn a_member_back_takes_more_than_a_thousand_messages_of_one_sender() {
             author: author.clone(),
             joined: 0,
             seq,
-            prev: Some(prev.clone()),
+            epoch: group.epoch(),
+            prev: Some((prev.clone(), sent)),
             deps: Vec::new(),
             reply_to: None,
             payload: message(&seq.to_string()),
         };
         let plaintext = header.encode();
         ciphertexts.push(Bytes(group.seal(&provider, &session, &plaintext).unwrap()));
-        prev = Bytes(lmk_proto::held::id(&plaintext).to_vec());
+        (prev, sent) = (Bytes(lmk_proto::held::id(&plaintext).to_vec()), group.epoch());
         ids.push(prev.clone());
     }
     drop(group);
