@@ -88,6 +88,14 @@ impl FileLink {
 mod tests {
     use super::*;
 
+    /// What deploy/deploy.sh checks the service it installs against is the service built in here.
+    #[test]
+    fn the_deployed_service_is_the_built_in_one() {
+        let backend: serde_json::Value = serde_json::from_str(include_str!("../../../deploy/backend.json")).unwrap();
+        let directory = serde_json::json!({ "key": MEMBERSHIP_KEY, "relay": RELAY, "relays": [RELAY] });
+        assert_eq!(backend, serde_json::json!({ "domain": DOMAIN, "directory": directory }));
+    }
+
     #[test]
     fn invite_round_trip() {
         let members = vec![[1; 32], [3; 32]];

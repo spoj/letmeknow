@@ -46,13 +46,6 @@ tokio = "1.53"
 tokio-rustls-acme = "0.9"
 yrs = "0.28"
 
-[profile.wasm]
-inherits = "release"
-opt-level = "z"
-lto = true
-codegen-units = 1
-strip = true
-
 # Dependencies optimized in tests, which do real cryptography.
 [profile.dev.package."*"]
 opt-level = 2

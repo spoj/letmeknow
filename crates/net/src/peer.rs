@@ -91,7 +91,7 @@ impl Session {
                     let linked = self.inner.groups.files(&group.0);
                     for file in files {
                         let Ok(hash) = <[u8; 32]>::try_from(&file.0[..]) else { continue };
-                        if linked.iter().any(|link| link.hash == hash) && self.inner.files.serve(&hash).await? {
+                        if linked.iter().any(|link| link.hash == hash) && self.inner.files.has(&hash).await? {
                             have.push(file);
                         }
                     }

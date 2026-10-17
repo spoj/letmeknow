@@ -4,8 +4,8 @@
 //! in causal order; commits keep them, by their cuts. A group's kind sees its content through the channels here (held
 //! messages as delivered, live ones, files, and a state link for joiners), and nothing of the rest; the core reads only
 //! its own payloads (`Control`). The identity kind (`devices`) is built on those channels. It stores everything through
-//! the core's `Provider`, so the same code runs natively (SQLite) and in the browser (memory the web client persists),
-//! one transaction per step (`Step`): nothing a step produces leaves the node before its transaction commits.
+//! the core's `Provider`, one transaction per step (`Step`): nothing a step produces leaves the node before its
+//! transaction commits.
 
 mod admission;
 mod api;
@@ -40,7 +40,6 @@ use lmk_proto::group::{Certificate, Credential, How, IdentityRef, Service, Setti
 use lmk_proto::links::FileLink;
 use lmk_proto::peer::{Frame, Seqs, Signed};
 use lmk_proto::Bytes;
-use n0_future::boxed::BoxFuture;
 use n0_future::task::{JoinHandle, spawn};
 use n0_future::time::Duration;
 use serde::de::DeserializeOwned;
@@ -52,7 +51,6 @@ use tokio::sync::{mpsc, oneshot};
 use held::Author;
 
 pub use lmk_core;
-pub use lmk_net::Disk;
 pub use peering::Heard;
 pub use lmk_proto::clock::now;
 
@@ -60,7 +58,6 @@ pub use lmk_proto::clock::now;
 pub const INVITE_VALID: u64 = 10 * 60 * 1000;
 /// How often files no group holds any longer are deleted.
 pub const COLLECT: Duration = Duration::from_secs(60 * 60);
-const PERSISTENCE_FAILED: &str = "local persistence failed";
 /// How long some waits for other members last: for those online to hold a file or an invite, for added members'
 /// certificates.
 const MEMBER_WAIT: Duration = Duration::from_secs(5);
@@ -71,7 +68,7 @@ pub struct Config {
     /// The name its credential gives it in groups but identity groups, fixed when it is created: a session process's
     /// handle, or empty for a device's node.
     pub handle: String,
-    /// The device, where this is a device's node or a browser's one session: its name is its credential's in its
+    /// The device, where this is a device's node: its name is its credential's in its
     /// identity groups, each of which this node joins with a key of its own, the device's key on that identity.
     pub device: Option<Device>,
     /// The relays of this session's directory: the relays it lives on unless `chosen` names others, and the fallback of
@@ -88,18 +85,11 @@ pub struct Config {
     pub home: Option<PathBuf>,
     /// Where files are kept; in memory if none.
     pub files: Option<PathBuf>,
-    pub disk: Option<Arc<dyn Disk>>,
     /// The largest file fetched without being asked.
     pub file_limit: u64,
     /// The kinds this session supports, `chat` among them.
     pub kinds: Vec<String>,
-    /// Where committed steps are not durable yet when they commit, as in the browser: makes them so, before anything
-    /// they produced leaves the node.
-    pub durable: Option<Durable>,
 }
-
-/// Makes the steps committed so far durable. A failure stops dependent output until the node restarts.
-pub type Durable = Arc<dyn Fn() -> BoxFuture<Result<()>> + Send + Sync>;
 
 /// A group member, from its leaf and credential, and its credential's certificate checked against its identity's key
 /// log.
@@ -579,10 +569,8 @@ pub(crate) struct Inner<P> {
     kinds: Vec<String>,
     events: mpsc::UnboundedSender<Event>,
     work: mpsc::UnboundedSender<Work>,
-    /// Peer output and client events from steps, in order, released once durable.
+    /// Peer output and client events from steps, in order.
     outbox: mpsc::UnboundedSender<(Vec<Out>, Vec<Event>)>,
-    durable: Option<Durable>,
-    persistence_error: Mutex<Option<String>>,
     committing: tokio::sync::Mutex<()>,
     /// Woken whenever a group's log is read further, for commits waiting to reach its head.
     advanced: tokio::sync::Notify,
@@ -862,18 +850,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
         self.net.get().expect("the peers start with the node")
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
         let mut tasks = self.tasks.lock().unwrap();
         tasks.retain(|task| !task.is_finished());
         tasks.push(spawn(task));
-    }
-
-    /// The browser runs on one thread, and its tasks end with the page. They are not kept: there, a task cannot ask
-    /// whether tasks are finished, its own among them.
-    #[cfg(target_arch = "wasm32")]
-    fn spawn(&self, task: impl Future<Output = ()> + 'static) {
-        spawn(task);
     }
 
     fn warn(&self, group: Option<&[u8]>, text: String) {
@@ -891,24 +871,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
         Step { guard, inner: self }
     }
 
-    /// Makes the steps committed so far durable, before what they produced leaves the node.
-    async fn durable(&self) -> Result<()> {
-        if let Some(error) = &*self.persistence_error.lock().unwrap() {
-            anyhow::bail!(error.clone());
-        }
-        let saved = match &self.durable {
-            Some(durable) => durable().await,
-            None => Ok(()),
-        };
-        let mut failed = self.persistence_error.lock().unwrap();
-        if let Err(error) = saved {
-            failed.get_or_insert_with(|| format!("{PERSISTENCE_FAILED}: {error:#}; output stopped until restart"));
-        }
-        match &*failed {
-            Some(error) => Err(anyhow::anyhow!(error.clone())),
-            None => Ok(()),
-        }
-    }
 
 }
 

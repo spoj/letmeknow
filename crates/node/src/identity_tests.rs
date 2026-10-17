@@ -82,7 +82,7 @@ async fn device(relay: &Relay, name: &str, post: Post) -> (Node<MemoryProvider>,
     let device = Device::new(name);
     let config = Config {
         handle: name.into(), device: Some(device.clone()), relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), post, ca: relay.ca(),
-        home: None, files: None, disk: None, file_limit: 0, kinds: vec![CHAT.into(), IDENTITY.into()], durable: None,
+        home: None, files: None, file_limit: 0, kinds: vec![CHAT.into(), IDENTITY.into()],
     };
     let (node, _events) = Node::start(MemoryProvider::default(), config).await.unwrap();
     let identity = Identity::new(node.clone(), device, Arc::new(|_| Ok(())));

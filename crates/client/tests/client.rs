@@ -1,5 +1,5 @@
-//! The client core as every shell runs it: on a node that is its device's too, as a browser's is, with plugins that
-//! answer in the call, as in-page plugins do, and requests as JSON, as the page and the command line send them.
+//! The client core on a node that is its device's too, with plugins that answer in the call, and requests as JSON, as
+//! the command line sends them.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -88,9 +88,7 @@ impl Member {
             ca: relay.ca(),
             home: None,
             files: None,
-            disk: None,
             file_limit: 100 << 20,
-            durable: None,
             kinds: vec![CHAT.into(), IDENTITY.into(), KIND.into()],
         };
         let (node, mut events) = Node::start(MemoryProvider::default(), config).await.unwrap();
@@ -307,9 +305,9 @@ async fn a_renamed_device_shows_its_new_name_to_its_other_devices_and_its_groups
     polled(&alice, json!({ "cmd": "members", "group": chat["group"] }), |m| m["members"].as_array().unwrap().iter().any(|m| m["identity"]["name"] == "Robert")).await;
 }
 
-/// A browser joins at once a group that another of its identity's devices adds it to.
+/// A device's node joins at once a group that another of its identity's devices adds it to.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_browser_joins_a_group_another_of_its_devices_adds_it_to() {
+async fn a_devices_node_joins_a_group_another_of_its_devices_adds_it_to() {
     let relay = relay().await;
     let laptop = Member::start(&relay, "laptop").await;
     let tablet = Member::start(&relay, "tablet").await;

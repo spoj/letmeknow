@@ -34,8 +34,7 @@ pub fn answered(domain: &str, status: u16, body: Vec<u8>) -> Result<Vec<u8>> {
     }
 }
 
-/// Posts over https, for at most 30 s a request: the native shells' `Post`, on a client that trusts what its roots say.
-#[cfg(not(target_arch = "wasm32"))]
+/// Posts over https, for at most 30 s a request, on a client that trusts what its roots say.
 pub fn https(http: reqwest::Client) -> Post {
     Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| -> BoxFuture<Result<Vec<u8>>> {
         let http = http.clone();

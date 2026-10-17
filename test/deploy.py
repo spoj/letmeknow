@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Execute rollout shells with structured gh metadata and a backend /health double."""
-import copy, io, json, os, pathlib, re, subprocess, sys, tarfile, tempfile, textwrap
+import copy, io, json, os, pathlib, re, subprocess, sys, tarfile, tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 VERSION = re.search(r'^version = "(.+)"', (ROOT / "Cargo.toml").read_text(), re.M).group(1)
@@ -28,11 +28,8 @@ elif name == "gh":
         artifact = sys.argv[sys.argv.index("--name") + 1]
         dest = pathlib.Path(sys.argv[sys.argv.index("--dir") + 1])
         dest.mkdir(parents=True, exist_ok=True)
-        if artifact == "frontend":
-            shutil.copy(os.environ["MOCK_FRONTEND"], dest / "frontend.tar.gz")
-        else:
-            assert artifact == "archive-x86_64-unknown-linux-musl"
-            shutil.copy(os.environ["MOCK_ARCHIVE"], dest / f"letmeknow-{os.environ['RELEASE_TAG']}-x86_64-unknown-linux-musl.tar.gz")
+        assert artifact == "archive-x86_64-unknown-linux-musl"
+        shutil.copy(os.environ["MOCK_ARCHIVE"], dest / f"letmeknow-{os.environ['RELEASE_TAG']}-x86_64-unknown-linux-musl.tar.gz")
 elif name == "ssh" and "systemctl is-active" in sys.argv[-1]:
     prelude = 'systemctl() { [ "$MOCK_LITESTREAM" = "$1" ]; }; id() { return 0; }; test() { return 0; }; '
     sys.exit(subprocess.run(["sh", "-c", prelude + sys.argv[-1]]).returncode)
@@ -49,16 +46,6 @@ elif name == "curl":
     version = "0.15.1" if os.environ["MOCK_PROBE"] == "stale" else os.environ["RELEASE_TAG"].removeprefix("v")
     print(json.dumps({"version": version, "membership": "11" * 32}))
 '''
-
-pages = (ROOT / ".github/workflows/pages.yml").read_text()
-scripts = [textwrap.dedent(block) for block in re.findall(r"        run: \|\n((?:          .*\n)+)", pages)]
-assert len(scripts) == 2
-assert all("release-run.py" in script and "check-backend.py" in script for script in scripts)
-verify, deploy = pages.split("  deploy:\n", 1)
-assert "environment:" not in verify and "needs: verify" in deploy and "environment:" in deploy
-assert "artifact-ids: ${{ needs.verify.outputs.config_artifact }}" in deploy
-assert "config_artifact: ${{ steps.config.outputs.artifact-id }}" in verify
-assert deploy.index("Recheck the backend") < deploy.index("actions/deploy-pages@")
 
 with tempfile.TemporaryDirectory(prefix="lmk-deploy-test-") as directory:
     tmp = pathlib.Path(directory)
@@ -92,7 +79,6 @@ with tempfile.TemporaryDirectory(prefix="lmk-deploy-test-") as directory:
         ("reviewed release", {}, SHA, "disabled", True),
         ("backend unreachable", {}, SHA, "disabled", True),
         ("backend runs another version", {}, SHA, "disabled", True),
-        ("frontend backend mismatch", {}, SHA, "disabled", True),
         ("wrong installation domain", {}, SHA, "disabled", True),
     ]
     for index, (name, changes, tag_sha, litestream, accepted) in enumerate(cases):
@@ -103,61 +89,37 @@ with tempfile.TemporaryDirectory(prefix="lmk-deploy-test-") as directory:
             f"repos/{REPO}/git/ref/tags/{TAG}": {"object": {"type": "tag", "sha": "b" * 40}},
             f"repos/{REPO}/git/tags/{'b' * 40}": {"object": {"type": "commit", "sha": tag_sha}},
         }
-        frontend = tmp / f"frontend-{index}.tar.gz"
-        frontend_config = copy.deepcopy(BACKEND)
-        if name == "frontend backend mismatch":
-            frontend_config["directory"]["key"] = "22" * 32
-        with tarfile.open(frontend, "w:gz") as tar:
-            for file, data in [("index.html", b"selected artifact"), ("backend.json", json.dumps(frontend_config).encode())]:
-                info = tarfile.TarInfo(file)
-                info.size = len(data)
-                tar.addfile(info, io.BytesIO(data))
-        for mode in ["backend", "pages-before", "pages-after"]:
-            work = tmp / f"{index}-{mode}"
-            work.mkdir()
-            (work / "deploy").symlink_to(ROOT / "deploy", target_is_directory=True)
-            # Simulate downloading the exact config artifact ID prepared before approval; do not reselect a release artifact.
-            (work / "config").mkdir()
-            (work / "config/backend.json").write_text(json.dumps(BACKEND))
-            log = work / "calls.jsonl"
-            log.write_text("")
-            probe = {"backend unreachable": "fail", "backend runs another version": "stale"}.get(name, "ok")
-            env = {**os.environ, "PATH": str(tmp) + os.pathsep + os.environ["PATH"],
-                   "MOCK_LOG": str(log), "MOCK_ARCHIVE": str(archive), "MOCK_FRONTEND": str(frontend),
-                   "MOCK_METADATA": json.dumps(metadata), "MOCK_LITESTREAM": litestream, "MOCK_PROBE": probe,
-                   "MOCK_DIRECTORY": json.dumps(BACKEND["directory"]),
-                   "GITHUB_REPOSITORY": REPO, "RELEASE_RUN": "123", "RELEASE_TAG": TAG, "RELEASE_SHA": SHA,
-                   "GITHUB_STEP_SUMMARY": str(work / "summary.md")}
-            domain = "wrong.example.com" if name == "wrong installation domain" else "relay.example.com"
-            command = (["sh", str(ROOT / "deploy/deploy.sh"), "mock-host", domain, REPO, "123", TAG, SHA]
-                       if mode == "backend" else ["bash", "-eu", "-c", scripts[mode == "pages-after"] + "\nprintf ready >pages-authorized\n"])
-            result = subprocess.run(command, cwd=work, env=env, capture_output=True, text=True, timeout=10)
-            preflight = accepted and (mode != "backend" or (litestream == "disabled" and name != "wrong installation domain"))
-            preflight = preflight and (mode != "pages-before" or name != "frontend backend mismatch")
-            ok = preflight and probe == "ok"
-            assert (result.returncode == 0) == ok, (name, mode, result.stdout, result.stderr)
-            calls = [json.loads(line) for line in log.read_text().splitlines()]
-            downloads = [call for call in calls if call[:3] == ["gh", "run", "download"]]
-            uploads = [call for call in calls if call[0] == "scp"]
-            probes = [call for call in calls if call[0] == "curl"]
-            assert len(downloads) == (0 if mode == "pages-after" else int(accepted) * (2 if mode == "pages-before" else 1)), calls
-            assert len(uploads) == (2 if preflight and mode == "backend" else 0), calls
-            assert len(probes) == (2 if ok else int(preflight)), calls
-            if mode != "backend":
-                assert (work / "pages-authorized").exists() == ok
-            if ok:
-                assert SHA in result.stdout and TAG in result.stdout and '"workflow_id": 17' in result.stdout
-                evidence = json.loads(result.stdout.splitlines()[-1])
-                assert evidence == {"version": VERSION, "membership": BACKEND["directory"]["key"], "domain": BACKEND["domain"]}
-                if mode == "backend":
-                    assert uploads[0][-1] == "mock-host:/usr/local/bin/letmeknow.new"
-                    assert uploads[1][-1] == "mock-host:/etc/systemd/system/letmeknow.service"
-                    assert calls.index(probes[0]) > max(i for i, call in enumerate(calls) if call[0] == "ssh")
-                else:
-                    assert '"membership"' in (work / "summary.md").read_text()
-                    if mode == "pages-before":
-                        assert (work / "site/index.html").read_bytes() == b"selected artifact"
-            print(f"ok - {mode}: {name}, deployment={ok}")
+        work = tmp / str(index)
+        work.mkdir()
+        (work / "deploy").symlink_to(ROOT / "deploy", target_is_directory=True)
+        log = work / "calls.jsonl"
+        log.write_text("")
+        probe = {"backend unreachable": "fail", "backend runs another version": "stale"}.get(name, "ok")
+        env = {**os.environ, "PATH": str(tmp) + os.pathsep + os.environ["PATH"],
+               "MOCK_LOG": str(log), "MOCK_ARCHIVE": str(archive),
+               "MOCK_METADATA": json.dumps(metadata), "MOCK_LITESTREAM": litestream, "MOCK_PROBE": probe,
+               "MOCK_DIRECTORY": json.dumps(BACKEND["directory"]), "RELEASE_TAG": TAG}
+        domain = "wrong.example.com" if name == "wrong installation domain" else "relay.example.com"
+        command = ["sh", str(ROOT / "deploy/deploy.sh"), "mock-host", domain, REPO, "123", TAG, SHA]
+        result = subprocess.run(command, cwd=work, env=env, capture_output=True, text=True, timeout=10)
+        preflight = accepted and litestream == "disabled" and name != "wrong installation domain"
+        ok = preflight and probe == "ok"
+        assert (result.returncode == 0) == ok, (name, result.stdout, result.stderr)
+        calls = [json.loads(line) for line in log.read_text().splitlines()]
+        downloads = [call for call in calls if call[:3] == ["gh", "run", "download"]]
+        uploads = [call for call in calls if call[0] == "scp"]
+        probes = [call for call in calls if call[0] == "curl"]
+        assert len(downloads) == int(accepted), calls
+        assert len(uploads) == (2 if preflight else 0), calls
+        assert len(probes) == (2 if ok else int(preflight)), calls
+        if ok:
+            assert SHA in result.stdout and TAG in result.stdout and '"workflow_id": 17' in result.stdout
+            evidence = json.loads(result.stdout.splitlines()[-1])
+            assert evidence == {"version": VERSION, "membership": BACKEND["directory"]["key"], "domain": BACKEND["domain"]}
+            assert uploads[0][-1] == "mock-host:/usr/local/bin/letmeknow.new"
+            assert uploads[1][-1] == "mock-host:/etc/systemd/system/letmeknow.service"
+            assert calls.index(probes[0]) > max(i for i, call in enumerate(calls) if call[0] == "ssh")
+        print(f"ok - {name}, deployment={ok}")
 
 # deploy/release.sh, from a clean main pushed to a bare origin: the commit carries the version and any pins, and the tag is pushed.
 RELEASE_MOCK = r"""
@@ -170,7 +132,7 @@ elif name == "gh" and sys.argv[1:3] == ["run", "list"]:
 elif name == "npm":
     print(sys.argv[2].rsplit("@", 1)[1])
 """
-PIN_FILES = ["README.md", "SKILL.md", "web/src/index.html", "web/src/main.ts", "AGENTS.md"]
+PIN_FILES = ["README.md", "SKILL.md", "site/index.html", "AGENTS.md"]
 
 
 def git(*args, cwd):
@@ -183,7 +145,7 @@ def release(tmp, before, version, mock_dir):
     origin, work = tmp / "origin.git", tmp / "work"
     git("init", "-q", "--bare", "-b", "main", str(origin), cwd=tmp)
     (work / "deploy").mkdir(parents=True)
-    (work / "web/src").mkdir(parents=True)
+    (work / "site").mkdir(parents=True)
     (work / "deploy/release.sh").write_bytes((ROOT / "deploy/release.sh").read_bytes())
     (work / "deploy/release-run.py").write_text("")
     (work / "Cargo.toml").write_text(f'[workspace.package]\nversion = "{before}"\n')

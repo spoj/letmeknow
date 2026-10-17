@@ -2,9 +2,7 @@
 
 pub mod chain;
 pub mod client;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod service;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod store;
 
 pub use chain::{Contradiction, Forged, Frontier, InvalidProof, Proof, VerifiedPage, WrongLog};

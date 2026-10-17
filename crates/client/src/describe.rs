@@ -17,7 +17,7 @@ pub struct Described {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fp: Option<String>,
-    /// Its session's handle; none for a browser, its device's only session.
+    /// Its session's handle; none for a device's node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handle: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

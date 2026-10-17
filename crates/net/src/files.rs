@@ -32,7 +32,7 @@ use tokio::{
 };
 
 use crate::{
-    Disk, Groups,
+    Groups,
     seal::{Opener, SEALED, Sealer, sealed_len},
 };
 
@@ -57,8 +57,6 @@ pub(crate) struct Files {
     downloads: Arc<Mutex<HashMap<[u8; 32], Download>>>,
     /// Files just added, kept from deletion until the next collection has seen them.
     added: Arc<Mutex<Vec<TempTag>>>,
-    disk: Option<Arc<dyn Disk>>,
-    memory_only: Mutex<HashSet<[u8; 32]>>,
 }
 
 struct Download {
@@ -71,7 +69,6 @@ impl Files {
     pub async fn new(
         endpoint: Endpoint,
         dir: Option<std::path::PathBuf>,
-        disk: Option<Arc<dyn Disk>>,
         groups: Arc<dyn Groups>,
         collect: Duration,
     ) -> Result<Self> {
@@ -88,16 +85,13 @@ impl Files {
         });
         let gc = GcConfig { interval: collect, add_protected: Some(protect) };
         let store = match dir {
-            #[cfg(not(target_family = "wasm"))]
             Some(dir) => {
                 let options = iroh_blobs::store::fs::options::Options { gc: Some(gc), ..iroh_blobs::store::fs::options::Options::new(&dir) };
                 (*iroh_blobs::store::fs::FsStore::load_with_opts(dir.join("blobs.db"), options).await?).clone()
             }
-            #[cfg(target_family = "wasm")]
-            Some(_) => bail!("a browser keeps files in memory"),
             None => (*iroh_blobs::store::mem::MemStore::new_with_opts(iroh_blobs::store::mem::Options { gc_config: Some(gc) })).clone(),
         };
-        Ok(Files { store, endpoint, downloads, added, disk, memory_only: Mutex::default() })
+        Ok(Files { store, endpoint, downloads, added })
     }
 
     /// Serves complete files to current members only: checked per connection, per request, and
@@ -112,7 +106,6 @@ impl Files {
             throttle: ThrottleMode::Intercept,
         };
         let (events, mut rx) = EventSender::channel(64, mask);
-        let disk = self.disk.clone();
         spawn(async move {
             let mut peers = HashMap::new();
             let mut requests = HashMap::new();
@@ -137,7 +130,7 @@ impl Files {
                             })?;
                             Some((*peer, group))
                         });
-                        let allowed = found.is_some() && disk.as_ref().is_none_or(|disk| disk.has(&hash));
+                        let allowed = found.is_some();
                         if let Some(found) = found {
                             requests.insert((msg.connection_id, msg.request_id), found);
                         }
@@ -188,50 +181,12 @@ impl Files {
         let tag = self.store.add_stream(stream).await.temp_tag().await?;
         let hash = *tag.hash().as_bytes();
         self.added.lock().unwrap().push(tag);
-        if let Some(disk) = &self.disk {
-            disk.save(hash, self.ciphertext(&hash).await?).await?;
-        }
         Ok(FileLink { hash, size: size.load(Ordering::Relaxed), key })
     }
 
-    /// Whether a file is whole in memory.
-    pub async fn complete(&self, hash: &[u8; 32]) -> Result<bool> {
-        Ok(self.bitfield(hash).await?.is_complete())
-    }
-
-    /// Whether a file is held whole, in memory or on a browser's disk.
+    /// Whether a file is held whole.
     pub async fn has(&self, hash: &[u8; 32]) -> Result<bool> {
-        if let Some(disk) = &self.disk {
-            if disk.has(hash) {
-                return Ok(true);
-            }
-            if !self.memory_only.lock().unwrap().contains(hash) {
-                return Ok(false);
-            }
-        }
-        self.complete(hash).await
-    }
-
-    /// Whether a file is held for the other members, then in memory: with a disk, only the files kept there are.
-    pub async fn serve(&self, hash: &[u8; 32]) -> Result<bool> {
-        match &self.disk {
-            Some(disk) if !disk.has(hash) => Ok(false),
-            _ => self.load(hash).await,
-        }
-    }
-
-    /// Whether a file is in memory, after loading it from a browser's disk if it is kept there.
-    async fn load(&self, hash: &[u8; 32]) -> Result<bool> {
-        if !self.has(hash).await? {
-            return Ok(false);
-        }
-        if self.complete(hash).await? {
-            return Ok(true);
-        }
-        let Some(disk) = self.disk.as_ref().filter(|disk| disk.has(hash)) else { return Ok(false) };
-        let tag = self.store.add_bytes(disk.load(*hash).await?).temp_tag().await?;
-        self.added.lock().unwrap().push(tag);
-        Ok(true)
+        Ok(self.bitfield(hash).await?.is_complete())
     }
 
     /// Closes the store. A session that starts again in this process opens it only once it is closed, on Windows.
@@ -244,12 +199,8 @@ impl Files {
         Ok(self.store.remote().local(Hash::from_bytes(*hash)).await?.local_bytes())
     }
 
-    pub async fn ciphertext(&self, hash: &[u8; 32]) -> Result<Vec<u8>> {
-        Ok(self.store.get_bytes(Hash::from_bytes(*hash)).await?.to_vec())
-    }
-
     pub async fn read(&self, link: &FileLink, out: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
-        ensure!(self.load(&link.hash).await?, "{} is not held", link.link());
+        ensure!(self.has(&link.hash).await?, "{} is not held", link.link());
         let mut reader = self.store.reader(Hash::from_bytes(link.hash));
         let mut opener = Opener::new(&link.key, sealed_len(link.size));
         let (mut buf, mut plain) = (vec![0; SEALED], Vec::new());
@@ -267,17 +218,13 @@ impl Files {
         Ok(())
     }
 
-    /// Adds a holder to the file's download, starting one if none runs; `done` is called once it ends. A browser keeps
-    /// the file on its disk if `keep`.
-    pub fn offer(self: &Arc<Self>, link: &FileLink, holder: EndpointId, keep: bool, done: impl FnOnce(bool) + Send + 'static) {
+    /// Adds a holder to the file's download, starting one if none runs; `done` is called once it ends.
+    pub fn offer(self: &Arc<Self>, link: &FileLink, holder: EndpointId, done: impl FnOnce(bool) + Send + 'static) {
         let mut downloads = self.downloads.lock().unwrap();
         if let Some(download) = downloads.get(&link.hash)
             && download.holders.send(holder).is_ok()
         {
             return;
-        }
-        if self.disk.is_some() && !keep {
-            self.memory_only.lock().unwrap().insert(link.hash);
         }
         let (holders, rx) = mpsc::unbounded_channel();
         holders.send(holder).unwrap();
@@ -285,10 +232,7 @@ impl Files {
         downloads.insert(link.hash, Download { holders, done: done_rx });
         let (files, hash, sealed) = (self.clone(), link.hash, sealed_len(link.size));
         spawn(async move {
-            let mut result = files.download(hash, sealed, rx).await;
-            if let (Ok(()), Some(disk), true) = (&result, &files.disk, keep) {
-                result = async { disk.save(hash, files.ciphertext(&hash).await?).await }.await;
-            }
+            let result = files.download(hash, sealed, rx).await;
             if let Err(e) = &result {
                 tracing::debug!("download of {} stopped: {e:#}", Hash::from_bytes(hash));
             }

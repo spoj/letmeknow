@@ -45,7 +45,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     }
                 }
             };
-            self.durable().await?;
             match self.clients.client(&service)?.append(&capability, std::slice::from_ref(&entry), false).await {
                 Ok(_) => {}
                 // A refusal that may pass keeps the entry posted, as an earlier attempt may have landed.

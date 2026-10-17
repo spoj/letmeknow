@@ -653,7 +653,6 @@ fn identity_authority_cannot_change_but_its_route_can() {
     assert_eq!(exports(&w.m[0]), exports(&w.m[1]));
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn sqlite_welcome_rollback_keeps_both_packages_across_restart() {
     use crate::provider::SqliteProvider;

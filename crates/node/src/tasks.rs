@@ -1,4 +1,4 @@
-//! Starting a session and its background tasks: what steps produced goes out once durable (`send_out`), the work the
+//! Starting a session and its background tasks: what steps produced goes out in order (`send_out`), the work the
 //! group logic hands on runs one item at a time (`drive`), the duties run at start and every while (`resume`), and
 //! files are fetched.
 
@@ -49,8 +49,6 @@ impl<P: Provider + Send + 'static> Node<P> {
             events,
             work,
             outbox,
-            durable: config.durable,
-            persistence_error: Mutex::default(),
             committing: tokio::sync::Mutex::new(()),
             advanced: tokio::sync::Notify::new(),
             heard: tokio::sync::Notify::new(),
@@ -60,7 +58,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             contradictions: Mutex::default(),
             warned: Mutex::default(),
         });
-        let net_config = lmk_net::Config { home: config.home, files: config.files, disk: config.disk, file_limit: config.file_limit, collect: COLLECT };
+        let net_config = lmk_net::Config { home: config.home, files: config.files, file_limit: config.file_limit, collect: COLLECT };
         let (net, net_events) = Net::spawn(endpoint, net_config, inner.clone(), Arc::new(admission::Admitter(inner.clone()))).await?;
         inner.net.set(net).ok();
         inner.run(net_events, work_rx, outbox_rx);
@@ -174,14 +172,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
         self.spawn(self.clone().polling());
     }
 
-    /// Sends what steps produced, in order, once it is durable.
+    /// Sends what steps produced, in order.
     async fn send_out(self: Arc<Self>, mut outbox: mpsc::UnboundedReceiver<(Vec<Out>, Vec<Event>)>) {
         while let Some((out, events)) = outbox.recv().await {
-            if let Err(error) = self.durable().await {
-                drop(outbox);
-                self.warn(None, format!("{error:#}"));
-                return;
-            }
             for event in events {
                 self.events.send(event).ok();
             }
@@ -339,206 +332,3 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use lmk_core::provider::MemoryProvider;
-    use lmk_proto::peer::Frame;
-
-    #[tokio::test]
-    async fn cached_file_work_requires_durability() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let relay = lmk_testing::relay().await;
-        for failed in [false, true] {
-            let fail = Arc::new(AtomicBool::new(false));
-            let failing = fail.clone();
-            let config = Config {
-                handle: "Alice".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), post: relay.post(), ca: relay.ca(),
-                home: None, files: None, disk: None, file_limit: 0, kinds: vec![],
-                durable: Some(Arc::new(move || {
-                    let fail = failing.load(Ordering::SeqCst);
-                    Box::pin(async move {
-                        anyhow::ensure!(!fail, "injected persistence failure");
-                        Ok(())
-                    })
-                })),
-            };
-            let (node, mut events) = Node::start(MemoryProvider::default(), config).await.unwrap();
-            let link = node.net().add_file(std::io::Cursor::new(b"cached file")).await.unwrap();
-            assert!(node.net().has(link.hash).await.unwrap());
-            if failed {
-                fail.store(true, Ordering::SeqCst);
-                assert!(node.inner.durable().await.is_err());
-                fail.store(false, Ordering::SeqCst);
-            }
-            node.fetch(&[], link.clone());
-            if failed {
-                let event = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv()).await.unwrap().unwrap();
-                assert!(matches!(event, Event::Warning { text, .. } if text.contains("injected persistence failure")), "cached file escaped the failed barrier");
-                assert!(node.inner.outbox.is_closed());
-                while let Ok(event) = events.try_recv() {
-                    assert!(!matches!(event, Event::File(_)), "cached file escaped the failed barrier");
-                }
-            } else {
-                let event = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv()).await.unwrap().unwrap();
-                assert!(matches!(event, Event::File(hash) if hash == link.hash));
-            }
-            node.shutdown().await.unwrap();
-        }
-    }
-
-    struct GatedDisk {
-        file: Mutex<Option<([u8; 32], Vec<u8>)>>,
-        entered: Arc<tokio::sync::Notify>,
-        release: Arc<tokio::sync::Notify>,
-    }
-
-    impl lmk_net::Disk for GatedDisk {
-        fn has(&self, hash: &[u8; 32]) -> bool {
-            self.file.lock().unwrap().as_ref().is_some_and(|(held, _)| held == hash)
-        }
-
-        fn load(&self, hash: [u8; 32]) -> n0_future::boxed::BoxFuture<Result<Vec<u8>>> {
-            let (held, bytes) = self.file.lock().unwrap().clone().unwrap();
-            assert_eq!(held, hash);
-            let (entered, release) = (self.entered.clone(), self.release.clone());
-            Box::pin(async move {
-                entered.notify_one();
-                release.notified().await;
-                Ok(bytes)
-            })
-        }
-
-        fn save(&self, hash: [u8; 32], ciphertext: Vec<u8>) -> n0_future::boxed::BoxFuture<Result<()>> {
-            *self.file.lock().unwrap() = Some((hash, ciphertext));
-            Box::pin(async { Ok(()) })
-        }
-    }
-
-    #[tokio::test]
-    async fn state_file_completion_requires_durability() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use lmk_proto::group::{PROTOCOL, Settings};
-        let relay = lmk_testing::relay().await;
-        let disk = Arc::new(GatedDisk {
-            file: Mutex::new(None),
-            entered: Arc::new(tokio::sync::Notify::new()),
-            release: Arc::new(tokio::sync::Notify::new()),
-        });
-        let config = Config {
-            handle: "Writer".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), post: relay.post(), ca: relay.ca(),
-            home: None, files: None, disk: Some(disk.clone()), file_limit: 0, kinds: vec![], durable: None,
-        };
-        let (writer, _) = Node::start(MemoryProvider::default(), config).await.unwrap();
-        let data = b"the complete state";
-        let link = writer.net().add_file(std::io::Cursor::new(data)).await.unwrap();
-        writer.shutdown().await.unwrap();
-        for failed in [false, true] {
-            let fail = Arc::new(AtomicBool::new(false));
-            let failing = fail.clone();
-            let config = Config {
-                handle: "Reader".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), post: relay.post(), ca: relay.ca(),
-                home: None, files: None, disk: Some(disk.clone()), file_limit: 0, kinds: vec!["test".into()],
-                durable: Some(Arc::new(move || {
-                    let fail = failing.load(Ordering::SeqCst);
-                    Box::pin(async move {
-                        anyhow::ensure!(!fail, "injected persistence failure");
-                        Ok(())
-                    })
-                })),
-            };
-            let (node, mut events) = Node::start(MemoryProvider::default(), config).await.unwrap();
-            let gid = node.create(Settings {
-                protocol: PROTOCOL, kind: "test".into(), name: "Plan".into(), carry: 7,
-                update: lmk_proto::group::UPDATE, membership: relay.service.clone(), public: None, rest: Default::default(),
-            }, None).unwrap();
-            assert_eq!(node.net().held(link.hash).await.unwrap(), 0);
-            node.inner.state_from(&gid.0, link.link(), node.net().id());
-            // On this single-thread runtime, state_from just registered the last task, before it could be polled.
-            let completion = node.inner.tasks.lock().unwrap().pop().unwrap();
-            tokio::time::timeout(std::time::Duration::from_secs(10), disk.entered.notified()).await.unwrap();
-            assert!(!completion.is_finished());
-            assert!(node.files().iter().any(|file| file.hash == link.hash));
-            if failed {
-                fail.store(true, Ordering::SeqCst);
-                assert!(node.inner.durable().await.is_err());
-                fail.store(false, Ordering::SeqCst);
-            }
-            disk.release.notify_one();
-            tokio::time::timeout(std::time::Duration::from_secs(10), completion).await.unwrap().unwrap();
-            assert!(node.net().held(link.hash).await.unwrap() > 0, "the file completed after the barrier");
-            if failed {
-                while let Ok(event) = events.try_recv() {
-                    assert!(!matches!(event, Event::State { .. }), "state escaped the failed barrier");
-                    if let Event::Warning { text, .. } = event {
-                        assert!(!text.contains("state did not arrive"), "{text}");
-                    }
-                }
-            } else {
-                tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                    loop {
-                        match events.recv().await.unwrap() {
-                            Event::State { group, data: received, .. } => {
-                                assert_eq!(group, gid);
-                                assert_eq!(received, data);
-                                break;
-                            }
-                            Event::Warning { text, .. } => panic!("{text}"),
-                            _ => {}
-                        }
-                    }
-                }).await.unwrap();
-            }
-            node.shutdown().await.unwrap();
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn failed_durability_closes_peer_outbox_and_withholds_client_effects() {
-        let relay = lmk_testing::relay().await;
-        let config = Config {
-            handle: "Alice".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), post: relay.post(), ca: relay.ca(),
-            home: None, files: None, disk: None, file_limit: 0, kinds: vec![],
-            durable: Some(Arc::new(|| Box::pin(async { anyhow::bail!("injected persistence failure") }))),
-        };
-        let (node, mut events) = Node::start(MemoryProvider::default(), config).await.unwrap();
-        let peer = node.net().id();
-        let out = vec![Out::Frame { peer, frame: Frame::Hello { groups: vec![], heads: vec![] } }, Out::WantFiles { peer, group: vec![1] }];
-        assert!(node.inner.outbox.send((out, vec![Event::Heard { group: Bytes(vec![1]) }])).is_ok());
-        let event = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv()).await.unwrap().unwrap();
-        assert!(matches!(event, Event::Warning { text, .. } if text.contains("injected persistence failure")));
-        assert!(events.try_recv().is_err(), "a failed barrier releases none of the batch's events");
-        assert!(node.inner.outbox.is_closed(), "no later peer batch can bypass the failure");
-        assert!(node.inner.durable().await.is_err(), "failure stays latched until restart");
-        tokio::time::timeout(std::time::Duration::from_secs(10), node.shutdown()).await.unwrap().unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn output_waits_for_success_and_shutdown_cancels_an_in_flight_barrier() {
-        let relay = lmk_testing::relay().await;
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let saving = entered.clone();
-        let release = Arc::new(tokio::sync::Notify::new());
-        let saved = release.clone();
-        let config = Config {
-            handle: "Alice".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), post: relay.post(), ca: relay.ca(),
-            home: None, files: None, disk: None, file_limit: 0, kinds: vec![],
-            durable: Some(Arc::new(move || {
-                saving.notify_one();
-                let saved = saved.clone();
-                Box::pin(async move { saved.notified().await; Ok(()) })
-            })),
-        };
-        let (node, mut events) = Node::start(MemoryProvider::default(), config).await.unwrap();
-        assert!(node.inner.outbox.send((vec![], vec![Event::Heard { group: Bytes(vec![1]) }])).is_ok());
-        tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified()).await.unwrap();
-        assert!(events.try_recv().is_err());
-        release.notify_one();
-        assert!(matches!(events.recv().await, Some(Event::Heard { .. })));
-
-        assert!(node.inner.outbox.send((vec![], vec![Event::Heard { group: Bytes(vec![2]) }])).is_ok());
-        tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified()).await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(10), node.shutdown()).await.unwrap().unwrap();
-        assert!(!matches!(events.try_recv(), Ok(Event::Heard { .. })), "shutdown cancels the barrier in flight");
-    }
-}

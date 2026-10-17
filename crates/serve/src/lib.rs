@@ -43,8 +43,6 @@ use tokio::{
 use tokio_rustls_acme::{AcmeConfig, caches::DirCache};
 use tokio_stream::StreamExt;
 
-/// The app's origin: its pages may append to the membership service, as may those `--origin` adds.
-const APP: &str = "https://letmeknow.dev";
 const HANDSHAKE: Duration = Duration::from_secs(10);
 const HEADERS: Duration = Duration::from_secs(10);
 const BODY: Duration = Duration::from_secs(15);
@@ -75,8 +73,6 @@ pub struct ServeConfig {
     /// Bytes a second that the relay reads from each connection.
     pub relay_rate_limit: NonZeroU32,
     pub policy: Policy,
-    /// Origins besides the app's whose pages may append to the membership service.
-    pub origins: Vec<String>,
 }
 
 impl ServeConfig {
@@ -91,7 +87,6 @@ impl ServeConfig {
             certificate: Certificate::Acme { contact: None },
             relay_rate_limit: NonZeroU32::new(1 << 20).unwrap(),
             policy: Policy::default(),
-            origins: vec![],
         }
     }
 
@@ -204,11 +199,9 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
     let membership = Service::new(store, config.policy);
 
     let tls = Arc::new(tls);
-    let origins = Arc::new(std::iter::once(APP.to_owned()).chain(config.origins.iter().cloned()).collect::<Vec<_>>());
     loop {
         let (tcp, peer) = https.accept().await?;
-        let (tls, relay, health, directory, membership, origins) =
-            (tls.clone(), relay.clone(), health.clone(), directory.clone(), membership.clone(), origins.clone());
+        let (tls, relay, health, directory, membership) = (tls.clone(), relay.clone(), health.clone(), directory.clone(), membership.clone());
         tokio::spawn(async move {
             let stream = timeout(HANDSHAKE, async move {
                 match &*tls {
@@ -227,7 +220,6 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
                 directory,
                 membership,
                 peer: peer.ip(),
-                origins,
                 drain,
             };
             let connection = hyper::server::conn::http1::Builder::new()
@@ -279,7 +271,6 @@ fn json(bytes: impl Into<Bytes>) -> http::Result<Response<BytesBody>> {
     respond(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CACHE_CONTROL, "no-store")
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .body(body(bytes))
 }
 
@@ -309,7 +300,7 @@ async fn redirect(listener: TcpListener, base: String) {
     }
 }
 
-/// WebSocket upgrades at /relay are cross-origin and cookie-free; iroh authenticates the peers.
+/// WebSocket upgrades at /relay are cookie-free; iroh authenticates the peers.
 struct Site {
     relay: RelayServiceWithNotify,
     /// This release's version and the service's public key, which rollouts compare with the release they install.
@@ -319,7 +310,6 @@ struct Site {
     membership: Service,
     /// The address membership budgets count the request against.
     peer: IpAddr,
-    origins: Arc<Vec<String>>,
     /// When the last membership answer must have drained, unless another request follows it.
     drain: watch::Sender<Option<Instant>>,
 }
@@ -341,25 +331,14 @@ impl Body for Held {
     fn size_hint(&self) -> SizeHint { SizeHint::with_exact(self.answer.len() as u64) }
 }
 
-/// Membership requests. Only the app's origins, and those `--origin` adds, may send them: another page could otherwise
-/// make its visitors append. A path with no route is a 404 those origins can read, so a page learns the service runs
-/// another minor.
-async fn answer_membership(route: Option<Route>, service: Service, peer: IpAddr, origins: Arc<Vec<String>>, drain: watch::Sender<Option<Instant>>, req: Request<Incoming>) -> http::Result<Response<BytesBody>> {
-    let origin = req.headers().get(header::ORIGIN).cloned();
-    if !origin.as_ref().is_none_or(|o| o.to_str().is_ok_and(|o| origins.iter().any(|allowed| allowed == o))) {
+/// Membership requests. One that a page sends, with an `Origin`, is refused: a page could otherwise make its visitors
+/// append. A path with no route is a 404, from which a session learns the service runs another minor.
+async fn answer_membership(route: Option<Route>, service: Service, peer: IpAddr, drain: watch::Sender<Option<Instant>>, req: Request<Incoming>) -> http::Result<Response<BytesBody>> {
+    if req.headers().contains_key(header::ORIGIN) {
         return respond(StatusCode::FORBIDDEN).body(body(""));
     }
-    let allow = |res: http::response::Builder| match &origin {
-        Some(o) => res.header(header::ACCESS_CONTROL_ALLOW_ORIGIN, o),
-        None => res,
-    };
     match (req.method(), route) {
-        (&Method::OPTIONS, _) => allow(respond(StatusCode::NO_CONTENT))
-            .header(header::ACCESS_CONTROL_ALLOW_METHODS, "POST")
-            .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "content-type")
-            .header(header::ACCESS_CONTROL_MAX_AGE, "600")
-            .body(body("")),
-        (_, None) => allow(respond(StatusCode::NOT_FOUND)).body(body("not found")),
+        (_, None) => respond(StatusCode::NOT_FOUND).body(body("not found")),
         (&Method::POST, Some(route)) => {
             let size = req.body().size_hint().upper().map_or(MAX_BODY, |upper| MAX_BODY.min(upper as usize));
             let Some(mut admission) = service.admit(peer, route, size) else {
@@ -372,7 +351,7 @@ async fn answer_membership(route: Option<Route>, service: Service, peer: IpAddr,
                 Ok(answer) => {
                     admission.keep(answer.len());
                     drain.send_replace(Some(Instant::now() + DRAIN));
-                    allow(respond(StatusCode::OK))
+                    respond(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "application/json")
                         .header(header::CACHE_CONTROL, "no-store")
                         .body(Box::new(Held { answer: answer.into(), _admission: admission }))
@@ -380,7 +359,7 @@ async fn answer_membership(route: Option<Route>, service: Service, peer: IpAddr,
                 Err(_) => respond(StatusCode::INTERNAL_SERVER_ERROR).body(body("")),
             }
         }
-        _ => respond(StatusCode::METHOD_NOT_ALLOWED).header(header::ALLOW, "POST, OPTIONS").body(body("")),
+        _ => respond(StatusCode::METHOD_NOT_ALLOWED).header(header::ALLOW, "POST").body(body("")),
     }
 }
 
@@ -395,17 +374,12 @@ impl HyperService<Request<Incoming>> for Site {
         self.drain.send_replace(None);
         if req.uri().path().starts_with("/membership/") {
             let route = Route::parse(req.uri().path());
-            let (service, peer, origins, drain) = (self.membership.clone(), self.peer, self.origins.clone(), self.drain.clone());
-            return Box::pin(async move { answer_membership(route, service, peer, origins, drain, req).await.map_err(Into::into) });
+            let (service, peer, drain) = (self.membership.clone(), self.peer, self.drain.clone());
+            return Box::pin(async move { answer_membership(route, service, peer, drain, req).await.map_err(Into::into) });
         }
         match req.uri().path() {
             "/relay" => return Box::pin(self.relay.call(req)),
-            "/ping" => {
-                let res = respond(StatusCode::OK)
-                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                    .body(body(""));
-                return Box::pin(std::future::ready(res.map_err(Into::into)));
-            }
+            "/ping" => return Box::pin(std::future::ready(respond(StatusCode::OK).body(body("")).map_err(Into::into))),
             "/.well-known/letmeknow.json" => return Box::pin(std::future::ready(json(self.directory.clone()).map_err(Into::into))),
             "/health" => return Box::pin(std::future::ready(json(self.health.clone()).map_err(Into::into))),
             // What the service took in each of the last completed days, which it keeps nothing private of.

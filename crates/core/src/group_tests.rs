@@ -523,7 +523,6 @@ fn a_forged_message_leaves_no_trace_in_memory() {
     a_forged_message_leaves_no_trace(|_| MemoryProvider::default());
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn a_forged_message_leaves_no_trace_in_sqlite() {
     let dir = std::env::temp_dir().join(format!("lmk-core-forged-{}", std::process::id()));
@@ -534,7 +533,6 @@ fn a_forged_message_leaves_no_trace_in_sqlite() {
 
 /// Proof: one SQLite connection, openmls's storage borrowing it. A step's openmls writes and our own records commit
 /// together, or are lost together; after a rollback to a savepoint, `MlsGroup::load` gives the group as it was before.
-#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn a_step_commits_or_rolls_back_with_openmls() {
     use crate::provider::SqliteProvider;
@@ -966,7 +964,6 @@ fn another_protocol_is_refused_at_join() {
     assert!(error.to_string().contains(&format!("protocol {}", PROTOCOL + 1)), "{error}");
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn state_survives_a_restart() {
     use crate::provider::SqliteProvider;

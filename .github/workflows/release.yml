@@ -39,14 +39,11 @@ jobs:
           echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$ndk/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
           echo "CC_aarch64_linux_android=$ndk/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
           echo "AR_aarch64_linux_android=$ndk/llvm-ar" >> "$GITHUB_ENV"
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
       # The plugins of the kinds letmeknow ships go beside it, where a session looks for them first.
       - run: cargo build --release --target ${{ matrix.target }} -p letmeknow -p lmk-kinds
       - if: matrix.npm == 'linux-x64'
         name: Test the release backend artifact
-        run: LMK_E2E_BIN="$PWD/target/${{ matrix.target }}/release/letmeknow" python3 -u test/e2e.py --no-browser
+        run: LMK_E2E_BIN="$PWD/target/${{ matrix.target }}/release/letmeknow" python3 -u test/e2e.py
       - name: Package
         run: |
           suffix=; [[ "${{ matrix.target }}" == *windows* ]] && suffix=.exe
@@ -54,8 +51,7 @@ jobs:
           for exe in letmeknow letmeknow-kind-doc letmeknow-kind-table; do exes+=("target/${{ matrix.target }}/release/$exe$suffix"); done
           name=letmeknow-${{ github.ref_name }}-${{ matrix.target }}
           mkdir -p "$name" "npm/${{ matrix.npm }}/bin"
-          cp README.md SKILL.md LICENSE deploy/letmeknow.service "${exes[@]}" "$name/"
-          node --input-type=module -e 'import {readBackend} from "./web/backend.mjs"; import {writeFileSync} from "node:fs"; writeFileSync(process.argv[1] + "/backend.json", JSON.stringify(readBackend("web/backend.json")) + "\n")' "$name"
+          cp README.md SKILL.md LICENSE deploy/letmeknow.service deploy/backend.json "${exes[@]}" "$name/"
           cp "${exes[@]}" "npm/${{ matrix.npm }}/bin/"
           if [[ -n "$suffix" ]]; then 7z a "$name.zip" "$name"; else tar czf "$name.tar.gz" "$name"; fi
       - uses: actions/upload-artifact@v4
@@ -69,36 +65,8 @@ jobs:
           name: npm-${{ matrix.npm }}
           path: npm/${{ matrix.npm }}
 
-  frontend:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: wasm-bindgen-cli@0.2.129
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-      - run: npm ci && npx playwright install --with-deps chromium-headless-shell
-        working-directory: web
-      # backend.json must contain the reviewed fresh public key. No environment override in releases.
-      - run: npm run build && npm run check && node artifact-test.mjs dist --negative-controls
-        working-directory: web
-      - run: tar -C web/dist -czf frontend.tar.gz .
-      - uses: actions/upload-artifact@v4
-        with:
-          name: frontend
-          path: frontend.tar.gz
-
   publish:
-    needs: [ci, build, frontend]
+    needs: [ci, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -113,10 +81,10 @@ jobs:
         run: |
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
             gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes
-          for file in dist/archive-*/* dist/frontend/frontend.tar.gz; do
+          for file in dist/archive-*/*; do
             (cd "$(dirname "$file")" && sha256sum "$(basename "$file")")
           done > SHA256SUMS
-          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber dist/archive-*/* dist/frontend/frontend.tar.gz SHA256SUMS
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber dist/archive-*/* SHA256SUMS
         env:
           GH_TOKEN: ${{ github.token }}
       # Trusted publishing: npm takes the workflow's OIDC token, so no npm token is kept.

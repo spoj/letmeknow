@@ -120,7 +120,7 @@ impl DeviceState {
     }
 }
 
-/// Kinds' plugins, through whatever carries their messages: a process's stdio, or calls into the page. What they write
+/// Kinds' plugins, through whatever carries their messages, as a process's stdio. What they write
 /// reaches the client through the channel given to `Client::new`: each line with its kind, and `None` once a plugin
 /// stopped.
 pub trait Plugins: Send + Sync {
@@ -517,7 +517,7 @@ impl<P: Provider + Send + 'static> Client<P> {
     /// sessions, valid for `ADD_VALID`, which the device's node hands that device in the identity group. `target` is a
     /// device's name and one of the sessions it runs, as members show them ("desk (swift-koala)"); a session's handle
     /// that only one device runs; or a device, by its name or key, whose session is the one it runs, or with none the one
-    /// that next acts for it, as a browser. It is refused while the group has a member of this identity on a device of
+    /// that next acts for it. It is refused while the group has a member of this identity on a device of
     /// that name, with that session's handle if it names one.
     async fn add(&self, target: &str, group: Option<String>) -> Result<Value> {
         let gid = self.resolve(group)?;
@@ -577,7 +577,7 @@ impl<P: Provider + Send + 'static> Client<P> {
         joined
     }
 
-    /// Joins the groups of the adds for this device, where this client's node is the device's own, as in a browser: as
+    /// Joins the groups of the adds for this device, where this client's node is the device's own: as
     /// they come, and as it starts, one pass at a time. An add that fails stays, until it expires.
     pub async fn take_adds(&self) {
         let _taking = self.inner.taking.lock().await;
@@ -610,7 +610,7 @@ impl<P: Provider + Send + 'static> Client<P> {
         match self.open_kind(&gid, Some(("invite", args, cwd))).await {
             Ok(opened) => Ok((gid, opened)),
             Err(error) => {
-                self.inner.node.leave(&gid.0).await?;
+                self.inner.node.leave(&gid.0)?;
                 self.drop_group(&gid).await?;
                 Err(error)
             }
@@ -642,7 +642,7 @@ impl<P: Provider + Send + 'static> Client<P> {
                 Err(error) => {
                     // Unless it was left or removed meanwhile.
                     if node.groups().contains(&gid) {
-                        node.leave(&gid.0).await?;
+                        node.leave(&gid.0)?;
                     }
                     return Err(error);
                 }
@@ -652,7 +652,7 @@ impl<P: Provider + Send + 'static> Client<P> {
     }
 
     async fn leave(&self, gid: &Bytes) -> Result<Value> {
-        if self.inner.node.leave(&gid.0).await?.is_none() {
+        if self.inner.node.leave(&gid.0)?.is_none() {
             self.drop_group(gid).await?;
             return Ok(json!({ "group": b64(&gid.0), "left": true }));
         }
@@ -818,7 +818,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             attachment: attachment.as_ref().map(|(_, a)| a.clone()),
             sent_at: Some(lmk_proto::clock::corrected()),
         };
-        let id = node.send(&gid.0, &serde_json::to_value(payload)?, chat.reply_to.as_ref().map(|id| &id[..])).await?;
+        let id = node.send(&gid.0, &serde_json::to_value(payload)?, chat.reply_to.as_ref().map(|id| &id[..]))?;
         let describer = self.describer(gid)?;
         let mut answer = json!({ "id": hex::encode(&id.0) });
         if !addressed.is_empty() {
@@ -892,7 +892,7 @@ impl<P: Provider + Send + 'static> Client<P> {
 
     // Events.
 
-    /// Takes an event of this client's node. Where the device's node is this node too, as in a browser, the devices
+    /// Takes an event of this client's node. Where the device's node is this node too, the devices
     /// kind takes its groups' events first.
     pub async fn event(&self, event: Event) {
         let event = match self.access() {

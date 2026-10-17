@@ -1,8 +1,7 @@
-//! openmls providers with room for our own state: SQLite natively, memory in the browser. A step's writes, openmls's
-//! and ours, commit together; a savepoint within it rolls both back.
+//! openmls providers with room for our own state: SQLite, and memory for tests. A step's writes, openmls's and ours,
+//! commit together; a savepoint within it rolls both back.
 
-use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::collections::HashMap;
 use std::sync::{Mutex, RwLock};
 
 use anyhow::Result;
@@ -36,18 +35,13 @@ pub trait Provider: OpenMlsProvider<StorageProvider: StorageProvider<1, Error: S
     }
 }
 
-/// The browser's provider: openmls's records in a `MemoryStorage`, ours beside them; the browser persists the changes
-/// (`changes`), ours under keys starting with `lmk/`.
+/// A provider in memory, for tests: openmls's records in a `MemoryStorage`, ours beside them.
 #[derive(Default)]
 pub struct MemoryProvider {
     crypto: RustCrypto,
-    pub storage: MemoryStorage,
+    storage: MemoryStorage,
     ours: RwLock<HashMap<Vec<u8>, Vec<u8>>>,
     savepoints: Mutex<Vec<Savepoint>>,
-    /// Our keys not yet acknowledged by `persisted`.
-    dirty: Mutex<HashSet<Vec<u8>>>,
-    /// A digest of each of openmls's persisted records.
-    shadow: Mutex<HashMap<Vec<u8>, u64>>,
 }
 
 /// openmls's records as they stood, and the old values of our records written since.
@@ -76,77 +70,27 @@ impl OpenMlsProvider for MemoryProvider {
 
 const OURS: &[u8] = b"lmk/";
 
-fn digest(value: &[u8]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
-}
-
 impl MemoryProvider {
-    /// A provider holding these persisted records.
+    /// A provider holding these records, as `records` gives them.
     pub fn load(records: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>) -> Self {
         let provider = MemoryProvider::default();
         for (key, value) in records {
             match key.strip_prefix(OURS) {
                 Some(ours) => drop(provider.ours.write().unwrap().insert(ours.to_vec(), value)),
-                None => {
-                    provider.shadow.lock().unwrap().insert(key.clone(), digest(&value));
-                    provider.storage.values.write().unwrap().insert(key, value);
-                }
+                None => drop(provider.storage.values.write().unwrap().insert(key, value)),
             }
         }
         provider
     }
 
-    /// Every record in memory, between steps.
+    /// Every record in memory, between steps: openmls's, and ours under keys starting with `lmk/`.
     pub fn records(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         let openmls = self.storage.values.read().unwrap().clone().into_iter();
         let ours = self.ours.read().unwrap().clone().into_iter().map(|(key, value)| ([OURS, &key].concat(), value));
         openmls.chain(ours).collect()
     }
 
-    /// Unpersisted records and deletions, between steps. Serialize saves and acknowledge only successful commits
-    /// with `persisted`; writes made while a save is in flight remain in the next batch.
-    pub fn changes(&self) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
-        let mut changes = Vec::new();
-        let ours = self.ours.read().unwrap();
-        for key in self.dirty.lock().unwrap().iter() {
-            changes.push(([OURS, key].concat(), ours.get(key).cloned()));
-        }
-        let values = self.storage.values.read().unwrap();
-        let shadow = self.shadow.lock().unwrap();
-        for (key, value) in values.iter() {
-            if shadow.get(key) != Some(&digest(value)) {
-                changes.push((key.clone(), Some(value.clone())));
-            }
-        }
-        for key in shadow.keys().filter(|key| !values.contains_key(*key)) {
-            changes.push((key.clone(), None));
-        }
-        changes
-    }
-
-    pub fn persisted(&self, changes: &[(Vec<u8>, Option<Vec<u8>>)]) {
-        let ours = self.ours.read().unwrap();
-        let mut dirty = self.dirty.lock().unwrap();
-        let mut shadow = self.shadow.lock().unwrap();
-        for (key, value) in changes {
-            match key.strip_prefix(OURS) {
-                Some(key) => {
-                    if ours.get(key) == value.as_ref() {
-                        dirty.remove(key);
-                    }
-                }
-                None => match value {
-                    Some(value) => { shadow.insert(key.clone(), digest(value)); }
-                    None => { shadow.remove(key); }
-                },
-            }
-        }
-    }
-
     fn touch(&self, key: &[u8], old: Option<Vec<u8>>) {
-        self.dirty.lock().unwrap().insert(key.to_vec());
         if let Some(savepoint) = self.savepoints.lock().unwrap().last_mut() {
             savepoint.ours.entry(key.to_vec()).or_insert(old);
         }
@@ -170,7 +114,7 @@ impl Provider for MemoryProvider {
         Ok(())
     }
 
-    /// The memory is the step: the browser persists it between steps.
+    /// The memory is the step.
     fn begin(&self) -> Result<()> {
         Ok(())
     }
@@ -210,10 +154,8 @@ impl Provider for MemoryProvider {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 pub use native::{Cbor, SqliteProvider};
 
-#[cfg(not(target_arch = "wasm32"))]
 mod native {
     use std::borrow::Borrow;
     use std::cell::Cell;
@@ -392,54 +334,9 @@ mod native {
     }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 mod tests {
-    use super::{MemoryProvider, Provider, SqliteProvider};
-
-    #[test]
-    fn failed_save_is_still_in_an_otherwise_empty_barrier() {
-        let provider = MemoryProvider::default();
-        provider.put(b"head", b"one").unwrap();
-        provider.storage.values.write().unwrap().insert(b"mls".to_vec(), b"epoch".to_vec());
-        let failed: std::collections::HashMap<_, _> = provider.changes().into_iter().collect();
-        let retry = provider.changes();
-        assert_eq!(retry.iter().cloned().collect::<std::collections::HashMap<_, _>>(), failed);
-        let reloaded = MemoryProvider::load(retry.iter().cloned().map(|(key, value)| (key, value.unwrap())));
-        assert_eq!(reloaded.get(b"head").unwrap(), Some(b"one".to_vec()));
-        assert_eq!(reloaded.storage.values.read().unwrap().get(b"mls".as_slice()).unwrap(), b"epoch");
-        provider.persisted(&retry);
-        assert!(provider.changes().is_empty());
-        assert!(reloaded.changes().is_empty());
-    }
-
-    #[test]
-    fn successful_save_does_not_acknowledge_intervening_writes() {
-        let provider = MemoryProvider::load([
-            (b"lmk/deleted".to_vec(), b"old".to_vec()),
-            (b"mls".to_vec(), b"old".to_vec()),
-        ]);
-        provider.put(b"head", b"one").unwrap();
-        provider.delete(b"deleted").unwrap();
-        provider.storage.values.write().unwrap().insert(b"mls".to_vec(), b"new".to_vec());
-        let saving = provider.changes();
-        provider.put(b"head", b"two").unwrap();
-        provider.put(b"deleted", b"back").unwrap();
-        provider.storage.values.write().unwrap().insert(b"mls".to_vec(), b"old".to_vec());
-        provider.persisted(&saving);
-        let next: std::collections::HashMap<_, _> = provider.changes().into_iter().collect();
-        assert_eq!(next.get(b"lmk/head".as_slice()), Some(&Some(b"two".to_vec())));
-        assert_eq!(next.get(b"lmk/deleted".as_slice()), Some(&Some(b"back".to_vec())));
-        assert_eq!(next.get(b"mls".as_slice()), Some(&Some(b"old".to_vec())));
-        provider.persisted(&next.into_iter().collect::<Vec<_>>());
-        provider.delete(b"head").unwrap();
-        provider.storage.values.write().unwrap().remove(b"mls".as_slice());
-        let deleted = provider.changes();
-        assert_eq!(deleted.len(), 2);
-        assert!(deleted.iter().all(|(_, value)| value.is_none()));
-        assert_eq!(provider.changes().len(), 2);
-        provider.persisted(&deleted);
-        assert!(provider.changes().is_empty());
-    }
+    use super::{Provider, SqliteProvider};
 
     /// The database files that hold `secret`. The `-shm` file holds only the WAL's index, and Windows locks parts of it.
     fn in_files(dir: &std::path::Path, secret: &[u8]) -> Vec<String> {

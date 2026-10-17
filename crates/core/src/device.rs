@@ -16,12 +16,10 @@ impl Device {
         Device { name: name.into() }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         Ok(serde_json::from_slice(&std::fs::read(path)?)?)
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
         use std::io::Write;
         let mut options = std::fs::OpenOptions::new();

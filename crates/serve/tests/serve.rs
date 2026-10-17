@@ -101,21 +101,16 @@ async fn serves_relay_and_membership_without_frontend() {
         let response = https_get(https, &cert, path, "").await;
         assert!(response.starts_with("HTTP/1.1 404"), "{path}: {response}");
     }
-    let ping = https_get(https, &cert, "/ping", "Origin: https://frontend.example\r\n").await;
-    assert!(ping.starts_with("HTTP/1.1 200") && ping.contains("access-control-allow-origin: *"), "{ping}");
+    let ping = https_get(https, &cert, "/ping", "").await;
+    assert!(ping.starts_with("HTTP/1.1 200"), "{ping}");
     let lmk_proto::group::Service::Serve { key, .. } = &service else {
         unreachable!()
     };
     let health = https_get(https, &cert, "/health", "").await;
     let expected = format!(r#"{{"version":"{}","membership":"{}"}}"#, env!("CARGO_PKG_VERSION"), hex::encode(&key.0));
     assert!(health.starts_with("HTTP/1.1 200") && health.ends_with(&expected), "{health}");
-    let directory = https_get(https, &cert, "/.well-known/letmeknow.json", "Origin: https://frontend.example\r\n").await;
-    assert!(
-        directory.starts_with("HTTP/1.1 200")
-            && directory.contains("access-control-allow-origin: *")
-            && directory.to_lowercase().contains("content-type: application/json"),
-        "{directory}"
-    );
+    let directory = https_get(https, &cert, "/.well-known/letmeknow.json", "").await;
+    assert!(directory.starts_with("HTTP/1.1 200") && directory.to_lowercase().contains("content-type: application/json"), "{directory}");
     let directory = Directory::parse(directory.split_once("\r\n\r\n").unwrap().1.as_bytes()).unwrap();
     assert_eq!(directory.key.to_vec(), key.0);
     assert_eq!(directory.relay, relay);
@@ -178,7 +173,6 @@ async fn directory_names_the_relays_given() {
     server.abort();
 }
 
-const APP: &str = "https://letmeknow.dev";
 const APPEND: &str = "/membership/2/append";
 
 fn append_json(capability: u8, entry: &[u8]) -> Vec<u8> {
@@ -196,47 +190,32 @@ fn answer<T: DeserializeOwned>(response: &str) -> Answer<T> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn membership_takes_appends_from_the_app_and_listed_origins_only() {
+async fn membership_refuses_what_pages_send() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let (mut config, cert) = configure(&state);
-    config.origins = vec!["http://localhost:5173".into()];
+    let (config, cert) = configure(&state);
     let (https, service) = (config.https_port, config.service().unwrap());
     let server = tokio::spawn(serve(config));
     wait_for_https(https).await;
     let lmk_proto::group::Service::Serve { key, .. } = &service else { unreachable!() };
     let key = VerifyingKey::from_bytes(key.0.as_slice().try_into().unwrap()).unwrap();
 
-    let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, Some(APP), &append_json(7, b"one"))).await;
-    assert!(response.starts_with("HTTP/1.1 200") && response.to_lowercase().contains(&format!("access-control-allow-origin: {APP}")), "{response}");
+    let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, None, &append_json(7, b"one"))).await;
+    assert!(response.starts_with("HTTP/1.1 200") && !response.to_lowercase().contains("access-control-allow-origin"), "{response}");
     let Answer::Ok(appended) = answer::<Appended>(&response) else { panic!("{response}") };
     assert!(appended.head.verify(&key));
 
-    let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, Some("https://evil.example"), &append_json(8, b"x"))).await;
+    let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, Some("https://letmeknow.dev"), &append_json(8, b"x"))).await;
     assert!(response.starts_with("HTTP/1.1 403"), "{response}");
     let read = serde_json::to_vec(&Read { capability: [8; 32], after: 0 }).unwrap();
     let response = https_raw("127.0.0.1", https, &cert, &post("/membership/2/read", None, &read)).await;
     let Answer::Ok(page) = answer::<Page>(&response) else { panic!("{response}") };
-    assert!(page.entries.is_empty(), "a page of another origin appended");
-
-    let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, None, &append_json(9, b"y"))).await;
-    assert!(response.starts_with("HTTP/1.1 200") && !response.to_lowercase().contains("access-control-allow-origin"), "{response}");
-    let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, Some("http://localhost:5173"), &append_json(10, b"z"))).await;
-    assert!(response.starts_with("HTTP/1.1 200") && response.to_lowercase().contains("access-control-allow-origin: http://localhost:5173"), "{response}");
-
-    let preflight = |path: &str, origin: &str| format!("OPTIONS {path} HTTP/1.1\r\nHost: localhost\r\nOrigin: {origin}\r\nAccess-Control-Request-Method: POST\r\nConnection: close\r\n\r\n");
-    let response = https_raw("127.0.0.1", https, &cert, preflight(APPEND, APP).as_bytes()).await;
-    let lower = response.to_lowercase();
-    assert!(response.starts_with("HTTP/1.1 204") && lower.contains(&format!("access-control-allow-origin: {APP}")) && lower.contains("access-control-max-age: 600"), "{response}");
-    let response = https_raw("127.0.0.1", https, &cert, preflight(APPEND, "https://evil.example").as_bytes()).await;
-    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    assert!(page.entries.is_empty(), "a page appended");
 
     let response = https_raw("127.0.0.1", https, &cert, b"GET /membership/2/read HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await;
     assert!(response.starts_with("HTTP/1.1 405"), "{response}");
-    let response = https_raw("127.0.0.1", https, &cert, preflight("/membership/3/append", APP).as_bytes()).await;
-    assert!(response.starts_with("HTTP/1.1 204") && response.to_lowercase().contains(&format!("access-control-allow-origin: {APP}")), "{response}");
-    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/3/append", Some(APP), &append_json(7, b"x"))).await;
-    assert!(response.starts_with("HTTP/1.1 404") && response.to_lowercase().contains(&format!("access-control-allow-origin: {APP}")), "{response}");
+    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/3/append", None, &append_json(7, b"x"))).await;
+    assert!(response.starts_with("HTTP/1.1 404"), "{response}");
 
     let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, None, b"not json")).await;
     let Answer::<()>::Refused { refusal, sig } = answer(&response) else { panic!("{response}") };
@@ -373,16 +352,16 @@ async fn the_journal_holds_no_addresses_keys_or_capabilities() {
     let lmk_proto::group::Service::Serve { key, .. } = &service else { unreachable!() };
     let key: [u8; 32] = key.0.as_slice().try_into().unwrap();
     let capability = [7u8; 32];
-    let append = post(APPEND, Some(APP), &append_json(7, b"one"));
+    let append = post(APPEND, None, &append_json(7, b"one"));
     assert!(https_raw("127.0.0.1", https, &cert, &append).await.starts_with("HTTP/1.1 200"));
     let read = serde_json::to_vec(&Read { capability, after: 0 }).unwrap();
-    assert!(https_raw("127.0.0.1", https, &cert, &post("/membership/2/read", Some(APP), &read)).await.starts_with("HTTP/1.1 200"));
+    assert!(https_raw("127.0.0.1", https, &cert, &post("/membership/2/read", None, &read)).await.starts_with("HTTP/1.1 200"));
     let heads = serde_json::to_vec(&Heads { logs: vec![Known(capability, 0)] }).unwrap();
-    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/2/heads", Some(APP), &heads)).await;
+    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/2/heads", None, &heads)).await;
     let Answer::<Moved>::Ok(moved) = answer(&response) else { panic!("{response}") };
     assert_eq!(moved.heads.len(), 1);
     let public = serde_json::to_vec(&Append { capability: [9; 32], entries: vec![Bytes(vec![0; 17 << 10])], public: true }).unwrap();
-    let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, Some(APP), &public)).await;
+    let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, None, &public)).await;
     assert!(matches!(answer::<Appended>(&response), Answer::Refused { .. }), "{response}");
     let mut failed = TcpStream::connect((Ipv4Addr::LOCALHOST, https)).await.unwrap();
     failed.write_all(b"not a TLS handshake\r\n\r\n").await.unwrap();
@@ -414,9 +393,9 @@ async fn the_journal_holds_no_addresses_keys_or_capabilities() {
     let store = lmk_membership::store::Store::open(&state).unwrap();
     while store.expire(i64::MAX as u64).unwrap() {}
     drop(store);
-    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/2/read", Some(APP), &read)).await;
+    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/2/read", None, &read)).await;
     assert!(matches!(answer::<Page>(&response), Answer::Expired { .. }), "{response}");
-    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/2/heads", Some(APP), &heads)).await;
+    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/2/heads", None, &heads)).await;
     assert!(matches!(answer::<Moved>(&response), Answer::Ok(moved) if moved.expired.len() == 1), "{response}");
     router.shutdown().await.unwrap();
     server.abort();

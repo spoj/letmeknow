@@ -134,7 +134,7 @@ fn b64(bytes: &[u8]) -> String {
     serde_json::to_value(Bytes(bytes.to_vec())).expect("JSON").as_str().expect("a string").to_owned()
 }
 
-/// The file extension of an image the browser shows inline, by its first bytes: PNG, JPEG, GIF or WebP.
+/// The file extension of an image, by its first bytes: PNG, JPEG, GIF or WebP.
 fn image_type(bytes: &[u8]) -> Option<&'static str> {
     match bytes {
         [0x89, b'P', b'N', b'G', ..] => Some("png"),

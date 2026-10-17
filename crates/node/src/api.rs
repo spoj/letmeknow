@@ -107,10 +107,9 @@ impl<P: Provider + Send + 'static> Node<P> {
             st.device_keys.insert(gid.clone(), (seed, session));
             (gid, IdentityRef { id: Bytes(id.to_vec()), membership: settings.membership }, first)
         };
-        self.inner.durable().await?;
         let address = lmk_proto::public::address(&identity.id.0);
         if let Err(error) = self.inner.clients.client(&identity.membership)?.append(&address, &[first], true).await {
-            self.leave(&gid).await?;
+            self.leave(&gid)?;
             return Err(error);
         }
         Ok(identity)
@@ -152,34 +151,28 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// Marks the group as one this session leaves, and sends its `leave`: the others remove it once a cut keeps the
     /// `leave`, and it is in the group until then. Forgets a group it is alone in. Returns the `leave`'s id; none once
     /// this session is out of the group.
-    pub async fn leave(&self, gid: &[u8]) -> Result<Option<Bytes>> {
-        let id = {
-            let mut st = self.inner.lock();
-            st.group_mut(gid)?.rec.leaving = true;
-            st.save(gid)?;
-            let g = st.group(gid)?;
-            let me = st.me(gid).to_vec();
-            if g.mls.members().len() == 1 {
-                self.inner.forget(&mut st, gid)?;
-                None
-            } else if let Some(seq) = g.left(&me) {
-                st.id_at(gid, &me, g.mls.joined(&me).context("a member of its group")?, seq)?
-            } else {
-                Some(self.inner.send(&mut st, gid, &json!({ "type": "leave" }), None)?)
-            }
-        };
-        self.inner.durable().await?;
-        Ok(id)
+    pub fn leave(&self, gid: &[u8]) -> Result<Option<Bytes>> {
+        let mut st = self.inner.lock();
+        st.group_mut(gid)?.rec.leaving = true;
+        st.save(gid)?;
+        let g = st.group(gid)?;
+        let me = st.me(gid).to_vec();
+        if g.mls.members().len() == 1 {
+            self.inner.forget(&mut st, gid)?;
+            Ok(None)
+        } else if let Some(seq) = g.left(&me) {
+            st.id_at(gid, &me, g.mls.joined(&me).context("a member of its group")?, seq)
+        } else {
+            Ok(Some(self.inner.send(&mut st, gid, &json!({ "type": "leave" }), None)?))
+        }
     }
 
     /// Sends a held payload, a reply to the delivered message `reply_to` if given: the node seals it, keeps it, delivers
     /// it to this session and pushes it to the members online, and seals it again in each epoch until a cut keeps it.
-    /// Answers its id once that is durable. Fails with `SendError` when this session sends faster than members take, or
-    /// the message is too large.
-    pub async fn send(&self, gid: &[u8], payload: &Value, reply_to: Option<&[u8]>) -> Result<Bytes> {
-        let id = self.inner.send(&mut self.inner.lock(), gid, payload, reply_to)?;
-        self.inner.durable().await?;
-        Ok(id)
+    /// Answers its id. Fails with `SendError` when this session sends faster than members take, or the message is too
+    /// large.
+    pub fn send(&self, gid: &[u8], payload: &Value, reply_to: Option<&[u8]>) -> Result<Bytes> {
+        self.inner.send(&mut self.inner.lock(), gid, payload, reply_to)
     }
 
     /// Seals a live payload, not held, and sends it to the members online, or to the one with fingerprint `to`; none
@@ -390,10 +383,8 @@ impl<P: Provider + Send + 'static> Node<P> {
             }
             latest.next(seed, writers)
         };
-        self.inner.durable().await?;
         let address = lmk_proto::public::address(&identity.id.0);
         self.inner.clients.client(&identity.membership)?.append(&address, &[entry], true).await?;
-        self.inner.durable().await?;
         self.inner.read_public(&identity).await
     }
 
@@ -416,7 +407,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         if needed {
             self.inner.commit(gid, change).await?;
         }
-        self.inner.durable().await
+        Ok(())
     }
 
     /// The identities this session speaks as in its groups.

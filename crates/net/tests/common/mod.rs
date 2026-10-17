@@ -11,10 +11,9 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
 use iroh::{EndpointId, RelayUrl, SecretKey, tls::CaTlsConfig};
 use iroh_relay::server::{CertConfig, QuicConfig, RelayConfig, Server, ServerConfig, TlsConfig};
-use lmk_net::{Admit, Config, Disk, Event, Groups, Net};
+use lmk_net::{Admit, Config, Event, Groups, Net};
 use lmk_proto::{
     Answer, Bytes,
     links::FileLink,
@@ -71,7 +70,6 @@ pub struct Node {
 
 pub struct Options {
     pub relay_only: bool,
-    pub disk: Option<Arc<dyn Disk>>,
     pub home: Option<PathBuf>,
     pub file_limit: u64,
     pub collect: Duration,
@@ -79,7 +77,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { relay_only: false, disk: None, home: None, file_limit: 100 << 20, collect: Duration::from_secs(3600) }
+        Options { relay_only: false, home: None, file_limit: 100 << 20, collect: Duration::from_secs(3600) }
     }
 }
 
@@ -90,7 +88,7 @@ pub async fn node(relay: &Relay, key: SecretKey, fake: Arc<Fake>, options: Optio
     }
     let endpoint = builder.bind().await.unwrap();
     tokio::time::timeout(WAIT, endpoint.online()).await.expect("online");
-    let config = Config { home: options.home, files: None, disk: options.disk, file_limit: options.file_limit, collect: options.collect };
+    let config = Config { home: options.home, files: None, file_limit: options.file_limit, collect: options.collect };
     let (net, events) = Net::spawn(endpoint, config, fake.clone(), Arc::new(Inviter)).await.unwrap();
     Node { net, events, fake }
 }
@@ -145,26 +143,6 @@ impl Admit for Inviter {
 pub struct Group {
     pub members: Vec<EndpointId>,
     pub files: Vec<FileLink>,
-}
-
-/// A browser's storage of files.
-#[derive(Default)]
-pub struct FakeDisk(pub Mutex<HashMap<[u8; 32], Vec<u8>>>);
-
-impl Disk for FakeDisk {
-    fn has(&self, hash: &[u8; 32]) -> bool {
-        self.0.lock().unwrap().contains_key(hash)
-    }
-
-    fn load(&self, hash: [u8; 32]) -> BoxFuture<Result<Vec<u8>>> {
-        let ciphertext = self.0.lock().unwrap()[&hash].clone();
-        Box::pin(async move { Ok(ciphertext) })
-    }
-
-    fn save(&self, hash: [u8; 32], ciphertext: Vec<u8>) -> BoxFuture<Result<()>> {
-        self.0.lock().unwrap().insert(hash, ciphertext);
-        Box::pin(async { Ok(()) })
-    }
 }
 
 pub struct Fake {

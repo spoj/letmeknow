@@ -3,7 +3,7 @@
 import pathlib, re, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-FILES = ["README.md", "SKILL.md", "web/src/index.html", "web/src/main.ts", "AGENTS.md"]
+FILES = ["README.md", "SKILL.md", "site/index.html", "AGENTS.md"]
 minor = re.search(r'^version = "(\d+\.\d+)\.\d+"', (ROOT / "Cargo.toml").read_text(), re.M).group(1)
 stale = [f"{name}:{number}: {line.strip()}" for name in FILES
          for number, line in enumerate((ROOT / name).read_text().splitlines(), 1)

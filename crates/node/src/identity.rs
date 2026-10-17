@@ -27,7 +27,7 @@ mod tests;
 const NO_IDENTITY: &str = "this device is on no identity";
 pub(crate) const LEFT_IDENTITY: &str = "this device left its identity: its identity group removed it, or the identity's directory expired. To join an identity again, take a device link from another of its devices (`identity invite`) and join with it (`identity join`); then add this device's sessions into their groups again. An expired identity has no device left to link from.";
 
-/// How long an add's invite is valid, in milliseconds: a week, for a browser opened now and then.
+/// How long an add's invite is valid, in milliseconds: a week, for a device online now and then.
 pub const ADD_VALID: u64 = 7 * 24 * 60 * 60 * 1000;
 
 /// An invite into a group for a session of one of the identity's devices, held in the identity group.
@@ -36,7 +36,7 @@ pub const ADD_VALID: u64 = 7 * 24 * 60 * 60 * 1000;
 pub struct Add {
     /// The device: its key on the identity.
     pub device: Bytes,
-    /// The session's handle; empty for the session that acts for the device, as a browser's.
+    /// The session's handle; empty for the session that acts for the device.
     pub session: String,
     pub group: Bytes,
     pub kind: String,
@@ -58,7 +58,7 @@ pub struct Presence {
 /// A group one of a device's sessions is in, as that session shows it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionGroup {
-    /// The session's handle; none for a browser's, its device's only session.
+    /// The session's handle; none in the groups a session writes of itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     pub group: Bytes,
@@ -76,7 +76,7 @@ pub struct Pending {
     pub add: Add,
 }
 
-/// Keeps the device, as when it is renamed: its `device.json`, or a browser's record.
+/// Keeps the device, as when it is renamed: its `device.json`.
 pub type Save = Arc<dyn Fn(&Device) -> Result<()> + Send + Sync>;
 
 /// The identity kind, on a device's node.
@@ -175,7 +175,7 @@ impl<P: Provider + Send + 'static> Identity<P> {
     pub async fn deliver(&self, add: &Add) -> Result<()> {
         let gid = self.group().context(NO_IDENTITY)?;
         self.duties(&gid.0).await?;
-        self.node.send(&gid.0, &serde_json::to_value(add)?, None).await?;
+        self.node.send(&gid.0, &serde_json::to_value(add)?, None)?;
         Ok(())
     }
 
@@ -259,7 +259,7 @@ impl<P: Provider + Send + 'static> Identity<P> {
             }
             break;
         }
-        Ok(self.node.leave(&gid.0).await?.is_none())
+        Ok(self.node.leave(&gid.0)?.is_none())
     }
 
     /// Renames the identity in its private settings; sessions refresh their signed claims after catching up.

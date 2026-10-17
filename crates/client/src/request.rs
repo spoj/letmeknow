@@ -123,7 +123,7 @@ pub enum IdentityOp {
         #[cfg_attr(feature = "clap", arg(long))]
         membership: Option<String>,
     },
-    /// Make a device link, valid for 10 minutes, for another device (a machine or a browser) to join this identity
+    /// Make a device link, valid for 10 minutes, for another device to join this identity
     Invite {
         /// Also show the link as a QR code, on stderr
         #[cfg_attr(feature = "clap", arg(long))]

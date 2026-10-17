@@ -64,7 +64,7 @@ async fn session_trusting(relays: [&Relay; 2], name: &str) -> Session {
     Session { node, events }
 }
 
-/// A device's own node, whose key is the device key, as a browser's is: a device and a session at once.
+/// A device's own node, whose key is the device key, as a session too.
 async fn device(relay: &Relay, name: &str) -> (Session, Identity<MemoryProvider>) {
     let device = Device::new(name);
     let (node, events) = Node::start(MemoryProvider::default(), config(relay, name, Some(device.clone()), &[CHAT, IDENTITY])).await.unwrap();
@@ -82,10 +82,8 @@ fn config(relay: &Relay, name: &str, device: Option<Device>, kinds: &[&str]) -> 
         ca: relay.ca(),
         home: None,
         files: None,
-        disk: None,
         file_limit: 100 << 20,
         kinds: kinds.iter().map(|kind| kind.to_string()).collect(),
-        durable: None,
     }
 }
 
@@ -277,7 +275,7 @@ async fn a_member_whose_identity_is_on_another_service_speaks_in_a_group() {
         alice.node.members(&gid.0).unwrap().iter().any(|m| m.key == bob.node.key() && m.identity.as_ref().is_some_and(|c| c.name == "Bob" && c.error.is_none()))
     })
     .await;
-    let sent = alice.node.send(&gid.0, &message("across services"), None).await.unwrap();
+    let sent = alice.node.send(&gid.0, &message("across services"), None).unwrap();
     let got = bob.until(|e| match e {
         Event::Message(message) => Some(message),
         _ => None,
@@ -302,7 +300,7 @@ async fn a_member_is_reached_through_its_groups_service_when_its_own_relay_is_do
     carol.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     carol.node.shutdown().await.unwrap();
     alice.node.sync().await;
-    let sent = alice.node.send(&gid.0, &message("through the service"), None).await.unwrap();
+    let sent = alice.node.send(&gid.0, &message("through the service"), None).unwrap();
     let got = bob.until(|e| match e {
         Event::Message(message) => Some(message),
         _ => None,
@@ -369,46 +367,51 @@ async fn a_join_survives_an_unresolved_link_domain() {
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
 }
 
-/// A joiner whose Welcome failed to persist retries after a restart with the Add already logged, not another.
+/// Posts through `post`, except the next append once `late` is set: it lands, is told on the channel, and is answered
+/// `after` later.
+fn late_append(post: Post, after: Duration) -> (Arc<std::sync::atomic::AtomicBool>, UnboundedReceiver<()>, Post) {
+    let late = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (landed, landing) = tokio::sync::mpsc::unbounded_channel();
+    let armed = late.clone();
+    let post: Post = Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
+        let late = route.ends_with("/append") && armed.swap(false, std::sync::atomic::Ordering::SeqCst);
+        let (post, landed) = (post.clone(), landed.clone());
+        Box::pin(async move {
+            let answer = post(domain, route, body).await;
+            if late {
+                landed.send(()).ok();
+                tokio::time::sleep(after).await;
+            }
+            answer
+        })
+    });
+    (late, landing, post)
+}
+
+/// A committer stopped once its Add is logged, before it hears so: restarted, it answers the joiner's retry with that
+/// Add, not another.
 #[tokio::test(flavor = "multi_thread")]
-async fn failed_welcome_is_retried_after_restart() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+async fn a_committer_stopped_once_its_add_is_logged_answers_the_retry_with_it() {
     let relay = relay().await;
-    let dir = folder("failed-welcome");
+    let dir = folder("logged-add");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("alice.db");
-    let fail = Arc::new(AtomicBool::new(false));
-    let failing = fail.clone();
-    let mut config = config(&relay, "Alice", None, &[CHAT, KIND]);
-    config.durable = Some(Arc::new(move || {
-        let fail = failing.load(Ordering::SeqCst);
-        Box::pin(async move {
-            anyhow::ensure!(!fail, "injected persistence failure");
-            Ok(())
-        })
-    }));
-    let (node, events) = Node::start(SqliteProvider::open(&path).unwrap(), config).await.unwrap();
-    let mut alice = Session { node, events };
+    let (late, mut landing, post) = late_append(relay.post(), Duration::from_secs(3600));
+    let alice = stored_with(&relay, "Alice", &path, post).await;
     let bob = session(&relay, "Bob").await;
     let gid = alice.node.create(settings(KIND, &relay), None).unwrap();
     let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
+    let epoch = alice.node.epoch(&gid.0).unwrap();
+    late.store(true, std::sync::atomic::Ordering::SeqCst);
     let joining = {
-        let node = bob.node.clone();
-        let link = link.clone();
+        let (node, link) = (bob.node.clone(), link.clone());
         tokio::spawn(async move { node.join(&link, None).await })
     };
-    let reply = alice.until(|event| match event {
-        Event::Snapshot { reply, .. } => Some(reply),
-        _ => None,
-    }).await;
-    fail.store(true, Ordering::SeqCst);
-    reply.send(None).unwrap();
-    let error = tokio::time::timeout(WAIT, joining).await.unwrap().unwrap().unwrap_err();
-    assert!(format!("{error:#}").contains("injected persistence failure"), "{error:#}");
-    assert!(bob.node.groups().is_empty(), "no Welcome escaped the failed barrier");
-    assert_eq!(alice.node.members(&gid.0).unwrap().len(), 2, "the Add was already logged");
+    tokio::time::timeout(WAIT, landing.recv()).await.unwrap().unwrap();
     alice.node.shutdown().await.unwrap();
     drop(alice);
+    joining.abort();
+    assert!(bob.node.groups().is_empty());
 
     let mut alice = stored(&relay, "Alice", &path).await;
     let joining = {
@@ -420,59 +423,9 @@ async fn failed_welcome_is_retried_after_restart() {
         _ => None,
     }).await.send(None).unwrap();
     assert_eq!(tokio::time::timeout(WAIT, joining).await.unwrap().unwrap().unwrap().0, gid);
-    assert_eq!(alice.node.members(&gid.0).unwrap().len(), 2, "retry used the logged Welcome, not another Add");
+    assert_eq!(alice.node.epoch(&gid.0).unwrap(), epoch + 1, "the retry got the logged Add, not another");
     alice.node.shutdown().await.unwrap();
     bob.node.shutdown().await.unwrap();
-}
-
-/// A removal is reported only once durable: while persistence fails, the removed member sees no `Removed`.
-#[tokio::test(flavor = "multi_thread")]
-async fn removal_events_require_durability() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    let relay = relay().await;
-    for failed in [false, true] {
-        let fail = Arc::new(AtomicBool::new(false));
-        let failing = fail.clone();
-        let mut config = config(&relay, "Bob", None, &[CHAT]);
-        config.durable = Some(Arc::new(move || {
-            let fail = failing.load(Ordering::SeqCst);
-            Box::pin(async move {
-                anyhow::ensure!(!fail, "injected persistence failure");
-                Ok(())
-            })
-        }));
-        let (node, events) = Node::start(MemoryProvider::default(), config).await.unwrap();
-        let mut bob = Session { node, events };
-        let alice = session(&relay, "Alice").await;
-        let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
-        let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
-        bob.node.join(&link, None).await.unwrap();
-        if failed {
-            fail.store(true, Ordering::SeqCst);
-            let error = bob.node.send(&gid.0, &message("not durable"), None).await.unwrap_err();
-            assert!(format!("{error:#}").contains("injected persistence failure"), "{error:#}");
-            fail.store(false, Ordering::SeqCst);
-        }
-        assert!(alice.node.remove(&gid.0, &bob.node.key().0).await.unwrap());
-        eventually("the MLS removal forgot Bob's group", || bob.node.groups().is_empty()).await;
-        if failed {
-            while let Ok(event) = bob.events.try_recv() {
-                assert!(!matches!(event, Event::Removed { .. }), "removal escaped the failed barrier");
-            }
-        } else {
-            bob.until(|event| match event {
-                Event::Removed { group, kind, by, .. } => {
-                    assert_eq!(group, gid);
-                    assert_eq!(kind, CHAT);
-                    assert_eq!(by.unwrap().name, "Alice");
-                    Some(())
-                }
-                _ => None,
-            }).await;
-        }
-        bob.node.shutdown().await.unwrap();
-        alice.node.shutdown().await.unwrap();
-    }
 }
 
 /// A chat of two: a message arrives with its sender, a settings change reaches the other member, and a removal ends its
@@ -493,14 +446,14 @@ async fn chat_and_removal() {
     assert_eq!(member.name, "Bob");
     assert_eq!(bob.node.members(&gid.0).unwrap().len(), 2);
 
-    let sent = bob.node.send(&gid.0, &message("hello"), None).await.unwrap();
+    let sent = bob.node.send(&gid.0, &message("hello"), None).unwrap();
     let got = alice.until(|e| match e {
         Event::Message(message) => Some(message),
         _ => None,
     }).await;
     assert_eq!((got.id, got.seq, got.sender.name.as_str()), (sent, 1, "Bob"));
     let big = message(&"x".repeat(1 << 20));
-    let refused = bob.node.send(&gid.0, &big, None).await.unwrap_err();
+    let refused = bob.node.send(&gid.0, &big, None).unwrap_err();
     assert!(matches!(refused.downcast_ref(), Some(lmk_node::SendError::Size(_))), "{refused:#}");
 
     alice.node.change_settings(&gid.0, |s| Settings { name: "Release".into(), ..s }).await.unwrap();
@@ -558,7 +511,7 @@ async fn any_member_admits_an_invite_once() {
     // An expired one too.
     let secret = [7u8; 16];
     let expired = json!({ "type": "invite", "hash": Bytes(Sha256::digest(secret).to_vec()), "expires": lmk_node::now() - 1 });
-    bob.node.send(&gid.0, &expired, None).await.unwrap();
+    bob.node.send(&gid.0, &expired, None).unwrap();
     eventually("Alice holds the expired invite", || alice.node.messages(&gid.0).unwrap().iter().any(|m| m.payload["type"] == "invite")).await;
     let expired = Invite { secret, members: vec![link.members[0]], ..link.clone() };
     assert!(format!("{:#}", erin.node.join(&expired, None).await.unwrap_err()).contains("unknown, used or expired"));
@@ -611,7 +564,7 @@ async fn an_invite_dies_when_its_inviter_leaves() {
     eventually("Alice holds both invites", || invites() == 4).await;
 
     alice.node.remove(&gid.0, &bob.node.key().0).await.unwrap();
-    carol.node.leave(&gid.0).await.unwrap();
+    carol.node.leave(&gid.0).unwrap();
     alice.node.sync().await;
     eventually("Bob and Carol are out", || alice.node.members(&gid.0).unwrap().len() == 1).await;
     let dave = session(&relay, "Dave").await;
@@ -657,7 +610,7 @@ async fn a_kind_gets_its_state_to_a_joiner_and_its_payloads_and_files_through() 
 
     // Held and live payloads; a live payload to one member.
     let push = json!({ "type": "push", "n": 1 });
-    let sent = alice.node.send(&gid.0, &push, None).await.unwrap();
+    let sent = alice.node.send(&gid.0, &push, None).unwrap();
     let held = bob.until(|e| match e {
         Event::Message(message) => Some(message),
         _ => None,
@@ -936,66 +889,6 @@ impl Gate {
     }
 }
 
-/// A publication that fails with its persistence appends nothing to the directory, and a retry resumes once it works.
-#[tokio::test(flavor = "multi_thread")]
-async fn publication_resuming_after_persistence_failure_does_not_append() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    let relay = relay().await;
-    let dir = folder("publication-durability");
-    let (membership, service) = served(&relay, &dir).await;
-    let (gate, mut reaching) = Gate::new(Some(&membership));
-    let fail = Arc::new(AtomicBool::new(false));
-    let failing = fail.clone();
-    let mut config = config(&relay, "laptop", Some(Device::new("laptop")), &[CHAT, IDENTITY]);
-    config.post = gate.post("laptop", relay.post());
-    config.durable = Some(Arc::new(move || {
-        let fail = failing.load(Ordering::SeqCst);
-        Box::pin(async move {
-            anyhow::ensure!(!fail, "injected persistence failure");
-            Ok(())
-        })
-    }));
-    let (node, _events) = Node::start(MemoryProvider::default(), config).await.unwrap();
-    let identity = node.create_identity(Settings { membership, ..settings(IDENTITY, &relay) }).await.unwrap();
-    let gid = devices_group(&node);
-    let before = node.read_public(&identity).await.unwrap();
-    let mut writers = before.writers.clone();
-    writers.push(lmk_core::device::public(&lmk_core::random()).into());
-    let published = node.publish(&gid.0, &before, writers).await.unwrap();
-    assert_eq!(published.writers.len(), 2);
-    let reader = session(&relay, "Reader").await;
-    assert_eq!(reader.node.read_public(&identity).await.unwrap().writers, published.writers);
-    let directory = ServeClient::for_service(relay.post(), &identity.membership).unwrap();
-    let address = lmk_proto::public::address(&identity.id.0);
-    let before = lmk_testing::head(&directory, &address).await;
-    assert_eq!(before.length, 2, "genesis and the successful publication");
-
-    let before_writers = vec![node.key_in(&gid.0)];
-    gate.set(false);
-    let publication = node.publish(&gid.0, &published, before_writers.clone());
-    tokio::pin!(publication);
-    tokio::time::timeout(WAIT, async {
-        tokio::select! {
-            result = &mut publication => panic!("the publication passed the shut gate: {result:?}"),
-            reached = reaching.recv() => assert_eq!(reached.unwrap(), "laptop"),
-        }
-    }).await.unwrap();
-    fail.store(true, Ordering::SeqCst);
-    let error = node.send(&gid.0, &message("not durable"), None).await.unwrap_err();
-    assert!(format!("{error:#}").contains("injected persistence failure"), "{error:#}");
-    fail.store(false, Ordering::SeqCst);
-    gate.set(true);
-    let error = tokio::time::timeout(WAIT, publication).await.unwrap().unwrap_err();
-    assert!(format!("{error:#}").contains("injected persistence failure"), "{error:#}");
-    let after = reader.node.read_public(&identity).await.unwrap();
-    assert_eq!(after.writers, published.writers);
-    let after = lmk_testing::head(&directory, &address).await;
-    assert_eq!((after.length, after.hash), (before.length, before.hash), "no append reached the directory");
-    node.shutdown().await.unwrap();
-    reader.node.shutdown().await.unwrap();
-    drop(service);
-}
-
 /// The rule a joiner comes by is checked again as the Add is built: an invite that expired while the admitter read the
 /// joiner's public log admits no one.
 #[tokio::test(flavor = "multi_thread")]
@@ -1022,7 +915,7 @@ async fn a_rule_is_checked_again_as_the_add_is_built() {
         let secret: [u8; 16] = lmk_core::random();
         let hash = Bytes(Sha256::digest(secret).to_vec());
         let rule = json!({ "type": "invite", "hash": hash, "expires": expires, "to": carol.id });
-        bob.node.send(&gid.0, &rule, None).await.unwrap();
+        bob.node.send(&gid.0, &rule, None).unwrap();
         eventually("Alice holds the invite", || alice.node.messages(&gid.0).unwrap().iter().any(|m| m.payload["hash"] == rule["hash"])).await;
         let link = Invite { device: false, secret, domain: link.domain.clone(), members: alice_only.clone() };
         let mut joining = tokio::spawn(async move { joiner.node.join(&link, Some(certificate)).await.map(|(gid, _)| gid) });
@@ -1230,7 +1123,7 @@ async fn devices_share_an_identity_list_their_devices_and_certify_their_sessions
     lists(&laptop.node, &bob, &[laptop_devices.key().unwrap()]).await;
     alice.until(|e| matches!(e, Event::Left { member, .. } if member.name == "tablet").then_some(())).await;
     alice.checked(&chat, "laptop", true).await;
-    let id = alice.node.send(&chat.0, &message("after the tablet left"), None).await.unwrap();
+    let id = alice.node.send(&chat.0, &message("after the tablet left"), None).unwrap();
     let got = laptop.until(|e| match e {
         Event::Message(message) if message.id == id => Some(message.id),
         _ => None,
@@ -1466,7 +1359,7 @@ async fn held_leave(test: &str, restart_leaver: bool) {
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
 
     gate.set(false);
-    bob.node.leave(&gid.0).await.unwrap().unwrap();
+    bob.node.leave(&gid.0).unwrap().unwrap();
     if restart_leaver {
         bob.node.shutdown().await.unwrap();
         drop(bob);
@@ -1504,7 +1397,7 @@ async fn an_old_leave_does_not_remove_a_member_added_again() {
     alice.node.shutdown().await.unwrap();
     drop(alice);
 
-    bob.node.leave(&gid.0).await.unwrap();
+    bob.node.leave(&gid.0).unwrap();
     bob.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
     bob.node.join(&carol.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     // Only Carol holds the leave: were Bob online, Alice's wait could end at her connection to him before Carol's lands.
@@ -1626,7 +1519,7 @@ async fn each_commit_moves_the_group_to_its_new_epochs_log() {
     let mut carol = session(&relay, "Carol").await;
     let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     let mut logs = vec![alice.node.log(&gid.0).unwrap()];
-    alice.node.send(&gid.0, &message("before anyone"), None).await.unwrap();
+    alice.node.send(&gid.0, &message("before anyone"), None).unwrap();
     for joiner in [&bob, &carol] {
         joiner.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
@@ -1639,7 +1532,7 @@ async fn each_commit_moves_the_group_to_its_new_epochs_log() {
     carol.node.sync().await;
     carol.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
     assert!(!logs.contains(&alice.node.log(&gid.0).unwrap()), "the Remove moved the group to a log Carol cannot name");
-    let after = alice.node.send(&gid.0, &message("after Carol"), None).await.unwrap();
+    let after = alice.node.send(&gid.0, &message("after Carol"), None).unwrap();
     let got = bob.until(|e| match e {
         Event::Message(m) if m.payload == message("after Carol") => Some(m.id),
         _ => None,
@@ -1659,9 +1552,8 @@ async fn a_leaver_left_alone_forgets_the_group() {
     let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-    let (a, b) = tokio::join!(alice.node.leave(&gid.0), bob.node.leave(&gid.0));
-    a.unwrap();
-    b.unwrap();
+    alice.node.leave(&gid.0).unwrap();
+    bob.node.leave(&gid.0).unwrap();
     eventually("both forgot the group", || alice.node.groups().is_empty() && bob.node.groups().is_empty()).await;
 }
 
@@ -1731,7 +1623,7 @@ async fn a_log_let_go_is_no_removal_while_a_peer_brings_the_commits() {
     let gid = alice.node.create(Settings { membership, ..settings(CHAT, &relay) }, None).unwrap();
     bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-    let held = bob.node.send(&gid.0, &message("held before refusal"), None).await.unwrap();
+    let held = bob.node.send(&gid.0, &message("held before refusal"), None).unwrap();
     let file = bob.node.add_file(&gid.0, b"held file".to_vec()).await.unwrap();
     let members = bob.node.members(&gid.0).unwrap();
     let epoch = bob.node.epoch(&gid.0).unwrap();
@@ -1743,7 +1635,7 @@ async fn a_log_let_go_is_no_removal_while_a_peer_brings_the_commits() {
     for name in ["Sooner", "Later"] {
         alice.node.change_settings(&gid.0, |s| Settings { name: name.into(), ..s }).await.unwrap();
     }
-    let missed = alice.node.send(&gid.0, &message("recover from the peer"), None).await.unwrap();
+    let missed = alice.node.send(&gid.0, &message("recover from the peer"), None).unwrap();
     alice.node.shutdown().await.unwrap();
     drop(alice);
     let store = Store::open(&dir.join("membership")).unwrap();
@@ -1933,7 +1825,7 @@ fn a_group_quiet_past_the_retention_survives() {
             node.sync_members().await.unwrap();
         }
         assert_eq!((alice.node.members(&gid.0).unwrap().len(), bob.node.members(&gid.0).unwrap().len()), (2, 2));
-        alice.node.send(&gid.0, &message("after the pause"), None).await.unwrap();
+        alice.node.send(&gid.0, &message("after the pause"), None).unwrap();
         bob.until(|e| matches!(e, Event::Message(message) if message.payload["content"] == "after the pause").then_some(())).await;
         alice.node.shutdown().await.unwrap();
         bob.node.shutdown().await.unwrap();
@@ -2170,7 +2062,7 @@ async fn an_announced_loss_reaches_every_member() {
     drop(carol);
 
     // Alice holds Bob's message and keeps it in a commit; then Alice and Bob stop, and Carol, back, has no holder.
-    let sent = bob.node.send(&gid.0, &message("only Alice and Bob hold this"), None).await.unwrap();
+    let sent = bob.node.send(&gid.0, &message("only Alice and Bob hold this"), None).unwrap();
     alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
     for name in ["One", "Two"] {
         alice.node.change_settings(&gid.0, |s| Settings { name: name.into(), ..s }).await.unwrap();
@@ -2223,7 +2115,7 @@ async fn catching_up() {
     carol.node.shutdown().await.unwrap();
     drop(carol);
 
-    bob.node.send(&gid.0, &message("only Alice and Bob hold this"), None).await.unwrap();
+    bob.node.send(&gid.0, &message("only Alice and Bob hold this"), None).unwrap();
     alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
     for name in ["One", "Two"] {
         alice.node.change_settings(&gid.0, |s| Settings { name: name.into(), ..s }).await.unwrap();
@@ -2294,7 +2186,7 @@ async fn a_leaver_asks_again_while_it_updates_every_t() {
     drop(alice);
 
     let epoch = bob.node.epoch(&gid.0).unwrap();
-    bob.node.leave(&gid.0).await.unwrap().unwrap();
+    bob.node.leave(&gid.0).unwrap().unwrap();
     eventually("Bob updates its leaf", || bob.node.epoch(&gid.0).unwrap() >= epoch + 2).await;
 
     let alice = stored(&relay, "Alice", &alice_db).await;
@@ -2420,7 +2312,7 @@ async fn a_member_waits_for_the_kept_message_its_only_holder_gives() {
     drop(rita);
 
     // Quinn is online for the message and holds it; Sam's first rename keeps it, as Quinn's summary shows it held.
-    let sent = sam.node.send(&gid.0, &message("p"), None).await.unwrap();
+    let sent = sam.node.send(&gid.0, &message("p"), None).unwrap();
     let got = quinn.until(|e| match e {
         Event::Message(message) => Some(message),
         _ => None,
@@ -2478,7 +2370,7 @@ async fn a_peer_not_admitted_changes_nothing() {
     let bob = session(&relay, "Bob").await;
     let gid = alice.node.create(Settings { membership, ..settings(CHAT, &relay) }, None).unwrap();
     bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
-    let sent = bob.node.send(&gid.0, &message("real"), None).await.unwrap();
+    let sent = bob.node.send(&gid.0, &message("real"), None).unwrap();
     alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
     bob.node.shutdown().await.unwrap();
     eventually("Bob is gone", || alice.node.online(&gid.0).unwrap().is_empty()).await;
@@ -2611,41 +2503,18 @@ async fn a_joiner_whose_answer_was_lost_is_admitted_by_the_committers_answer() {
 /// answers with the Add it kept, adding the joiner once.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_joiner_asks_again_once_the_committers_answer_is_late() {
-    use std::sync::atomic::{AtomicBool, Ordering};
     let relay = relay().await;
-    let slow = Arc::new(AtomicBool::new(false));
-    let busy = slow.clone();
-    let mut config = config(&relay, "Alice", None, &[CHAT, KIND]);
-    config.durable = Some(Arc::new(move || {
-        let busy = busy.clone();
-        Box::pin(async move {
-            while busy.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Ok(())
-        })
-    }));
-    let (node, events) = Node::start(MemoryProvider::default(), config).await.unwrap();
-    let mut alice = Session { node, events };
+    let (late, _landing, post) = late_append(relay.post(), Duration::from_secs(35));
+    let (node, events) = Node::start(MemoryProvider::default(), Config { post, ..config(&relay, "Alice", None, &[CHAT]) }).await.unwrap();
+    let alice = Session { node, events };
     let bob = session(&relay, "Bob").await;
-    let gid = alice.node.create(settings(KIND, &relay), None).unwrap();
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
-    let (node, first) = (bob.node.clone(), link.clone());
-    let joining = tokio::spawn(async move { node.join(&first, None).await });
-    // The Add is in, and its answer waits for the state, which it does not get in time: its durable step then runs past
-    // the joiner's wait for it.
-    let _reply = alice.until(|e| match e {
-        Event::Snapshot { reply, .. } => Some(reply),
-        _ => None,
-    }).await;
     let epoch = alice.node.epoch(&gid.0).unwrap();
-    slow.store(true, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_secs(35)).await;
-    slow.store(false, Ordering::SeqCst);
-    alice.snapshot(Some(b"state")).await;
-    let (joined, _) = tokio::time::timeout(WAIT, joining).await.unwrap().unwrap().unwrap();
+    late.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (joined, _) = tokio::time::timeout(Duration::from_secs(120), bob.node.join(&link, None)).await.unwrap().unwrap();
     assert_eq!(joined, gid);
-    assert_eq!(alice.node.epoch(&gid.0).unwrap(), epoch, "no second Add");
+    assert_eq!(alice.node.epoch(&gid.0).unwrap(), epoch + 1, "one Add");
     assert_eq!(bob.node.members(&gid.0).unwrap().len(), 2);
 }
 
@@ -2654,44 +2523,23 @@ async fn a_joiner_asks_again_once_the_committers_answer_is_late() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_joiner_asks_its_committer_again_past_a_silent_member() {
     use lmk_proto::links::Invite;
-    use std::sync::atomic::{AtomicBool, Ordering};
     let relay = relay().await;
-    let slow = Arc::new(AtomicBool::new(false));
-    let busy = slow.clone();
-    let mut config = config(&relay, "Alice", None, &[CHAT, KIND]);
-    config.durable = Some(Arc::new(move || {
-        let busy = busy.clone();
-        Box::pin(async move {
-            while busy.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Ok(())
-        })
-    }));
-    let (node, events) = Node::start(MemoryProvider::default(), config).await.unwrap();
-    let mut alice = Session { node, events };
+    let (late, _landing, post) = late_append(relay.post(), Duration::from_secs(35));
+    let (node, events) = Node::start(MemoryProvider::default(), Config { post, ..config(&relay, "Alice", None, &[CHAT]) }).await.unwrap();
+    let alice = Session { node, events };
     let bob = session(&relay, "Bob").await;
-    let gid = alice.node.create(settings(KIND, &relay), None).unwrap();
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
     let key = iroh::SecretKey::from_bytes(&lmk_core::random());
     let silent = *key.public().as_bytes();
     let _silent = hand(&relay, key.clone(), &bob.node).await;
     eventually("the silent member is connected", || bob.node.net().connected().contains(&key.public())).await;
     let link = Invite { members: vec![link.members[0], silent], ..link };
-    let (node, first) = (bob.node.clone(), link.clone());
-    let joining = tokio::spawn(async move { node.join(&first, None).await });
-    let _reply = alice.until(|e| match e {
-        Event::Snapshot { reply, .. } => Some(reply),
-        _ => None,
-    }).await;
     let epoch = alice.node.epoch(&gid.0).unwrap();
-    slow.store(true, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_secs(35)).await;
-    slow.store(false, Ordering::SeqCst);
-    alice.snapshot(Some(b"state")).await;
-    let (joined, _) = tokio::time::timeout(Duration::from_secs(120), joining).await.unwrap().unwrap().unwrap();
+    late.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (joined, _) = tokio::time::timeout(Duration::from_secs(120), bob.node.join(&link, None)).await.unwrap().unwrap();
     assert_eq!(joined, gid);
-    assert_eq!(alice.node.epoch(&gid.0).unwrap(), epoch, "no second Add");
+    assert_eq!(alice.node.epoch(&gid.0).unwrap(), epoch + 1, "one Add");
 }
 
 /// Two asks with one KeyPackage at once, as a joiner's again after one failed in transit: the member adds it once and
@@ -2815,7 +2663,7 @@ async fn three_members_chat_in_causal_order() {
     let mut bob = bob;
     let mut carol = carol;
 
-    let a1 = alice.node.send(&gid.0, &message("a1"), None).await.unwrap();
+    let a1 = alice.node.send(&gid.0, &message("a1"), None).unwrap();
     let first = bob.until(|e| match e {
         Event::Message(message) => Some(message),
         _ => None,
@@ -2823,10 +2671,10 @@ async fn three_members_chat_in_causal_order() {
     assert_eq!((first.id.clone(), first.sender.name.as_str()), (a1.clone(), "Alice"));
     bob.node.mark_shown(&gid.0, std::slice::from_ref(&a1)).unwrap();
     assert!(bob.node.shown(&gid.0, &a1.0).unwrap());
-    let b1 = bob.node.send(&gid.0, &message("b1 replies to a1"), None).await.unwrap();
-    let a2 = alice.node.send(&gid.0, &message("a2"), None).await.unwrap();
-    let a3 = alice.node.send(&gid.0, &message("a3"), None).await.unwrap();
-    let b2 = bob.node.send(&gid.0, &message("b2 is sent after a2 arrived, unshown"), None).await.unwrap();
+    let b1 = bob.node.send(&gid.0, &message("b1 replies to a1"), None).unwrap();
+    let a2 = alice.node.send(&gid.0, &message("a2"), None).unwrap();
+    let a3 = alice.node.send(&gid.0, &message("a3"), None).unwrap();
+    let b2 = bob.node.send(&gid.0, &message("b2 is sent after a2 arrived, unshown"), None).unwrap();
     assert!(!bob.node.shown(&gid.0, &a2.0).unwrap());
 
     // Carol takes all five, each of Alice's in its seq order, and Bob's replies after the message they depend on.
@@ -2880,7 +2728,7 @@ async fn a_message_whose_dep_is_withheld_is_delivered_with_missing_and_the_dep_c
     // Bob's m1 reaches Sam, who shows it and replies. Bob's rename keeps m1, since Sam's summary shows it held: Carol
     // then knows m1 was sent. Then Bob and Sam stop.
     let bob_key = bob.node.key();
-    let m1 = bob.node.send(&gid.0, &message("m1"), None).await.unwrap();
+    let m1 = bob.node.send(&gid.0, &message("m1"), None).unwrap();
     let mut sam = sam;
     let m1_seq = sam.until(|e| match e {
         Event::Message(message) => Some(message.seq),
@@ -2889,7 +2737,7 @@ async fn a_message_whose_dep_is_withheld_is_delivered_with_missing_and_the_dep_c
     sam.node.mark_shown(&gid.0, std::slice::from_ref(&m1)).unwrap();
     eventually("Bob hears that Sam holds m1", || bob.node.heard(&gid.0).unwrap().iter().any(|h| h.member.name == "Sam" && h.held.iter().any(|s| s.key == bob_key && s.seqs.contains(m1_seq)))).await;
     bob.node.change_settings(&gid.0, |s| Settings { name: "Kept".into(), ..s }).await.unwrap();
-    let m2 = sam.node.send(&gid.0, &message("m2 replies to m1"), None).await.unwrap();
+    let m2 = sam.node.send(&gid.0, &message("m2 replies to m1"), None).unwrap();
     bob.node.shutdown().await.unwrap();
     sam.node.shutdown().await.unwrap();
 
@@ -2935,8 +2783,8 @@ async fn chat_works_while_the_service_is_down() {
     drop(bob);
 
     drop(service);
-    let one = alice.node.send(&gid.0, &message("one"), None).await.unwrap();
-    let two = alice.node.send(&gid.0, &message("two"), None).await.unwrap();
+    let one = alice.node.send(&gid.0, &message("one"), None).unwrap();
+    let two = alice.node.send(&gid.0, &message("two"), None).unwrap();
     let mut bob = stored(&relay, "Bob", &dir.join("bob.db")).await;
     for (id, seq) in [(one, 2), (two, 3)] {
         let got = bob.until(|e| match e {
@@ -2972,7 +2820,7 @@ async fn a_commit_keeps_what_an_online_member_holds() {
     let (bob_key, dave_key) = (bob.node.key(), dave.node.key());
 
     let alice_key = alice.node.key();
-    let m1 = alice.node.send(&gid.0, &message("one"), None).await.unwrap();
+    let m1 = alice.node.send(&gid.0, &message("one"), None).unwrap();
     let mut bob = bob;
     let seq = bob.until(|e| match e {
         Event::Message(message) => Some(message.seq),
@@ -2980,7 +2828,7 @@ async fn a_commit_keeps_what_an_online_member_holds() {
     }).await;
     eventually("Alice hears that Bob holds her messages up to one", || alice.node.heard(&gid.0).unwrap().iter().any(|h| h.member.key == bob_key && (1..=seq).all(|q| h.held.iter().any(|s| s.key == alice_key && s.seqs.contains(q))))).await;
     dave.node.shutdown().await.unwrap();
-    let m2 = alice.node.send(&gid.0, &message("two"), None).await.unwrap();
+    let m2 = alice.node.send(&gid.0, &message("two"), None).unwrap();
     bob.until(|e| matches!(e, Event::Message(message) if message.id == m2).then_some(())).await;
     let held = |node: &Node<SqliteProvider>| node.only_here(&gid.0).unwrap().into_iter().map(|(id, _)| id).collect::<Vec<_>>();
     eventually("Alice hears that Bob holds both", || held(&alice.node).is_empty()).await;
@@ -3017,7 +2865,7 @@ async fn a_message_held_in_an_ended_epoch_is_only_here_until_its_holder_takes_th
     let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     eventually("Alice has Bob", || alice.node.members(&gid.0).unwrap().len() == 2).await;
-    let m = alice.node.send(&gid.0, &message("held"), None).await.unwrap();
+    let m = alice.node.send(&gid.0, &message("held"), None).unwrap();
     let seq = bob.until(|e| match e {
         Event::Message(message) => Some(message.seq),
         _ => None,
@@ -3053,7 +2901,7 @@ async fn a_message_an_online_member_holds_is_kept_by_the_next_commit() {
     let gid = alice.node.create(Settings { update: 2, ..settings(CHAT, &relay) }, None).unwrap();
     bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     eventually("Alice has Bob", || alice.node.members(&gid.0).unwrap().len() == 2).await;
-    alice.node.send(&gid.0, &message("kept"), None).await.unwrap();
+    alice.node.send(&gid.0, &message("kept"), None).unwrap();
     bob.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
     eventually("Alice hears that Bob holds it", || alice.node.only_here(&gid.0).unwrap().is_empty()).await;
     let epoch = alice.node.epoch(&gid.0).unwrap();
@@ -3177,9 +3025,9 @@ fn a_chat_of_held_messages_commits_only_for_an_update_or_change() {
         bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
         eventually("Alice has Bob's Add", || alice.node.members(&gid.0).unwrap().len() == 2).await;
         let epoch = alice.node.epoch(&gid.0).unwrap();
-        alice.node.send(&gid.0, &message("one"), None).await.unwrap();
+        alice.node.send(&gid.0, &message("one"), None).unwrap();
         bob.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
-        bob.node.send(&gid.0, &message("two"), None).await.unwrap();
+        bob.node.send(&gid.0, &message("two"), None).unwrap();
         alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
         alice.node.shutdown().await.unwrap();
         bob.node.shutdown().await.unwrap();
@@ -3212,8 +3060,8 @@ async fn a_removed_member_is_told_which_of_its_messages_no_cut_kept() {
     drop(alice);
 
     // Alice is away, so Dave's messages are held by Dave alone; then Dave stops too.
-    let one = dave.node.send(&gid.0, &message("one"), None).await.unwrap();
-    let two = dave.node.send(&gid.0, &message("two"), None).await.unwrap();
+    let one = dave.node.send(&gid.0, &message("one"), None).unwrap();
+    let two = dave.node.send(&gid.0, &message("two"), None).unwrap();
     dave.node.shutdown().await.unwrap();
     drop(dave);
 
@@ -3248,7 +3096,7 @@ async fn a_holder_keeps_the_removed_members_last_kept_message() {
     eventually("Alice has three members", || alice.node.members(&gid.0).unwrap().len() == 3).await;
     let (bob_key, dave_key) = (bob.node.key(), dave.node.key());
     let mut bob = bob;
-    let last = dave.node.send(&gid.0, &message("Dave's last"), None).await.unwrap();
+    let last = dave.node.send(&gid.0, &message("Dave's last"), None).unwrap();
     bob.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
     alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
     eventually("Alice hears that Bob holds it", || alice.node.heard(&gid.0).unwrap().iter().any(|h| h.member.key == bob_key && h.held.iter().any(|s| s.key == dave_key && s.seqs.contains(1)))).await;
@@ -3269,11 +3117,11 @@ async fn a_joiner_takes_what_was_unkept_at_its_add_and_what_follows() {
     let relay = relay().await;
     let mut alice = session(&relay, "Alice").await;
     let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
-    let before = alice.node.send(&gid.0, &message("before Bob"), None).await.unwrap();
+    let before = alice.node.send(&gid.0, &message("before Bob"), None).unwrap();
     let mut bob = session(&relay, "Bob").await;
     bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-    let after = alice.node.send(&gid.0, &message("after Bob"), None).await.unwrap();
+    let after = alice.node.send(&gid.0, &message("after Bob"), None).unwrap();
     // Alice's invite took seq 2: before is seq 1, after seq 3. Bob may take after first, given up on before, which then comes late.
     let mut taken = Vec::new();
     while taken.len() < 2 {
@@ -3311,7 +3159,7 @@ async fn missed_commits(test: &str) -> (Vec<u64>, Vec<u64>) {
     // The two invites took seqs 1 and 2; Alice's messages are 3 and 4, each held by Bob before the rename that keeps it.
     let mut sent = Vec::new();
     for text in ["a1", "a2"] {
-        alice.node.send(&gid.0, &message(text), None).await.unwrap();
+        alice.node.send(&gid.0, &message(text), None).unwrap();
         let seq = bob.until(|e| match e {
             Event::Message(message) => Some(message.seq),
             _ => None,
@@ -3391,7 +3239,7 @@ async fn a_removed_members_send_past_its_final_cut_reaches_no_one() {
     eventually("Bob applies the removal", || bob.node.epoch(&gid.0).unwrap() == epoch).await;
     let dave = stored_with(&relay, "Dave", &dir.join("dave.db"), gate.post("Dave", relay.post())).await;
     eventually("Dave reaches Alice", || dave.node.online(&gid.0).unwrap().iter().any(|m| m.name == "Alice")).await;
-    let sealed_on = dave.node.send(&gid.0, &message("sealed on after the removal"), None).await.unwrap();
+    let sealed_on = dave.node.send(&gid.0, &message("sealed on after the removal"), None).unwrap();
     let quiet = tokio::time::timeout(Duration::from_secs(3), async {
         tokio::join!(
             alice.until(|e| matches!(e, Event::Message(m) if m.id == sealed_on).then_some(())),
@@ -3428,7 +3276,7 @@ async fn lost_seqs_are_told_once_across_restarts() {
     carol.node.shutdown().await.unwrap();
     drop(carol);
     let bob_key = bob.node.key();
-    let sent = bob.node.send(&gid.0, &message("only Alice and Bob hold this"), None).await.unwrap();
+    let sent = bob.node.send(&gid.0, &message("only Alice and Bob hold this"), None).unwrap();
     alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
     eventually("Alice hears that Bob holds it", || alice.node.heard(&gid.0).unwrap().iter().any(|h| h.member.key == bob_key && h.held.iter().any(|s| s.key == bob_key && s.seqs.contains(1)))).await;
     for name in ["One", "Two"] {

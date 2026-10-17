@@ -18,12 +18,6 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 zeroize = "1.8"
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ciborium.workspace = true
 openmls_sqlite_storage.workspace = true
 rusqlite.workspace = true
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-openmls = { workspace = true, features = ["js"] }
-getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }

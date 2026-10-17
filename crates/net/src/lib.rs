@@ -55,17 +55,6 @@ pub trait Groups: Send + Sync + 'static {
     fn admit(&self, peer: &EndpointId, frame: Frame) -> Option<Frame>;
 }
 
-/// A browser's own storage of the files it holds, since iroh-blobs keeps only memory there. With one, a session keeps
-/// there the files it adds and those it fetches up to its limit, holds and serves only those, and loads each into
-/// memory when it is needed.
-pub trait Disk: Send + Sync + 'static {
-    fn has(&self, hash: &[u8; 32]) -> bool;
-    /// A kept file's ciphertext.
-    fn load(&self, hash: [u8; 32]) -> BoxFuture<Result<Vec<u8>>>;
-    /// Resolves only once the ciphertext is durable; failure must not publish it through `has`.
-    fn save(&self, hash: [u8; 32], ciphertext: Vec<u8>) -> BoxFuture<Result<()>>;
-}
-
 /// A member's decision on a joiner's request; it may commit an Add before it answers.
 pub trait Admit: Send + Sync + 'static {
     fn join(&self, peer: EndpointId, join: Join) -> BoxFuture<Answer<Admitted>>;
@@ -89,7 +78,6 @@ pub struct Config {
     pub home: Option<PathBuf>,
     /// Where files are kept; in memory if none.
     pub files: Option<PathBuf>,
-    pub disk: Option<Arc<dyn Disk>>,
     /// The largest file fetched without being asked.
     pub file_limit: u64,
     /// How often the files no group links any longer are deleted.
@@ -117,7 +105,6 @@ pub(crate) struct Inner {
     links: Mutex<BTreeMap<EndpointId, Link>>,
     events: mpsc::UnboundedSender<Event>,
     /// The task that publishes this session's addresses in its home, as they change.
-    #[cfg(not(target_family = "wasm"))]
     publishing: Mutex<Option<n0_future::task::JoinHandle<()>>>,
 }
 
@@ -134,8 +121,7 @@ impl Net {
         groups: Arc<dyn Groups>,
         admit: Arc<dyn Admit>,
     ) -> Result<(Net, mpsc::UnboundedReceiver<Event>)> {
-        let files = Arc::new(Files::new(endpoint.clone(), config.files.clone(), config.disk.clone(), groups.clone(), config.collect).await?);
-        #[cfg(not(target_family = "wasm"))]
+        let files = Arc::new(Files::new(endpoint.clone(), config.files.clone(), groups.clone(), config.collect).await?);
         let publishing = config.home.as_ref().map(|home| addresses::publish(&endpoint, home)).transpose()?;
         let (events, rx) = mpsc::unbounded_channel();
         let mut homes = endpoint.watch_addr().stream();
@@ -159,7 +145,6 @@ impl Net {
             files,
             links: Mutex::default(),
             events,
-            #[cfg(not(target_family = "wasm"))]
             publishing: Mutex::new(publishing),
         });
         let blobs = inner.files.protocol(inner.groups.clone());
@@ -277,9 +262,7 @@ impl Net {
     /// process can open the store only once it is closed (on Windows), and is reached only once no endpoint of its key
     /// is left closing, refusing connections.
     pub async fn shutdown(&self) -> Result<()> {
-        #[cfg(not(target_family = "wasm"))]
         let publishing = self.inner.publishing.lock().unwrap().take();
-        #[cfg(not(target_family = "wasm"))]
         if let Some(publishing) = publishing {
             publishing.abort();
             publishing.await.ok();
@@ -326,9 +309,7 @@ impl Inner {
     }
 
     fn addr(&self, key: EndpointId, relays: impl IntoIterator<Item = RelayUrl>) -> EndpointAddr {
-        #[allow(unused_mut)]
         let mut addr = relays.into_iter().fold(EndpointAddr::new(key), EndpointAddr::with_relay_url);
-        #[cfg(not(target_family = "wasm"))]
         if let Some(home) = &self.config.home {
             addr = addresses::read(home, &key).into_iter().fold(addr, EndpointAddr::with_ip_addr);
         }
@@ -426,7 +407,7 @@ impl Inner {
 
     fn offer(&self, link: &FileLink, holder: EndpointId) {
         let (events, hash) = (self.events.clone(), link.hash);
-        self.files.offer(link, holder, link.size <= self.config.file_limit, move |ok| {
+        self.files.offer(link, holder, move |ok| {
             if ok {
                 events.send(Event::Fetched(hash)).ok();
             }
@@ -458,7 +439,6 @@ impl ProtocolHandler for Handler {
 
 /// Sessions of one device find each other through `LETMEKNOW_HOME/addresses/<iroh key>.json`,
 /// which holds `{"addrs": ["<ip:port>", ...]}`.
-#[cfg(not(target_family = "wasm"))]
 mod addresses {
     use std::{
         net::SocketAddr,

@@ -49,16 +49,14 @@ A poll on a new TLS connection takes about 3.3 KB of egress, and on a kept one a
 - Test: a session polling through several `POLL`s makes one TLS handshake at the service.
 - Measure egress per poll at letmeknow.dev, on 0.19's service before and on 0.20's after, and with it the delivery time between online members at p99, which no test measures yet.
 
-## 6. No browser
+## 6. No browser (done)
 
 For: portability, now Linux, macOS, Windows and Android (Termux); one client; one fewer party that can replace the code people run.
 
-- Goes: `crates/web`; `web/`, with its build and test scripts; the browser half of `test/e2e.py`; the release's `frontend` job and asset; pages.yml's app build and its gate on the backend's health; the membership service's `--origin` and CORS answers, `serve`'s `APP` and its hidden `--public-logs`; the wasm32 builds of the node, core, net, membership and client crates, with their wasm gates, getrandom's `wasm_js`, `[profile.wasm]`, CI jobs and AGENTS.md checks; and the seams only the page needed: `Config.durable` and `Durable`, `MemoryProvider`'s save tracking, the wasm `spawn`.
-- `lmk-client`, now with one user, folds into the session, its seams for the page and for plugins gone.
-- `web/backend.json` and its reader move to `deploy/`, which `deploy/deploy.sh`, the release workflow and `deploy/check-backend.py` read; the pin lists (`test/pins.py`, `deploy/release.sh`, `test/deploy.py`) drop web files.
-- letmeknow.dev, where invite links point (`https://letmeknow.dev/i#…`), serves a static page from `site/`, published by pages.yml: what the link is, and the command that joins with it. The page's service worker clears the app's caches and unregisters, so that an installed 0.19 app gives way to it.
-- Docs: README's browser and trusted-frontend parts; SKILL's browser mentions; AGENTS.md's frontend and browser-database lines and its checks; deploy/README's frontend rollout.
-- Test: `test/e2e.py` runs its command-line path alone.
+- Gone: `crates/web`, `web/`, the browser half of `test/e2e.py`, the release's `frontend` job and asset, the wasm32 builds and gates, the membership service's `--origin`, CORS answers and hidden `--public-logs` (a request with an `Origin` is refused), and the seams only the page needed: `Config.durable`, the net's `Disk`, `MemoryProvider`'s save tracking, the wasm `spawn`. `Node::send` and `leave` no longer wait, so they are no longer async.
+- `deploy/backend.json` is what the release packages and `deploy/deploy.sh` checks the service against; a test holds it to the service built into `links.rs`.
+- letmeknow.dev serves `site/`, published from a tag by pages.yml: what letmeknow is, and for an invite link the commands that join with it. Its service worker takes the old app's place, deletes its caches and databases, and unregisters.
+- Left for the fold of `lmk-client` into the session, after step 7: the client's configuration on the device's own node (`Client::event`'s `Access::Here` branch, `take_adds`, crates/client/tests' harness).
 
 ## 7. No docs or tables
 

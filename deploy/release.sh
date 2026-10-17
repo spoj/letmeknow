@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 sed -i "0,/^version = \".*\"/s//version = \"$version\"/" Cargo.toml
 minor=${version%.*}
 if [ "${version##*.}" = 0 ]; then
-  sed -i "s#@letmeknow/cli@[0-9]*\.[0-9]*#@letmeknow/cli@$minor#g" README.md SKILL.md web/src/index.html web/src/main.ts AGENTS.md
+  sed -i "s#@letmeknow/cli@[0-9]*\.[0-9]*#@letmeknow/cli@$minor#g" README.md SKILL.md site/index.html AGENTS.md
 fi
 cargo update -w --offline
 git commit -q --allow-empty -am "$version"
@@ -33,5 +33,5 @@ gh release edit "v$version" --repo "$repo" --notes-file "$notes"
 [ "$(npm view "@letmeknow/cli@$version" version --prefer-online)" = "$version" ]
 echo "Published $version. Rollout (deploy/README.md):"
 echo "Backend: deploy/deploy.sh root@129.212.227.207 relay.letmeknow.dev $repo $run v$version $sha"
-echo "Frontend: gh workflow run pages.yml --repo $repo -f release_run=$run -f release_tag=v$version -f release_sha=$sha"
+echo "Site: gh workflow run pages.yml --repo $repo -f release_tag=v$version"
 if [ "${version##*.}" = 0 ]; then echo "pi-letmeknow, by hand: MINOR = \"$minor\" in extensions/letmeknow.ts"; fi

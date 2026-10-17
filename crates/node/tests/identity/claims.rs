@@ -123,7 +123,7 @@ async fn installed_bindings_survive_refresh_collision_restart_and_group_deletion
     let public = observer.node.read_public(&identity).await.unwrap();
     publish(&relay, &observer.node, &identity, public.next(&device, vec![])).await;
     observer.until(|e| matches!(e, Event::Left { member, .. } if member.name == "peer").then_some(())).await;
-    observer.node.leave(&gid.0).await.unwrap();
+    observer.node.leave(&gid.0).unwrap();
     assert_eq!(binding_record(&db).unwrap(), stored, "revocation and leaving all groups retain the baseline");
     observer.node.shutdown().await.unwrap();
     drop(observer);
@@ -219,70 +219,11 @@ async fn a_late_directory_response_cannot_observe_a_roster_that_was_left() {
         }
     }).await.unwrap();
     assert!(binding_record(&db).is_none());
-    observer.node.leave(&gid.0).await.unwrap();
+    observer.node.leave(&gid.0).unwrap();
     gate.set(true);
     tokio::time::timeout(WAIT, lookup).await.unwrap().unwrap().unwrap();
     assert!(binding_record(&db).is_none(), "an authenticated response authorizes no departed/historical roster");
     observer.node.shutdown().await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn observation_events_wait_for_storage_and_failure_never_releases_them() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    for fail in [false, true] {
-        let relay = relay().await;
-        let dir = folder(if fail { "observation-fail" } else { "observation-hold" });
-        let db = dir.join("observer.db");
-        std::fs::create_dir_all(&dir).unwrap();
-        let held = Arc::new(AtomicBool::new(false));
-        let release = Arc::new(tokio::sync::Notify::new());
-        let mut cfg = config(&relay, "observer", None, &[CHAT, KIND]);
-        let (holding, releasing) = (held.clone(), release.clone());
-        cfg.durable = Some(Arc::new(move || {
-            let (holding, releasing) = (holding.clone(), releasing.clone());
-            Box::pin(async move {
-                if holding.load(Ordering::SeqCst) {
-                    releasing.notified().await;
-                    anyhow::ensure!(!fail, "injected observation storage failure");
-                }
-                Ok(())
-            })
-        }));
-        let (node, events) = Node::start(SqliteProvider::open(&db).unwrap(), cfg).await.unwrap();
-        let mut observer = Session { node, events };
-        let (identity, device) = identity(&relay, &observer.node, relay.service.clone()).await;
-        let gid = observer.node.create(settings(CHAT, &relay), None).unwrap();
-        let peer = session(&relay, "peer").await;
-        peer.node.join(&observer.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), Some(certificate(&identity, &device, &peer.node.key(), "Ann", "phone"))).await.unwrap();
-        observer.until(|e| matches!(e, Event::Warning { text, .. } if text.contains("First locally observed")).then_some(())).await;
-        while observer.events.try_recv().is_ok() {}
-        held.store(true, Ordering::SeqCst);
-        peer.node.recertify(&gid.0, certificate(&identity, &device, &peer.node.key(), "Ann Lee", "phone")).await.unwrap();
-        // The observer's held storage holds back its hellos too, so no peer brings the commit: it asks for heads.
-        tokio::time::timeout(WAIT, async {
-            while !binding_record(&db).is_some_and(|r| String::from_utf8(r).unwrap().contains("Ann Lee")) {
-                observer.node.sync().await;
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }).await.expect("observation staged before output");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        while let Ok(e) = observer.events.try_recv() {
-            assert!(!matches!(e, Event::Warning { text, .. } if text.contains("Ann Lee")), "observation escaped held storage");
-        }
-        held.store(false, Ordering::SeqCst);
-        release.notify_waiters();
-        if fail {
-            observer.until(|e| matches!(e, Event::Warning { text, .. } if text.contains("injected observation storage failure")).then_some(())).await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            while let Ok(e) = observer.events.try_recv() {
-                assert!(!matches!(e, Event::Warning { text, .. } if text.contains("Ann Lee")), "observation escaped failed storage");
-            }
-        } else {
-            observer.until(|e| matches!(e, Event::Warning { text, .. } if text.contains("Ann Lee")).then_some(())).await;
-        }
-        observer.node.shutdown().await.unwrap();
-        peer.node.shutdown().await.unwrap();
-    }
 }
 
 static LATER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

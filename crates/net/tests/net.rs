@@ -1,13 +1,10 @@
 mod common;
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use common::*;
 use iroh::RelayUrl;
-use lmk_net::{Disk, Event};
+use lmk_net::Event;
 use n0_future::StreamExt;
 use lmk_proto::{
     Answer, Bytes, frame,
@@ -77,7 +74,7 @@ async fn file_from_two_holders_one_cut_off() {
     let (fake_a, fake_b, fake_c) = (Fake::new().with(G, group()), Fake::new().with(G, group()), Fake::new().with(G, group()));
     let a = node(&relay, keys[0].clone(), fake_a.clone(), Options::default()).await;
     let b = node(&relay, keys[1].clone(), fake_b.clone(), Options::default()).await;
-    // C, like a browser, goes through the relay, and would fetch only files up to 1 MiB unasked.
+    // C goes through the relay, and would fetch only files up to 1 MiB unasked.
     let c = node(&relay, keys[2].clone(), fake_c.clone(), Options { file_limit: 1 << 20, relay_only: true, ..Options::default() }).await;
 
     let plain: Vec<u8> = (0..16 << 20).map(|i: u32| (i % 251) as u8).collect();
@@ -131,137 +128,6 @@ async fn small_files_are_fetched_when_wanted() {
     assert_eq!(a.net.holders(G, link.hash).collect::<Vec<_>>().await, vec![members[1]]);
     a.net.shutdown().await.unwrap();
     b.net.shutdown().await.unwrap();
-}
-
-struct DiskWrite {
-    hash: [u8; 32],
-    reply: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
-}
-
-struct GatedDisk {
-    files: Arc<FakeDisk>,
-    writes: tokio::sync::mpsc::UnboundedSender<DiskWrite>,
-}
-
-impl Disk for GatedDisk {
-    fn has(&self, hash: &[u8; 32]) -> bool {
-        self.files.has(hash)
-    }
-
-    fn load(&self, hash: [u8; 32]) -> n0_future::boxed::BoxFuture<anyhow::Result<Vec<u8>>> {
-        self.files.load(hash)
-    }
-
-    fn save(&self, hash: [u8; 32], ciphertext: Vec<u8>) -> n0_future::boxed::BoxFuture<anyhow::Result<()>> {
-        let (reply, saved) = tokio::sync::oneshot::channel();
-        self.writes.send(DiskWrite { hash, reply }).unwrap();
-        let files = self.files.clone();
-        Box::pin(async move {
-            saved.await??;
-            files.save(hash, ciphertext).await
-        })
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn disk_acknowledgements_wait_for_persistence() {
-    let relay = relay().await;
-    let keys = keys(3);
-    let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
-    let group = || Group { members: members.clone(), ..Group::default() };
-    let (writes, mut writing) = tokio::sync::mpsc::unbounded_channel();
-    let disk = Arc::new(GatedDisk { files: Arc::default(), writes });
-    let a = node(&relay, keys[0].clone(), Fake::new().with(G, group()), Options::default()).await;
-    let mut b = node(&relay, keys[1].clone(), Fake::new().with(G, group()), Options { disk: Some(disk.clone()), ..Options::default() }).await;
-    a.net.dial(members[1], vec![relay.url.clone()], Box::pin(std::future::ready(vec![]))).await.unwrap();
-    b.until(|e| matches!(e, Event::Connected(..))).await;
-
-    let net = b.net.clone();
-    let added = tokio::spawn(async move { net.add_file(std::io::Cursor::new(b"not acknowledged".to_vec())).await });
-    let write = tokio::time::timeout(WAIT, writing.recv()).await.unwrap().unwrap();
-    assert!(!added.is_finished());
-    assert!(!disk.has(&write.hash));
-    assert!(!b.net.has(write.hash).await.unwrap());
-    write.reply.send(Err(anyhow::anyhow!("injected disk abort"))).unwrap();
-    assert!(added.await.unwrap().unwrap_err().to_string().contains("injected disk abort"));
-    assert!(!disk.has(&write.hash));
-
-    let link = a.net.add_file(std::io::Cursor::new(b"downloaded".to_vec())).await.unwrap();
-    for fake in [&a.fake, &b.fake] {
-        fake.groups.lock().unwrap().get_mut(G).unwrap().files.push(link.clone());
-    }
-    let raw = lmk_net::builder([relay.url.clone()]).secret_key(keys[2].clone())
-        .ca_tls_config(iroh::tls::CaTlsConfig::custom_roots([relay.cert.clone()])).bind().await.unwrap();
-    for commit in [false, true] {
-        let (net, fetching) = (b.net.clone(), link.clone());
-        let fetched = tokio::spawn(async move { net.fetch(G, &fetching).await });
-        let write = tokio::time::timeout(WAIT, writing.recv()).await.unwrap().unwrap();
-        assert_eq!(write.hash, link.hash);
-        assert!(!fetched.is_finished());
-        assert!(!b.net.has(link.hash).await.unwrap());
-        assert!(a.net.holders(G, link.hash).collect::<Vec<_>>().await.is_empty());
-        assert!(b.events.try_recv().is_err(), "no Fetched event precedes the disk commit");
-        let connection = raw.connect(iroh::EndpointAddr::new(members[1]).with_relay_url(relay.url.clone()), iroh_blobs::ALPN).await.unwrap();
-        let store = iroh_blobs::store::mem::MemStore::new();
-        let get = store.remote().execute_get(connection, iroh_blobs::protocol::GetRequest::all(iroh_blobs::Hash::from_bytes(link.hash))).complete();
-        assert!(tokio::time::timeout(WAIT, get).await.unwrap().is_err(), "raw blob requests cannot bypass the disk gate");
-        write.reply.send(if commit { Ok(()) } else { Err(anyhow::anyhow!("injected disk abort")) }).unwrap();
-        assert_eq!(fetched.await.unwrap().is_ok(), commit);
-        assert_eq!(b.net.has(link.hash).await.unwrap(), commit);
-        if commit {
-            b.until(|e| *e == Event::Fetched(link.hash)).await;
-            assert_eq!(a.net.holders(G, link.hash).collect::<Vec<_>>().await, vec![members[1]]);
-            let mut plain = Vec::new();
-            b.net.read_file(&link, &mut plain).await.unwrap();
-            assert_eq!(plain, b"downloaded");
-        } else {
-            assert!(b.events.try_recv().is_err(), "no Fetched event escapes the aborted save");
-            assert!(a.net.holders(G, link.hash).collect::<Vec<_>>().await.is_empty());
-        }
-    }
-    raw.close().await;
-    a.net.shutdown().await.unwrap();
-    b.net.shutdown().await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_disk_holds_and_serves_only_what_it_keeps() {
-    let relay = relay().await;
-    let keys = keys(3);
-    let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
-        let group = || Group { members: members.clone(), ..Group::default() };
-    let c_disk = Arc::new(FakeDisk::default());
-    let c = node(&relay, keys[2].clone(), Fake::new().with(G, group()), Options { disk: Some(c_disk.clone()), ..Options::default() }).await;
-    let kept = c.net.add_file(std::io::Cursor::new(b"kept".to_vec())).await.unwrap();
-    let fetched = c.net.add_file(std::io::Cursor::new(b"fetched".to_vec())).await.unwrap();
-    assert!(c_disk.has(&kept.hash) && c_disk.has(&fetched.hash), "a browser keeps the files it adds");
-    // A is a browser that keeps one file on its disk, not in memory, and fetches the other, over its limit, into memory.
-    let disk = Arc::new(FakeDisk::default());
-    disk.0.lock().unwrap().insert(kept.hash, c_disk.0.lock().unwrap()[&kept.hash].clone());
-    let options = Options { disk: Some(disk.clone()), file_limit: 0, ..Options::default() };
-    let a = node(&relay, keys[0].clone(), Fake::new().with(G, group()), options).await;
-    let b = node(&relay, keys[1].clone(), Fake::new().with(G, group()), Options { file_limit: 0, ..Options::default() }).await;
-    let own = a.net.add_file(std::io::Cursor::new(b"own".to_vec())).await.unwrap();
-    for fake in [&a.fake, &b.fake, &c.fake] {
-        fake.groups.lock().unwrap().get_mut(G).unwrap().files.extend([kept.clone(), fetched.clone(), own.clone()]);
-    }
-    assert!(a.net.has(kept.hash).await.unwrap());
-    a.net.dial(members[2], vec![relay.url.clone()], Box::pin(std::future::ready(vec![]))).await.unwrap();
-    a.net.fetch(G, &fetched).await.unwrap();
-    let mut out = Vec::new();
-    a.net.read_file(&fetched, &mut out).await.unwrap();
-    assert_eq!(out, b"fetched");
-    b.net.dial(members[0], vec![relay.url.clone()], Box::pin(std::future::ready(vec![]))).await.unwrap();
-    assert_eq!(b.net.holders(G, kept.hash).collect::<Vec<_>>().await, vec![members[0]], "A loads a kept file to serve it");
-    b.net.fetch(G, &kept).await.unwrap();
-    out.clear();
-    b.net.read_file(&kept, &mut out).await.unwrap();
-    assert_eq!(out, b"kept");
-    assert!(!disk.has(&fetched.hash) && b.net.holders(G, fetched.hash).collect::<Vec<_>>().await.is_empty(), "A keeps and serves no file over its limit that it fetched");
-    assert_eq!(b.net.holders(G, own.hash).collect::<Vec<_>>().await, vec![members[0]], "A serves a file it added, whatever its size");
-    for node in [&a, &b, &c] {
-        node.net.shutdown().await.unwrap();
-    }
 }
 
 /// Each request to be admitted goes on a stream of its own, answered there.

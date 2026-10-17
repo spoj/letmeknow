@@ -23,12 +23,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --no-fail-fast
-      - if: runner.os == 'Linux'
-        run: cargo build -p lmk-node -p lmk-core -p lmk-net -p lmk-membership -p lmk-client -p lmk-web --target wasm32-unknown-unknown
       # The client core, and the binaries released for Termux, build for Android, with the runner's NDK.
       - if: runner.os == 'Linux'
         run: |
@@ -36,37 +33,12 @@ jobs:
           ndk=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
           CC_aarch64_linux_android=$ndk/aarch64-linux-android24-clang AR_aarch64_linux_android=$ndk/llvm-ar \
             cargo check -p lmk-client -p letmeknow -p lmk-kinds --target aarch64-linux-android
-      - if: runner.os == 'Linux'
-        run: cargo clippy -p lmk-web --target wasm32-unknown-unknown --all-targets -- -D warnings
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # The browser client is the same on every OS, so only Linux builds and tests it.
-      - if: runner.os == 'Linux'
-        uses: taiki-e/install-action@v2
-        with:
-          tool: wasm-bindgen-cli@0.2.129
-      - if: runner.os == 'Linux'
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-      - if: runner.os == 'Linux'
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ hashFiles('web/package-lock.json') }}
-      - if: runner.os == 'Linux'
-        run: npm ci && npx playwright install --with-deps chromium-headless-shell
-        working-directory: web
       - if: runner.os == 'Linux'
         run: python -u test/deploy.py
       - if: runner.os == 'Linux'
         run: python -u test/pins.py
-      - run: python -u test/e2e.py ${{ runner.os != 'Linux' && '--no-browser' || '' }}
+      - run: python -u test/e2e.py
         timeout-minutes: 15
-      # After e2e.py, which builds web/pkg, the WebAssembly bindings the app imports.
-      - if: runner.os == 'Linux'
-        run: npm run check
-        working-directory: web

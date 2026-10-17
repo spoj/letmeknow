@@ -63,7 +63,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             st.group(gid)?.mls.settings().kind == IDENTITY
         };
         let rule = serde_json::to_value(Control::Invite { hash, expires, to })?;
-        let id = self.send(gid, &rule, None).await?;
+        let id = self.send(gid, &rule, None)?;
         let seq = self.inner.lock().record(gid, &id.0)?.context("the invite's message")?.header.seq;
         // The members online whose summaries hold the invite's message admit by it too: a member asked before its push
         // arrived would refuse the joiner.
@@ -126,7 +126,6 @@ impl<P: Provider + Send + 'static> Node<P> {
             let device_key = kept.device.map(|seed| seed.0.try_into()).transpose().ok().context("a device key is 32 bytes")?;
             (Join { secret, key_package: kept.key_package }, device_key)
         };
-        self.inner.durable().await?;
         // Each dial is a task of its own, so it goes on, and times out, while a member reached earlier is asked.
         let inviter_first = Instant::now() + INVITER_FIRST;
         let mut dials: FuturesUnordered<_> = members
@@ -179,16 +178,9 @@ impl<P: Provider + Send + 'static> Node<P> {
                 Ok(Ok(Answer::Ok(admitted))) => {
                     let gid = self.inner.welcomed(admitted, &join.key_package.0, peer, device_key).await?;
                     self.inner.lock().provider.delete(&joining)?;
-                    self.inner.durable().await?;
                     return Ok((gid, *peer.as_bytes()));
                 }
-                Ok(Ok(Answer::Refused { refused })) => {
-                    // The Add may already be logged: keep its KeyPackage to recover the Welcome after storage is fixed.
-                    if refused.starts_with(crate::PERSISTENCE_FAILED) {
-                        refused_by_all = false;
-                    }
-                    refusal = anyhow::anyhow!("refused: {refused}");
-                }
+                Ok(Ok(Answer::Refused { refused })) => refusal = anyhow::anyhow!("refused: {refused}"),
                 // The connection may have been replaced by one the member dialed meanwhile; asking again is safe, as a
                 // member that added this session answers with the Add it kept. The ask may have added it.
                 Ok(Err(error)) => {
@@ -364,7 +356,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
             )
         };
         admitted.doc = self.state_link(gid).await.map(|link| seal_link(&key, &link)).transpose()?.map(Bytes);
-        self.durable().await?;
         Ok(admitted)
     }
 }
