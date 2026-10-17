@@ -31,7 +31,6 @@ const SEALING_LABEL: &str = "letmeknow epoch log sealing v1";
 const ENVELOPE_DOMAIN: &[u8] = b"letmeknow epoch envelope v1\0";
 const MAX_INNER: usize = (1 << 20) - 45;
 const LIVE_LABEL: &str = "letmeknow live";
-const STATE_LABEL: &str = "letmeknow state";
 /// What a live payload's key is bound to, and its author's signature covers, before the group and epoch.
 const LIVE: &[u8] = b"letmeknow live v1\0";
 const NEIGHBOURS_LABEL: &str = "letmeknow neighbours";
@@ -195,11 +194,6 @@ pub fn key_package_reference<P: Provider>(provider: &P, key_package: &[u8]) -> R
     Ok(key_package_in(provider, key_package)?.hash_ref(provider.crypto())?.as_slice().try_into()?)
 }
 
-/// The leaf data a KeyPackage carries.
-pub fn key_package_leaf<P: Provider>(provider: &P, key_package: &[u8]) -> Result<Leaf> {
-    leaf_of(key_package_in(provider, key_package)?.leaf_node().extensions()).context("a KeyPackage without our leaf data")
-}
-
 fn key_package_in<P: Provider>(provider: &P, bytes: &[u8]) -> Result<KeyPackage> {
     let MlsMessageBodyIn::KeyPackage(key_package) = parse::<MlsMessageIn>(bytes)?.extract() else {
         bail!("not a KeyPackage")
@@ -331,9 +325,6 @@ pub struct Applied {
     pub gone: bool,
     /// The cut of the epoch it ended, by the members of that epoch: the removed ones' last.
     pub cut: Vec<Ref>,
-    /// For a commit this session made: the state key of the epoch it moved into, which its Add's answer seals a state
-    /// link under.
-    pub link_key: Option<Vec<u8>>,
     /// For a commit this session made that adds a member: its Welcome.
     pub admission: Option<Admission>,
 }
@@ -751,7 +742,6 @@ impl Group {
                 let staged = g.mls.pending_commit().expect("a posted commit is pending");
                 let aad = g.state.aad.clone();
                 let mut applied = observe(provider, &g.mls, &mut g.state, staged, by, aad, true)?;
-                applied.link_key = Some(staged.export_secret(provider.crypto(), STATE_LABEL, &state_context(g.id(), staged.epoch().as_u64()), 32)?);
                 applied.admission = g.state.posted.take().and_then(|posted| posted.admission);
                 g.mls.merge_pending_commit(provider)?;
                 return g.merged(provider, applied);
@@ -849,11 +839,6 @@ impl Group {
         [LIVE, self.id(), &epoch.to_be_bytes()].concat()
     }
 
-    /// The state key of the current epoch, under which the file links to its state are sealed.
-    pub fn state_secret<P: Provider>(&self, provider: &P) -> Result<Vec<u8>> {
-        Ok(self.mls.export_secret(provider.crypto(), STATE_LABEL, &state_context(self.id(), self.epoch()), 32)?)
-    }
-
     /// Seals a live payload under the current epoch's live key, signed by this session: `epoch ‖ nonce ‖ ciphertext` of
     /// `body ‖ sig`, the body `{"author", "nonce", "payload"}`, and its id, as `open_live` gives it. It uses none of the MLS
     /// ratchet.
@@ -893,25 +878,6 @@ impl Group {
         ensure!(live.payload["type"].is_string(), "a payload without a type");
         Ok((member, live.payload, held::id(sig)))
     }
-}
-
-/// Seals a file link to a group's state under the state key of its epoch: `nonce ‖ ciphertext`.
-pub fn seal_link(key: &[u8], link: &str) -> Result<Vec<u8>> {
-    let nonce = crate::random::<24>();
-    let ciphertext = XChaCha20Poly1305::new_from_slice(key)?.encrypt((&nonce).into(), link.as_bytes())?;
-    Ok([nonce.as_slice(), &ciphertext].concat())
-}
-
-/// Opens a file link sealed by `seal_link` under the same key.
-pub fn open_link(key: &[u8], sealed: &[u8]) -> Result<String> {
-    let (nonce, ciphertext) = sealed.split_at_checked(24).context("a state link too short")?;
-    let plaintext = XChaCha20Poly1305::new_from_slice(key)?.decrypt(nonce.try_into()?, ciphertext)
-        .map_err(|_| anyhow::anyhow!("a state link that does not open in this epoch"))?;
-    Ok(String::from_utf8(plaintext)?)
-}
-
-fn state_context(group: &[u8], epoch: u64) -> Vec<u8> {
-    [group, &epoch.to_be_bytes()].concat()
 }
 
 /// A live payload's signed body.
@@ -980,7 +946,6 @@ fn observe<P: Provider>(
         settings: staged.queued_proposals().any(|p| matches!(p.proposal(), Proposal::GroupContextExtensions(_))),
         gone: staged.self_removed(),
         cut: aad.cut,
-        link_key: None,
         admission: None,
     })
 }

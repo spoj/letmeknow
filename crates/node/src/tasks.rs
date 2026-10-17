@@ -31,7 +31,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         let ca = std::mem::take(&mut config.ca);
         let home = if config.chosen.is_empty() { config.relays.clone() } else { config.chosen.clone() };
         let endpoint = lmk_net::builder(home).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
-        let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), kinds: config.kinds.clone(), revision: REVISION };
+        let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), revision: REVISION };
         let clients = logs::Clients::new(config.post.clone());
         let state = State::open(provider, &config, leaf)?;
         let (events, events_rx) = mpsc::unbounded_channel();
@@ -45,7 +45,6 @@ impl<P: Provider + Send + 'static> Node<P> {
             chosen: config.chosen.clone(),
             resolve: config.resolve.clone(),
             file_limit: config.file_limit,
-            kinds: config.kinds,
             events,
             work,
             outbox,

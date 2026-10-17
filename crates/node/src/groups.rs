@@ -144,7 +144,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         for (epoch, _) in commits {
             st.provider.delete(&reading::commit_key(gid, epoch))?;
-            st.provider.delete(&reading::admitted_key(gid, epoch))?;
         }
         st.forget_heard(gid)?;
         let g = st.groups.remove(gid).context("this session is not in that group")?;

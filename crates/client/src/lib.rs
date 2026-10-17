@@ -1,8 +1,7 @@
-//! The client core: what one member does on top of its lmk-node session, alike in every client. It answers requests,
-//! turns the node's events into `ClientEvent`s with members described as this client knows them, has its device certify
-//! it for the identity it speaks as, and hosts kinds' plugins.
-//! A shell gives it storage (the node's provider), a network, the device's node, the plugins' transport, and shows or
-//! prints what it tells.
+//! The client core: what one member does on top of its lmk-node session. It answers requests, turns the node's events
+//! into `ClientEvent`s with members described as this client knows them, and has its device certify it for the identity
+//! it speaks as. A shell gives it storage (the node's provider), a network and the device's node, and prints what it
+//! tells.
 
 mod describe;
 mod request;
@@ -14,7 +13,7 @@ pub use request::{IdentityOp, Request};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use lmk_core::device::Device;
 use lmk_core::provider::Provider;
@@ -24,17 +23,12 @@ use lmk_proto::Bytes;
 use lmk_proto::group::{Attachment, CHAT, Certificate, ChatMessage, IDENTITY, How, IdentityRef, PROTOCOL, Service, Settings, UPDATE};
 use lmk_proto::links::{FileLink, Invite};
 use lmk_proto::peer::Seqs;
-use n0_future::time::{Duration, Instant, timeout};
-use n0_future::{Either, FutureExt};
+use n0_future::time::{Duration, timeout};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 
-/// How long the client waits for a plugin's answer, except to a command.
-const ASK_WAIT: Duration = Duration::from_secs(60);
-/// How long a plugin's `spread` waits for a member online to hold its file.
-const SPREAD_WAIT: Duration = Duration::from_secs(30);
 /// How long a file asked for may take to arrive.
 const FETCH_WAIT: Duration = Duration::from_secs(60);
 const NO_IDENTITY: &str = "this device is on no identity";
@@ -47,13 +41,6 @@ pub(crate) fn b64(bytes: &[u8]) -> String {
 
 pub fn message_id(hex_id: &str) -> Result<[u8; 32]> {
     hex::decode(hex_id).ok().and_then(|id| id.try_into().ok()).with_context(|| format!("{hex_id} is not a message id"))
-}
-
-/// Adds an object's fields to another.
-fn merge(into: &mut Value, from: Value) {
-    if let (Some(into), Value::Object(from)) = (into.as_object_mut(), from) {
-        into.extend(from);
-    }
 }
 
 /// letmeknow.dev's membership service.
@@ -120,23 +107,6 @@ impl DeviceState {
     }
 }
 
-/// Kinds' plugins, through whatever carries their messages, as a process's stdio. What they write
-/// reaches the client through the channel given to `Client::new`: each line with its kind, and `None` once a plugin
-/// stopped.
-pub trait Plugins: Send + Sync {
-    /// The kinds it has plugins for.
-    fn kinds(&self) -> Vec<String>;
-    /// Starts a kind's plugin; returns the fields of its `start` besides `kind`, such as `dir`.
-    fn start(&self, kind: &str) -> Result<Value>;
-    fn running(&self) -> Vec<String>;
-    fn send(&self, kind: &str, message: &Value) -> Result<()>;
-    /// A plugin's lines ended: whether it ran steadily, and may be started again.
-    fn stopped(&self, kind: &str) -> bool;
-    /// Stops a kind's plugin, as no group of its kind is left; its lines end without a `None`. Plugins that are no
-    /// process of their own have nothing to stop.
-    fn stop(&self, _kind: &str) {}
-}
-
 /// Seqs of one author's membership that a message needed and this client gave up on.
 #[derive(Debug, Serialize)]
 pub struct Missing {
@@ -186,15 +156,10 @@ pub enum ClientEvent {
     },
     /// Held messages lost, as `member` tells: this client's own, or as another member's summary tells, each seq once.
     Lost { group: Bytes, member: Described, messages: Vec<LostMessages> },
-    /// A sync of the group's held messages with a member ended.
-    Synced { group: Bytes },
     /// A member's summary of the group came: who holds and read what may have changed (`Client::receipts`).
     Heard { group: Bytes },
     /// A file is held whole.
     File { hash: String },
-    /// An event of a kind's plugin: by the delivery policy, waking with `wake`; with `key`, it replaces a held one with
-    /// the same key.
-    Plugin { group: Bytes, kind: String, event: serde_json::Map<String, Value>, wake: bool, key: Option<String> },
     /// The devices of this device's identity changed.
     Identity { identity: Bytes },
     /// This client joined a group by an add that `device`, another of its identity's devices, sent: what `join` answered.
@@ -213,9 +178,7 @@ impl ClientEvent {
             | ClientEvent::Settings { group, .. }
             | ClientEvent::Message { group, .. }
             | ClientEvent::Lost { group, .. }
-            | ClientEvent::Synced { group }
-            | ClientEvent::Heard { group }
-            | ClientEvent::Plugin { group, .. } => Some(group),
+            | ClientEvent::Heard { group } => Some(group),
             ClientEvent::Warning { group, .. } => group.as_ref(),
             ClientEvent::File { .. } | ClientEvent::Identity { .. } | ClientEvent::Added { .. } => None,
         }
@@ -238,36 +201,12 @@ pub struct File {
     pub data: Vec<u8>,
 }
 
-/// What waits for a plugin's answer.
-enum Waiter {
-    Answer(oneshot::Sender<Result<Value>>),
-    Snapshot(oneshot::Sender<Option<Vec<u8>>>),
-}
-
 #[derive(Default)]
 struct State {
-    /// The kind of each group a plugin was told of.
-    kind_of: HashMap<Bytes, String>,
-    /// The last id this client gave a request to a plugin.
-    asked: u64,
-    waiting: HashMap<(String, u64), Waiter>,
     /// Files waited for, by hash.
     files: Vec<([u8; 32], oneshot::Sender<()>)>,
-    /// What plugins show of their groups in `groups`.
-    infos: HashMap<Bytes, Value>,
-    /// What a group's kind is told before it opens, as a joiner's state may come: its latest state and synced of each
-    /// member.
-    held: HashMap<Bytes, Vec<Value>>,
     /// The invite secrets this session is joining by.
     joining: HashSet<Vec<u8>>,
-}
-
-impl State {
-    fn wait_for(&mut self, kind: &str, waiter: Waiter) -> u64 {
-        self.asked += 1;
-        self.waiting.insert((kind.to_owned(), self.asked), waiter);
-        self.asked
-    }
 }
 
 /// What another member holds and shows of a group, as its latest summary says.
@@ -314,8 +253,6 @@ struct Inner<P> {
     node: Node<P>,
     config: Config,
     access: Mutex<Access<P>>,
-    plugins: Arc<dyn Plugins>,
-    lines: tokio::sync::Mutex<mpsc::UnboundedReceiver<(String, Option<Value>)>>,
     state: Mutex<State>,
     events: mpsc::UnboundedSender<ClientEvent>,
     /// Held while a pass takes the adds for this device.
@@ -337,20 +274,12 @@ impl<P> Clone for Client<P> {
 }
 
 impl<P: Provider + Send + 'static> Client<P> {
-    pub fn new(
-        node: Node<P>,
-        config: Config,
-        access: Access<P>,
-        plugins: Arc<dyn Plugins>,
-        lines: mpsc::UnboundedReceiver<(String, Option<Value>)>,
-    ) -> (Self, mpsc::UnboundedReceiver<ClientEvent>) {
+    pub fn new(node: Node<P>, config: Config, access: Access<P>) -> (Self, mpsc::UnboundedReceiver<ClientEvent>) {
         let (events, told) = mpsc::unbounded_channel();
         let inner = Inner {
             node,
             config,
             access: Mutex::new(access),
-            plugins,
-            lines: tokio::sync::Mutex::new(lines),
             state: Mutex::default(),
             events,
             taking: tokio::sync::Mutex::new(()),
@@ -390,21 +319,14 @@ impl<P: Provider + Send + 'static> Client<P> {
         self.emit(ClientEvent::Warning { group: group.cloned(), text });
     }
 
-    /// Tells the plugins of its groups' kinds of the groups, as when the client starts.
-    pub async fn start(&self) {
+    /// Refreshes its identity claims in the background, as when the client starts.
+    pub fn start(&self) {
         let client = self.clone();
         n0_future::task::spawn(async move {
             for error in client.refresh_identity().await {
                 client.warn(None, format!("refreshing identity claims: {error:#}"));
             }
         });
-        for gid in self.inner.node.groups() {
-            if self.inner.node.settings(&gid.0).is_ok_and(|s| s.kind != CHAT && s.kind != IDENTITY)
-                && let Err(error) = self.open_kind(&gid, None).await
-            {
-                self.warn(Some(&gid), format!("{error:#}"));
-            }
-        }
     }
 
     /// The device's state: from its node if it runs here, else as published.
@@ -440,10 +362,8 @@ impl<P: Provider + Send + 'static> Client<P> {
             return remote.request(request).await;
         }
         match request {
-            Request::Invite { group, kind, name, args, cwd, carry, membership, to, qr: _ } => {
-                self.invite(group, kind, name, (args, cwd), carry, membership, to).await
-            }
-            Request::Join { target, args, cwd } => self.join(target, (args, cwd)).await,
+            Request::Invite { group, name, carry, membership, to, qr: _ } => self.invite(group, name, carry, membership, to).await,
+            Request::Join { target } => self.join(target).await,
             Request::Add { target, group } => self.add(&target, group).await,
             Request::Deliver { add } => {
                 self.devices()?.deliver(&add).await?;
@@ -451,7 +371,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             }
             Request::Members { group } => {
                 let gid = self.resolve(group)?;
-                Ok(json!({ "group": b64(&gid.0), "kind": self.inner.node.settings(&gid.0)?.kind, "members": self.described_members(&gid)? }))
+                Ok(json!({ "group": b64(&gid.0), "members": self.described_members(&gid)? }))
             }
             Request::Groups => self.groups(),
             Request::Remove { group, member } => {
@@ -477,32 +397,19 @@ impl<P: Provider + Send + 'static> Client<P> {
 
     // Groups.
 
-    #[allow(clippy::too_many_arguments)]
-    async fn invite(
-        &self,
-        group: Option<String>,
-        kind: String,
-        name: Option<String>,
-        args: (Vec<String>, String),
-        carry: u32,
-        membership: Option<String>,
-        to: Option<String>,
-    ) -> Result<Value> {
+    async fn invite(&self, group: Option<String>, name: Option<String>, carry: u32, membership: Option<String>, to: Option<String>) -> Result<Value> {
         let to = to.map(|to| URL_SAFE_NO_PAD.decode(&to).ok().filter(|id| id.len() == 32).map(Bytes).context("--to takes an identity's id, as `members` shows it")).transpose()?;
         let mut answer = json!({ "expires_in": INVITE_VALID / 1000 });
         let gid = match group {
             Some(group) => self.resolve(Some(group))?,
             None => {
                 let membership = membership.map(|m| service(&m)).transpose()?.unwrap_or(self.inner.config.membership.clone());
-                let settings = Settings { protocol: PROTOCOL, kind, name: name.unwrap_or_default(), carry, update: UPDATE, membership, public: None, rest: Default::default() };
-                let (gid, opened) = self.create(settings, args).await?;
-                merge(&mut answer, opened);
-                gid
+                let settings = Settings { protocol: PROTOCOL, kind: CHAT.into(), name: name.unwrap_or_default(), carry, update: UPDATE, membership, public: None, rest: Default::default() };
+                self.inner.node.create(settings, self.speaking_as().await?)?
             }
         };
         let settings = self.inner.node.settings(&gid.0)?;
         answer["group"] = json!(b64(&gid.0));
-        answer["kind"] = json!(settings.kind);
         if !settings.name.is_empty() {
             answer["name"] = json!(settings.name);
         }
@@ -552,7 +459,7 @@ impl<P: Provider + Send + 'static> Client<P> {
         let settings = self.inner.node.settings(&gid.0)?;
         let expires = lmk_proto::clock::now() + ADD_VALID;
         let link = self.inner.node.invite(&gid.0, Some(key.clone()), ADD_VALID).await?.link();
-        let add = Add { device: key, session: session.clone(), group: gid.clone(), kind: settings.kind, name: settings.name, link: link.clone(), expires };
+        let add = Add { device: key, session: session.clone(), group: gid.clone(), name: settings.name, link: link.clone(), expires };
         Box::pin(self.request(Request::Deliver { add })).await?;
         Ok(json!({ "group": b64(&gid.0), "device": device["name"], "session": session, "link": link, "expires_in": ADD_VALID / 1000 }))
     }
@@ -564,7 +471,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             return Ok(Value::Null);
         }
         self.inner.adding.lock().unwrap().insert(group.clone(), Vec::new());
-        let joined = self.join(link.to_owned(), (Vec::new(), String::new())).await;
+        let joined = self.join(link.to_owned()).await;
         // Under the lock, so that no event of the group comes between.
         let mut adding = self.inner.adding.lock().unwrap();
         let held = adding.remove(group).unwrap_or_default();
@@ -594,40 +501,17 @@ impl<P: Provider + Send + 'static> Client<P> {
         }
     }
 
-    /// Makes a group, speaking as the device's identity if it has one, and tells its kind's plugin, with the arguments
-    /// `invite` has for the kind and the directory they are relative to; returns its id and what the plugin answered.
-    pub async fn create(&self, settings: Settings, (args, cwd): (Vec<String>, String)) -> Result<(Bytes, Value)> {
-        let kind = settings.kind.clone();
-        ensure!(
-            kind == CHAT || self.inner.plugins.kinds().contains(&kind),
-            "this session has no plugin for {kind} groups (letmeknow-kind-{kind})"
-        );
-        ensure!(args.is_empty() || kind != CHAT, "a chat takes no arguments");
-        let gid = self.inner.node.create(settings, self.speaking_as().await?)?;
-        if kind == CHAT {
-            return Ok((gid, json!({})));
-        }
-        match self.open_kind(&gid, Some(("invite", args, cwd))).await {
-            Ok(opened) => Ok((gid, opened)),
-            Err(error) => {
-                self.inner.node.leave(&gid.0)?;
-                self.drop_group(&gid).await?;
-                Err(error)
-            }
-        }
-    }
-
-    async fn join(&self, link: String, args: (Vec<String>, String)) -> Result<Value> {
+    async fn join(&self, link: String) -> Result<Value> {
         let invite = Invite::parse(link.trim())?;
         // As the node's, which share one KeyPackage per invite.
         let key = invite.secret.to_vec();
         ensure!(self.state().joining.insert(key.clone()), "this session is joining that already: wait for that join to end");
-        let joined = self.join_by(invite, args).await;
+        let joined = self.join_by(invite).await;
         self.state().joining.remove(&key);
         joined
     }
 
-    async fn join_by(&self, invite: Invite, (args, cwd): (Vec<String>, String)) -> Result<Value> {
+    async fn join_by(&self, invite: Invite) -> Result<Value> {
         if invite.device {
             self.devices()?.join(&invite).await?;
             return Ok(json!({ "device": "this device joined the identity" }));
@@ -635,25 +519,12 @@ impl<P: Provider + Send + 'static> Client<P> {
         let node = &self.inner.node;
         let gid = node.join(&invite, self.speaking_as().await?).await?.0;
         let settings = node.settings(&gid.0)?;
-        let mut answer = json!({ "group": b64(&gid.0), "kind": settings.kind, "name": settings.name, "members": self.described_members(&gid)? });
-        if settings.kind != CHAT {
-            match self.open_kind(&gid, Some(("join", args, cwd))).await {
-                Ok(opened) => merge(&mut answer, opened),
-                Err(error) => {
-                    // Unless it was left or removed meanwhile.
-                    if node.groups().contains(&gid) {
-                        node.leave(&gid.0)?;
-                    }
-                    return Err(error);
-                }
-            }
-        }
-        Ok(answer)
+        Ok(json!({ "group": b64(&gid.0), "name": settings.name, "members": self.described_members(&gid)? }))
     }
 
     async fn leave(&self, gid: &Bytes) -> Result<Value> {
         if self.inner.node.leave(&gid.0)?.is_none() {
-            self.drop_group(gid).await?;
+            self.drop_group(gid)?;
             return Ok(json!({ "group": b64(&gid.0), "left": true }));
         }
         Ok(json!({ "group": b64(&gid.0), "left": true, "pending": true, "status": "a member removes this session once a cut keeps its leave" }))
@@ -667,21 +538,8 @@ impl<P: Provider + Send + 'static> Client<P> {
         Ok(answer)
     }
 
-    /// Lets go of a group the node has left: tells its kind's plugin, and the shell.
-    async fn drop_group(&self, gid: &Bytes) -> Result<()> {
-        let kind = {
-            let mut st = self.state();
-            st.infos.remove(gid);
-            st.held.remove(gid);
-            st.kind_of.remove(gid)
-        };
-        if let Some(kind) = kind {
-            // Answered once the plugin let go of the group, so that a doc file it made is gone when `leave` returns.
-            self.ask(&kind, json!({ "type": "gone", "group": b64(&gid.0) })).await?;
-            if !self.state().kind_of.values().any(|k| *k == kind) {
-                self.inner.plugins.stop(&kind);
-            }
-        }
+    /// Lets go of a group the node has left: tells the shell.
+    fn drop_group(&self, gid: &Bytes) -> Result<()> {
         self.emit(ClientEvent::Gone { group: gid.clone() });
         self.inner.node.scrub()
     }
@@ -692,14 +550,11 @@ impl<P: Provider + Send + 'static> Client<P> {
         for gid in node.groups() {
             let settings = node.settings(&gid.0)?;
             let mut group = json!({
-                "group": b64(&gid.0), "kind": settings.kind, "members": node.members(&gid.0)?.len(), "carry": settings.carry,
+                "group": b64(&gid.0), "members": node.members(&gid.0)?.len(), "carry": settings.carry,
                 "membership": settings.membership, "epoch": node.epoch(&gid.0)?,
             });
             if !settings.name.is_empty() {
                 group["name"] = json!(settings.name);
-            }
-            if let Some(info) = self.state().infos.get(&gid) {
-                merge(&mut group, info.clone());
             }
             groups.push(group);
         }
@@ -910,7 +765,7 @@ impl<P: Provider + Send + 'static> Client<P> {
                 if let Event::Message(message) = &event
                     && devices.identity_of(&message.group.0).is_some()
                 {
-                    // A join waits on events, as a doc's state.
+                    // A join waits on events.
                     let client = self.clone();
                     n0_future::task::spawn(async move { client.take_adds().await });
                     return;
@@ -961,7 +816,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             Event::Removed { group, by, not_kept, .. } => {
                 let by = by.map(|by| self.describe(&group, &by)).transpose()?;
                 let not_kept = not_kept.iter().map(|id| hex::encode(&id.0)).collect();
-                self.drop_group(&group).await?;
+                self.drop_group(&group)?;
                 self.emit(ClientEvent::Removed { group, by, not_kept });
             }
             Event::Settings { group, settings, by } => {
@@ -983,33 +838,15 @@ impl<P: Provider + Send + 'static> Client<P> {
             }
             // No other kind holds messages.
             Event::Message(_) => {}
-            Event::Live { group, sender, payload } => {
-                let item = json!({ "type": "message", "from": self.describe(&group, &sender)?, "payload": payload });
-                self.tell_plugin(&group, item)?;
-            }
+            // A chat has no live payloads, and an identity group's are the identity kind's.
+            Event::Live { .. } | Event::Synced { .. } => {}
             Event::Lost(lost) => {
                 let describer = self.describer(&lost.group)?;
                 let member = describer.describe(&lost.member);
                 let messages = lost.messages.iter().map(|of| LostMessages { from: describer.describe(&of.from), seqs: of.seqs.clone(), ids: of.ids.iter().map(|id| hex::encode(&id.0)).collect() });
                 self.emit(ClientEvent::Lost { group: lost.group, member, messages: messages.collect() });
             }
-            Event::Synced { group, member } => {
-                let item = json!({ "type": "synced", "member": self.describe(&group, &member)? });
-                self.tell_plugin(&group, item)?;
-                self.emit(ClientEvent::Synced { group });
-            }
             Event::Heard { group } => self.emit(ClientEvent::Heard { group }),
-            Event::State { group, from, data } => {
-                let item = json!({ "type": "state", "from": self.describe(&group, &from)?, "data": Bytes(data) });
-                self.tell_plugin(&group, item)?;
-            }
-            Event::Snapshot { group, reply } => {
-                let kind = self.state().kind_of.get(&group).cloned();
-                if let Some(kind) = kind {
-                    let id = self.state().wait_for(&kind, Waiter::Snapshot(reply));
-                    self.inner.plugins.send(&kind, &json!({ "type": "snapshot", "id": id, "group": b64(&group.0) }))?;
-                }
-            }
             Event::File(hash) => {
                 let arrived: Vec<oneshot::Sender<()>> = {
                     let mut st = self.state();
@@ -1053,8 +890,8 @@ impl<P: Provider + Send + 'static> Client<P> {
         Ok(describer.members.iter().map(|m| describer.describe(m)).collect())
     }
 
-    /// This client's groups but identity groups, as its identity's devices hear of them: each one's id, name and kind,
-    /// and its other members as they show.
+    /// This client's groups but identity groups, as its identity's devices hear of them: each one's id and name, and its
+    /// other members as they show.
     pub fn session_groups(&self) -> Result<Vec<SessionGroup>> {
         let node = &self.inner.node;
         let mut groups = Vec::new();
@@ -1066,7 +903,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             }
             let members = self.described_members(&gid)?.into_iter().filter(|m| !m.you);
             let members = members.map(|m| Ok(shown(&serde_json::to_value(m)?))).collect::<Result<_>>()?;
-            groups.push(SessionGroup { session: None, group: gid, name: settings.name, kind: settings.kind, members });
+            groups.push(SessionGroup { session: None, group: gid, name: settings.name, members });
         }
         Ok(groups)
     }
@@ -1191,254 +1028,6 @@ impl<P: Provider + Send + 'static> Client<P> {
                 Ok(json!({ "identity": identity.id, "removed": key }))
             }
         }
-    }
-
-    // Kinds' plugins.
-
-    /// Tells a group's kind's plugin of the group, starting the plugin if need be, with the arguments of `invite` or
-    /// `join` and the directory they are relative to. Returns the plugin's answer, when it is asked one.
-    async fn open_kind(&self, gid: &Bytes, args: Option<(&str, Vec<String>, String)>) -> Result<Value> {
-        let settings = self.inner.node.settings(&gid.0)?;
-        let kind = settings.kind.clone();
-        if !self.inner.plugins.running().contains(&kind) {
-            self.start_plugin(&kind).await?;
-        }
-        let me = self.describe_key(gid, &self.inner.node.key())?;
-        let mut message = json!({ "type": "group", "group": b64(&gid.0), "settings": settings, "me": me });
-        let (answer, answered) = oneshot::channel();
-        // At once: the plugin hears of the group, then what was held for it, then what comes for it. A group let go of
-        // while the plugin started is not told of, as letting go of it told the plugin nothing.
-        let asked = {
-            let mut st = self.state();
-            ensure!(self.inner.node.groups().contains(gid), "{} is gone", b64(&gid.0));
-            let asked = args.map(|(command, args, cwd)| {
-                message["command"] = json!(command);
-                message["args"] = json!(args);
-                message["cwd"] = json!(cwd);
-                let id = st.wait_for(&kind, Waiter::Answer(answer));
-                message["id"] = json!(id);
-                id
-            });
-            self.inner.plugins.send(&kind, &message)?;
-            st.kind_of.insert(gid.clone(), kind.clone());
-            for item in st.held.remove(gid).into_iter().flatten() {
-                self.inner.plugins.send(&kind, &item)?;
-            }
-            asked
-        };
-        match asked {
-            Some(id) => self.answered(&kind, id, answered).await,
-            None => Ok(json!({})),
-        }
-    }
-
-    /// Starts a kind's plugin, and waits until it answers `start`.
-    async fn start_plugin(&self, kind: &str) -> Result<()> {
-        let mut start = self.inner.plugins.start(kind)?;
-        start["type"] = json!("start");
-        start["kind"] = json!(kind);
-        self.ask(kind, start).await?;
-        Ok(())
-    }
-
-    /// Passes a command to a kind's plugin: `letmeknow <kind> <args>...`, run in `cwd`. The plugin's answer comes on
-    /// the receiver, or an error once the plugin stops.
-    pub async fn command(&self, kind: &str, args: Vec<String>, cwd: String) -> Result<oneshot::Receiver<Result<Value>>> {
-        if !self.inner.plugins.running().iter().any(|running| running == kind) {
-            self.start_plugin(kind).await?;
-        }
-        let (answer, answered) = oneshot::channel();
-        let id = self.state().wait_for(kind, Waiter::Answer(answer));
-        self.inner.plugins.send(kind, &json!({ "type": "command", "id": id, "args": args, "cwd": cwd }))?;
-        Ok(answered)
-    }
-
-    /// Sends a plugin a message about one of its groups, if it has the group, or holds a state or synced till it does.
-    fn tell_plugin(&self, gid: &Bytes, mut message: Value) -> Result<()> {
-        message["group"] = json!(b64(&gid.0));
-        let kinded = message["type"] != "message" && self.inner.node.settings(&gid.0).is_ok_and(|s| s.kind != CHAT && s.kind != IDENTITY);
-        let mut st = self.state();
-        match st.kind_of.get(gid) {
-            Some(kind) => self.inner.plugins.send(kind, &message)?,
-            None if kinded => {
-                let held = st.held.entry(gid.clone()).or_default();
-                held.retain(|item| item["type"] != message["type"] || item["member"]["fp"] != message["member"]["fp"]);
-                held.push(message);
-            }
-            None => {}
-        }
-        Ok(())
-    }
-
-    /// Asks a plugin, and takes in what plugins write meanwhile, until it answers.
-    async fn ask(&self, kind: &str, mut message: Value) -> Result<Value> {
-        let (answer, answered) = oneshot::channel();
-        let id = self.state().wait_for(kind, Waiter::Answer(answer));
-        message["id"] = json!(id);
-        self.inner.plugins.send(kind, &message)?;
-        self.answered(kind, id, answered).await
-    }
-
-    async fn answered(&self, kind: &str, id: u64, mut answered: oneshot::Receiver<Result<Value>>) -> Result<Value> {
-        let deadline = Instant::now() + ASK_WAIT;
-        loop {
-            // A line is taken in whole, even if the answer comes meanwhile.
-            let next = async { Either::Left((&mut answered).await) }.or(async { Either::Right(self.next_line().await) });
-            match timeout(deadline.saturating_duration_since(Instant::now()), next).await {
-                Err(_) => {
-                    self.state().waiting.remove(&(kind.to_owned(), id));
-                    bail!("the {kind} plugin did not answer");
-                }
-                Ok(Either::Left(answer)) => return answer.map_err(|_| anyhow!("the {kind} plugin stopped"))?,
-                Ok(Either::Right((from, line))) => Box::pin(self.plugin_line(from, line)).await,
-            }
-        }
-    }
-
-    /// The next line a plugin wrote, for `plugin_line`.
-    pub async fn next_line(&self) -> (String, Option<Value>) {
-        match self.inner.lines.lock().await.recv().await {
-            Some(line) => line,
-            None => std::future::pending().await,
-        }
-    }
-
-    /// Brings every plugin into step, as before what the user acts on is shown, and before a command.
-    pub async fn sync_kinds(&self) {
-        for kind in self.inner.plugins.running() {
-            if let Err(error) = self.ask(&kind, json!({ "type": "sync" })).await {
-                self.warn(None, format!("{error:#}"));
-            }
-        }
-    }
-
-    /// Tells a plugin that its event with `key` of a group was shown.
-    pub fn printed(&self, kind: &str, group: &str, key: &str) {
-        self.inner.plugins.send(kind, &json!({ "type": "printed", "group": group, "key": key })).ok();
-    }
-
-    /// A line a plugin wrote, or `None` once it stopped, when it is started again if it ran steadily.
-    pub async fn plugin_line(&self, kind: String, line: Option<Value>) {
-        let Some(message) = line else {
-            // What waits for its answers hears that it stopped.
-            self.state().waiting.retain(|(of, _), _| *of != kind);
-            if !self.inner.plugins.stopped(&kind) {
-                self.warn(None, format!("the {kind} plugin stopped; it runs again once this session restarts"));
-                return;
-            }
-            self.warn(None, format!("the {kind} plugin stopped; starting it again"));
-            let restarted = async {
-                self.start_plugin(&kind).await?;
-                let gids: Vec<Bytes> = self.state().kind_of.iter().filter(|(_, k)| **k == kind).map(|(gid, _)| gid.clone()).collect();
-                for gid in gids {
-                    if let Err(error) = self.open_kind(&gid, None).await {
-                        self.warn(Some(&gid), format!("{error:#}"));
-                    }
-                }
-                anyhow::Ok(())
-            };
-            if let Err(error) = restarted.await {
-                self.warn(None, format!("{error:#}"));
-            }
-            return;
-        };
-        if let Err(error) = self.carry_out(&kind, &message).await {
-            match message.get("id") {
-                Some(id) if message["type"] != "answer" => self.answer(&kind, id.clone(), Err(error)),
-                _ => {
-                    let gid = message["group"].as_str().and_then(|g| URL_SAFE_NO_PAD.decode(g).ok()).map(Bytes);
-                    self.warn(gid.as_ref(), format!("the {kind} plugin: {error:#}"));
-                }
-            }
-        }
-    }
-
-    /// Answers a plugin's request.
-    fn answer(&self, kind: &str, id: Value, answer: Result<Value>) {
-        let message = match answer {
-            Ok(answer) => json!({ "type": "answer", "id": id, "answer": answer }),
-            Err(error) => json!({ "type": "answer", "id": id, "error": format!("{error:#}") }),
-        };
-        if let Err(error) = self.inner.plugins.send(kind, &message) {
-            self.warn(None, format!("{error:#}"));
-        }
-    }
-
-    /// Carries out what a plugin asks, through its groups' channels.
-    async fn carry_out(&self, kind: &str, message: &Value) -> Result<()> {
-        let node = &self.inner.node;
-        let group = || -> Result<Bytes> {
-            let gid = Bytes(URL_SAFE_NO_PAD.decode(message["group"].as_str().context("no group")?)?);
-            ensure!(self.state().kind_of.get(&gid).is_some_and(|k| k == kind), "not a {kind} group of this session");
-            Ok(gid)
-        };
-        let to = message["to"].as_str();
-        let id = message["id"].clone();
-        match message["type"].as_str().unwrap_or_default() {
-            "send" => node.send_live(&group()?.0, &message["payload"], to)?,
-            // These take a while: they are answered without holding up the client.
-            "spread" => {
-                let (client, gid, kind) = (self.clone(), group()?, kind.to_owned());
-                let link = FileLink::parse(message["link"].as_str().context("no link")?)?;
-                n0_future::task::spawn(async move {
-                    let holders = client.inner.node.holders(&gid.0, &link, SPREAD_WAIT).await;
-                    let held_by = client.describer(&gid).map(|describer| json!({ "held_by": holders.iter().map(|m| describer.describe(m)).collect::<Vec<_>>() }));
-                    client.answer(&kind, id, held_by);
-                });
-            }
-            "add" => {
-                let data = serde_json::from_value::<Bytes>(message["data"].clone())?.0;
-                let link = node.add_file(&group()?.0, data).await?;
-                self.answer(kind, id, Ok(json!({ "link": link.link() })));
-            }
-            "hold" => node.hold(&group()?.0, &serde_json::from_value::<Vec<String>>(message["links"].clone())?)?,
-            "links" => node.set_links(&group()?.0, serde_json::from_value(message["links"].clone())?)?,
-            "fetch" => {
-                let (client, gid) = (self.clone(), group()?);
-                let link = FileLink::parse(message["link"].as_str().context("no link")?)?;
-                ensure!(node.linked(&gid.0).contains(&link), "the group does not link that file");
-                let kind = kind.to_owned();
-                n0_future::task::spawn(async move {
-                    let fetched = client.fetched(&gid, &link).await.map(|data| json!({ "data": Bytes(data) }));
-                    client.answer(&kind, id, fetched);
-                });
-            }
-            "state" => {
-                let data = serde_json::from_value::<Bytes>(message["data"].clone())?.0;
-                node.hand_state(&group()?.0, to.context("a state goes to a member")?, data).await?;
-            }
-            "event" => {
-                let gid = group()?;
-                let event = message["event"].as_object().context("no event")?.clone();
-                if event.get("type") == Some(&json!("warning")) {
-                    self.warn(Some(&gid), event.get("text").and_then(Value::as_str).unwrap_or_default().to_owned());
-                    return Ok(());
-                }
-                let key = message["key"].as_str().map(str::to_owned);
-                self.emit(ClientEvent::Plugin { group: gid, kind: kind.to_owned(), event, wake: message["wake"] == true, key });
-            }
-            "info" => {
-                let gid = group()?;
-                self.state().infos.insert(gid, message["info"].clone());
-            }
-            "answer" => {
-                let waiter = self.state().waiting.remove(&(kind.to_owned(), id.as_u64().unwrap_or_default()));
-                match waiter {
-                    Some(Waiter::Answer(answered)) => drop(answered.send(match &message["error"] {
-                        Value::Null => Ok(message["answer"].clone()),
-                        error => Err(anyhow!("{}", error.as_str().unwrap_or_default())),
-                    })),
-                    Some(Waiter::Snapshot(reply)) => {
-                        drop(reply.send(message["answer"]["data"].as_str().and_then(|data| URL_SAFE_NO_PAD.decode(data).ok())))
-                    }
-                    None => {}
-                }
-            }
-            // A newer plugin's: a request is refused, anything else skipped.
-            _ if id.is_null() => {}
-            other => bail!("unknown request {other:?}"),
-        }
-        Ok(())
     }
 }
 

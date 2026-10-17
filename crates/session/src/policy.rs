@@ -18,15 +18,14 @@ pub fn mentions(text: &str, member: &Value) -> bool {
     })
 }
 
-/// Messages addressed to this session (by `to` or by mention), answering one of its messages, or urgent; doc edits that
-/// mention it; `lost`; and `removed`, which a `sessions remove` waits for. Membership and settings changes wait, as other
+/// Messages addressed to this session (by `to` or by mention), answering one of its messages, or urgent; `lost`; and
+/// `removed`, which a `sessions remove` waits for. Membership and settings changes wait, as other
 /// members' messages do: each wakes every agent of the group, and seldom needs one.
 pub fn wakes(item: &Value, mine: impl Fn(&str) -> bool) -> bool {
     match item["type"].as_str() {
         Some("message") => {
             item["direct"] == true || item["urgent"] == true || item["reply_to"].as_str().is_some_and(mine)
         }
-        Some("edited") => item["direct"] == true,
         Some("lost" | "removed") => true,
         _ => false,
     }
@@ -84,15 +83,6 @@ impl Outbox {
         self.held_since.map(|since| since + hold)
     }
 
-    /// Drops a held event of a group that a plugin's newer one with the same key (`printed`) replaces.
-    pub fn take_keyed(&mut self, group: &Value, printed: &Value) {
-        self.held.retain(|item| item["group"] != *group || item["printed"] != *printed);
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.out.is_empty()
-    }
-
     pub fn take(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.out)
     }
@@ -127,8 +117,6 @@ mod tests {
         assert!(wakes(&message(json!({ "urgent": true })), mine));
         assert!(wakes(&message(json!({ "reply_to": "m1" })), mine));
         assert!(!wakes(&message(json!({ "reply_to": "m2" })), mine));
-        assert!(!wakes(&json!({ "type": "edited", "direct": false }), mine));
-        assert!(wakes(&json!({ "type": "edited", "direct": true }), mine));
         assert!(!wakes(&json!({ "type": "joined" }), mine));
         assert!(wakes(&json!({ "type": "removed" }), mine));
         assert!(!wakes(&json!({ "type": "settings" }), mine));
@@ -141,7 +129,7 @@ mod tests {
         let mut outbox = Outbox::default();
         outbox.deliver(json!({ "n": 1 }), false);
         outbox.deliver(json!({ "n": 2 }), false);
-        assert!(outbox.is_empty());
+        assert!(outbox.take().is_empty());
         assert!(outbox.deadline(Duration::from_secs(60)).is_some());
         outbox.deliver(json!({ "n": 3 }), true);
         let printed: Vec<Value> = outbox.take().iter().map(|item| item["n"].clone()).collect();
@@ -168,16 +156,4 @@ mod tests {
         assert_eq!(printed.len(), 21);
     }
 
-    #[test]
-    fn a_plugins_held_event_is_replaced_by_its_newer_one() {
-        let mut outbox = Outbox::default();
-        let printed = json!({ "kind": "doc", "key": "edited" });
-        outbox.deliver(json!({ "type": "edited", "group": "g", "lines": 1, "printed": printed }), false);
-        outbox.deliver(json!({ "type": "edited", "group": "h", "lines": 2, "printed": printed }), false);
-        outbox.take_keyed(&json!("g"), &printed);
-        outbox.deliver(json!({ "type": "edited", "group": "g", "lines": 3, "printed": printed }), false);
-        outbox.flush_held();
-        let lines: Vec<Value> = outbox.take().iter().map(|item| item["lines"].clone()).collect();
-        assert_eq!(lines, [json!(2), json!(3)]);
-    }
 }

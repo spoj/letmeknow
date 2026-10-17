@@ -58,15 +58,14 @@ For: portability, now Linux, macOS, Windows and Android (Termux); one client; on
 - letmeknow.dev serves `site/`, published from a tag by pages.yml: what letmeknow is, and for an invite link the commands that join with it. Its service worker takes the old app's place, deletes its caches and databases, and unregisters.
 - Left for the fold of `lmk-client` into the session, after step 7: the client's configuration on the device's own node (`Client::event`'s `Access::Here` branch, `take_adds`, crates/client/tests' harness).
 
-## 7. No docs or tables
+## 7. No docs or tables (done)
 
 For: "Who will read this?" exact, with step 4: today a doc or table hands every joiner its whole state, written before it joined.
 
-- Goes: `crates/kinds`, with its yrs dependency, its binaries in the release and its CI check; kinds' plugins and their hosting (`crates/session/src/kinds.rs`, `kinds::discover`, the client's `Plugins`); `Leaf.kinds` and the admission's check of it; the kind state handed to a joiner and to a member found behind (`crates/node/src/kind.rs`, `Frame::State`, state links, `STATE_LABEL`, `Admitted.doc`); `invite --kind`, `join <link> [file]`, `doc attach`, `edited`, the `letmeknow <kind>` commands, and `test/e2e.py`'s doc path.
-- `logged_commit` knows its own Adds by `commit_key`, not by the state's `admitted_key`.
-- Stay: chat, attachments and `fetch`, live payloads, and the identity kind, built in. Agents share files as attachments and code as git bundles (SKILL's "Sharing code").
-- Docs: SKILL's description, its Docs and Tables sections and its plugins paragraph; README; `npm/cli/package.json`'s description.
-- Test: a joiner gets nothing from before it joined but its Welcome.
+- Gone: `crates/kinds` and yrs, kinds' plugins and their hosting, `Leaf.kinds`, the kind state handed between members (`Frame::State`, state links, `Admitted.doc`), `invite --kind`, `join <link> [file]`, `doc attach`, `edited` and `letmeknow <kind>`; and with them a group's `kind` in `groups`, `members`, adds and presence, all chats now. Settings keep `kind`, which tells an identity's group from a chat.
+- `logged_commit` knows its own Adds by `commit_key`.
+- Stay: chat, attachments and `fetch`, live payloads (the identity kind's presence), and the identity kind.
+- The test that a joiner gets nothing from before it joined but its Welcome comes with step 4.
 
 ## 8. A week's retention
 

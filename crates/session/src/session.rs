@@ -1,6 +1,5 @@
 //! The session process: the client core on this session's node, and, holding the device's lock, the device's node with
-//! the identity kind; the plugins of its groups' kinds as executables; and what concerns the agent, printed. Chat is its
-//! built-in kind. The session process that holds the lock publishes the device's identity and its key on it to
+//! the identity kind; and what concerns the agent, printed. The session process that holds the lock publishes the device's identity and its key on it to
 //! `device-state.json`, and answers the requests only the device's node can on the command channel `device-endpoint`,
 //! both in `LETMEKNOW_HOME`; the device's other session processes read the one and send such
 //! requests to the other, among them for the certificates their credentials carry. It also finds which of the device's
@@ -14,7 +13,7 @@ use lmk_core::provider::SqliteProvider;
 use lmk_node::identity::{Identity, Pending, Presence, SessionGroup};
 use lmk_node::{Event, Message, Node};
 use lmk_proto::Bytes;
-use lmk_proto::group::{IDENTITY, Service};
+use lmk_proto::group::Service;
 use lmk_proto::links::FileLink;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -28,7 +27,6 @@ use tokio::time::Instant;
 
 use crate::Network;
 use crate::cli::{Request, private_file};
-use crate::kinds::Plugins;
 use crate::policy::{Outbox, mentions, wakes};
 use crate::short;
 
@@ -50,8 +48,6 @@ pub struct Config {
     pub keep_log: bool,
     /// The domain of the membership service for groups and identities this session creates.
     pub membership: String,
-    /// Where it looks for kinds' plugins, in order.
-    pub plugins: Vec<PathBuf>,
     /// Where it looks for a newer release.
     pub registry: String,
 }
@@ -98,7 +94,6 @@ impl Remote for Published {
 pub struct Session {
     db: Connection,
     client: Client<SqliteProvider>,
-    plugins: Arc<Plugins>,
     /// What the client tells.
     told: mpsc::UnboundedReceiver<ClientEvent>,
     /// The session's lock, held while this process runs it.
@@ -171,17 +166,14 @@ impl Session {
         held: std::fs::File,
         membership: Service,
     ) -> Result<Self> {
-        let (plugins, lines) = Plugins::new(crate::kinds::discover(&config.plugins), config.dir.join("kinds"));
         let device = Device::load(&home.join("device.json"))?;
         let client_config = lmk_client::Config { device, membership };
         let access = Access::Elsewhere(Arc::new(Published(home.to_path_buf())));
-        let plugins = Arc::new(plugins);
-        let (client, told) = Client::new(node, client_config, access, plugins.clone(), lines);
+        let (client, told) = Client::new(node, client_config, access);
         let device_lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(home.join("device.lock"))?;
         let mut session = Self {
             db,
             client,
-            plugins,
             told,
             _held: held,
             device: None,
@@ -206,7 +198,7 @@ impl Session {
         for gid in &groups {
             session.outbox.catch_up(&b64(&gid.0));
         }
-        session.client.start().await;
+        session.client.start();
         for gid in groups {
             if !session.client.chats(&gid) {
                 continue;
@@ -240,8 +232,7 @@ impl Session {
         }
         let device = Device::load(&self.home.join("device.json"))?;
         let provider = SqliteProvider::open(&self.home.join("device.db"))?;
-        let kinds = vec![lmk_proto::group::CHAT.into(), IDENTITY.into()];
-        let config = crate::node_config(&self.network, &self.home, "", Some(device.clone()), self.home.join("device-files"), kinds);
+        let config = crate::node_config(&self.network, &self.home, "", Some(device.clone()), self.home.join("device-files"));
         let (node, mut events) = Node::start(provider, config).await?;
         let path = self.home.join("device.json");
         let devices = Identity::new(node.clone(), device, Arc::new(move |device: &Device| device.save(&path)));
@@ -331,15 +322,9 @@ impl Session {
         }
     }
 
-    /// Prints what is waiting, once the plugins are in step (a doc's file with its doc): whatever wakes the agent, it
-    /// acts on current state. A message is seen once its line is written.
-    pub async fn emit(&mut self, print: &mut impl FnMut(String) -> std::io::Result<()>) -> Result<()> {
-        if self.outbox.is_empty() {
-            return Ok(());
-        }
-        self.sync_kinds().await;
-        for mut item in self.outbox.take() {
-            let printed = item.as_object_mut().and_then(|item| item.remove("printed"));
+    /// Prints what is waiting. A message is seen once its line is written.
+    pub fn emit(&mut self, print: &mut impl FnMut(String) -> std::io::Result<()>) -> Result<()> {
+        for item in self.outbox.take() {
             print(short::line(&self.compact(item.clone())))?;
             if item["type"] == "message" {
                 let shown = || -> Result<()> {
@@ -350,10 +335,6 @@ impl Session {
                 if let Err(error) = shown() {
                     self.warn(format!("marking a message shown: {error:#}"));
                 }
-            }
-            if let Some(printed) = printed {
-                let (kind, key) = (printed["kind"].as_str().unwrap_or_default(), printed["key"].as_str().unwrap_or_default());
-                self.client.printed(kind, item["group"].as_str().unwrap_or_default(), key);
             }
         }
         Ok(())
@@ -368,14 +349,6 @@ impl Session {
         item
     }
 
-    /// Brings the plugins into step, and takes in what they told meanwhile.
-    async fn sync_kinds(&mut self) {
-        self.client.sync_kinds().await;
-        while let Ok(event) = self.told.try_recv() {
-            self.client_event(event).await;
-        }
-    }
-
     /// Takes a request: what may wait on the network goes on in `running`, and is answered once done.
     pub async fn handle(&mut self, (request, reply): Inbound) {
         if self.device.is_none()
@@ -383,8 +356,6 @@ impl Session {
         {
             self.warn(format!("acting for this device: {error:#}"));
         }
-        // The agent may have just changed a file.
-        self.sync_kinds().await;
         let client = self.client.clone();
         match request {
             Request::Read { id, ancestors } => {
@@ -413,16 +384,6 @@ impl Session {
                 }
                 Err(error) => self.answer(Err(error), reply),
             },
-            // A plugin's command may take a while, and may need this session meanwhile.
-            Request::Kind { kind, args, cwd } => {
-                self.running.spawn_local(async move {
-                    let answered = async {
-                        let answer = client.command(&kind, args, cwd).await?;
-                        answer.await.unwrap_or_else(|_| Err(anyhow::anyhow!("the {kind} plugin stopped")))
-                    };
-                    Done::Answered(answered.await, reply)
-                });
-            }
             Request::Client(request) => _ = self.running.spawn_local(async move { Done::Answered(client.request(request).await, reply) }),
             Request::IdentityJoin { .. } | Request::Status { .. } => unreachable!("the CLI sends these as the client's requests"),
             Request::Stop => unreachable!("`run` stops on it"),
@@ -540,15 +501,6 @@ impl Session {
                 self.outbox.deliver(joined, wake);
             }
             ClientEvent::File { hash } => self.arrived(hex::decode(hash)?.try_into().ok().context("a hash is 32 bytes")?).await?,
-            ClientEvent::Plugin { group, kind, event, wake, key } => {
-                let mut item = json!({ "group": group });
-                item.as_object_mut().expect("an object").extend(event);
-                if let Some(key) = key {
-                    item["printed"] = json!({ "kind": kind, "key": key });
-                    self.outbox.take_keyed(&item["group"], &item["printed"]);
-                }
-                self.outbox.deliver(item, wake);
-            }
             _ => {}
         }
         Ok(())
@@ -757,15 +709,14 @@ impl Session {
         Ok(())
     }
 
-    /// The file a message's attachment or a doc's text links, the group that links it, and the file's name if a message
-    /// attached it.
+    /// The file a message's attachment links, the group that links it, and the file's name if a message attached it.
     fn fetching(&self, link: &str) -> Result<(FileLink, Bytes, Option<String>)> {
         let parsed = FileLink::parse(link.trim())?;
-        let (gid, name) = self.linking(&parsed.link())?.context("no message or doc here links that")?;
+        let (gid, name) = self.linking(&parsed.link())?.context("no message here links that")?;
         Ok((parsed, gid, name))
     }
 
-    /// The group whose chat messages or kind link `link`, and the file's name if a message attached it.
+    /// The group that links `link`, by a message, which names the file, or by a file it holds.
     fn linking(&self, link: &str) -> Result<Option<(Bytes, Option<String>)>> {
         let node = self.client.node();
         for gid in node.groups() {
@@ -786,7 +737,6 @@ impl Session {
     }
 
     pub async fn shutdown(&self) {
-        self.plugins.stop_all().await;
         let _ = std::fs::remove_file(self.config.dir.join("endpoint"));
         if self.device.is_some() {
             let _ = std::fs::remove_file(self.home.join("device-endpoint"));
@@ -831,7 +781,7 @@ pub async fn run(
     if print(short::line(&ready)).is_ok() {
         loop {
             session.publish();
-            if session.emit(&mut print).await.is_err() {
+            if session.emit(&mut print).is_err() {
                 break;
             }
             let due = session.next_due();
@@ -846,7 +796,6 @@ pub async fn run(
                 Some(done) = session.running.join_next() => session.done(done.expect("work in flight runs until shutdown")),
                 Some(event) = events.recv() => client.event(event).await,
                 Some(event) = session.told.recv() => session.client_event(event).await,
-                (kind, line) = client.next_line() => client.plugin_line(kind, line).await,
                 _ = tokio::time::sleep_until(due) => session.tick().await,
                 _ = &mut shutdown => break,
             }

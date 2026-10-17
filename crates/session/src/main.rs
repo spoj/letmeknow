@@ -1,5 +1,4 @@
 use letmeknow::cli::{Cli, Command, Request, SessionsOp, call, home_dir, new_handle, running_session, session_dir};
-use letmeknow::kinds;
 use letmeknow::session::Config;
 use letmeknow::Network;
 use std::process::ExitCode;
@@ -42,14 +41,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 hold: Duration::from_secs(hold),
                 keep_log,
                 membership,
-                plugins: kinds::dirs(),
                 registry: registry(),
             };
             let print = |line: String| {
                 use std::io::Write;
                 writeln!(std::io::stdout(), "{line}")
             };
-            // Work in flight runs on the loop's thread: the client starts a plugin, and takes in its lines, a step at a time.
+            // Work in flight runs on the loop's thread, a step at a time.
             let listen = letmeknow::listen(config, &home, network, print, letmeknow::shutdown());
             tokio::task::LocalSet::new().run_until(listen).await
         }
@@ -65,7 +63,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 hold: Duration::from_secs(3600),
                 keep_log: false,
                 membership,
-                plugins: kinds::dirs(),
                 registry: registry(),
             };
             let remove = letmeknow::remove(config, &home, network);
@@ -77,15 +74,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Command::Serve(serve) => letmeknow::serve(serve).await,
-        Command::Kind(mut args) => {
-            let kind = args.remove(0);
-            let session = match cli.session {
-                Some(session) => session,
-                None => running_session(&home).await?,
-            };
-            println!("{}", letmeknow::short::line(&call(&home, &session, Request::Kind { kind, args, cwd: String::new() }).await?));
-            Ok(())
-        }
         Command::Request(request) => {
             let session = match cli.session {
                 Some(session) => session,

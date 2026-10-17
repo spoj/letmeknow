@@ -8,7 +8,7 @@ use iroh::tls::CaTlsConfig;
 use n0_future::boxed::BoxFuture;
 use n0_future::task::AbortOnDropHandle;
 use lmk_core::device::Device;
-use lmk_core::group::{Group, Session as Mls, open_link, seal_link};
+use lmk_core::group::Session as Mls;
 use lmk_core::provider::{MemoryProvider, Provider, SqliteProvider};
 use lmk_membership::client::{Post, ServeClient};
 use lmk_membership::store::Store;
@@ -21,7 +21,6 @@ use lmk_proto::Bytes;
 use lmk_proto::frame::{self, ALPN};
 use lmk_proto::head::Head;
 use lmk_proto::membership::{Answer, Page};
-use lmk_proto::links::FileLink;
 use lmk_proto::peer::{Frame, SUMMARY, Seqs, Signed, Summary};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -39,39 +38,32 @@ struct Session<P = MemoryProvider> {
     events: UnboundedReceiver<Event>,
 }
 
-/// The kinds the sessions here support, besides chat.
-const KIND: &str = "test";
-
 async fn session(relay: &Relay, name: &str) -> Session {
-    node(relay, name, &[CHAT, KIND]).await
-}
-
-async fn node(relay: &Relay, name: &str, kinds: &[&str]) -> Session {
-    let (node, events) = Node::start(MemoryProvider::default(), config(relay, name, None, kinds)).await.unwrap();
+    let (node, events) = Node::start(MemoryProvider::default(), config(relay, name, None)).await.unwrap();
     Session { node, events }
 }
 
 /// A session that posts to membership services through `post`.
 async fn session_with(relay: &Relay, name: &str, post: Post) -> Session {
-    let (node, events) = Node::start(MemoryProvider::default(), Config { post, ..config(relay, name, None, &[CHAT, KIND]) }).await.unwrap();
+    let (node, events) = Node::start(MemoryProvider::default(), Config { post, ..config(relay, name, None) }).await.unwrap();
     Session { node, events }
 }
 
 /// A session that trusts the certificates of several relays, for peers and services on any of them.
 async fn session_trusting(relays: [&Relay; 2], name: &str) -> Session {
     let ca = CaTlsConfig::custom_roots([relays[0].cert.clone(), relays[1].cert.clone()]);
-    let (node, events) = Node::start(MemoryProvider::default(), Config { ca, ..config(relays[0], name, None, &[CHAT, KIND]) }).await.unwrap();
+    let (node, events) = Node::start(MemoryProvider::default(), Config { ca, ..config(relays[0], name, None) }).await.unwrap();
     Session { node, events }
 }
 
 /// A device's own node, whose key is the device key, as a session too.
 async fn device(relay: &Relay, name: &str) -> (Session, Identity<MemoryProvider>) {
     let device = Device::new(name);
-    let (node, events) = Node::start(MemoryProvider::default(), config(relay, name, Some(device.clone()), &[CHAT, IDENTITY])).await.unwrap();
+    let (node, events) = Node::start(MemoryProvider::default(), config(relay, name, Some(device.clone()))).await.unwrap();
     (Session { node: node.clone(), events }, Identity::new(node, device, Arc::new(|_: &Device| Ok(()))))
 }
 
-fn config(relay: &Relay, name: &str, device: Option<Device>, kinds: &[&str]) -> Config {
+fn config(relay: &Relay, name: &str, device: Option<Device>) -> Config {
     Config {
         handle: name.into(),
         device,
@@ -83,7 +75,6 @@ fn config(relay: &Relay, name: &str, device: Option<Device>, kinds: &[&str]) -> 
         home: None,
         files: None,
         file_limit: 100 << 20,
-        kinds: kinds.iter().map(|kind| kind.to_string()).collect(),
     }
 }
 
@@ -294,7 +285,7 @@ async fn a_member_is_reached_through_its_groups_service_when_its_own_relay_is_do
     let alice = session_trusting([&own, &service], "Alice").await;
     alice.node.join(&carol.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     let dead: iroh::RelayUrl = "https://127.0.0.1:1".parse().unwrap();
-    let (node, events) = Node::start(MemoryProvider::default(), Config { relays: vec![dead, service.url.clone()], ..config(&service, "Bob", None, &[CHAT, KIND]) }).await.unwrap();
+    let (node, events) = Node::start(MemoryProvider::default(), Config { relays: vec![dead, service.url.clone()], ..config(&service, "Bob", None) }).await.unwrap();
     let mut bob = Session { node, events };
     bob.node.join(&carol.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     carol.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
@@ -317,7 +308,7 @@ async fn a_join_reaches_an_inviter_on_another_relay_than_the_services() {
     let mut carol = session(&service, "Carol").await;
     let gid = carol.node.create(settings(CHAT, &service), None).unwrap();
     // Bob's home is his first relay, which is not the service's.
-    let (node, events) = Node::start(MemoryProvider::default(), Config { relays: vec![own.url.clone(), service.url.clone()], ca: CaTlsConfig::custom_roots([own.cert.clone(), service.cert.clone()]), ..config(&service, "Bob", None, &[CHAT, KIND]) }).await.unwrap();
+    let (node, events) = Node::start(MemoryProvider::default(), Config { relays: vec![own.url.clone(), service.url.clone()], ca: CaTlsConfig::custom_roots([own.cert.clone(), service.cert.clone()]), ..config(&service, "Bob", None) }).await.unwrap();
     let mut bob = Session { node, events };
     bob.node.join(&carol.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     carol.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
@@ -334,7 +325,7 @@ async fn an_identity_whose_directory_is_down_at_join_is_read_again() {
     let (group_relay, identity_relay) = (relay().await, relay().await);
     let (gate, _reaching) = Gate::new(Some(&identity_relay.service));
     let ca = CaTlsConfig::custom_roots([group_relay.cert.clone(), identity_relay.cert.clone()]);
-    let (node, events) = Node::start(MemoryProvider::default(), Config { ca, post: gate.post("Alice", identity_relay.post()), ..config(&group_relay, "Alice", None, &[CHAT, KIND]) }).await.unwrap();
+    let (node, events) = Node::start(MemoryProvider::default(), Config { ca, post: gate.post("Alice", identity_relay.post()), ..config(&group_relay, "Alice", None) }).await.unwrap();
     let alice = Session { node, events };
     let bob = session_trusting([&group_relay, &identity_relay], "Bob").await;
     let (claim, laptop) = identity(&identity_relay, &bob.node, identity_relay.service.clone()).await;
@@ -361,7 +352,7 @@ async fn a_join_survives_an_unresolved_link_domain() {
     let unresolved: lmk_membership::client::Resolve = Arc::new(|domain: String| -> BoxFuture<anyhow::Result<Directory>> {
         Box::pin(async move { anyhow::bail!("no directory for {domain}") })
     });
-    let (node, events) = Node::start(MemoryProvider::default(), Config { resolve: unresolved, ..config(&relay, "Bob", None, &[CHAT, KIND]) }).await.unwrap();
+    let (node, events) = Node::start(MemoryProvider::default(), Config { resolve: unresolved, ..config(&relay, "Bob", None) }).await.unwrap();
     let bob = Session { node, events };
     bob.node.join(&link, None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
@@ -399,7 +390,7 @@ async fn a_committer_stopped_once_its_add_is_logged_answers_the_retry_with_it() 
     let (late, mut landing, post) = late_append(relay.post(), Duration::from_secs(3600));
     let alice = stored_with(&relay, "Alice", &path, post).await;
     let bob = session(&relay, "Bob").await;
-    let gid = alice.node.create(settings(KIND, &relay), None).unwrap();
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
     let epoch = alice.node.epoch(&gid.0).unwrap();
     late.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -413,15 +404,11 @@ async fn a_committer_stopped_once_its_add_is_logged_answers_the_retry_with_it() 
     joining.abort();
     assert!(bob.node.groups().is_empty());
 
-    let mut alice = stored(&relay, "Alice", &path).await;
+    let alice = stored(&relay, "Alice", &path).await;
     let joining = {
         let node = bob.node.clone();
         tokio::spawn(async move { node.join(&link, None).await })
     };
-    alice.until(|event| match event {
-        Event::Snapshot { reply, .. } => Some(reply),
-        _ => None,
-    }).await.send(None).unwrap();
     assert_eq!(tokio::time::timeout(WAIT, joining).await.unwrap().unwrap().unwrap().0, gid);
     assert_eq!(alice.node.epoch(&gid.0).unwrap(), epoch + 1, "the retry got the logged Add, not another");
     alice.node.shutdown().await.unwrap();
@@ -577,265 +564,6 @@ async fn an_invite_dies_when_its_inviter_leaves() {
     while let Ok(event) = alice.events.try_recv() {
         assert!(!matches!(&event, Event::Warning { text, .. } if text.contains("refused a join")), "a routine refusal is no warning: {event:?}");
     }
-    alice.node.shutdown().await.unwrap();
-}
-
-/// A joiner gets the kind's state from its admitter; the kind's held and live payloads and its linked files reach it.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_kind_gets_its_state_to_a_joiner_and_its_payloads_and_files_through() {
-    let relay = relay().await;
-    let mut alice = session(&relay, "Alice").await;
-    let bob = session(&relay, "Bob").await;
-    let carol = node(&relay, "Carol", &[CHAT]).await;
-    let gid = alice.node.create(settings(KIND, &relay), None).unwrap();
-    assert!(carol.node.create(settings(KIND, &relay), None).is_err(), "a session makes no group of a kind it lacks");
-    let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
-    let refused = carol.node.join(&link, None).await.unwrap_err();
-    assert!(format!("{refused:#}").contains("does not support test groups"), "{refused:#}");
-
-    // The inviter's kind hands the joiner its state.
-    let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
-    let joining = tokio::spawn(async move { bob.node.join(&link, None).await.map(|_| bob) });
-    let reply = alice.until(|e| match e {
-        Event::Snapshot { reply, .. } => Some(reply),
-        _ => None,
-    }).await;
-    reply.send(Some(b"the state".to_vec())).unwrap();
-    let mut bob = joining.await.unwrap().unwrap();
-    let (data, from) = bob.until(|e| match e {
-        Event::State { data, from, .. } => Some((data, from)),
-        _ => None,
-    }).await;
-    assert_eq!((data.as_slice(), from.name.as_str()), (&b"the state"[..], "Alice"));
-
-    // Held and live payloads; a live payload to one member.
-    let push = json!({ "type": "push", "n": 1 });
-    let sent = alice.node.send(&gid.0, &push, None).unwrap();
-    let held = bob.until(|e| match e {
-        Event::Message(message) => Some(message),
-        _ => None,
-    }).await;
-    assert_eq!((held.id, held.payload), (sent, push));
-    alice.node.send_live(&gid.0, &json!({ "type": "edit", "n": 2 }), Some(&lmk_node::fp(&bob.node.key().0))).unwrap();
-    let live = bob.until(|e| match e {
-        Event::Live { payload, sender, .. } => Some((payload, sender.name)),
-        _ => None,
-    }).await;
-    assert_eq!(live, (json!({ "type": "edit", "n": 2 }), "Alice".to_owned()));
-    assert!(bob.node.messages(&gid.0).unwrap().iter().all(|m| m.payload["type"] != "edit"), "a live payload is not held");
-
-    // A file the kind links now is fetched and held; one it hands as state reaches the member it names.
-    let file = alice.node.add_file(&gid.0, b"linked".to_vec()).await.unwrap();
-    bob.node.set_links(&gid.0, vec![file.link()]).unwrap();
-    let hash = bob.until(|e| match e {
-        Event::File(hash) => Some(hash),
-        _ => None,
-    }).await;
-    assert_eq!((hash, bob.node.linked(&gid.0).contains(&file)), (file.hash, true));
-    alice.node.hand_state(&gid.0, &lmk_node::fp(&bob.node.key().0), b"newer".to_vec()).await.unwrap();
-    let data = bob.until(|e| match e {
-        Event::State { data, .. } => Some(data),
-        _ => None,
-    }).await;
-    assert_eq!(data, b"newer");
-}
-
-/// A state handed from a later epoch than this session's is dropped. Once this session is past that epoch, it asks the
-/// member for the state again, and takes the link the member seals in the epoch it asks in.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_state_from_a_later_epoch_is_asked_again_once_passed() {
-    let relay = relay().await;
-    let dir = folder("state-epoch");
-    let (membership, _service) = served(&relay, &dir).await;
-    let (gate, _reaching) = Gate::new(Some(&membership));
-    let db = |name: &str| dir.join(format!("{name}.db"));
-    let mut alice = stored(&relay, "Alice", &db("alice")).await;
-    let bob = stored(&relay, "Bob", &db("bob")).await;
-    let gid = alice.node.create(Settings { membership, ..settings(KIND, &relay) }, None).unwrap();
-    let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
-    let joining = {
-        let node = bob.node.clone();
-        tokio::spawn(async move { node.join(&link, None).await })
-    };
-    alice.until(|e| match e {
-        Event::Snapshot { reply, .. } => Some(reply),
-        _ => None,
-    }).await.send(Some(b"the state".to_vec())).unwrap();
-    joining.await.unwrap().unwrap();
-
-    // Bob is away while Alice commits, so no peer brings it her commits, and once back it cannot read the service: it
-    // stays in the epoch it has.
-    bob.node.shutdown().await.unwrap();
-    alice.node.change_settings(&gid.0, |settings| Settings { name: "Renamed".into(), ..settings }).await.unwrap();
-    let ahead = alice.node.epoch(&gid.0).unwrap();
-    alice.node.change_settings(&gid.0, |settings| Settings { name: "Renamed again".into(), ..settings }).await.unwrap();
-    let passed = alice.node.epoch(&gid.0).unwrap();
-    alice.node.shutdown().await.unwrap();
-    gate.set(false);
-    let mut bob = stored_with(&relay, "Bob", &db("bob"), gate.post("Bob", relay.post())).await;
-    let (alice_key, _) = member_of(&db("alice"));
-    let mut hand = hand(&relay, alice_key, &bob.node).await;
-    hand.send(&Frame::State { group: gid.clone(), epoch: ahead, link: Some(Bytes(vec![0; 64])) }).await;
-    hand.settle(&gid).await;
-
-    gate.set(true);
-    bob.node.sync().await;
-    let asked = hand.until(|frame| match frame {
-        Frame::State { group, epoch, link: None } if epoch == passed => Some(group),
-        _ => None,
-    }).await;
-    assert_eq!(asked, gid, "bob asks alice again, in the epoch it is in");
-
-    // Alice's state key of that epoch seals a link to a file Bob holds: Bob opens it and takes the state.
-    let file = bob.node.add_file(&gid.0, b"the state".to_vec()).await.unwrap();
-    let key = Group::load(&SqliteProvider::open(&db("alice")).unwrap(), &gid.0).unwrap().state_secret(&SqliteProvider::open(&db("alice")).unwrap()).unwrap();
-    let sealed = seal_link(&key, &file.link()).unwrap();
-    hand.send(&Frame::State { group: gid.clone(), epoch: passed, link: Some(Bytes(sealed)) }).await;
-    let (data, from) = bob.until(|e| match e {
-        Event::State { data, from, .. } => Some((data, from)),
-        _ => None,
-    }).await;
-    assert_eq!((data.as_slice(), from.name.as_str()), (&b"the state"[..], "Alice"));
-    bob.node.shutdown().await.unwrap();
-}
-
-/// A member's request for the state is answered with a link sealed in the answering member's epoch, to the file it holds.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_request_for_the_state_is_answered_with_a_link_sealed_in_its_epoch() {
-    let relay = relay().await;
-    let dir = folder("state-answer");
-    let db = |name: &str| dir.join(format!("{name}.db"));
-    let mut alice = stored(&relay, "Alice", &db("alice")).await;
-    let bob = stored(&relay, "Bob", &db("bob")).await;
-    let gid = alice.node.create(settings(KIND, &relay), None).unwrap();
-    let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
-    let joining = {
-        let node = bob.node.clone();
-        tokio::spawn(async move { node.join(&link, None).await })
-    };
-    alice.until(|e| match e {
-        Event::Snapshot { reply, .. } => Some(reply),
-        _ => None,
-    }).await.send(Some(b"the state".to_vec())).unwrap();
-    joining.await.unwrap().unwrap();
-    bob.node.shutdown().await.unwrap();
-
-    let (bob_key, _) = member_of(&db("bob"));
-    let mut hand = hand(&relay, bob_key, &alice.node).await;
-    let epoch = alice.node.epoch(&gid.0).unwrap();
-    hand.send(&Frame::State { group: gid.clone(), epoch, link: None }).await;
-    let reply = alice.until(|e| match e {
-        Event::Snapshot { reply, .. } => Some(reply),
-        _ => None,
-    }).await;
-    reply.send(Some(b"the state".to_vec())).unwrap();
-    let (sent, sealed) = hand.until(|frame| match frame {
-        Frame::State { epoch, link: Some(link), .. } => Some((epoch, link)),
-        _ => None,
-    }).await;
-    let provider = SqliteProvider::open(&db("bob")).unwrap();
-    assert_eq!(sent, epoch);
-    let key = Group::load(&provider, &gid.0).unwrap().state_secret(&provider).unwrap();
-    let link = FileLink::parse(&open_link(&key, &sealed.0).unwrap()).unwrap();
-    assert_eq!(alice.node.file(&link).await.unwrap(), Some(b"the state".to_vec()));
-
-    // Nothing more is answered in that epoch, nor a request made in another.
-    hand.send(&Frame::State { group: gid.clone(), epoch, link: None }).await;
-    hand.send(&Frame::State { group: gid.clone(), epoch: epoch - 1, link: None }).await;
-    hand.settle(&gid).await;
-    assert!(!std::iter::from_fn(|| alice.events.try_recv().ok()).any(|event| matches!(event, Event::Snapshot { .. })));
-    alice.node.change_settings(&gid.0, |settings| Settings { name: "Renamed".into(), ..settings }).await.unwrap();
-    let next = alice.node.epoch(&gid.0).unwrap();
-    hand.send(&Frame::State { group: gid.clone(), epoch: next, link: None }).await;
-    let reply = alice.until(|e| match e {
-        Event::Snapshot { reply, .. } => Some(reply),
-        _ => None,
-    }).await;
-    reply.send(Some(b"the state".to_vec())).unwrap();
-    let sent = hand.until(|frame| match frame {
-        Frame::State { epoch, link: Some(_), .. } => Some(epoch),
-        _ => None,
-    }).await;
-    assert_eq!(sent, next, "once in a new epoch, a member is answered again");
-    alice.node.shutdown().await.unwrap();
-}
-
-/// A joiner whose Admitted carries no state asks its committer for it once joined, and takes the state it answers.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_joiner_without_state_asks_for_it_once_joined() {
-    let relay = relay().await;
-    let mut alice = session(&relay, "Alice").await;
-    let bob = session(&relay, "Bob").await;
-    let gid = alice.node.create(settings(KIND, &relay), None).unwrap();
-    let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
-    let joining = {
-        let node = bob.node.clone();
-        tokio::spawn(async move { node.join(&link, None).await.map(|_| bob) })
-    };
-    alice.until(|e| match e {
-        Event::Snapshot { reply, .. } => Some(reply),
-        _ => None,
-    }).await.send(None).unwrap();
-    let mut bob = joining.await.unwrap().unwrap();
-    alice.until(|e| match e {
-        Event::Snapshot { reply, .. } => Some(reply),
-        _ => None,
-    }).await.send(Some(b"the state".to_vec())).unwrap();
-    let (data, from) = bob.until(|e| match e {
-        Event::State { data, from, .. } => Some((data, from)),
-        _ => None,
-    }).await;
-    assert_eq!((data.as_slice(), from.name.as_str()), (&b"the state"[..], "Alice"));
-    alice.node.shutdown().await.unwrap();
-    bob.node.shutdown().await.unwrap();
-}
-
-/// A joiner's state link is sealed under the state key of the epoch its Add moved into, so it opens although another
-/// commit landed before the answer was sent.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_joiner_opens_its_state_after_another_commit_landed_before_the_answer() {
-    let relay = relay().await;
-    let mut alice = session(&relay, "Alice").await;
-    let carol = session(&relay, "Carol").await;
-    let bob = session(&relay, "Bob").await;
-    let gid = alice.node.create(settings(KIND, &relay), None).unwrap();
-    let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
-    let joining = {
-        let node = carol.node.clone();
-        tokio::spawn(async move { node.join(&link, None).await })
-    };
-    alice.until(|e| match e {
-        Event::Snapshot { reply, .. } => Some(reply),
-        _ => None,
-    }).await.send(Some(b"the state".to_vec())).unwrap();
-    joining.await.unwrap().unwrap();
-
-    let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
-    let joining = {
-        let node = bob.node.clone();
-        tokio::spawn(async move { node.join(&link, None).await.map(|_| bob) })
-    };
-    let reply = alice.until(|e| match e {
-        Event::Snapshot { reply, .. } => Some(reply),
-        _ => None,
-    }).await;
-    carol.node.change_settings(&gid.0, |settings| Settings { name: "Renamed".into(), ..settings }).await.unwrap();
-    let ahead = carol.node.epoch(&gid.0).unwrap();
-    tokio::time::timeout(WAIT, async {
-        while alice.node.epoch(&gid.0).unwrap() != ahead {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("alice applies the commit that landed");
-    reply.send(Some(b"the state".to_vec())).unwrap();
-
-    let mut bob = joining.await.unwrap().unwrap();
-    let data = bob.until(|e| match e {
-        Event::State { data, .. } => Some(data),
-        _ => None,
-    }).await;
-    assert_eq!(data, b"the state");
     alice.node.shutdown().await.unwrap();
 }
 
@@ -1009,18 +737,6 @@ async fn a_directory_naming_another_key_is_reported_once() {
     assert_eq!(warnings, 1);
 }
 
-impl Session {
-    /// Answers the next request for the kind's state.
-    async fn snapshot(&mut self, state: Option<&[u8]>) {
-        let reply = self.until(|e| match e {
-            Event::Snapshot { reply, .. } => Some(reply),
-            _ => None,
-        }).await;
-        reply.send(state.map(<[u8]>::to_vec)).unwrap();
-    }
-}
-
-
 impl<P: Provider + Send + 'static> Session<P> {
     /// Waits until a member's identity checks out, or not.
     async fn checked(&self, gid: &Bytes, name: &str, valid: bool) -> lmk_node::Member {
@@ -1054,7 +770,7 @@ fn routed<P: Provider + Send + 'static>(session: &mut Session<P>, devices: Ident
 /// A device's own node on SQLite at `db`, which survives a restart, with the identity kind taking its events first.
 async fn stored_device(relay: &Relay, name: &str, db: &Path) -> (Session<SqliteProvider>, Identity<SqliteProvider>) {
     let device = Device::new(name);
-    let (node, events) = Node::start(SqliteProvider::open(db).unwrap(), config(relay, name, Some(device.clone()), &[CHAT, IDENTITY])).await.unwrap();
+    let (node, events) = Node::start(SqliteProvider::open(db).unwrap(), config(relay, name, Some(device.clone()))).await.unwrap();
     let devices = Identity::new(node.clone(), device, Arc::new(|_: &Device| Ok(())));
     let mut session = Session { node, events };
     routed(&mut session, devices.clone());
@@ -1268,7 +984,7 @@ async fn a_session_updates_an_older_leaf_as_it_starts() {
     let dir = folder("revision");
     std::fs::create_dir_all(&dir).unwrap();
     let bob_db = dir.join("bob.db");
-    let start = || async { Node::start(SqliteProvider::open(&bob_db).unwrap(), config(&relay, "Bob", None, &[CHAT])).await.unwrap().0 };
+    let start = || async { Node::start(SqliteProvider::open(&bob_db).unwrap(), config(&relay, "Bob", None)).await.unwrap().0 };
     let alice = session(&relay, "Alice").await;
     let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     let bob = start().await;
@@ -1314,7 +1030,7 @@ async fn a_device_keeps_its_identity_across_restarts() {
     let device = Device::new("laptop");
     let start = || async {
         let (node, _events) =
-            Node::start(SqliteProvider::open(&dir.join("device.db")).unwrap(), config(&relay, "laptop", Some(device.clone()), &[CHAT, IDENTITY])).await.unwrap();
+            Node::start(SqliteProvider::open(&dir.join("device.db")).unwrap(), config(&relay, "laptop", Some(device.clone()))).await.unwrap();
         (node.clone(), Identity::new(node, device.clone(), Arc::new(|_: &Device| Ok(()))))
     };
     let (node, devices) = start().await;
@@ -1348,7 +1064,7 @@ async fn held_leave(test: &str, restart_leaver: bool) {
     let start = |name: &'static str| {
         let (relay, db, gate) = (&relay, dir.join(format!("{name}.db")), gate.clone());
         async move {
-            let (node, events) = Node::start(SqliteProvider::open(&db).unwrap(), Config { post: gate.post(name, relay.post()), ..config(relay, name, None, &[CHAT]) }).await.unwrap();
+            let (node, events) = Node::start(SqliteProvider::open(&db).unwrap(), Config { post: gate.post(name, relay.post()), ..config(relay, name, None) }).await.unwrap();
             Session { node, events }
         }
     };
@@ -1382,7 +1098,7 @@ async fn an_old_leave_does_not_remove_a_member_added_again() {
     std::fs::create_dir_all(&dir).unwrap();
     let alice_db = dir.join("alice.db");
     let start = || async {
-        let (node, events) = Node::start(SqliteProvider::open(&alice_db).unwrap(), config(&relay, "Alice", None, &[CHAT])).await.unwrap();
+        let (node, events) = Node::start(SqliteProvider::open(&alice_db).unwrap(), config(&relay, "Alice", None)).await.unwrap();
         Session { node, events }
     };
     let mut alice = start().await;
@@ -1611,7 +1327,7 @@ async fn a_log_let_go_is_no_removal_while_a_peer_brings_the_commits() {
     let start = |name: &'static str| {
         let (relay, dir, gate) = (&relay, &dir, gate.clone());
         async move {
-            let mut config = config(relay, name, None, &[CHAT]);
+            let mut config = config(relay, name, None);
             config.post = gate.post(name, relay.post());
             config.files = Some(dir.join(format!("{name}-files")));
             let (node, events) = Node::start(SqliteProvider::open(&dir.join(format!("{name}.db"))).unwrap(), config).await.unwrap();
@@ -1690,7 +1406,7 @@ async fn an_expired_directory_ends_its_identity_on_its_devices() {
         let (relay, dir) = (&relay, &dir);
         async move {
             let device = Device::new(name);
-            let config = config(relay, name, Some(device.clone()), &[CHAT, IDENTITY]);
+            let config = config(relay, name, Some(device.clone()));
             let (node, events) = Node::start(SqliteProvider::open(&dir.join(format!("{name}.db"))).unwrap(), config).await.unwrap();
             let devices = Identity::new(node.clone(), device, Arc::new(|_: &Device| Ok(())));
             (Session { node, events }, devices)
@@ -1848,7 +1564,7 @@ fn a_device_missing_its_identitys_commits_past_the_retention_is_revoked_and_told
             let (relay, dir) = (&relay, &dir);
             async move {
                 let device = Device::new(name);
-                let config = config(relay, name, Some(device.clone()), &[CHAT, IDENTITY]);
+                let config = config(relay, name, Some(device.clone()));
                 let (node, events) = Node::start(SqliteProvider::open(&dir.join(format!("{name}.db"))).unwrap(), config).await.unwrap();
                 let devices = Identity::new(node.clone(), device, Arc::new(|_: &Device| Ok(())));
                 (Session { node, events }, devices)
@@ -2036,7 +1752,7 @@ async fn stored(relay: &Relay, name: &str, db: &Path) -> Session<SqliteProvider>
 
 /// A session on SQLite at `db` that posts to membership services through `post`.
 async fn stored_with(relay: &Relay, name: &str, db: &Path, post: Post) -> Session<SqliteProvider> {
-    let (node, events) = Node::start(SqliteProvider::open(db).unwrap(), Config { post, ..config(relay, name, None, &[CHAT, KIND]) }).await.unwrap();
+    let (node, events) = Node::start(SqliteProvider::open(db).unwrap(), Config { post, ..config(relay, name, None) }).await.unwrap();
     Session { node, events }
 }
 
@@ -2396,15 +2112,11 @@ async fn a_peer_not_admitted_changes_nothing() {
     let log = alice.node.log(&gid.0).unwrap();
     let head = Head { log_ref: log.0.as_slice().try_into().unwrap(), length: 2, hash: [9; 32], time: lmk_node::now(), sig: Bytes(vec![0; 64]) };
     mallory.send(&Frame::Entries { log, entries: vec![Bytes(b"junk".to_vec())], head }).await;
-    let file = lmk_proto::links::FileLink { hash: [7; 32], size: 1, key: [0; 32] };
-    let epoch = alice.node.epoch(&gid.0).unwrap();
-    mallory.send(&Frame::State { group: gid.clone(), epoch, link: Some(Bytes(file.link().into_bytes())) }).await;
     mallory.send(&Frame::Live { group: gid.clone(), hops: 0, item: forged(3) }).await;
     assert!(mallory.settle(&gid).await.is_empty(), "a want the gate does not take gets nothing");
     assert_eq!(dump(&alice_db), before);
-    assert!(!alice.node.linked(&gid.0).contains(&file));
     while let Ok(event) = alice.events.try_recv() {
-        assert!(!matches!(event, Event::Message(_) | Event::Live { .. } | Event::State { .. }), "{event:?}");
+        assert!(!matches!(event, Event::Message(_) | Event::Live { .. }), "{event:?}");
     }
     alice.node.shutdown().await.unwrap();
 }
@@ -2474,28 +2186,23 @@ async fn peer_entries_are_bound_to_the_destination_log_and_service() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_joiner_whose_answer_was_lost_is_admitted_by_the_committers_answer() {
     let relay = relay().await;
-    let mut alice = session(&relay, "Alice").await;
+    let (late, mut landing, post) = late_append(relay.post(), Duration::from_secs(5));
+    let alice = session_with(&relay, "Alice", post).await;
     let bob = session(&relay, "Bob").await;
-    let gid = alice.node.create(settings(KIND, &relay), None).unwrap();
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
+    let epoch = alice.node.epoch(&gid.0).unwrap();
+    late.store(true, std::sync::atomic::Ordering::SeqCst);
     let (node, first) = (bob.node.clone(), link.clone());
     let joining = tokio::spawn(async move { node.join(&first, None).await });
-    // The Add is in: its answer waits for the kind's state, and the joiner stops waiting for it.
-    let reply = alice.until(|e| match e {
-        Event::Snapshot { reply, .. } => Some(reply),
-        _ => None,
-    }).await;
-    let epoch = alice.node.epoch(&gid.0).unwrap();
+    // The Add is in, and its answer is late: the joiner stops waiting for it.
+    tokio::time::timeout(WAIT, landing.recv()).await.unwrap().unwrap();
     joining.abort();
     assert!(joining.await.is_err());
-    drop(reply);
 
-    let node = bob.node.clone();
-    let again = tokio::spawn(async move { node.join(&link, None).await });
-    alice.snapshot(Some(b"state")).await;
-    let (joined, _) = again.await.unwrap().unwrap();
+    let (joined, _) = tokio::time::timeout(WAIT, bob.node.join(&link, None)).await.unwrap().unwrap();
     assert_eq!(joined, gid);
-    assert_eq!(alice.node.epoch(&gid.0).unwrap(), epoch, "no second Add");
+    assert_eq!(alice.node.epoch(&gid.0).unwrap(), epoch + 1, "no second Add");
     assert_eq!(bob.node.members(&gid.0).unwrap().len(), 2);
 }
 
@@ -2505,7 +2212,7 @@ async fn a_joiner_whose_answer_was_lost_is_admitted_by_the_committers_answer() {
 async fn a_joiner_asks_again_once_the_committers_answer_is_late() {
     let relay = relay().await;
     let (late, _landing, post) = late_append(relay.post(), Duration::from_secs(35));
-    let (node, events) = Node::start(MemoryProvider::default(), Config { post, ..config(&relay, "Alice", None, &[CHAT]) }).await.unwrap();
+    let (node, events) = Node::start(MemoryProvider::default(), Config { post, ..config(&relay, "Alice", None) }).await.unwrap();
     let alice = Session { node, events };
     let bob = session(&relay, "Bob").await;
     let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
@@ -2525,7 +2232,7 @@ async fn a_joiner_asks_its_committer_again_past_a_silent_member() {
     use lmk_proto::links::Invite;
     let relay = relay().await;
     let (late, _landing, post) = late_append(relay.post(), Duration::from_secs(35));
-    let (node, events) = Node::start(MemoryProvider::default(), Config { post, ..config(&relay, "Alice", None, &[CHAT]) }).await.unwrap();
+    let (node, events) = Node::start(MemoryProvider::default(), Config { post, ..config(&relay, "Alice", None) }).await.unwrap();
     let alice = Session { node, events };
     let bob = session(&relay, "Bob").await;
     let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
@@ -2574,7 +2281,7 @@ async fn a_link_altered_to_another_kind_admits_to_nothing() {
     let (mut laptop, laptop_devices) = device(&relay, "laptop").await;
     routed(&mut laptop, laptop_devices.clone());
     laptop_devices.create("Bob", membership.clone()).await.unwrap();
-    let mallory = node(&relay, "Mallory", &[CHAT, IDENTITY]).await;
+    let mallory = session(&relay, "Mallory").await;
     let link = Invite::parse(&laptop_devices.invite().await.unwrap()).unwrap();
     // Nor does a device-link attempt left waiting make the same secret, read as a group link, join with a device key.
     let dead = *iroh::SecretKey::from_bytes(&lmk_core::random()).public().as_bytes();
@@ -3446,7 +3153,7 @@ async fn members_learn_each_others_relays() {
 async fn chosen_relays_replace_the_directorys() {
     let relay = relay().await;
     let dead = "https://127.0.0.1:1".parse().unwrap();
-    let (node, events) = Node::start(MemoryProvider::default(), Config { relays: vec![dead], chosen: vec![relay.url.clone()], ..config(&relay, "Alice", None, &[CHAT, KIND]) })
+    let (node, events) = Node::start(MemoryProvider::default(), Config { relays: vec![dead], chosen: vec![relay.url.clone()], ..config(&relay, "Alice", None) })
         .await
         .unwrap();
     let alice = Session { node, events };

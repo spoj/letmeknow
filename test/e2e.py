@@ -125,7 +125,7 @@ def serve():
 
 def main():
     if "LMK_E2E_BIN" not in os.environ:
-        subprocess.run(["cargo", "build", "-q", "-p", "letmeknow", "-p", "lmk-kinds"], cwd=ROOT, check=True)
+        subprocess.run(["cargo", "build", "-q", "-p", "letmeknow"], cwd=ROOT, check=True)
     server = serve()
     listeners = []
     passed = False
@@ -139,7 +139,7 @@ def main():
 
         # An invite, and chat.
         invite = run("alice", "invite", "--name", "Plans")
-        check(invite["link"].startswith("https://letmeknow.dev/i#9.g.") and invite["kind"] == "chat", "invite gives a link to a new chat")
+        check(invite["link"].startswith("https://letmeknow.dev/i#9.g."), "invite gives a link to a new chat")
         group = invite["group"]
         check("serve" in run("alice", "groups")[0]["membership"], "its log is on the local letmeknow serve")
         joined = run("bob", "join", invite["link"])
@@ -168,26 +168,6 @@ def main():
         arrived = bob.expect("attachment") if "path" not in message["attachment"] else message["attachment"]
         check(content(arrived["path"]) == "s3cret", "the attachment arrives as a private file")
         check(content(run("bob", "fetch", message["attachment"]["link"])["path"]) == "s3cret", "fetch gives the same file")
-
-        # A doc edited as a file by two sessions.
-        notes = write("notes.md", "- [ ] alpha\n- [ ] beta\n")
-        doc = run("alice", "invite", "--kind", "doc", "--name", "Notes", notes)
-        bob_notes = os.path.join(TMP, "bob-notes.md")
-        check(run("bob", "join", doc["link"], bob_notes)["kind"] == "doc", "bob joins the doc into a file of his")
-        check(until(lambda: content(bob_notes), lambda text: text == "- [ ] alpha\n- [ ] beta\n"), "the doc's text reaches the joiner")
-        with open(bob_notes, "ab") as f:
-            f.write(b"- [ ] gamma @alice\n")
-        edited = alice.expect("edited", lambda e: e["group"] == "Notes")
-        check(edited["by"] == [f"Bob · {bob.ready['name']}"] and edited["direct"], "alice is told bob edited, mentioning her")
-        check(content(notes) == "- [ ] alpha\n- [ ] beta\n- [ ] gamma @alice\n", "and her file has his line")
-        write("notes.md", "- [x] alpha\n- [ ] beta\n- [ ] gamma @alice\n")
-        check(until(lambda: content(bob_notes), lambda text: text.startswith("- [x] alpha")) == "- [x] alpha\n- [ ] beta\n- [ ] gamma @alice\n", "her edit reaches his file")
-        attached = run("alice", "doc", "attach", f"--group={doc['group']}", token)
-        check(attached["markdown"].startswith("[token.txt](lmk:"), "the doc plugin answers `letmeknow doc attach`")
-        with open(notes, "a") as f:
-            f.write(attached["markdown"] + "\n")
-        until(lambda: content(bob_notes), lambda text: attached["link"] in text)
-        check(content(run("bob", "fetch", attached["link"])["path"]) == "s3cret", "and a member fetches the file the doc links")
 
         # Carol joins through bob; the chat is then opened to bob's identity.
         joined = run("carol", "join", run("bob", "invite", f"--group={group}")["link"])

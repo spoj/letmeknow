@@ -12,7 +12,7 @@ pub const REVISION: u32 = 0;
 pub const SETTINGS_EXTENSION: u16 = 0xff01;
 pub const LEAF_EXTENSION: u16 = 0xff02;
 
-/// The kind every client supports, built in. Every other kind is a plugin's, but `IDENTITY`.
+/// The kind of every group but identities' groups.
 pub const CHAT: &str = "chat";
 /// The built-in kind of an identity's group, whose members are its devices; sessions do not join it.
 pub const IDENTITY: &str = "identity";
@@ -60,8 +60,6 @@ pub struct Settings {
 pub struct Leaf {
     /// The session's iroh key.
     pub key: Bytes,
-    /// The kinds the session supports.
-    pub kinds: Vec<String>,
     /// The session's protocol revision.
     #[serde(default)]
     pub revision: u32,
@@ -192,7 +190,7 @@ mod tests {
         let settings: Settings = serde_json::from_str(text).unwrap();
         let renamed = Settings { name: "Release".into(), ..settings };
         assert_eq!(serde_json::to_string(&renamed).unwrap(), text.replace("Plan", "Release"));
-        let leaf: Leaf = serde_json::from_str(r#"{"key":"AQ","kinds":["chat"]}"#).unwrap();
+        let leaf: Leaf = serde_json::from_str(r#"{"key":"AQ"}"#).unwrap();
         assert_eq!(leaf.revision, 0);
     }
 }

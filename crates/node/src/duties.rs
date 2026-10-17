@@ -25,7 +25,7 @@ use lmk_proto::peer::Seqs;
 
 use crate::groups::renaming;
 use crate::held::delivered_key;
-use crate::reading::{admitted_key, commit_key};
+use crate::reading::commit_key;
 use crate::{Event, G, Inner, State, Work, days, get, now};
 
 /// How often every group's duties run, besides as its log moves.
@@ -88,7 +88,6 @@ impl<P: Provider> State<P> {
         g.rec.commits = kept;
         for (epoch, _) in old {
             self.provider.delete(&commit_key(gid, epoch))?;
-            self.provider.delete(&admitted_key(gid, epoch))?;
         }
         let rec = &self.group(gid)?.rec;
         let (mut first, last) = (rec.first.max(1), rec.index);

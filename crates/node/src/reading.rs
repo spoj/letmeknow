@@ -21,12 +21,6 @@ pub(crate) fn commit_key(gid: &[u8], epoch: u64) -> Vec<u8> {
     [b"node/commit/".as_slice(), gid, b"/", &epoch.to_be_bytes()].concat()
 }
 
-/// The state key of the epoch an Add moved into, kept by its committer with the commit entry, for the answer to a joiner
-/// whose answer was lost.
-pub(crate) fn admitted_key(gid: &[u8], epoch: u64) -> Vec<u8> {
-    [b"node/admitted/".as_slice(), gid, b"/", &epoch.to_be_bytes()].concat()
-}
-
 impl<P: Provider + Send + 'static> Inner<P> {
     /// Reads the stored entries of a group's log this session has not judged yet, in order.
     pub(crate) fn advance(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
@@ -43,7 +37,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if st.groups.contains_key(gid) {
             st.save(gid)?;
             if st.at_head(gid) {
-                st.ask_state(gid)?;
                 self.work.send(Work::Duties(gid.to_vec())).ok();
             }
         }
@@ -120,10 +113,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             (g.rec.updated, g.rec.committed) = (now, current);
         }
         if let Some(core::Admission { welcome, sig }) = applied.admission.take() {
-            put(&st.provider, &commit_key(gid, ending), &Admitted { commit: Bytes(inner), welcome: Bytes(welcome), sig: Bytes(sig), doc: None })?;
-            if let Some(key) = &applied.link_key {
-                st.provider.put(&admitted_key(gid, ending), key)?;
-            }
+            put(&st.provider, &commit_key(gid, ending), &Admitted { commit: Bytes(inner), welcome: Bytes(welcome), sig: Bytes(sig) })?;
             st.group_mut(gid)?.rec.commits.push((ending, now));
         }
         self.cuts(st, gid, &applied, ending)?;

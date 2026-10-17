@@ -1,5 +1,4 @@
 pub mod cli;
-pub mod kinds;
 pub mod policy;
 pub mod session;
 pub mod short;
@@ -260,8 +259,7 @@ pub async fn listen(
     }
     let db = store::open(&config.dir.join("session.db"))?;
     let provider = SqliteProvider::open(&config.dir.join("session.db"))?;
-    let kinds = [lmk_proto::group::CHAT.to_owned()].into_iter().chain(kinds::discover(&config.plugins).into_keys()).collect();
-    let node_config = node_config(&network, home, &config.handle, None, config.dir.join("files"), kinds);
+    let node_config = node_config(&network, home, &config.handle, None, config.dir.join("files"));
     let (node, events) = Node::start(provider, node_config).await?;
     let lookup = newer_minor(network.clone(), config.registry.clone());
     let (session, newer) = tokio::join!(session::Session::open(config, db, node, home, network, inbound, held, membership), lookup);
@@ -348,7 +346,7 @@ pub async fn remove(config: session::Config, home: &Path, network: Network) -> R
     Ok(json!({ "removed": handle, "left": groups.as_array().unwrap().iter().map(|g| &g["group"]).collect::<Vec<_>>() }))
 }
 
-fn node_config(network: &Network, home: &Path, handle: &str, device: Option<Device>, files: PathBuf, kinds: Vec<String>) -> lmk_node::Config {
+fn node_config(network: &Network, home: &Path, handle: &str, device: Option<Device>, files: PathBuf) -> lmk_node::Config {
     lmk_node::Config {
         handle: handle.into(),
         device,
@@ -360,7 +358,6 @@ fn node_config(network: &Network, home: &Path, handle: &str, device: Option<Devi
         home: Some(home.to_path_buf()),
         files: Some(files),
         file_limit: 100 << 20,
-        kinds,
     }
 }
 

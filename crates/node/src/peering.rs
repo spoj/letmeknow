@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use iroh::{EndpointId, RelayUrl};
-use lmk_core::group::open_link;
 use lmk_core::provider::Provider;
 use lmk_membership::Contradiction;
 use lmk_net::Groups;
@@ -79,7 +78,6 @@ fn group_of(frame: &Frame) -> Option<&Bytes> {
         | Frame::Want { group, .. }
         | Frame::WantFiles { group, .. }
         | Frame::Have { group, .. }
-        | Frame::State { group, .. }
         | Frame::Live { group, .. } => Some(group),
     }
 }
@@ -576,23 +574,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 }
                 let sender = st.member(&gid, &sender).context("the sender has no letmeknow credential")?;
                 st.events.push(Event::Live { group, sender, payload });
-            }
-            Frame::State { epoch, link, .. } => {
-                st.peers.used(&key, now);
-                match link {
-                    None => {
-                        if st.may_answer(&gid, peer, epoch)? {
-                            self.answer_state(&gid, peer);
-                        }
-                    }
-                    Some(sealed) if st.group(&gid)?.mls.epoch() == epoch => {
-                        let g = st.group(&gid)?;
-                        let Ok(link) = open_link(&g.mls.state_secret(&st.provider)?, &sealed.0) else { return Ok(()) };
-                        st.group_mut(&gid)?.rec.wanted = None;
-                        self.state_from(&gid, link, peer);
-                    }
-                    Some(_) => st.group_mut(&gid)?.rec.wanted = Some((*peer.as_bytes(), epoch)),
-                }
             }
             _ => {}
         }

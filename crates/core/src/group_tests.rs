@@ -26,7 +26,7 @@ pub(crate) fn settings(name: &str) -> Settings {
 }
 
 pub(crate) fn leaf(name: &str) -> Leaf {
-    Leaf { key: Bytes(name.as_bytes().to_vec()), kinds: vec![CHAT.into()], revision: REVISION }
+    Leaf { key: Bytes(name.as_bytes().to_vec()), revision: REVISION }
 }
 
 /// An entry as a member read it: its verdict, and for a commit what applying it did.
@@ -671,7 +671,7 @@ fn leaf_data() {
     w.found(0, &[1, 2]);
     let leaves: Vec<_> = w.m[0].g().members().into_iter().map(|m| m.leaf.unwrap()).collect();
     assert_eq!(leaves, [leaf("A"), leaf("B"), leaf("C")]);
-    let moved = Leaf { kinds: vec![CHAT.into(), "doc".into()], ..leaf("B") };
+    let moved = Leaf { key: Bytes(b"moved".to_vec()), ..leaf("B") };
     let cut = w.m[1].cut();
     let commit = w.m[1].commit(Change { cut, leaf: Some(moved.clone()), ..Change::default() });
     w.post(commit.entry);
@@ -1296,57 +1296,21 @@ fn live_payloads_open_only_in_their_epoch() {
     assert_eq!(open_live(&w.m[0], &current).unwrap().1, edit);
 }
 
-/// A state link opens for the members of the epoch it was sealed in. A member removed since does not open a later one,
-/// and only the committer of an Add keeps the key its answer seals under.
+/// An Add's committer keeps its Welcome, with which the joiner joins; another member keeps none.
 #[test]
-fn state_links_open_only_in_their_epoch() {
-    let mut w = World::new(&["A", "B", "C"]);
-    w.found(0, &[1, 2]);
-    let state = |m: &Member| m.group.as_ref().unwrap().state_secret(&m.provider).unwrap();
-    let first = state(&w.m[0]);
-    assert_eq!(state(&w.m[1]), first);
-    let sealed = seal_link(&first, "lmk:a.1#aa").unwrap();
-    assert_eq!(open_link(&state(&w.m[1]), &sealed).unwrap(), "lmk:a.1#aa");
-    let removed_key = state(&w.m[2]);
-
-    let cut = w.m[1].cut();
-    let commit = w.m[1].commit(Change { cut, ..Change::default() });
-    w.post(commit.entry);
-    let read = w.read(&[0, 1]);
-    assert_eq!(applied(&read[1][0]).link_key.as_deref(), Some(&state(&w.m[1])[..]), "the committer's key");
-    assert!(applied(&read[0][0]).link_key.is_none());
-    assert!(open_link(&state(&w.m[0]), &sealed).is_err(), "sealed in an earlier epoch");
-
-    let c = w.m[0].index_of("C");
-    let cut = w.m[0].cut();
-    let commit = w.m[0].commit(Change { cut, remove: vec![c], ..Change::default() });
-    w.post(commit.entry);
-    w.read(&[0, 1, 2]);
-    let later = seal_link(&state(&w.m[0]), "lmk:b.2#bb").unwrap();
-    assert_eq!(open_link(&state(&w.m[1]), &later).unwrap(), "lmk:b.2#bb");
-    assert!(open_link(&removed_key, &later).is_err(), "sealed after a member's removal");
-    assert!(w.m[2].group.as_ref().unwrap().state_secret(&w.m[2].provider).is_err(), "a removed member holds no state key");
-}
-
-/// An Add's committer keeps the key its epoch's state links seal under, which is the key the members of that epoch derive.
-#[test]
-fn the_committer_keeps_the_state_key_of_the_epoch_its_add_moved_into() {
+fn the_committer_keeps_the_welcome_of_its_add() {
     let mut w = World::new(&["A", "B", "C"]);
     w.found(0, &[1]);
     let package = w.key_package(2);
     let cut = w.m[0].cut();
     let commit = w.m[0].commit(Change { cut, add: vec![package.clone()], how: Some(How::Invite), ..Change::default() });
     let inner = w.m[0].open_inner(&commit.entry);
-    let admission = commit.admission.clone().unwrap();
     let pos = w.post(commit.entry);
     let read = w.read(&[0, 1]);
-    let own = applied(&read[0][0]).link_key.clone().expect("the committer keeps its key");
-    assert_eq!(own, w.m[0].group.as_ref().unwrap().state_secret(&w.m[0].provider).unwrap());
-    assert_eq!(applied(&read[1][0]).link_key, None, "another member keeps none");
-    assert!(applied(&read[0][0]).admission.is_some(), "the committer keeps the Welcome");
+    let admission = applied(&read[0][0]).admission.clone().expect("the committer keeps the Welcome");
     assert!(applied(&read[1][0]).admission.is_none(), "another member keeps none");
     w.m[2].join(&inner, &admission, pos, &package);
-    assert_eq!(w.m[2].group.as_ref().unwrap().state_secret(&w.m[2].provider).unwrap(), own, "the joiner derives the same key");
+    w.agree(&[0, 1, 2]);
 }
 
 /// Opens one receiver's messages from one sender in one epoch: `n` held messages, the first `n` of the sender's.

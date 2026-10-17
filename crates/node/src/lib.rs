@@ -13,7 +13,6 @@ pub mod identity;
 mod duties;
 mod groups;
 mod held;
-mod kind;
 mod logs;
 mod peering;
 mod reading;
@@ -46,7 +45,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use held::Author;
 
@@ -61,8 +60,6 @@ pub const COLLECT: Duration = Duration::from_secs(60 * 60);
 /// How long some waits for other members last: for those online to hold a file or an invite, for added members'
 /// certificates.
 const MEMBER_WAIT: Duration = Duration::from_secs(5);
-/// How long a member admitting a joiner waits for the state of the group's kind.
-const SNAPSHOT_WAIT: Duration = Duration::from_secs(10);
 
 pub struct Config {
     /// The name its credential gives it in groups but identity groups, fixed when it is created: a session process's
@@ -87,8 +84,6 @@ pub struct Config {
     pub files: Option<PathBuf>,
     /// The largest file fetched without being asked.
     pub file_limit: u64,
-    /// The kinds this session supports, `chat` among them.
-    pub kinds: Vec<String>,
 }
 
 /// A group member, from its leaf and credential, and its credential's certificate checked against its identity's key
@@ -240,17 +235,6 @@ pub enum Event {
     Heard {
         group: Bytes,
     },
-    /// The state of the group's kind that `from` handed this session: beside the Welcome that admitted it, or later.
-    State {
-        group: Bytes,
-        from: Member,
-        data: Vec<u8>,
-    },
-    /// A member is being admitted, or asks for it: the state of the group's kind to hand it, if any.
-    Snapshot {
-        group: Bytes,
-        reply: oneshot::Sender<Option<Vec<u8>>>,
-    },
     /// A file is held whole.
     File([u8; 32]),
     /// An identity's public log grew, as this session read it.
@@ -277,9 +261,7 @@ impl Event {
             | Event::Live { group, .. }
             | Event::Synced { group, .. }
             | Event::Heard { group }
-            | Event::Duties { group }
-            | Event::State { group, .. }
-            | Event::Snapshot { group, .. } => Some(group),
+            | Event::Duties { group } => Some(group),
             Event::Message(message) => Some(&message.group),
             Event::Lost(lost) => Some(&lost.group),
             Event::Warning { group, .. } => group.as_ref(),
@@ -301,11 +283,9 @@ struct Rec {
     committed: u64,
     /// The files this session added that no other member held yet.
     pending: Vec<[u8; 32]>,
-    /// File links, with when they were linked: those the kind holds (its files added, and those its held messages
-    /// link) and states handed to or by this session. Each is held for the group's H.
+    /// File links, with when they were linked: the files this session added, and those held messages link. Each is
+    /// held for the group's H.
     files: Vec<(String, u64)>,
-    /// The files the kind links now, held while it does.
-    links: Vec<String>,
     /// The invites shared with the group, kept for H after they expire.
     invites: Vec<Rule>,
     /// The `leave`s opened: each one's membership, and its seq.
@@ -330,11 +310,6 @@ struct Rec {
     told: Vec<(Bytes, u64, Seqs)>,
     /// The epochs whose ending commits are saved, with when they applied.
     commits: Vec<(u64, u64)>,
-    /// The member to ask for the state, and its epoch: once this session is at or past that epoch, it asks that member
-    /// until a state opens.
-    wanted: Option<([u8; 32], u64)>,
-    /// The members this session answered a request for the state, with the epoch it answered in.
-    answered: Vec<([u8; 32], u64)>,
     /// The epoch this session's messages past its cut were last sealed again in.
     resealed: u64,
     /// The epoch each other member is surely at: its join epoch, its latest commit's, or a summary's in the current epoch.
@@ -367,11 +342,10 @@ impl Rec {
         self.files.push((link, now()));
     }
 
-    /// The files this session holds for the group: those linked within H, and those the kind links now.
+    /// The files this session holds for the group: those linked within H.
     fn held(&self, carry: u32) -> Vec<FileLink> {
         let since = now().saturating_sub(days(carry));
-        let linked = self.files.iter().filter(|(_, at)| *at >= since).map(|(link, _)| link);
-        linked.chain(&self.links).filter_map(|link| FileLink::parse(link).ok()).collect()
+        self.files.iter().filter(|(_, at)| *at >= since).filter_map(|(link, _)| FileLink::parse(link).ok()).collect()
     }
 }
 
@@ -566,7 +540,6 @@ pub(crate) struct Inner<P> {
     relays: Vec<RelayUrl>,
     chosen: Vec<RelayUrl>,
     file_limit: u64,
-    kinds: Vec<String>,
     events: mpsc::UnboundedSender<Event>,
     work: mpsc::UnboundedSender<Work>,
     /// Peer output and client events from steps, in order.
@@ -888,12 +861,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_group_holds_files_linked_within_h_and_its_kinds_links() {
+    fn a_group_holds_files_linked_within_h() {
         let link = |n: u8| FileLink { hash: [n; 32], size: 1, key: [0; 32] }.link();
         let old = now() - 3 * 24 * 3600 * 1000;
         let files = vec![(link(1), old), (link(2), now())];
-        let rec = Rec { files, links: vec![link(3)], ..Rec::default() };
+        let rec = Rec { files, ..Rec::default() };
         let held: Vec<u8> = rec.held(2).iter().map(|file| file.hash[0]).collect();
-        assert_eq!(held, [2, 3]);
+        assert_eq!(held, [2]);
     }
 }

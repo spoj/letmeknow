@@ -39,20 +39,18 @@ jobs:
           echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$ndk/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
           echo "CC_aarch64_linux_android=$ndk/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
           echo "AR_aarch64_linux_android=$ndk/llvm-ar" >> "$GITHUB_ENV"
-      # The plugins of the kinds letmeknow ships go beside it, where a session looks for them first.
-      - run: cargo build --release --target ${{ matrix.target }} -p letmeknow -p lmk-kinds
+      - run: cargo build --release --target ${{ matrix.target }} -p letmeknow
       - if: matrix.npm == 'linux-x64'
         name: Test the release backend artifact
         run: LMK_E2E_BIN="$PWD/target/${{ matrix.target }}/release/letmeknow" python3 -u test/e2e.py
       - name: Package
         run: |
           suffix=; [[ "${{ matrix.target }}" == *windows* ]] && suffix=.exe
-          exes=()
-          for exe in letmeknow letmeknow-kind-doc letmeknow-kind-table; do exes+=("target/${{ matrix.target }}/release/$exe$suffix"); done
+          exe=target/${{ matrix.target }}/release/letmeknow$suffix
           name=letmeknow-${{ github.ref_name }}-${{ matrix.target }}
           mkdir -p "$name" "npm/${{ matrix.npm }}/bin"
-          cp README.md SKILL.md LICENSE deploy/letmeknow.service deploy/backend.json "${exes[@]}" "$name/"
-          cp "${exes[@]}" "npm/${{ matrix.npm }}/bin/"
+          cp README.md SKILL.md LICENSE deploy/letmeknow.service deploy/backend.json "$exe" "$name/"
+          cp "$exe" "npm/${{ matrix.npm }}/bin/"
           if [[ -n "$suffix" ]]; then 7z a "$name.zip" "$name"; else tar czf "$name.tar.gz" "$name"; fi
       - uses: actions/upload-artifact@v4
         with:

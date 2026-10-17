@@ -26,13 +26,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --no-fail-fast
-      # The client core, and the binaries released for Termux, build for Android, with the runner's NDK.
+      # The client core, and the binary released for Termux, build for Android, with the runner's NDK.
       - if: runner.os == 'Linux'
         run: |
           rustup target add aarch64-linux-android
           ndk=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
           CC_aarch64_linux_android=$ndk/aarch64-linux-android24-clang AR_aarch64_linux_android=$ndk/llvm-ar \
-            cargo check -p lmk-client -p letmeknow -p lmk-kinds --target aarch64-linux-android
+            cargo check -p lmk-client -p letmeknow --target aarch64-linux-android
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

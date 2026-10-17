@@ -13,8 +13,8 @@ fn signed_rename_reaches_all_native_sessions_and_offline_leaves_wait_for_resume(
         tablet.cmd(&["identity", "join", link["link"].as_str().unwrap()]).await.unwrap();
         let identity = owner.cmd(&["identity", "list"]).await.unwrap()["identity"].as_str().unwrap().to_owned();
         let mut groups = Vec::new();
-        for kind in ["chat", "doc", "table"] {
-            let made = observer.cmd(&["invite", "--kind", kind, "--name", kind]).await.unwrap();
+        for name in ["one", "two", "three"] {
+            let made = observer.cmd(&["invite", "--name", name]).await.unwrap();
             let gid = made["group"].as_str().unwrap().to_owned();
             owner.cmd(&["join", made["link"].as_str().unwrap()]).await.unwrap();
             for joiner in [&side, &tablet] {

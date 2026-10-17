@@ -72,14 +72,8 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok(self.inner.lock().group(gid)?.rec.pending.clone())
     }
 
-    /// The kinds this session supports.
-    pub fn kinds(&self) -> &[String] {
-        &self.inner.kinds
-    }
-
     /// A new group with this session its only member, speaking as `identity`.
     pub fn create(&self, settings: Settings, identity: Option<Certificate>) -> Result<Bytes> {
-        ensure!(self.inner.kinds.contains(&settings.kind), "this session does not support {} groups", settings.kind);
         let gid = {
             let mut st = self.inner.lock();
             let st = &mut *st;
@@ -94,7 +88,6 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// public log, whose first entry lists that key as its writer, and whose id the group's settings carry. Leaves the
     /// group if the entry cannot be appended.
     pub async fn create_identity(&self, mut settings: Settings) -> Result<IdentityRef> {
-        ensure!(self.inner.kinds.contains(&settings.kind), "this session does not support {} groups", settings.kind);
         let (gid, identity, first) = {
             let mut st = self.inner.lock();
             let st = &mut *st;
@@ -196,27 +189,6 @@ impl<P: Provider + Send + 'static> Node<P> {
         }
         st.save(gid)?;
         self.inner.fetch_within_limit(gid, parsed);
-        Ok(())
-    }
-
-    /// The files the group's kind links now, held while it does; fetches those new within this session's limit.
-    pub fn set_links(&self, gid: &[u8], links: Vec<String>) -> Result<()> {
-        let mut st = self.inner.lock();
-        let rec = &mut st.group_mut(gid)?.rec;
-        let new = links.iter().filter(|link| !rec.links.contains(link)).map(|link| FileLink::parse(link)).collect::<Result<Vec<_>>>()?;
-        rec.links = links;
-        st.save(gid)?;
-        self.inner.fetch_within_limit(gid, new);
-        Ok(())
-    }
-
-    /// Hands the member with fingerprint `to` a state of the group's kind, as a file it fetches.
-    pub async fn hand_state(&self, gid: &[u8], to: &str, data: Vec<u8>) -> Result<()> {
-        let peer = self.inner.lock().by_fp(gid, to)?;
-        let link = self.inner.state_file(gid, data).await?;
-        let mut st = self.inner.lock();
-        let frame = st.state_frame(gid, &link)?;
-        st.emit(gid, peer, frame);
         Ok(())
     }
 

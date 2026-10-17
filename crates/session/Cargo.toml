@@ -35,12 +35,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 semver = "1"
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "rt", "macros", "net", "io-util", "sync", "time", "signal", "process"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "rt", "macros", "net", "io-util", "sync", "time", "signal"] }
 dirs = "7"
 qrcode = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 lmk-testing.workspace = true
 rcgen = "0.14"
-lmk-kinds.workspace = true
 tempfile.workspace = true

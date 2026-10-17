@@ -592,8 +592,8 @@ fn the_gate() {
     assert!(takes(&hello, false, false) && !sends(&hello, false, false));
     let want = Frame::Want { group: id(), epoch: 1, wants: vec![], ids: vec![] };
     assert!(!takes(&want, false, true) && takes(&want, true, false));
-    let state = Frame::State { group: id(), epoch: 1, link: None };
-    assert!(!takes(&state, false, true) && takes(&state, true, false) && sends(&state, true, false));
+    let files = Frame::WantFiles { group: id(), files: vec![] };
+    assert!(!takes(&files, false, true) && takes(&files, true, false) && sends(&files, true, false));
     let live = Frame::Live { group: id(), hops: 1, item: Bytes(vec![]) };
     assert!(!takes(&live, true, false) && takes(&live, true, true));
     assert!(!sends(&live, true, false) && sends(&live, true, true));

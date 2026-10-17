@@ -39,7 +39,6 @@ pub struct Add {
     /// The session's handle; empty for the session that acts for the device.
     pub session: String,
     pub group: Bytes,
-    pub kind: String,
     pub name: String,
     pub link: String,
     /// When the link expires, in milliseconds.
@@ -63,8 +62,7 @@ pub struct SessionGroup {
     pub session: Option<String>,
     pub group: Bytes,
     pub name: String,
-    /// Its kind and its other members, as they show to the session.
-    pub kind: String,
+    /// Its other members, as they show to the session.
     pub members: Vec<String>,
 }
 
@@ -355,7 +353,6 @@ impl<P: Provider + Send + 'static> Identity<P> {
             return Some(event);
         }
         match event {
-            Event::Snapshot { reply, .. } => _ = reply.send(None),
             Event::Duties { .. } => self.due(&gid.0),
             Event::Synced { member, .. } => self.tell(&gid.0, Some(&member.key)),
             Event::Live { sender, payload, .. } => {

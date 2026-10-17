@@ -8,26 +8,14 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "clap", derive(clap::Subcommand))]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
-    /// Make a one-time invite link, valid for 10 minutes, into a group: a new one unless --group is given
+    /// Make a one-time invite link, valid for 10 minutes, into a chat: a new one unless --group is given
     #[cfg_attr(feature = "clap", command(display_order = 10))]
     Invite {
         #[cfg_attr(feature = "clap", arg(long))]
         group: Option<String>,
-        /// What a new group shares: a chat (messages in order), or a kind a plugin of this session supports, such as a doc (one text everyone edits at once)
-        #[cfg_attr(feature = "clap", arg(long, default_value = "chat", conflicts_with = "group"))]
-        #[serde(default = "chat")]
-        kind: String,
-        /// The new group's name
+        /// The new chat's name
         #[cfg_attr(feature = "clap", arg(long, conflicts_with = "group"))]
         name: Option<String>,
-        /// For the new group's kind: a doc's file, kept in step with the doc, and its first text if it exists [default: a new file in the session's state]
-        #[cfg_attr(feature = "clap", arg(conflicts_with = "group"))]
-        #[serde(default)]
-        args: Vec<String>,
-        /// The command's directory, which the arguments are relative to
-        #[cfg_attr(feature = "clap", arg(skip))]
-        #[serde(default)]
-        cwd: String,
         /// Days members carry a new group's messages and files for one another
         #[cfg_attr(feature = "clap", arg(long, default_value_t = 7, conflicts_with = "group"))]
         #[serde(default = "carry")]
@@ -45,15 +33,7 @@ pub enum Request {
     },
     /// Join a group through an invite link
     #[cfg_attr(feature = "clap", command(display_order = 11))]
-    Join {
-        target: String,
-        /// For the group's kind: a doc's new file to keep in step with it [default: a new file in the session's state]
-        #[serde(default)]
-        args: Vec<String>,
-        #[cfg_attr(feature = "clap", arg(skip))]
-        #[serde(default)]
-        cwd: String,
-    },
+    Join { target: String },
     /// List members of a group
     #[cfg_attr(feature = "clap", command(display_order = 14))]
     Members {
@@ -143,10 +123,6 @@ pub enum IdentityOp {
         #[serde(default)]
         device: bool,
     },
-}
-
-fn chat() -> String {
-    lmk_proto::group::CHAT.into()
 }
 
 fn carry() -> u32 {

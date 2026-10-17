@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::session::Inbound;
 use lmk_proto::links::Invite;
 
-/// End-to-end encrypted chats and documents for agents and their people.
+/// End-to-end encrypted chats for agents and their people.
 #[derive(Parser)]
 #[command(name = "letmeknow", version)]
 pub struct Cli {
@@ -33,9 +33,9 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Run the session process, which runs the plugins of its groups' kinds, and print what arrives as NDJSON
+    /// Run the session process, and print what arrives as NDJSON
     Listen {
-        /// Seconds a message or doc edit not addressed to this session may wait for something that wakes the agent anyway
+        /// Seconds a message not addressed to this session may wait for something that wakes the agent anyway
         #[arg(long, env = "LETMEKNOW_HOLD", default_value_t = 3600)]
         hold: u64,
         /// Keep the text of messages once delivered, for audit; by default only ids, senders and references are kept
@@ -59,9 +59,6 @@ pub enum Command {
     Serve(Serve),
     #[command(flatten)]
     Request(Request),
-    /// A command of a kind's plugin: `letmeknow <kind> <args>...`, such as `letmeknow doc attach <path>`
-    #[command(external_subcommand)]
-    Kind(Vec<String>),
 }
 
 #[derive(Subcommand)]
@@ -150,12 +147,9 @@ pub enum Request {
         #[arg(long, default_value_t = 0)]
         ancestors: usize,
     },
-    /// The file a message or a group's kind (a doc) links, decrypted into a file only you can read; prints its path
+    /// The file a message links, decrypted into a file only you can read; prints its path
     #[command(display_order = 20)]
     Fetch { link: String },
-    /// A command of a kind's plugin, from `letmeknow <kind> <args>...`.
-    #[command(skip)]
-    Kind { kind: String, args: Vec<String>, cwd: String },
     /// `identity join <link>`: sent as the client's `join`.
     #[command(skip)]
     #[serde(skip)]
@@ -324,9 +318,8 @@ async fn answer(stream: TcpStream, token: String, inbound: mpsc::UnboundedSender
     let _ = write.write_all(format!("{response}\n").as_bytes()).await;
 }
 
-/// Sends a request to the running session and returns its answer: made short, but for `members`, and for a kind's
-/// commands, which their plugin answers. Files the request names are read, or made absolute, here, and a kind's arguments
-/// go with this directory: the session process runs elsewhere.
+/// Sends a request to the running session and returns its answer: made short, but for `members`. Files the request
+/// names are read here: the session process runs elsewhere.
 pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Value> {
     if let Request::Client(lmk_client::Request::Join { target, .. }) = &request {
         ensure!(
@@ -338,7 +331,7 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
     match request {
         Request::IdentityJoin { link } => {
             ensure!(Invite::parse(link.trim())?.device, "that is not a device link; `identity invite` makes them");
-            request = Request::Client(lmk_client::Request::Join { target: link, args: Vec::new(), cwd: String::new() })
+            request = Request::Client(lmk_client::Request::Join { target: link })
         }
         Request::Status { group } => {
             only = Some(group);
@@ -367,12 +360,7 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
             std::io::stdin().read_to_string(text)?;
         }
     }
-    if let Request::Client(lmk_client::Request::Invite { cwd, .. } | lmk_client::Request::Join { cwd, .. }) | Request::Kind { cwd, .. } =
-        &mut request
-    {
-        *cwd = absolute(".")?;
-    }
-    let full = matches!(request, Request::Client(lmk_client::Request::Members { .. }) | Request::Kind { .. });
+    let full = matches!(request, Request::Client(lmk_client::Request::Members { .. }));
     let channel = connect(&session_dir(home, session)?.join("endpoint"))
         .await
         .with_context(|| format!("session {session} is not running; start it with `letmeknow --session {session} listen`"))?;
@@ -407,11 +395,6 @@ pub async fn exchange((stream, token): (TcpStream, String), request: Request) ->
         bail!("{error}");
     }
     Ok(response)
-}
-
-fn absolute(path: &str) -> Result<String> {
-    let absolute: PathBuf = std::path::absolute(path)?.components().collect();
-    Ok(absolute.to_str().context("path is not UTF-8")?.to_owned())
 }
 
 #[cfg(unix)]

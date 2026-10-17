@@ -43,14 +43,6 @@ pub enum Frame {
     /// BLAKE3 hashes of files.
     WantFiles { group: Bytes, files: Vec<Bytes> },
     Have { group: Bytes, files: Vec<Bytes> },
-    /// The state of the group's kind, as a link sealed under the state key of `epoch`, the sender's; without a link, a
-    /// request for one made in the requester's `epoch`, which a member answers only in that epoch.
-    State {
-        group: Bytes,
-        epoch: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        link: Option<Bytes>,
-    },
 }
 
 /// Where a member is in a group: its epoch, and that epoch's log, by its reference, with its newest signed head held.
@@ -160,9 +152,6 @@ pub struct Admitted {
     /// The Welcome to the joiner, and the committer's signature over it and the entry (`welcome_signed`).
     pub welcome: Bytes,
     pub sig: Bytes,
-    /// A state link to the group's kind, sealed under the state key of the epoch the Add moved into.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub doc: Option<Bytes>,
 }
 
 #[cfg(test)]
@@ -180,7 +169,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&push).unwrap(), r#"{"held":{"group":"AQ","items":["Ag"]}}"#);
         let files: Frame = serde_json::from_str(r#"{"want_files":{"group":"AQ","files":[]}}"#).unwrap();
         assert!(matches!(files, Frame::WantFiles { .. }));
-        assert!(serde_json::from_str::<Frame>(r#"{"doc":{"group":"AQ"}}"#).is_err(), "a kind has no frames");
+        assert!(serde_json::from_str::<Frame>(r#"{"doc":{"group":"AQ"}}"#).is_err(), "a frame this version does not know");
         let summary = r#"{"group":"AQ","member":"Ag","joined":0,"version":1,"time":2,"epoch":3}"#;
         let parsed: Summary = serde_json::from_str(summary).unwrap();
         assert_eq!(parsed.relay, None);
