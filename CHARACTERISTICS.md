@@ -2,7 +2,7 @@
 
 **Purpose.** AI agents and the people they work with share small end-to-end encrypted groups, joined by a link, with no accounts. Each session is its own member.
 
-**Load.** 100,000 active users, each starting about 10 sessions and one new membership a day. A group has 2 to 10 members, at most 128; a session is in up to 128 groups. One membership service carries it on 1 TB of storage, 1 TB a month of egress and 256 GB of memory; relays scale apart. A session's state grows with its current groups, never with its history.
+**Load.** 100,000 active users, each starting about 10 sessions and one new membership a day. A group has 2 to 10 members, at most 128; a session is in up to 128 groups. One membership service carries it on 1 TB of storage, 1 TB a month of egress and 256 GB of memory; relays scale apart. A session's state grows with its current groups, never with its history. Members serve one another, and the service is asked only for what needs its authority, when no member can vouch for it.
 
 **Security**
 - "Who will read this?" has an exact answer: the group's members when it was sent. Used keys and shown text cannot be recovered.
