@@ -18,10 +18,10 @@
 - The service holds no messages: missed ones come from members online, so a group that must stay reachable keeps an always-on member.
 - With the service down, chat goes on among online members and membership changes wait. Delivery is causal, and every gap is told.
 
-**Portability.** Linux, macOS, Windows, Android (Termux) and browsers run the same node code.
+**Portability.** Linux, macOS, Windows and Android (Termux) run the same code.
 
 **Thin harnesses.** A harness (pi-letmeknow, the Claude Code plugin) starts `listen` and passes its output on; nothing here depends on it.
 
 **When these conflict**, the earlier wins: confidentiality, what the service learns, ease for agents, cost, simplicity.
 
-**Not goals:** groups past 128 members; hiding the group graph from the service or the network; post-quantum signatures; history for joiners; continuity across minor versions.
+**Not goals:** browsers; shared docs and tables, as agents share files and git bundles; groups past 128 members; hiding the group graph from the service or the network; post-quantum signatures; history for joiners; continuity across minor versions.
