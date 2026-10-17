@@ -66,7 +66,7 @@ For: "Who will read this?" exact, with step 4: today a doc or table hands every 
 - Stay: chat, attachments and `fetch`, live payloads (the identity kind's presence), and the identity kind.
 - The test that a joiner gets nothing from before it joined but its Welcome comes with step 4.
 
-## 8. A week's retention
+## 8. A week's retention (done)
 
 For: a session resumes within seven days, and nothing in use lapses.
 

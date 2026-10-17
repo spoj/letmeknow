@@ -49,7 +49,7 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            appends_per_minute: 600, retention_days: 30, disk: DISK_BYTES,
+            appends_per_minute: 600, retention_days: 7, disk: DISK_BYTES,
             append_bytes_per_day: 256 << 20, reads_per_minute: 600, read_bytes_per_minute: 64 << 20,
             new_logs_per_day: 2_000, new_public_logs_per_day: 10, public_appends_per_day: 10,
             requests_at_once: 8, bytes_at_once: 16 << 20, bytes_at_once_in_all: 256 << 20,

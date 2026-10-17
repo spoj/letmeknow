@@ -256,11 +256,11 @@ async fn touched_directory_outlives_retention() {
     let untouched = other_devices.create("untouched", relay.service.clone()).await.unwrap();
     other.node.shutdown().await.unwrap();
     let gid = devices_group(&laptop.node);
-    LATER.store(20 * DAY, std::sync::atomic::Ordering::Relaxed);
+    LATER.store(5 * DAY, std::sync::atomic::Ordering::Relaxed);
     let epoch = laptop.node.epoch(&gid.0).unwrap();
     laptop_devices.rename("renamed-canary").await.unwrap();
     assert!(laptop.node.epoch(&gid.0).unwrap() > epoch, "the rename commits, and so touches the directory");
-    LATER.store(35 * DAY, std::sync::atomic::Ordering::Relaxed);
+    LATER.store(9 * DAY, std::sync::atomic::Ordering::Relaxed);
     while relay.membership.expire().await {}
     let reader = ServeClient::for_service(relay.post(), &touched.membership).unwrap();
     let logs = [touched.id.0, untouched.id.0].map(|id| lmk_proto::membership::Known(lmk_proto::public::address(&id), u64::MAX));

@@ -1548,12 +1548,43 @@ fn a_member_in_an_epoch_the_service_let_go_is_removed_by_the_others() {
         alice.node.sync_members().await.unwrap();
         assert_eq!(alice.node.members(&gid.0).unwrap().len(), 2, "the log Bob is in is not gone yet");
 
-        SHIFT.store(31 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         while relay.membership.expire().await {}
         alice.node.sync_members().await.unwrap();
         alice.until(|e| matches!(e, Event::Left { member, .. } if member.name == "Bob").then_some(())).await;
         assert_eq!(alice.node.members(&gid.0).unwrap().len(), 1);
         alice.node.shutdown().await.unwrap();
+    });
+}
+
+/// A member away six days resumes: the service keeps the log of the commit it missed for a week.
+#[test]
+fn a_member_away_six_days_resumes() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let dir = folder("six-days");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut alice = session(&relay, "Alice").await;
+        let bob = stored(&relay, "Bob", &dir.join("bob.db")).await;
+        let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+        bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+        bob.node.shutdown().await.unwrap();
+        drop(bob);
+        alice.node.change_settings(&gid.0, |s| Settings { name: "Later".into(), ..s }).await.unwrap();
+
+        SHIFT.store(6 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        while relay.membership.expire().await {}
+        let mut bob = stored(&relay, "Bob", &dir.join("bob.db")).await;
+        eventually("Bob applied the rename", || bob.node.settings(&gid.0).is_ok_and(|s| s.name == "Later")).await;
+        alice.node.send(&gid.0, &message("welcome back"), None).unwrap();
+        bob.until(|e| matches!(e, Event::Message(m) if m.payload == message("welcome back")).then_some(())).await;
+        alice.node.shutdown().await.unwrap();
+        bob.node.shutdown().await.unwrap();
     });
 }
 
@@ -1577,7 +1608,7 @@ fn a_member_whose_log_the_service_let_go_leaves_when_no_peer_brings_it_within_wa
         alice.node.change_settings(&gid.0, |s| Settings { name: "Later".into(), ..s }).await.unwrap();
         alice.node.shutdown().await.unwrap();
 
-        SHIFT.store(31 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         while relay.membership.expire().await {}
         let mut bob = stored(&relay, "Bob", &dir.join("bob.db")).await;
         bob.node.sync().await;
@@ -1664,9 +1695,9 @@ fn a_device_missing_its_identitys_commits_past_the_retention_is_revoked_and_told
         drop((phone, phone_devices));
         laptop_devices.rename("Renamed").await.unwrap();
 
-        SHIFT.store(20 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        SHIFT.store(5 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         laptop_devices.rename("Again").await.unwrap();
-        SHIFT.store(35 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        SHIFT.store(9 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         while relay.membership.expire().await {}
         laptop.node.sync_members().await.unwrap();
         laptop.until(|e| matches!(e, Event::Left { member, .. } if member.name == "phone").then_some(())).await;
@@ -1712,7 +1743,7 @@ fn a_joiner_whose_key_is_in_the_tree_of_a_lapsed_member_is_removed_before_its_ad
         alice.node.change_settings(&gid.0, |s| Settings { name: "Later".into(), ..s }).await.unwrap();
         alice.node.shutdown().await.unwrap();
 
-        SHIFT.store(31 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         while relay.membership.expire().await {}
         let mut bob = stored(&relay, "Bob", &dir.join("bob.db")).await;
         bob.node.sync().await;
@@ -1752,7 +1783,7 @@ fn an_untouched_directory_ends_its_identity_for_the_chats_its_sessions_are_in() 
         laptop.node.join(&link, Some(laptop_devices.certify(&laptop.node.key().0).unwrap())).await.unwrap();
         alice.checked(&chat, "laptop", true).await;
 
-        SHIFT.store(31 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         while relay.membership.expire().await {}
         alice.node.sync().await;
         alice.until(|e| matches!(&e, Event::Left { member, .. } if member.name == "laptop").then_some(())).await;
@@ -1809,9 +1840,9 @@ fn a_single_device_identity_survives_the_retention_by_its_own_commits() {
         routed(&mut laptop, laptop_devices.clone());
         let bob = laptop_devices.create("Bob", relay.service.clone()).await.unwrap();
         lists(&laptop.node, &bob, &[laptop_devices.key().unwrap()]).await;
-        SHIFT.store(20 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        SHIFT.store(5 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         laptop_devices.rename("Robert").await.unwrap();
-        SHIFT.store(35 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        SHIFT.store(9 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         while relay.membership.expire().await {}
         laptop.node.sync().await;
         laptop.node.sync_members().await.unwrap();

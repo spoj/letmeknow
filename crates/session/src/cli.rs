@@ -100,7 +100,7 @@ pub struct Serve {
     #[arg(long, default_value_t = 4096)]
     pub disk: u64,
     /// Days a group's log is kept after its first entry, and a directory's after its last append, at least 7
-    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(7..))]
+    #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u64).range(7..))]
     pub retention: u64,
     /// A certificate (PEM) to use instead of Let's Encrypt, with --key
     #[arg(long, requires = "key")]
@@ -453,8 +453,8 @@ mod tests {
             Command::Serve(serve) => serve.retention,
             _ => panic!("not serve"),
         });
-        assert_eq!(retention(&[]).unwrap(), 30);
-        assert_eq!(retention(&["--retention", "7"]).unwrap(), 7);
+        assert_eq!(retention(&[]).unwrap(), 7);
+        assert_eq!(retention(&["--retention", "30"]).unwrap(), 30);
         assert!(retention(&["--retention", "6"]).is_err());
     }
 
