@@ -44,7 +44,9 @@ use tokio_rustls_acme::{AcmeConfig, caches::DirCache};
 use tokio_stream::StreamExt;
 
 const HANDSHAKE: Duration = Duration::from_secs(10);
-const HEADERS: Duration = Duration::from_secs(10);
+/// How long a connection waits for a request's headers, idle between requests included: past the 2 minutes sessions
+/// wait between polls, so that their polls keep one connection.
+const HEADERS: Duration = Duration::from_secs(150);
 const BODY: Duration = Duration::from_secs(15);
 /// How long a membership answer may take to drain before its connection is closed.
 const DRAIN: Duration = Duration::from_secs(30);

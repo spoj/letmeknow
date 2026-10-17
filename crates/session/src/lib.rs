@@ -29,6 +29,9 @@ const LOOKUP: Duration = Duration::from_secs(2);
 /// How long a fetched directory answers without another fetch, and how long a fetch of one may take.
 const FRESH: Duration = Duration::from_secs(10 * 60);
 const FETCH: Duration = Duration::from_secs(5);
+/// How long a connection to a service is kept idle: past the 2 minutes between polls, within the 150 seconds the service
+/// waits.
+const IDLE: Duration = Duration::from_secs(140);
 /// How long a domain whose last fetch failed, or is still under way, is not fetched again.
 const RETRY: Duration = Duration::from_secs(60);
 
@@ -75,6 +78,7 @@ impl Network {
             .tls_backend_preconfigured(tls)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
+            .pool_idle_timeout(IDLE)
             .timeout(FETCH);
         if let Some(proxy) = proxy() {
             builder = builder.proxy(reqwest::Proxy::all(proxy)?);

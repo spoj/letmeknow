@@ -225,10 +225,10 @@ async fn membership_refuses_what_pages_send() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn stalled_handshakes_and_headers_are_dropped() {
+async fn stalled_handshakes_are_dropped() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let (config, cert) = configure(&state);
+    let (config, _) = configure(&state);
     let https = config.https_port;
     let server = tokio::spawn(serve(config));
     wait_for_https(https).await;
@@ -236,11 +236,44 @@ async fn stalled_handshakes_and_headers_are_dropped() {
     let mut silent = TcpStream::connect((Ipv4Addr::LOCALHOST, https)).await.unwrap();
     let mut rest = Vec::new();
     assert!(timeout(Duration::from_secs(14), silent.read_to_end(&mut rest)).await.is_ok(), "a silent handshake was kept open");
+    server.abort();
+}
+
+/// Reads one HTTP response whose body has a `content-length`.
+async fn response(tls: &mut tokio_rustls::client::TlsStream<TcpStream>) -> String {
+    let mut bytes = Vec::new();
+    loop {
+        let mut chunk = [0; 4096];
+        let n = tls.read(&mut chunk).await.unwrap();
+        assert!(n > 0, "the connection closed");
+        bytes.extend_from_slice(&chunk[..n]);
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        if let Some((head, body)) = text.split_once("\r\n\r\n") {
+            let length = head.lines().find_map(|line| line.to_lowercase().strip_prefix("content-length: ").map(|n| n.parse::<usize>().unwrap())).unwrap();
+            if body.len() >= length {
+                return text;
+            }
+        }
+    }
+}
+
+/// A connection waits for its next request longer than a stalled handshake: sessions poll on one kept connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_connection_is_kept_for_its_next_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let (config, cert) = configure(&state);
+    let https = config.https_port;
+    let server = tokio::spawn(serve(config));
+    wait_for_https(https).await;
 
     let mut tls = tls_connect("127.0.0.1", https, &cert).await;
-    tls.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n").await.unwrap();
-    let mut rest = Vec::new();
-    assert!(timeout(Duration::from_secs(14), tls.read_to_end(&mut rest)).await.is_ok(), "stalled headers were kept open");
+    let health = b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    tls.write_all(health).await.unwrap();
+    assert!(response(&mut tls).await.starts_with("HTTP/1.1 200"));
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    tls.write_all(health).await.unwrap();
+    assert!(response(&mut tls).await.starts_with("HTTP/1.1 200"));
     server.abort();
 }
 

@@ -30,23 +30,22 @@ Today a group's state keeps an `Added` record, with credentials and certificates
 - `taken` rows and `attachments` rows go H after their message; an attachment's private copy goes with its row. SKILL says how long copies last.
 - Tests: removed members' records go after H, while current members', recent ones and those of usable invites stay; a group's saved state and the session's tables after K messages, joins and leaves do not grow with K.
 
-## 4. Messages stay with the members they were sent to
+## 4. Messages stay with the members they were sent to (done)
 
 For: "Who will read this?" has an exact answer: the group's members when it was sent.
 
-Today `reseal` (`crates/node/src/sending.rs`) seals a sender's messages past its cut again in the new epoch and broadcasts them to every member, a member that the epoch's commit added included; answers to `Want` are sealed for the asker's epoch too. So a message sent while an Add is in flight reaches the joiner.
+- A held message's header names the epoch it was sent in, and its `prev`'s; a `Ref` (deps, cuts) names its message's. No member passes a message, as a reseal, a forward or an answer, to a member that joined after it was sent.
+- A joiner tells by a cut's epoch, a `prev`'s or a dep's that what it names is not its to have: it neither waits for it nor reports it `missing` or `lost`. An author's message sent before every other member joined needs no holder before a cut keeps it.
+- Test: a message sent while an Add is in flight never reaches the joiner, whose next message from the same author comes at once, missing nothing.
 
-- No member sends a joiner, as a reseal or as an answer, a message sent before it joined. A joiner that a later message names such a message to sees it as `missing`, as any message it cannot get.
-- Test: a message sent while an Add is in flight never reaches the joiner.
-
-## 5. Polls on kept connections
+## 5. Polls on kept connections (done but the measurement, after release)
 
 For: the service's egress, within 1 TB a month.
 
 A poll on a new TLS connection takes about 3.3 KB of egress, and on a kept one about 0.4 KB: with about 10,000 sessions online at once in the reference load, 27 GB a day against 3, of a 33 GB budget. Today the client drops idle connections after 90 seconds (reqwest's default) while it polls every 90 to 120; the server's `header_read_timeout` of 10 seconds (`crates/serve/src/lib.rs`) may close idle ones sooner; and the server's rustls keeps its default cache of 256 sessions, with no ticketer, so few clients resume.
 
-- A running session's polls reuse one connection to its service; the server keeps an idle connection longer than `POLL`.
-- Test: a session polling through several `POLL`s makes one TLS handshake at the service.
+- A running session keeps an idle connection 140 seconds, past `POLL`; the server waits 150 for a request's headers, idle included. Waiting that long for stalled headers costs nothing more: a client could hold a connection idle anyway.
+- Test: the server answers a second request on a connection idle past the old 10 seconds.
 - Measure egress per poll at letmeknow.dev, on 0.19's service before and on 0.20's after, and with it the delivery time between online members at p99, which no test measures yet.
 
 ## 6. No browser (done)
