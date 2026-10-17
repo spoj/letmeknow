@@ -38,22 +38,26 @@ assumptions are rough:
 - **Egress binds.** It fits only if polls keep their connections, which reqwest drops after 90 s idle against a poll
   every 90 to 120 s and the server's TLS cache resumes only 256 clients, or the service pushes; and if peers carry
   most commits, leaving the service those who were away. Measure both.
-- **Memberships held at once** are the new ones times the days until each is removed: about 3,000,000 today, as a stale
-  member stays about 30 days, and about 500,000 with the leases below, if 9 in 10 sessions are ephemeral. A group that
-  every new session joins would otherwise fill its 128 places with stale members within a day, each named in every
-  commit's cut and carried in every Welcome (about 1.7 KB a member).
+- **Memberships held at once** are the new ones times the days until each is removed, the lease below: about 3,000,000
+  at today's 30 days, 700,000 at 7 and 100,000 at one. A group gathers stale members at the rate sessions join it,
+  each named in every commit's cut and carried in every Welcome (about 1.7 KB a member): one that 100 sessions a day
+  join fills its 128 places within 2 days whatever the lease, unless they leave as they stop.
 - **Expired references** grow by under 1 GB a month; their expiry (0.20's C) is due once a service outlives its minor
   (Decide: continuity).
 
 **Quiet, absent and gone.** An online session commits a leaf update every T (24 h) even when it says nothing, and the
-log shows that to every member alike: a quiet member and an absent one already differ. An absent member and one gone
-for good differ only to the session, or its harness. **Decide**:
-- A harness that knows a task is over removes its session (`sessions remove`); an ephemeral session leaves as it stops.
-- Each leaf names its lease, how long its session may be absent: 2 days for an ephemeral session, 30 for a persistent
-  one. Duties remove a member whose last commit is older, from the log alone, so every member agrees, as with today's
-  30-day lapse. A lease is at least 2T, as an online member commits only every T.
-- A wrong guess costs a re-invite, and what was sent meanwhile: the lease trades small groups against a forgiving
-  resume. Characteristic 3's resume becomes "within its lease".
+log shows that to every member alike, so a quiet member and an absent one already differ. Only the session knows
+whether an absent one is gone for good, and harnesses are disposable, so the lease is central: the service's retention
+of group logs, by 0.19's lapse rule. A member away past it cannot read the commit it missed; it leaves, and the others
+remove it, with nothing in a leaf or a harness. **Decide** its length, a promise to people more than a budget: at 7
+days the service already stores 30 to 50 GB and holds about 700,000 memberships. At 24 hours, as the code stands:
+- Directories share the retention, so an identity whose devices are all off for a day ends, with its memberships:
+  directories need their own, 30 days.
+- Identity groups' logs are group logs, so a device unused for a day while another is in use is revoked everywhere,
+  and the service cannot tell those logs apart.
+- The 7-day floor is there because retention must stay well above T: an unheard member is judged by its last commit,
+  and would be removed while online.
+- Resume shrinks to a day: an agent resumed after a weekend, or a person back on Monday, needs new invites.
 
 ## Characteristics, ranked
 
@@ -93,6 +97,8 @@ When two conflict, the higher one wins, unless a target says otherwise.
 Constraints:
 - **Portability:** Linux, macOS, Windows, Android (Termux) and browsers (wasm), on the same node code. What the node
   depends on builds for wasm32, and everything native builds for Windows.
+- **Thin harnesses:** a harness (pi-letmeknow, a Claude Code plugin) starts `listen` and passes its output on; no
+  characteristic depends on what it does.
 - **Evolution:** while pre-alpha, speed over continuity: nothing crosses a minor version, and within one, members run
   side by side (AGENTS.md). **Decide** what ends this (identities carried over, #56).
 
@@ -117,7 +123,7 @@ versions, until its trigger.
 
 ## Decide
 
-1. **Leases:** as in "Quiet, absent and gone", and how a harness says a session is ephemeral.
+1. **The lease:** the group logs' retention, a day, a weekend or a week, with directories split off at 30 days.
 2. **What a later quantum observer may learn:** which of names, the group graph and file hashes must stay hidden; at the
    transport (a hybrid key exchange through iroh's `crypto_provider`, if it builds for wasm) or frame by frame.
 3. **Continuity:** when minor versions stop resetting everyone, what carries over, and whether the service's state,
@@ -132,5 +138,5 @@ versions, until its trigger.
 - Dropped: the adaptive T, as groups stay at 128 members or fewer.
 - Waiting on Decide 2: sealed admission, whose invites must stay unusable to removed members. On 3: tombstone expiry. On
   a relay list that changes: live relays.
-- New, from the load: leases in the leaf, a change for a minor version (Decide 1); polls on kept connections, a patch
-  once measured.
+- New, from the load: `serve`'s retention split into group logs' (the lease, Decide 1) and directories', a patch;
+  polls on kept connections, a patch once measured.
