@@ -38,6 +38,8 @@ const DEVICE_RETRY: Duration = Duration::from_secs(10);
 const IDENTITY_CHECK: Duration = Duration::from_secs(10);
 /// How often the session acting for the device finds which of the device's sessions run.
 const PRESENCE: Duration = Duration::from_secs(2);
+/// How often a session forgets the messages it took in more than H ago.
+const FORGET: Duration = Duration::from_secs(3600);
 
 pub type SessionNode = Node<SqliteProvider>;
 
@@ -106,6 +108,8 @@ pub struct Session {
     identity_at: Instant,
     /// When the session acting for the device next finds which of the device's sessions run, and hands them their adds.
     presence_at: Instant,
+    /// When the session next forgets the messages it took in more than H ago.
+    forget_at: Instant,
     /// The adds handed to a session, by id, while it runs: one that failed goes again once the session starts again.
     handed: HashMap<Bytes, String>,
     /// The device's state as last published.
@@ -181,6 +185,7 @@ impl Session {
             device_retry: Instant::now(),
             identity_at: Instant::now(),
             presence_at: Instant::now(),
+            forget_at: Instant::now() + FORGET,
             handed: HashMap::new(),
             published: String::new(),
             groups: String::new(),
@@ -194,6 +199,7 @@ impl Session {
             running: JoinSet::new(),
         };
         session.take_device().await?;
+        session.forget_old()?;
         let groups = session.client.node().groups();
         for gid in &groups {
             session.outbox.catch_up(&b64(&gid.0));
@@ -289,7 +295,7 @@ impl Session {
         let device = self.device.is_none().then_some(self.device_retry);
         let presence = self.device.is_some().then_some(self.presence_at);
         let later = Instant::now() + Duration::from_secs(3600);
-        let due = held.into_iter().chain(device).chain(presence).chain([self.identity_at]);
+        let due = held.into_iter().chain(device).chain(presence).chain([self.identity_at, self.forget_at]);
         due.chain(self.catching_up).fold(later, Instant::min)
     }
 
@@ -312,6 +318,12 @@ impl Session {
             self.identity_at = now + Duration::from_secs(3600);
             let client = self.client.clone();
             self.running.spawn_local(async move { Done::IdentityRefreshed(client.refresh_identity().await) });
+        }
+        if self.forget_at <= now {
+            self.forget_at = now + FORGET;
+            if let Err(error) = self.forget_old() {
+                self.warn(format!("forgetting old messages: {error:#}"));
+            }
         }
         if self.outbox.deadline(self.config.hold).is_some_and(|at| at <= now) {
             self.outbox.flush_held();
@@ -555,7 +567,7 @@ impl Session {
         let mut item = self.message_item(event)?;
         let gid: Bytes = serde_json::from_value(item["group"].clone())?;
         let id = message_id(item["id"].as_str().context("a message has an id")?)?;
-        self.db.execute("INSERT OR IGNORE INTO taken (id, gid) VALUES (?, ?)", params![id, gid.0])?;
+        self.db.execute("INSERT OR IGNORE INTO taken (id, gid, at) VALUES (?, ?, ?)", params![id, gid.0, lmk_proto::clock::now()])?;
         let wakes = wakes(&item, |id| self.mine(id));
         if item["attachment"].is_object() {
             let link = FileLink::parse(item["attachment"]["link"].as_str().context("an attachment has a link")?)?;
@@ -574,6 +586,26 @@ impl Session {
             }
         }
         self.outbox.deliver(item, wakes);
+        Ok(())
+    }
+
+    /// Forgets the messages taken in more than the group's H ago, and their attachments, with the copies of their files: no
+    /// member can send them again by then.
+    fn forget_old(&self) -> Result<()> {
+        let node = self.client.node();
+        for gid in node.groups() {
+            let before = lmk_proto::clock::now().saturating_sub(node.settings(&gid.0)?.carry as u64 * 24 * 3600 * 1000);
+            let old = "SELECT path FROM attachments WHERE path IS NOT NULL AND message IN (SELECT id FROM taken WHERE gid = ?1 AND at < ?2)";
+            let paths: Vec<String> = self.db.prepare(old)?.query_map(params![gid.0, before], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+            for path in paths {
+                match std::fs::remove_file(&path) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+                    _ => {}
+                }
+            }
+            self.db.execute("DELETE FROM attachments WHERE message IN (SELECT id FROM taken WHERE gid = ?1 AND at < ?2)", params![gid.0, before])?;
+            self.db.execute("DELETE FROM taken WHERE gid = ?1 AND at < ?2", params![gid.0, before])?;
+        }
         Ok(())
     }
 

@@ -477,6 +477,41 @@ fn shifted() -> u64 {
     now + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// A message taken in leaves nothing in the session's tables once H has passed, and its attachment's copy goes with it.
+#[test]
+fn a_message_taken_in_is_forgotten_after_h_with_its_attachments_copy() {
+    static LATER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn later() -> u64 {
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64 + LATER.load(Ordering::Relaxed)
+    }
+    local(async {
+        lmk_proto::clock::set(later);
+        let world = world("forgotten").await;
+        let (mut alice, bob, _) = pair(&world, HOUR).await;
+        let file = world.root.path().join("token.txt");
+        std::fs::write(&file, "s3cret").unwrap();
+        bob.cmd(&["send", "--to", "Alice", "--attach", file.to_str().unwrap(), "the token"]).await.unwrap();
+        let message = alice.expect("message").await;
+        let path = match message["attachment"]["path"].as_str() {
+            Some(path) => path.to_owned(),
+            None => alice.expect("attachment").await["path"].as_str().unwrap().to_owned(),
+        };
+        let db = session_dir(&alice.home, "alice").unwrap().join("session.db");
+        let rows = || {
+            let db = rusqlite::Connection::open(&db).unwrap();
+            let count = |table: &str| db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get::<_, i64>(0)).unwrap();
+            (count("taken"), count("attachments"))
+        };
+        assert_eq!(rows(), (1, 1));
+        alice.stop().await;
+        LATER.store(8 * 24 * 3600 * 1000, Ordering::Relaxed);
+        let alice = world.start("alice", HOUR).await;
+        alice.cmd(&["status"]).await.unwrap();
+        assert_eq!(rows(), (0, 0));
+        assert!(!Path::new(&path).exists());
+    });
+}
+
 #[test]
 fn status_lists_sends_held_only_here_and_members_away() {
     local(async {

@@ -1453,6 +1453,50 @@ fn on_clock(clock: fn() -> u64, test: impl std::future::Future<Output = ()>) {
 
 const DAY_MS: u64 = 24 * 3600 * 1000;
 
+/// The records of who added whom keep the group's members, the joins of the last H and those whose invites still admit:
+/// a member removed longer than H ago leaves none.
+#[test]
+fn a_group_forgets_who_added_its_members_once_they_are_gone_past_h() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let dir = folder("forgotten-adds");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("alice.db");
+        let alice = stored(&relay, "Alice", &db).await;
+        let gid = alice.node.create(Settings { carry: 2, ..settings(CHAT, &relay) }, None).unwrap();
+        let mut keys = Vec::new();
+        for (name, valid) in [("Bob", INVITE_VALID), ("Carol", INVITE_VALID), ("Dave", 7 * DAY_MS)] {
+            let joiner = session(&relay, name).await;
+            joiner.node.join(&alice.node.invite(&gid.0, None, valid).await.unwrap(), None).await.unwrap();
+            keys.push(joiner.node.key());
+            joiner.node.shutdown().await.unwrap();
+        }
+        for key in [&keys[0], &keys[2]] {
+            assert!(alice.node.remove(&gid.0, &key.0).await.unwrap());
+        }
+        alice.node.shutdown().await.unwrap();
+        drop(alice);
+        let state = || {
+            let mut provider = SqliteProvider::open(&db).unwrap();
+            let state = String::from_utf8(provider.get(&[b"group/".as_slice(), &gid.0].concat()).unwrap().unwrap()).unwrap();
+            provider.close().unwrap();
+            state
+        };
+        assert!(["Bob", "Carol", "Dave"].iter().all(|name| state().contains(&format!("\"name\":\"{name}\""))));
+
+        SHIFT.store(3 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        let alice = stored(&relay, "Alice", &db).await;
+        eventually("Bob's record is forgotten", || !state().contains("\"name\":\"Bob\"")).await;
+        assert!(state().contains("\"name\":\"Carol\""), "a member's record stays");
+        assert!(state().contains("\"name\":\"Dave\""), "a record stays while its invite admits");
+        alice.node.shutdown().await.unwrap();
+    });
+}
+
 /// A member whose epoch's log its service let go is removed by the others, which hold the commits it missed: the hourly
 /// check finds the log gone, and their next pass removes the member.
 #[test]

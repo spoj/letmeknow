@@ -20,7 +20,7 @@ Today one node-wide lock (`Inner.committing`, `crates/node/src/lib.rs`) is held 
 - Accepted for now: an admission into a group that is itself waiting for kept messages still waits for them, up to `WAIT`, so links into such a group miss the 10 seconds.
 - Test: while group A's commit waits in `caught_up`, a commit in group B and an admission retry in A complete.
 
-## 3. History forgotten
+## 3. History forgotten (done)
 
 For: a session's state grows with its current groups, never with its history.
 

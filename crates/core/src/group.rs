@@ -352,6 +352,8 @@ pub struct Added {
     /// The epoch the Add moves into.
     pub epoch: u64,
     pub key_package_ref: [u8; 32],
+    /// When this session applied the Add, in milliseconds.
+    pub at: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -529,9 +531,15 @@ impl Group {
         Ok(self.mls.public_group().leaf(member.index).is_some_and(|ours| ours.encryption_key() == leaf.encryption_key()))
     }
 
-    /// Who added whom, as the log showed it since this session joined.
+    /// Who added whom, as the log showed it since this session joined, but the records forgotten.
     pub fn added(&self) -> &[Added] {
         &self.state.added
+    }
+
+    /// Forgets the records of who added whom that `keep` does not keep.
+    pub fn forget_added<P: Provider>(&mut self, provider: &P, keep: impl Fn(&Added) -> bool) -> Result<()> {
+        self.state.added.retain(keep);
+        self.save(provider)
     }
 
     /// Whether a commit this session applied added a member by the invite whose secret hashes to `hash`.
@@ -931,7 +939,7 @@ fn observe<P: Provider>(
             };
             Ok(Added {
                 member: leaf_credential(add.add_proposal().key_package().leaf_node())?,
-                by: committer.clone(), how: aad.how.clone(), invite: aad.invite.clone(), epoch, key_package_ref,
+                by: committer.clone(), how: aad.how.clone(), invite: aad.invite.clone(), epoch, key_package_ref, at: now(),
             })
         }).collect::<Result<Vec<_>>>()?;
         state.added.extend(records);

@@ -84,6 +84,16 @@ impl<P: Provider> State<P> {
         let g = self.group_mut(gid)?;
         g.rec.files.retain(|(_, at)| *at >= before);
         g.rec.invites.retain(|rule| rule.expires >= before);
+        let g = self.group(gid)?;
+        // A record of who added whom stays while its member is in the group, while its invite admits, and for H, so that
+        // an invite told late finds itself used.
+        let members: Vec<Vec<u8>> = g.mls.members().into_iter().map(|m| m.key).collect();
+        let usable: Vec<Bytes> = g.rec.invites.iter().filter(|rule| rule.expires > now()).map(|rule| rule.hash.clone()).collect();
+        let keep = |added: &lmk_core::group::Added| {
+            added.at >= before || members.contains(&added.member.key.0) || added.invite.as_ref().is_some_and(|hash| usable.contains(hash))
+        };
+        self.groups.get_mut(gid).unwrap().mls.forget_added(&self.provider, keep)?;
+        let g = self.group_mut(gid)?;
         let (old, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut g.rec.commits).into_iter().partition(|(_, at)| *at < before);
         g.rec.commits = kept;
         for (epoch, _) in old {
