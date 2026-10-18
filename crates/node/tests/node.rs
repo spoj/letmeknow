@@ -1618,7 +1618,7 @@ fn deps_of(db: &Path, gid: &Bytes, id: &Bytes) -> Vec<lmk_proto::held::Ref> {
 
 /// Three members chat in causal order. Each sender's messages come with seqs 1, 2, 3, in order. A reply's deps are the
 /// messages its sender marked shown: Bob's replies depend on Alice's first message, which it showed, and not on her
-/// second, which it received but did not show.
+/// second, which it received but did not show. Answering a message shows it, so the answer's deps cover it.
 #[tokio::test(flavor = "multi_thread")]
 async fn three_members_chat_in_causal_order() {
     let relay = relay().await;
@@ -1650,10 +1650,13 @@ async fn three_members_chat_in_causal_order() {
     let a3 = alice.node.send(&gid.0, &message("a3"), None).await.unwrap();
     let b2 = bob.node.send(&gid.0, &message("b2 is sent after a2 arrived, unshown"), None).await.unwrap();
     assert!(!bob.node.shown(&gid.0, &a2.0).unwrap());
+    eventually("Bob holds a3", || bob.node.message(&gid.0, &a3.0).unwrap().is_some()).await;
+    let b3 = bob.node.send(&gid.0, &message("b3 answers a3"), Some(&a3.0)).await.unwrap();
+    assert!(bob.node.shown(&gid.0, &a3.0).unwrap());
 
-    // Carol takes all five, each of Alice's in its seq order, and Bob's replies after the message they depend on.
+    // Carol takes all six, each of Alice's in its seq order, and Bob's replies after the message they depend on.
     let mut taken = Vec::new();
-    while taken.len() < 5 {
+    while taken.len() < 6 {
         taken.push(carol.until(|e| match e {
             Event::Message(message) => Some(message),
             _ => None,
@@ -1662,7 +1665,8 @@ async fn three_members_chat_in_causal_order() {
     let index = |id: &Bytes| taken.iter().find(|m| m.id == *id).unwrap().index;
     let seq = |id: &Bytes| taken.iter().find(|m| m.id == *id).unwrap().seq;
     assert_eq!([seq(&a1), seq(&a2), seq(&a3)], [3, 4, 5], "the two invites took seqs 1 and 2");
-    assert!(index(&a1) < index(&b1) && index(&a2) < index(&a3), "causal order: {taken:?}");
+    assert!(index(&a1) < index(&b1) && index(&a2) < index(&a3) && index(&a3) < index(&b3), "causal order: {taken:?}");
+    assert_eq!(taken.iter().find(|m| m.id == b3).unwrap().reply_to, Some(a3.clone()));
     assert!(taken.iter().all(|m| m.index >= 1 && m.missing.is_empty() && !m.late));
 
     // Heard, Alice sees what Bob holds and showed.
@@ -1675,6 +1679,7 @@ async fn three_members_chat_in_causal_order() {
     let sent = record(&db("bob"), &gid, &a1)["header"]["epoch"].as_u64().unwrap();
     assert_eq!(deps_of(&db("bob"), &gid, &b1), [lmk_proto::held::Ref { key: alice.node.key(), joined: 0, seq: 3, id: a1.clone(), epoch: sent }]);
     assert_eq!(deps_of(&db("bob"), &gid, &b2), deps_of(&db("bob"), &gid, &b1), "b2 depends on a1 still: a2 was not shown");
+    assert_eq!(deps_of(&db("bob"), &gid, &b3), [lmk_proto::held::Ref { key: alice.node.key(), joined: 0, seq: 5, id: a3.clone(), epoch: sent }]);
     carol.node.shutdown().await.unwrap();
     alice.node.shutdown().await.unwrap();
 }

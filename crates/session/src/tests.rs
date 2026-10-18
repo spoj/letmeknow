@@ -252,18 +252,14 @@ fn messages_that_do_not_concern_a_session_wait_for_one_that_does() {
         let members = alice.cmd(&["members"]).await.unwrap();
         let robert = members["members"].as_array().unwrap().iter().find(|m| m["fp"] == bob.fp).unwrap();
         assert_eq!(robert["added_by"], alice.fp);
-        // The read frontier: Alice's answer comes after what she was shown, and a reply to Bob wakes him.
+        // A reply to Bob wakes him.
         let id = second["id"].as_str().unwrap();
-        let answer = alice.cmd(&["send", "--reply-to", id, "on it"]).await.unwrap();
-        let read = alice.cmd(&["read", answer["id"].as_str().unwrap(), "--ancestors", "2"]).await.unwrap();
-        let read: Vec<&str> = read.as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
-        assert_eq!(read.len(), 3);
-        assert_eq!(read[2], answer["id"].as_str().unwrap());
+        alice.cmd(&["send", "--reply-to", id, "on it"]).await.unwrap();
         let reply = bob.expect("message").await;
         assert_eq!(reply["reply_to"], id);
         // Shown text is forgotten.
         let read = alice.cmd(&["read", id]).await.unwrap();
-        assert!(read[0]["content"].is_null());
+        assert!(read["content"].is_null());
     });
 }
 
@@ -325,8 +321,8 @@ fn an_attachment_arrives_as_a_private_file() {
             assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
         }
         let id = sent["id"].as_str().unwrap();
-        assert_eq!(alice.cmd(&["read", id]).await.unwrap()[0]["attachment"], message["attachment"]);
-        assert_eq!(bob.cmd(&["read", id]).await.unwrap()[0]["attachment"], json!({ "name": "token.txt" }), "the sender's own is not saved");
+        assert_eq!(alice.cmd(&["read", id]).await.unwrap()["attachment"], message["attachment"]);
+        assert_eq!(bob.cmd(&["read", id]).await.unwrap()["attachment"], json!({ "name": "token.txt" }), "the sender's own is not saved");
     });
 }
 
@@ -409,27 +405,20 @@ fn a_message_printed_is_read_and_one_waiting_only_held() {
         let quiet = bob.cmd(&["send", "fyi"]).await.unwrap();
         let id = quiet["id"].as_str().unwrap();
         let alice_shown = json!([alice.fp]);
-        let read = until(|| async { bob.cmd(&["read", id]).await.unwrap() }, |read| read[0]["held_by"] == alice_shown).await;
-        assert_eq!((&read[0]["held_by"], &read[0]["read_by"]), (&alice_shown, &Value::Null), "Alice holds it, unprinted");
-        let look = bob.cmd(&["send", "--to", &alice.fp, "look"]).await.unwrap();
+        let read = until(|| async { bob.cmd(&["read", id]).await.unwrap() }, |read| read["held_by"] == alice_shown).await;
+        assert_eq!((&read["held_by"], &read["read_by"]), (&alice_shown, &Value::Null), "Alice holds it, unprinted");
+        bob.cmd(&["send", "--to", &alice.fp, "look"]).await.unwrap();
         assert_eq!(alice.expect("message").await["id"], id);
         alice.expect("message").await;
-        let read = until(|| async { bob.cmd(&["read", id]).await.unwrap() }, |read| read[0]["read_by"] == alice_shown).await;
-        assert_eq!(read[0]["read_by"], alice_shown, "printed, so read");
-        // Alice's next message carries what she read.
-        let answer = alice.cmd(&["send", "seen both"]).await.unwrap();
-        // Unknown to Bob until her message reaches him.
-        let ask = || async { bob.cmd(&["read", answer["id"].as_str().unwrap(), "--ancestors", "5"]).await.unwrap_or_default() };
-        let shown = until(ask, |shown| shown.as_array().is_some_and(|shown| shown.len() == 3)).await;
-        let shown: Vec<&Value> = shown.as_array().expect("Bob knows Alice's message by the id send answered").iter().map(|m| &m["id"]).collect();
-        assert_eq!(shown, [&quiet["id"], &look["id"], &answer["id"]]);
+        let read = until(|| async { bob.cmd(&["read", id]).await.unwrap() }, |read| read["read_by"] == alice_shown).await;
+        assert_eq!(read["read_by"], alice_shown, "printed, so read");
     });
 }
 
 /// Waits until the member named `by` holds a message of `alice`'s, as her `read` shows.
 async fn held(alice: &Agent, sent: &Value, by: &str) {
-    let read = until(|| async { alice.cmd(&["read", sent["id"].as_str().unwrap()]).await.unwrap() }, |read| read[0]["held_by"] == json!([by])).await;
-    assert_eq!(read[0]["held_by"], json!([by]), "{read}");
+    let read = until(|| async { alice.cmd(&["read", sent["id"].as_str().unwrap()]).await.unwrap() }, |read| read["held_by"] == json!([by])).await;
+    assert_eq!(read["held_by"], json!([by]), "{read}");
 }
 
 static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -479,8 +468,8 @@ fn status_lists_sends_held_only_here_and_members_away() {
         // Bob was shown it, so his summary that says so shows that he holds it and the invite before it: Alice's next
         // commit keeps both.
         bob.told(&["message"]).await;
-        let read = until(|| async { alice.cmd(&["read", hello["id"].as_str().unwrap()]).await.unwrap() }, |read| read[0]["read_by"] == json!([bob.fp])).await;
-        assert_eq!(read[0]["read_by"], json!([bob.fp]), "{read}");
+        let read = until(|| async { alice.cmd(&["read", hello["id"].as_str().unwrap()]).await.unwrap() }, |read| read["read_by"] == json!([bob.fp])).await;
+        assert_eq!(read["read_by"], json!([bob.fp]), "{read}");
         add_and_remove(&world, &mut alice, &group).await;
         let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["only_here"].is_null()).await;
         assert!(status["groups"][0]["only_here"].is_null(), "{status}");
@@ -740,39 +729,13 @@ fn a_restarted_session_prints_what_came_after_the_last_it_showed() {
         bob.cmd(&["send", "after one"]).await.unwrap();
         let last = bob.cmd(&["send", "after two"]).await.unwrap();
         // Alice holds both and, unaddressed, prints neither.
-        let read = until(|| async { bob.cmd(&["read", last["id"].as_str().unwrap()]).await.unwrap() }, |read| read[0]["held_by"] == json!([alice.fp])).await;
-        assert_eq!(read[0]["held_by"], json!([alice.fp]));
+        let read = until(|| async { bob.cmd(&["read", last["id"].as_str().unwrap()]).await.unwrap() }, |read| read["held_by"] == json!([alice.fp])).await;
+        assert_eq!(read["held_by"], json!([alice.fp]));
         alice.stop().await;
         let mut alice = world.start("alice", HOUR).await;
         assert_eq!(alice.expect("message").await["content"], "after one");
         assert_eq!(alice.expect("message").await["content"], "after two");
         assert!(alice.printed().await.iter().all(|e| e["type"] != "message"));
-    });
-}
-
-/// `read --ancestors` shows the latest chat messages in a message's causal past that the session delivered, before it.
-#[test]
-fn read_shows_the_latest_messages_in_its_causal_past() {
-    local(async {
-        let world = world("ancestors").await;
-        let (alice, bob, _) = pair(&world, HOUR).await;
-        let mut sent = Vec::new();
-        for text in ["one", "two", "three"] {
-            sent.push(bob.cmd(&["send", text]).await.unwrap()["id"].as_str().unwrap().to_owned());
-        }
-        // Alice replies to the last once she holds it: the reply's causal past is all three.
-        let reply = until(|| async { alice.cmd(&["send", "--reply-to", sent[2].as_str(), "four"]).await.unwrap_or_default() }, |reply| reply["id"].is_string()).await;
-        let reply = reply["id"].as_str().unwrap().to_owned();
-        let ids = |read: &Value| read.as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
-        let cases = [
-            ("0", vec![reply.clone()]),
-            ("1", vec![sent[2].clone(), reply.clone()]),
-            ("5", vec![sent[0].clone(), sent[1].clone(), sent[2].clone(), reply.clone()]),
-        ];
-        for (n, expected) in cases {
-            let read = alice.cmd(&["read", &reply, "--ancestors", n]).await.unwrap();
-            assert_eq!(ids(&read), expected, "--ancestors {n}");
-        }
     });
 }
 

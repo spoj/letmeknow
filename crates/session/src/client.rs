@@ -64,9 +64,8 @@ pub enum ClientEvent {
     Removed { group: Bytes, by: Option<Described>, not_kept: Vec<String> },
     /// The client let go of a group, removed or leaving: the shell drops what it keeps of it.
     Gone { group: Bytes },
-    /// A chat message, in delivery order. `missing`: what it needed and this client gave
-    /// up on; `late`: messages that needed those were delivered without them; `reply_outside`: `reply_to` is not in its
-    /// causal past.
+    /// A chat message, in delivery order. `missing`: what it needed and this client gave up on; `late`: messages that
+    /// needed those were delivered without them.
     Message {
         group: Bytes,
         id: String,
@@ -76,8 +75,6 @@ pub enum ClientEvent {
         missing: Vec<Missing>,
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         late: bool,
-        #[serde(skip_serializing_if = "std::ops::Not::not")]
-        reply_outside: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         reply_to: Option<String>,
         payload: Value,
@@ -386,8 +383,8 @@ impl Client {
                 let missing: Vec<Missing> = message.missing.iter().map(|seqs| Missing { from: describer.describe_key(&seqs.key), seqs: seqs.seqs.iter().collect() }).collect();
                 let id = hex::encode(&message.id.0);
                 let reply_to = message.reply_to.as_ref().map(|id| hex::encode(&id.0));
-                let (seq, late, reply_outside) = (message.seq, message.late, message.reply_outside);
-                self.emit(ClientEvent::Message { group: message.group, id, from, seq, missing, late, reply_outside, reply_to, payload: message.payload });
+                let (seq, late) = (message.seq, message.late);
+                self.emit(ClientEvent::Message { group: message.group, id, from, seq, missing, late, reply_to, payload: message.payload });
             }
             // The others are the node's: invites and leaves.
             Event::Message(_) => {}
@@ -453,7 +450,6 @@ mod tests {
             payload: json!({ "type": "message", "content": "" }),
             missing: Vec::new(),
             late: false,
-            reply_outside: false,
         }
     }
 

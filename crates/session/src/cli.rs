@@ -140,9 +140,6 @@ pub enum Request {
     Read {
         /// Its id, or any unique beginning of it
         id: String,
-        /// Show first this many of the chat messages in its causal past that this session delivered, latest last
-        #[arg(long, default_value_t = 0)]
-        ancestors: usize,
     },
     /// `status --group <group>`: the client's `status`, of that group only.
     #[command(skip)]

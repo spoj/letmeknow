@@ -171,8 +171,8 @@ impl Session {
     pub fn handle(&mut self, (request, reply): Inbound) {
         let client = self.client.clone();
         match request {
-            Request::Read { id, ancestors } => {
-                let answer = self.read(&id, ancestors);
+            Request::Read { id } => {
+                let answer = self.read(&id);
                 self.answer(answer, reply);
             }
             Request::Send { group, to, reply_to, urgent, attach, attach_name, text } => {
@@ -331,7 +331,6 @@ impl Session {
             seq: message.seq,
             missing: message.missing.iter().map(|seqs| Missing { from: describer.describe_key(&seqs.key), seqs: seqs.seqs.iter().collect() }).collect(),
             late: message.late,
-            reply_outside: message.reply_outside,
             reply_to: message.reply_to.as_ref().map(|id| hex::encode(&id.0)),
             payload: message.payload.clone(),
         })
@@ -387,27 +386,18 @@ impl Session {
         Ok(())
     }
 
-    /// A chat message, after the latest `ancestors` chat messages in its causal past that this session delivered; this
-    /// session's own say who holds and who was shown them.
-    fn read(&self, id: &str, ancestors: usize) -> Result<Value> {
+    /// A chat message; this session's own says who holds it and who was shown it.
+    fn read(&self, id: &str) -> Result<Value> {
         let message = self.find(id)?;
-        let node = self.client.node();
-        let (gid, me) = (message.group.clone(), node.key());
-        let mut shown = node.ancestors(&gid.0, &message.id.0, ancestors)?;
-        shown.push(message);
-        let receipts = self.client.receipts(&gid)?;
-        let describer = self.client.describer(&gid)?;
-        let mut found = Vec::new();
-        for m in shown {
-            let mut item = self.message_item(self.message_event(&m)?)?;
-            if m.sender.key == me {
-                item["held_by"] = json!(receipts.iter().filter(|r| r.holds(&m)).map(|r| describer.describe(&r.member)).collect::<Vec<_>>());
-                item["read_by"] = json!(receipts.iter().filter(|r| r.showed(&m)).map(|r| describer.describe(&r.member)).collect::<Vec<_>>());
-            }
-            self.show(&gid, &m.id.0)?;
-            found.push(self.compact(item));
+        let gid = message.group.clone();
+        let mut item = self.message_item(self.message_event(&message)?)?;
+        if message.sender.key == self.client.node().key() {
+            let (receipts, describer) = (self.client.receipts(&gid)?, self.client.describer(&gid)?);
+            item["held_by"] = json!(receipts.iter().filter(|r| r.holds(&message)).map(|r| describer.describe(&r.member)).collect::<Vec<_>>());
+            item["read_by"] = json!(receipts.iter().filter(|r| r.showed(&message)).map(|r| describer.describe(&r.member)).collect::<Vec<_>>());
         }
-        Ok(Value::Array(found))
+        self.show(&gid, &message.id.0)?;
+        Ok(self.compact(item))
     }
 
     /// The message of this session's groups whose id begins with `id`.

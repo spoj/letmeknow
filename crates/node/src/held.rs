@@ -126,15 +126,10 @@ pub(crate) struct Delivered {
     pub index: u64,
     pub at: u64,
     pub sender: Member,
-    /// Its causal past: per membership, the highest seq in it; `whole` unless a requirement was not delivered here.
-    pub past: Vec<(Bytes, u64, u64)>,
-    pub whole: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing: Vec<Seqs>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub late: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub reply_outside: bool,
 }
 
 impl Record {
@@ -149,19 +144,11 @@ impl Record {
             sender: delivered.sender.clone(),
             joined: h.joined,
             seq: h.seq,
-            reply_to: h.reply_to.clone(),
+            reply_to: h.reply_to.as_ref().map(|r| r.id.clone()),
             payload: h.payload.clone(),
             missing: delivered.missing.clone(),
             late: delivered.late,
-            reply_outside: delivered.reply_outside,
         })
-    }
-
-    /// Whether its causal past holds the message of membership `(key, joined)` at `seq`.
-    pub(crate) fn after(&self, key: &Bytes, joined: u64, seq: u64) -> bool {
-        let h = &self.header;
-        let own = h.author == *key && h.joined == joined && seq < h.seq;
-        own || self.delivered.as_ref().is_some_and(|d| d.past.iter().any(|(k, j, s)| k == key && *j == joined && *s >= seq))
     }
 }
 
@@ -320,20 +307,19 @@ impl State {
         found.map_or_else(|| Member { key: Bytes(key.to_vec()), iroh: Bytes::default(), revision: 0, added: None }, |m| self.member(gid, &m))
     }
 
-    /// The deps of a message this session sends now: per membership but its own, the highest seq its client showed,
-    /// less those in another's causal past, of messages it still holds.
+    /// The deps of a message this session sends now: per membership but its own, the highest seq its client showed, of
+    /// messages it still holds.
     pub(crate) fn deps(&self, gid: &[u8]) -> Result<Vec<lmk_proto::held::Ref>> {
         let g = self.group(gid)?;
         let me = self.me();
-        let mut candidates = Vec::new();
+        let mut deps = Vec::new();
         for author in g.rec.authors.iter().filter(|a| !(a.key.0 == me && Some(a.joined) == g.mls.joined(me))) {
             let Some(&(_, seq)) = author.shown.ranges().last() else { continue };
             if let Some(record) = self.record_at(gid, &author.key.0, author.joined, seq)? {
-                candidates.push((lmk_proto::held::Ref { key: author.key.clone(), joined: author.joined, seq, id: record.id.clone(), epoch: record.header.epoch }, record));
+                deps.push(lmk_proto::held::Ref { key: author.key.clone(), joined: author.joined, seq, id: record.id, epoch: record.header.epoch });
             }
         }
-        let covered = |dep: &lmk_proto::held::Ref| candidates.iter().any(|(other, record)| other != dep && record.after(&dep.key, dep.joined, dep.seq));
-        Ok(candidates.iter().filter(|(dep, _)| !covered(dep)).map(|(dep, _)| dep.clone()).collect())
+        Ok(deps)
     }
 }
 
@@ -573,38 +559,15 @@ impl Inner {
         st.save(gid)
     }
 
-    /// Delivers a held message: its index, its causal past, what its requirements reached that was given up, and an
-    /// event for the client unless it is the core's or this session's own.
+    /// Delivers a held message: its index, what its requirements reached that was given up, and an event for the client
+    /// unless it is the core's or this session's own.
     pub(crate) fn deliver(&self, st: &mut State, gid: &[u8], mut record: Record) -> Result<()> {
         let now = st.tick();
         let h = record.header.clone();
-        let mut past: BTreeMap<(Bytes, u64), u64> = BTreeMap::new();
-        let mut whole = true;
         let mut requirements: Vec<(Bytes, u64, u64)> = h.deps.iter().map(|dep| (dep.key.clone(), dep.joined, dep.seq)).collect();
         if h.seq > 1 {
             requirements.push((h.author.clone(), h.joined, h.seq - 1));
         }
-        for (key, joined, seq) in &requirements {
-            let e = past.entry((key.clone(), *joined)).or_default();
-            *e = (*e).max(*seq);
-            match st.record_at(gid, &key.0, *joined, *seq)?.and_then(|r| r.delivered) {
-                Some(delivered) => {
-                    whole &= delivered.whole;
-                    for (k, j, s) in delivered.past {
-                        let e = past.entry((k, j)).or_default();
-                        *e = (*e).max(s);
-                    }
-                }
-                None => whole = false,
-            }
-        }
-        let reply_outside = match &h.reply_to {
-            Some(target) => match st.record(gid, &target.0)? {
-                Some(t) => whole && !past.get(&(t.header.author.clone(), t.header.joined)).is_some_and(|s| *s >= t.header.seq),
-                None => false,
-            },
-            None => false,
-        };
         let sender = st.member_by_key(gid, &h.author.0);
         let me = st.me().to_vec();
         let shown = !Control::TYPES.contains(&type_of(&h.payload)) && h.author.0 != me;
@@ -622,8 +585,7 @@ impl Inner {
         author.delivered.insert(h.seq);
         g.rec.index += 1;
         let index = g.rec.index;
-        let past = past.into_iter().map(|((k, j), s)| (k, j, s)).collect();
-        record.delivered = Some(Delivered { index, at: now, sender, past, whole, missing, late, reply_outside });
+        record.delivered = Some(Delivered { index, at: now, sender, missing, late });
         put(&st.provider, &delivered_key(gid, index), &record.id)?;
         st.store(gid, &record)?;
         if shown && let Some(message) = record.message(gid) {

@@ -25,8 +25,9 @@ pub struct Header {
     /// The frontier of what the author's client had shown: at most one message per membership, none the author's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deps: Vec<Ref>,
+    /// The message it answers, which its prev or deps cover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reply_to: Option<Bytes>,
+    pub reply_to: Option<Ref>,
     /// A JSON object with a `type`: the core's (`Control`), or a chat message.
     pub payload: Value,
 }
@@ -99,6 +100,11 @@ impl Header {
                 && header.deps.iter().all(|dep| dep.seq >= 1),
             "a held message's deps name a membership twice, its author's, or nothing"
         );
+        let covered = |r: &Ref| {
+            (r.key == header.author && r.joined == header.joined && r.seq < header.seq)
+                || header.deps.iter().any(|dep| dep.key == r.key && dep.joined == r.joined && dep.seq >= r.seq)
+        };
+        ensure!(header.reply_to.as_ref().is_none_or(covered), "a held message answers one its prev and deps do not cover");
         Ok(header)
     }
 
@@ -167,5 +173,17 @@ mod tests {
         assert!(Header::open(&Header { seq: 1, prev: None, ..header() }.encode()).is_ok());
         let earlier = Ref { joined: 1, ..me };
         assert!(Header::open(&Header { deps: vec![earlier], ..header() }.encode()).is_ok(), "the author's earlier membership");
+    }
+
+    /// A reply answers a message its prev or deps cover: its author's earlier one, or one at or before a dep.
+    #[test]
+    fn a_reply_answers_what_its_prev_or_deps_cover() {
+        let dep = header().deps[0].clone();
+        let opens = |reply_to: Ref| Header::open(&Header { reply_to: Some(reply_to), ..header() }.encode()).is_ok();
+        assert!(opens(Ref { key: Bytes(vec![9; 32]), joined: 3, seq: 1, id: Bytes(vec![4; 32]), epoch: 3 }), "its prev");
+        assert!(opens(dep.clone()) && opens(Ref { seq: 6, ..dep.clone() }), "a dep, or before it");
+        assert!(!opens(Ref { seq: 8, ..dep.clone() }), "past its dep");
+        assert!(!opens(Ref { joined: 1, ..dep.clone() }), "another membership of the dep's key");
+        assert!(!opens(Ref { key: Bytes(vec![9; 32]), joined: 3, seq: 2, ..dep }), "itself");
     }
 }

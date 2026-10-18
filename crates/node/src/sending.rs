@@ -2,12 +2,12 @@
 //! neighbours; nothing of it involves the membership service. The author keeps its plaintext until a cut keeps it, and
 //! seals it again in each epoch until then, once it is at the head of its log.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use iroh::EndpointId;
 use lmk_core::group::{FRAMING, MAX_MESSAGE};
 use lmk_net::peers::ANSWER;
 use lmk_proto::Bytes;
-use lmk_proto::held::{self, Header};
+use lmk_proto::held::{self, Header, Ref};
 use lmk_proto::peer::{Frame, Seqs, Summary};
 use lmk_proto::ranges::Ranges;
 use serde_json::Value;
@@ -87,9 +87,6 @@ impl Inner {
         let g = st.group(gid)?;
         let joined = g.mls.joined(&me).context("a member of its group")?;
         let seq = g.current(&me).context("its own membership")?.last() + 1;
-        if let Some(reply_to) = reply_to {
-            ensure!(st.record(gid, reply_to)?.is_some_and(|record| record.delivered.is_some()), "reply_to names no message delivered here");
-        }
         // A message a cut kept may be gone after H; the cut names it.
         let kept = g.mls.cut().iter().find(|r| r.key.0 == me && r.joined == joined).context("its own cut")?;
         let prev = match seq {
@@ -99,6 +96,18 @@ impl Inner {
                 let prev = st.record_at(gid, &me, joined, seq - 1)?.context("this session's previous message")?;
                 Some((prev.id, prev.header.epoch))
             }
+        };
+        // Replying shows what it answers, so that the deps cover it, unless prev does.
+        let reply_to = match reply_to {
+            Some(id) => {
+                let target = st.record(gid, id)?.filter(|record| record.delivered.is_some()).context("reply_to names no message delivered here")?;
+                let h = target.header;
+                if let Some(author) = st.group_mut(gid)?.author_mut(&h.author.0, h.joined).filter(|_| h.author.0 != me || h.joined != joined) {
+                    author.shown.insert(h.seq);
+                }
+                Some(Ref { key: h.author, joined: h.joined, seq: h.seq, id: target.id, epoch: h.epoch })
+            }
+            None => None,
         };
         let control = lmk_proto::group::Control::TYPES.contains(&lmk_proto::group::type_of(payload));
         let deps = if control { Vec::new() } else { st.deps(gid)? };
@@ -110,7 +119,7 @@ impl Inner {
             epoch: st.group(gid)?.mls.epoch(),
             prev,
             deps,
-            reply_to: reply_to.map(|id| Bytes(id.to_vec())),
+            reply_to,
             payload: payload.clone(),
         };
         let plaintext = header.encode();

@@ -99,9 +99,6 @@ pub struct Message {
     /// Messages that needed it were delivered without it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub late: bool,
-    /// Its `reply_to` is not in its causal past, as far as this session knows that past whole.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub reply_outside: bool,
 }
 
 /// Held messages a member can no longer have, as this session found its own or a member's summary told them.

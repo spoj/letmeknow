@@ -9,8 +9,7 @@ use lmk_proto::group::Settings;
 use lmk_proto::Bytes;
 use serde_json::{Value, json};
 
-use crate::held::delivered_key;
-use crate::{G, Member, Message, Node, Rec, State, Work, get};
+use crate::{G, Member, Message, Node, Rec, State, Work};
 
 impl Node {
     /// Stops the peers and every task, and closes the provider.
@@ -132,26 +131,6 @@ impl Node {
     /// The group's held messages this session delivered and holds, in delivery order.
     pub fn messages(&self, gid: &[u8]) -> Result<Vec<Message>> {
         self.inner.lock().messages(gid)
-    }
-
-    /// The latest `n` chat messages in a delivered message's causal past that this session delivered, in delivery order.
-    pub fn ancestors(&self, gid: &[u8], id: &[u8], n: usize) -> Result<Vec<Message>> {
-        let st = self.inner.lock();
-        let record = st.record(gid, id)?.context("no such message here")?;
-        let index = record.delivered.as_ref().context("a message not delivered here")?.index;
-        let mut found = Vec::new();
-        for at in (st.group(gid)?.rec.first.max(1)..index).rev() {
-            if found.len() == n {
-                break;
-            }
-            let Some(earlier) = get::<Bytes>(&st.provider, &delivered_key(gid, at))?.and_then(|id| st.record(gid, &id.0).transpose()).transpose()? else { continue };
-            let h = &earlier.header;
-            if h.payload["type"] == "message" && record.after(&h.author, h.joined, h.seq) {
-                found.extend(earlier.message(gid));
-            }
-        }
-        found.reverse();
-        Ok(found)
     }
 
     /// Replaces a held message's payload, as when its text is forgotten; it is still served to members as ciphertext.
