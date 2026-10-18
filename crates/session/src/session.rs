@@ -186,7 +186,6 @@ impl Session {
             }
             Request::Client(request) => _ = self.running.spawn_local(async move { Answered(client.request(request).await, reply) }),
             Request::Status { .. } => unreachable!("the CLI sends it as the client's request"),
-            Request::Stop => unreachable!("`run` stops on it"),
         }
     }
 
@@ -424,8 +423,7 @@ impl Session {
     }
 }
 
-/// Runs a session until `shutdown`, a `stop` request, which it answers once it stopped, or a line it prints that cannot
-/// be written: prints `ready`, then handles what arrives and prints what concerns the agent, one JSON object per line.
+/// Runs a session until `shutdown` or a line it prints that cannot be written: prints `ready`, then handles what arrives and prints what concerns the agent, one JSON object per line.
 pub async fn run(
     mut session: Session,
     mut inbound: mpsc::UnboundedReceiver<Inbound>,
@@ -447,7 +445,6 @@ pub async fn run(
     }
     let mut shutdown = std::pin::pin!(shutdown);
     let client = session.client.clone();
-    let mut stopped = None;
     if print(short::line(&ready)).is_ok() {
         loop {
             session.publish();
@@ -456,13 +453,7 @@ pub async fn run(
             }
             let due = session.next_due();
             tokio::select! {
-                Some(item) = inbound.recv() => match item {
-                    (Request::Stop, reply) => {
-                        stopped = Some(reply);
-                        break;
-                    }
-                    item => session.handle(item),
-                },
+                Some(item) = inbound.recv() => session.handle(item),
                 Some(done) = session.running.join_next() => {
                     let Answered(answer, reply) = done.expect("work in flight runs until shutdown");
                     session.answer(answer, reply);
@@ -476,10 +467,5 @@ pub async fn run(
     }
     session.running.shutdown().await;
     session.shutdown().await;
-    // Its locks go before the answer: `sessions remove` runs the session as soon as it has it.
-    drop(session);
-    if let Some(reply) = stopped {
-        reply.send(json!({ "stopped": true })).ok();
-    }
     Ok(())
 }

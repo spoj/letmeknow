@@ -18,7 +18,6 @@ letmeknow invite                     # new chat; prints a one-time link, valid f
 letmeknow join '<link>'              # join through a link
 letmeknow send "text"                # --to <fingerprint>, --reply-to <id>, --urgent, --attach <file>
 letmeknow sessions                   # this machine's sessions: handle, whether it runs, its groups
-letmeknow sessions remove <handle>   # stop a session, have its groups remove it, and delete it
 ```
 
 An invite link opened in a browser shows the commands that join with it.

@@ -1,4 +1,4 @@
-use letmeknow::cli::{Cli, Command, Request, SessionsOp, call, home_dir, new_handle, running_session, session_dir};
+use letmeknow::cli::{Cli, Command, Request, call, home_dir, new_handle, running_session, session_dir};
 use letmeknow::session::Config;
 use letmeknow::Network;
 use std::process::ExitCode;
@@ -51,22 +51,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let listen = letmeknow::listen(config, &home, network, print, letmeknow::shutdown());
             tokio::task::LocalSet::new().run_until(listen).await
         }
-        Command::Sessions { op: None } => {
+        Command::Sessions => {
             println!("{}", letmeknow::sessions(&home).await?);
-            Ok(())
-        }
-        Command::Sessions { op: Some(SessionsOp::Remove { handle, membership, relay }) } => {
-            let network = Network::new(&home, &relay, letmeknow::ca()?)?;
-            let config = Config {
-                dir: session_dir(&home, &handle)?,
-                handle,
-                hold: Duration::from_secs(3600),
-                keep_log: false,
-                membership,
-                registry: registry(),
-            };
-            let remove = letmeknow::remove(config, &home, network);
-            println!("{}", tokio::task::LocalSet::new().run_until(remove).await?);
             Ok(())
         }
         Command::Skill => {

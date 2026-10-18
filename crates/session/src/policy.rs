@@ -9,8 +9,8 @@ use tokio::time::Instant;
 /// How many items that arrived while catching up are printed; older ones are counted as `omitted`.
 const CATCH_UP: usize = 20;
 
-/// Messages addressed to this session, answering one of its messages, or urgent; `lost`; and `removed`, which a
-/// `sessions remove` waits for. Membership changes wait, as other members' messages do: each wakes every agent of the
+/// Messages addressed to this session, answering one of its messages, or urgent; `lost`; and `removed`. Membership
+/// changes wait, as other members' messages do: each wakes every agent of the
 /// group, and seldom needs one.
 pub fn wakes(item: &Value, mine: impl Fn(&str) -> bool) -> bool {
     match item["type"].as_str() {

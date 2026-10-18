@@ -292,63 +292,6 @@ pub async fn sessions(home: &Path) -> Result<Value> {
     Ok(json!({ "sessions": sessions }))
 }
 
-/// How long removing a session waits for the other members of its groups to remove it.
-const LEAVE_WAIT: Duration = Duration::from_secs(60);
-
-/// Removes a session: stops its process if one runs, runs it here, printing nothing, until the other members of each of its
-/// groups have removed it, and deletes it. Fails, keeping the session, where that does not happen within `LEAVE_WAIT`.
-/// Runs on a `LocalSet`, as `listen` does.
-pub async fn remove(config: session::Config, home: &Path, network: Network) -> Result<Value> {
-    let (handle, dir) = (config.handle.clone(), config.dir.clone());
-    ensure!(dir.join("session.db").exists(), "no session {handle} here");
-    if cli::connect(&dir.join("endpoint")).await.is_ok() {
-        // Answered once it stopped, or not at all as its process exits.
-        let _ = cli::call(home, &handle, cli::Request::Stop).await;
-    }
-    let (lines, mut printed) = tokio::sync::mpsc::unbounded_channel();
-    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let at = home.to_path_buf();
-    let running = tokio::task::spawn_local(async move {
-        let print = move |line: String| {
-            lines.send(line).ok();
-            Ok(())
-        };
-        listen(config, &at, network, print, async { drop(stopped.await) }).await
-    });
-    let left = async {
-        while let Some(line) = printed.recv().await {
-            if serde_json::from_str::<Value>(&line)?["type"] == "ready" {
-                break;
-            }
-        }
-        let groups = cli::call(home, &handle, cli::Request::Client(crate::client::Request::Groups)).await?;
-        let mut waiting = Vec::new();
-        for group in groups.as_array().context("groups are a list")? {
-            let leave = crate::client::Request::Leave { group: group["group"].as_str().map(str::to_owned), end: false };
-            if cli::call(home, &handle, cli::Request::Client(leave)).await?["pending"] == true {
-                waiting.push(group["group"].clone());
-            }
-        }
-        let held = async {
-            while !waiting.is_empty() {
-                let line: Value = serde_json::from_str(&printed.recv().await.context("the session stopped")?)?;
-                if line["type"] == "removed" {
-                    waiting.retain(|id| *id != line["group"]);
-                }
-            }
-            anyhow::Ok(())
-        };
-        tokio::time::timeout(LEAVE_WAIT, held).await.map_err(|_| anyhow!("a group it left has not removed the session yet: the session stays; remove it again once another member is online"))??;
-        anyhow::Ok(groups)
-    };
-    let left = left.await;
-    stop.send(()).ok();
-    running.await??;
-    let groups = left?;
-    std::fs::remove_dir_all(&dir)?;
-    Ok(json!({ "removed": handle, "left": groups.as_array().unwrap().iter().map(|g| &g["group"]).collect::<Vec<_>>() }))
-}
-
 /// Resolves on Ctrl-C or, on Unix, SIGTERM.
 pub async fn shutdown() {
     #[cfg(unix)]

@@ -606,31 +606,24 @@ fn a_session_stops_once_it_cannot_print_and_prints_the_rest_when_started_again()
     });
 }
 
-/// `sessions` lists this machine's sessions, each with its group ids and whether it runs. `sessions remove` stops one that runs, or runs one that does not, until another member holds its
-/// leave of each group, and deletes it.
+/// `sessions` lists this machine's sessions, each with its group ids and whether it runs.
 #[test]
-fn a_session_is_listed_and_removed_running_or_stopped() {
+fn sessions_lists_this_machines_sessions_running_or_stopped() {
     local(async {
         let world = world("sessions").await;
-        let (mut alice, mut bob, group) = pair(&world, HOUR).await;
-        let desk = world.start_in("bob", "desk", HOUR).await;
+        let (alice, mut bob, group) = pair(&world, HOUR).await;
+        let mut desk = world.start_in("bob", "desk", HOUR).await;
         let invite = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap();
         desk.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
-        let both = json!({ "sessions": [
+        let listed = |desk: bool| json!({ "sessions": [
             { "handle": "bob", "running": true, "groups": [group] },
-            { "handle": "desk", "running": true, "groups": [group] },
+            { "handle": "desk", "running": desk, "groups": [group] },
         ] });
-        let listed = until(|| async { crate::sessions(&bob.home).await.unwrap() }, |listed| *listed == both).await;
-        assert_eq!(listed, both);
-
-        let removed = crate::remove(world.config("bob", "desk"), &bob.home, world.network.clone()).await.unwrap();
-        assert_eq!(removed, json!({ "removed": "desk", "left": [group] }));
-        assert_eq!(alice.told(&["left"]).await["member"], desk.fp);
-        drop(desk);
+        let running = until(|| async { crate::sessions(&bob.home).await.unwrap() }, |running| *running == listed(true)).await;
+        assert_eq!(running, listed(true));
+        desk.stop().await;
+        assert_eq!(crate::sessions(&bob.home).await.unwrap(), listed(false));
         bob.stop().await;
-        crate::remove(world.config("bob", "bob"), &bob.home, world.network.clone()).await.unwrap();
-        assert_eq!(alice.told(&["left"]).await["member"], bob.fp);
-        assert_eq!(crate::sessions(&bob.home).await.unwrap(), json!({ "sessions": [] }));
     });
 }
 
@@ -690,27 +683,6 @@ fn a_restarted_session_prints_what_came_after_the_last_it_showed() {
         assert_eq!(alice.expect("message").await["content"], "after one");
         assert_eq!(alice.expect("message").await["content"], "after two");
         assert!(alice.printed().await.iter().all(|e| e["type"] != "message"));
-    });
-}
-
-/// `leave` is pending until another member removes the session, and `sessions remove` finishes on that removal.
-#[test]
-fn a_leave_then_a_removal_finishes_on_the_removal() {
-    local(async {
-        let world = world("leave-remove").await;
-        let (mut alice, mut bob, group) = pair(&world, HOUR).await;
-        alice.stop().await;
-        let left = bob.cmd(&["leave"]).await.unwrap();
-        assert_eq!((&left["left"], &left["pending"]), (&json!(true), &json!(true)), "{left}");
-        bob.stop().await;
-        let (home, config, network) = (bob.home.clone(), world.config("bob", "bob"), world.network.clone());
-        let removing = tokio::task::spawn_local(async move { crate::remove(config, &home, network).await });
-        // Bob's removal waits for Alice, who comes back only once the session it runs answers, and so waits for her.
-        until(|| async { json!(bob.cmd(&["status"]).await.is_ok()) }, |running| *running == json!(true)).await;
-        assert!(!removing.is_finished());
-        let _alice = world.start("alice", HOUR).await;
-        assert_eq!(removing.await.unwrap().unwrap(), json!({ "removed": "bob", "left": [group] }));
-        assert_eq!(crate::sessions(&bob.home).await.unwrap(), json!({ "sessions": [] }));
     });
 }
 

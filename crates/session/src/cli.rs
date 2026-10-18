@@ -48,30 +48,13 @@ pub enum Command {
         relay: Vec<String>,
     },
     /// This machine's sessions: each one's handle, whether it runs, and its groups
-    Sessions {
-        #[command(subcommand)]
-        op: Option<SessionsOp>,
-    },
+    Sessions,
     /// Print instructions for agents
     Skill,
     /// Run a membership service and an iroh relay
     Serve(Serve),
     #[command(flatten)]
     Request(Request),
-}
-
-#[derive(Subcommand)]
-pub enum SessionsOp {
-    /// Stop a session if it runs, leave its groups, and delete it, once the other members have removed it from each group
-    Remove {
-        handle: String,
-        /// The domain of the session's membership service
-        #[arg(long, env = "LETMEKNOW_MEMBERSHIP", default_value = lmk_proto::links::DOMAIN)]
-        membership: String,
-        /// A relay the session is reached through, instead of its directory's; repeat for several
-        #[arg(long, env = "LETMEKNOW_RELAY", value_delimiter = ',')]
-        relay: Vec<String>,
-    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -145,9 +128,6 @@ pub enum Request {
     #[command(skip)]
     #[serde(skip)]
     Status { group: String },
-    /// `sessions remove`: stops the session, answered once it stopped.
-    #[command(skip)]
-    Stop,
     #[command(flatten)]
     #[serde(untagged)]
     Client(crate::client::Request),
