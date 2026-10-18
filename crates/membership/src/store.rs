@@ -165,12 +165,11 @@ impl Store {
         db.pragma_update(None, "synchronous", "FULL")?;
         db.pragma_update(None, "fullfsync", true)?;
         db.pragma_update(None, "secure_delete", true)?;
-        // The retention counts only days the service runs: live logs' days move on by those since the last expiry pass,
-        // and one more, as days are whole.
+        // The retention counts only days the service runs: live logs' days move on by those since the last expiry pass.
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let (passed, today): (u64, u64) = (tx.query_row("SELECT passed FROM metadata", [], |r| r.get(0))?, now() / DAY_MS);
         if today > passed {
-            tx.execute("UPDATE anchors SET opened=opened+?1, day=day+?1", [today - passed + 1])?;
+            tx.execute("UPDATE anchors SET opened=opened+?1, day=day+?1", [today - passed])?;
             tx.execute("UPDATE metadata SET passed=?", [today])?;
         }
         tx.commit()?;
@@ -514,6 +513,24 @@ mod tests {
         let store = Store::open(&path).unwrap();
         store.expire(32).unwrap();
         assert!(store.records(&group).is_err() && store.records(&directory).is_err(), "a start on the day of the last pass moves nothing");
+    }
+
+    #[test]
+    fn a_start_on_the_day_after_the_last_pass_moves_days_by_one() {
+        let (_dir, path) = state();
+        let store = Store::initialize(&path).unwrap();
+        let (group, directory) = (store.log(&[1; 32]), store.log(&[2; 32]));
+        on(10);
+        store.append(&group, &[], false).unwrap();
+        store.append(&directory, &[Bytes(b"entry".to_vec())], true).unwrap();
+        store.expire(3).unwrap();
+        drop(store);
+        on(11);
+        let store = Store::open(&path).unwrap();
+        store.expire(11).unwrap();
+        assert!(store.records(&group).unwrap() && store.records(&directory).unwrap(), "their day 10 moved to 11");
+        store.expire(12).unwrap();
+        assert!(store.records(&group).is_err() && store.records(&directory).is_err(), "and no further");
     }
 
     #[test]
