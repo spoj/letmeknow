@@ -2771,14 +2771,14 @@ async fn a_message_an_online_member_holds_is_kept_by_the_next_commit() {
     let relay = relay().await;
     let alice = session(&relay, "Alice").await;
     let mut bob = session(&relay, "Bob").await;
-    let gid = alice.node.create(Settings { update: 2, ..settings(CHAT, &relay) }, None).unwrap();
+    // No update comes due in the test: one already on its way as Alice hears Bob would not keep the message.
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     eventually("Alice has Bob", || alice.node.members(&gid.0).unwrap().len() == 2).await;
     alice.node.send(&gid.0, &message("kept"), None).await.unwrap();
     bob.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
     eventually("Alice hears that Bob holds it", || alice.node.only_here(&gid.0).unwrap().is_empty()).await;
-    let epoch = alice.node.epoch(&gid.0).unwrap();
-    eventually("Alice commits its update", || alice.node.epoch(&gid.0).unwrap() > epoch).await;
+    alice.node.change_settings(&gid.0, |s| Settings { name: "Kept".into(), ..s }).await.unwrap();
     bob.node.shutdown().await.unwrap();
     eventually("Alice sees Bob go", || alice.node.online(&gid.0).unwrap().is_empty()).await;
     assert!(alice.node.only_here(&gid.0).unwrap().is_empty(), "the commit kept it");

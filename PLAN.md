@@ -35,6 +35,7 @@ When a test flakes there, its timing is fixed:
 
 - `a_device_is_renamed_and_leaves_its_identity_from_another_of_its_sessions` waits 30 s for a rename that takes a 10-second identity check and two commits. It and `until` (session tests) wait `WAIT`, as the other waits do.
 - `an_update_waits_for_what_connected_members_list_for_at_most_hear`: with Bob away, Alice commits an update every 2 seconds; one in flight when the stand-in lists lands at once, and the listing, of the epoch before, then counts for nothing. The stand-in lists right after an epoch change, with an update period that leaves it room, and the bound counts from when the update came due.
+- `a_message_an_online_member_holds_is_kept_by_the_next_commit` (Windows, this patch's CI): with an update every 2 seconds, one already on its way as Alice heard that Bob held her message landed after, without keeping it, and Bob left before the next. The commit is a rename now, with no update due.
 - `installed_bindings_survive_refresh_collision_restart_and_group_deletion` (claims.rs, Windows, before 0.20.1): the peer's recertify commit did not reach the observer within 60 s. Without polls, a lost push now waits for the next `hello` (5 minutes) or a reconnection. A node test's `until` that times out now names where it waited and each group's epoch and members online; the fix follows what that shows.
 
 ## 5. Small fixes (done)
