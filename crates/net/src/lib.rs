@@ -1,4 +1,4 @@
-//! Everything a session says to its peers over iroh: one `letmeknow/5` connection per pair of sessions, its `peer`
+//! Everything a session says to its peers over iroh: one `letmeknow/6` connection per pair of sessions, its `peer`
 //! stream of frames, and an `admission` stream per joiner's request. What the frames mean is the node's (see [`peers`]):
 //! this crate moves them, and holds no keys.
 

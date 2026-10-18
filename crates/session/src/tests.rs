@@ -222,7 +222,7 @@ async fn pair(world: &World, hold: Duration) -> (Agent, Agent, String) {
     let invite = alice.cmd(&["invite"]).await.unwrap();
     assert_eq!(keys(&invite), keys(&json!({ "link": 0, "group": 0, "expires_in": 0 })));
     let link = invite["link"].as_str().unwrap();
-    assert!(link.starts_with("https://letmeknow.dev/i#9."));
+    assert!(link.starts_with("https://letmeknow.dev/i#10."));
     let joined = bob.cmd(&["join", link]).await.unwrap();
     assert_eq!(joined["group"], invite["group"]);
     assert_eq!(joined["members"].as_array().unwrap().len(), 2);
@@ -691,7 +691,8 @@ fn a_home_of_another_format_is_refused_and_names_its_release() {
             ("5", "letmeknow 0.16", "@letmeknow/cli@0.16"),
             ("7", "letmeknow 0.18", "@letmeknow/cli@0.18"),
             ("8", "letmeknow 0.19", "@letmeknow/cli@0.19"),
-            ("10", "a newer letmeknow", "@letmeknow/cli@latest"),
+            ("9", "letmeknow 0.20", "@letmeknow/cli@0.20"),
+            ("11", "a newer letmeknow", "@letmeknow/cli@latest"),
         ] {
             let home = world.root.path().join(format!("format-{format}"));
             std::fs::create_dir_all(&home).unwrap();
