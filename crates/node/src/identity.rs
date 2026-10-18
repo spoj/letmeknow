@@ -291,6 +291,18 @@ impl<P: Provider + Send + 'static> Identity<P> {
         });
     }
 
+    /// Whether the directory held lists the identity group's devices but those it dropped, as a pass would publish them:
+    /// a pass the group's duties or the directory's growth start then asks the service nothing.
+    fn listed(&self, gid: &[u8]) -> bool {
+        let Some(identity) = self.identity_of(gid) else { return true };
+        let held = self.node.inner.lock().public.get(&identity.id.0).cloned();
+        let (Some(held), Ok(members)) = (held, self.node.members(gid)) else { return false };
+        let mut writers: Vec<Bytes> = members.into_iter().map(|m| m.key).filter(|key| !held.is_dropped(key)).collect();
+        writers.sort();
+        writers.dedup();
+        held.writers == writers
+    }
+
     /// Derive the roster after reading its public predecessor and applying the private log, not merely receiving it;
     /// again while another device's publication moves the directory on meanwhile.
     pub async fn duties(&self, gid: &[u8]) -> Result<()> {
@@ -334,12 +346,14 @@ impl<P: Provider + Send + 'static> Identity<P> {
     }
 
     /// Takes the events of identity groups, but for their members joining and leaving, adds delivered (`Message`) and
-    /// warnings; returns every other event. Its duties run as the group's do, and as the identity's public log moves. A
-    /// device that comes online hears which sessions this one runs.
+    /// warnings; returns every other event. Its duties run as the group's do, and as the identity's public log moves,
+    /// unless the directory held lists the group's devices already. A device that comes online hears which sessions this
+    /// one runs.
     pub fn on(&self, event: Event) -> Option<Event> {
         if let Event::Public { identity } = &event {
             if let Ok((gid, own)) = self.own()
                 && own.id == *identity
+                && !self.listed(&gid.0)
             {
                 self.due(&gid.0);
             }
@@ -353,7 +367,7 @@ impl<P: Provider + Send + 'static> Identity<P> {
             return Some(event);
         }
         match event {
-            Event::Duties { .. } => self.due(&gid.0),
+            Event::Duties { .. } if !self.listed(&gid.0) => self.due(&gid.0),
             Event::Synced { member, .. } => self.tell(&gid.0, Some(&member.key)),
             Event::Live { sender, payload, .. } => {
                 if let Ok(presence) = serde_json::from_value(payload) {

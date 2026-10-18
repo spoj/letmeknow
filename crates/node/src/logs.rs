@@ -34,6 +34,8 @@ const FRESH_WAIT: Duration = Duration::from_secs(5);
 /// How often a session opens its groups' logs, touches its identities' directories, and asks about the logs members are
 /// behind in.
 const OPEN: Duration = Duration::from_secs(60 * 60);
+/// How long after a public log could not be read it is read again; each failure since doubles the wait, up to `OPEN`.
+const UNREAD: u64 = 30_000;
 
 /// The logs asked of one service, each with the length held.
 type Asked = (Service, Vec<(Vec<u8>, Known)>);
@@ -586,18 +588,20 @@ impl<P: Provider + Send + 'static> Inner<P> {
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Reads the public logs of the identities in this session's groups that it holds none of, and once more for each
-    /// device a member's certificate names that its identity does not list. A log read is followed from then on.
+    /// Reads the public logs of the identities in this session's groups that it holds none of, once their wait after a
+    /// failed read is up, and once more for each device a member's certificate names that its identity does not list. A
+    /// log read is followed from then on.
     pub(crate) async fn refresh_all(self: &Arc<Self>) {
         let unread: Vec<IdentityRef> = {
             let mut st = self.lock();
             let st = &mut *st;
+            let now = crate::now();
             let mut unread = Vec::new();
             for credential in st.groups.values().flat_map(|g| g.mls.members()).filter_map(|m| m.credential) {
                 let Some(certificate) = &credential.certificate else { continue };
                 let identity = &certificate.identity;
                 let read = match st.public.get(&identity.id.0) {
-                    None => true,
+                    None => st.unreadable.get(&identity.id.0).is_none_or(|(at, _)| *at <= now),
                     Some(log) => log.verify(&credential) == Verdict::Unverified && st.unlisted.insert((identity.id.0.clone(), certificate.device.0.clone())),
                 };
                 if read && !unread.contains(identity) {
@@ -607,8 +611,15 @@ impl<P: Provider + Send + 'static> Inner<P> {
             unread
         };
         for identity in unread {
-            if let Err(error) = timeout(MEMBER_WAIT, self.read_public(&identity)).await.map_err(anyhow::Error::from).and_then(|r| r) {
-                tracing::debug!("the public log of {}: {error:#}", hex(&identity.id.0));
+            let read = timeout(MEMBER_WAIT, self.read_public(&identity)).await.map_err(anyhow::Error::from).and_then(|r| r);
+            let mut st = self.lock();
+            match read {
+                Ok(_) => drop(st.unreadable.remove(&identity.id.0)),
+                Err(error) => {
+                    tracing::debug!("the public log of {}: {error:#}", hex(&identity.id.0));
+                    let wait = st.unreadable.get(&identity.id.0).map_or(UNREAD, |(_, wait)| (wait * 2).min(OPEN.as_millis() as u64));
+                    st.unreadable.insert(identity.id.0.clone(), (crate::now() + wait, wait));
+                }
             }
         }
     }

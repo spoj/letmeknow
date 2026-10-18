@@ -294,65 +294,7 @@ fn dropped(public: &BTreeMap<Vec<u8>, PublicLog>, credential: &Credential) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Config, INVITE_VALID, Node};
-    use lmk_core::provider::MemoryProvider;
-    use lmk_membership::client::ServeClient;
-    use lmk_proto::group::{CHAT, Certificate, IdentityRef, PROTOCOL, Settings, UPDATE};
     use lmk_proto::ranges::Ranges;
-    use lmk_testing::Relay;
-
-    async fn node(relay: &Relay, name: &str) -> Node<MemoryProvider> {
-        let config = Config {
-            handle: name.into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), post: relay.post(),
-            ca: relay.ca(), home: None, files: None, file_limit: 0,
-        };
-        Node::start(MemoryProvider::default(), config).await.unwrap().0
-    }
-
-    /// While reading waits before a commit, no pass removes a member whose device its identity dropped, and a send to its
-    /// group fails; once reading goes on, the send removes it first.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_send_fails_while_a_dropped_device_cannot_be_removed() {
-        let relay = lmk_testing::relay().await;
-        let (alice, tablet) = (node(&relay, "Alice").await, node(&relay, "tablet").await);
-        let (laptop, tablet_key): ([u8; 32], [u8; 32]) = (lmk_core::random(), lmk_core::random());
-        let (id, first) = lmk_core::public::create(&laptop, relay.service.clone());
-        let carol = IdentityRef { id: id.into(), membership: relay.service.clone() };
-        let (directory, address) = (ServeClient::for_service(relay.post(), &carol.membership).unwrap(), lmk_proto::public::address(&carol.id.0));
-        directory.append(&address, &[first], true).await.unwrap();
-        let list = async |devices: &[[u8; 32]]| {
-            let log = alice.read_public(&carol).await.unwrap();
-            let mut writers: Vec<Bytes> = devices.iter().map(|device| lmk_core::device::public(device).into()).collect();
-            writers.sort();
-            directory.append(&address, &[log.next(&laptop, writers)], true).await.unwrap();
-            alice.read_public(&carol).await.unwrap();
-        };
-        list(&[laptop, tablet_key]).await;
-        let settings = Settings { protocol: PROTOCOL, kind: CHAT.into(), name: String::new(), carry: 7, update: UPDATE, membership: relay.service.clone(), public: None, rest: Default::default() };
-        let gid = alice.create(settings, None).unwrap();
-        let device = lmk_core::device::public(&tablet_key);
-        let claim = lmk_proto::public::certified(tablet.key().0.as_slice().try_into().unwrap(), carol.id.0.as_slice().try_into().unwrap(), &device, "Carol", "tablet");
-        let certificate = Certificate { identity: carol.clone(), device: device.into(), name: "Carol".into(), device_name: "tablet".into(), sig: Bytes(lmk_core::device::sign(&tablet_key, &claim)) };
-        tablet.join(&alice.invite(&gid.0, None, INVITE_VALID).await.unwrap(), Some(certificate)).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(60), async {
-            while alice.members(&gid.0).unwrap().len() < 2 {
-                sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .expect("Alice applied the tablet's Add");
-
-        alice.inner.lock().group_mut(&gid.0).unwrap().waiting = true;
-        list(&[laptop]).await;
-        let message = serde_json::json!({ "type": "message", "content": "after" });
-        assert!(alice.send(&gid.0, &message, None).await.is_err(), "a send while the tablet's session stays fails");
-        assert_eq!(alice.members(&gid.0).unwrap().len(), 2);
-        alice.inner.lock().group_mut(&gid.0).unwrap().waiting = false;
-        alice.send(&gid.0, &message, None).await.unwrap();
-        assert_eq!(alice.members(&gid.0).unwrap().len(), 1, "the tablet's session was removed before the message was sealed");
-        alice.shutdown().await.unwrap();
-        tablet.shutdown().await.unwrap();
-    }
 
     fn seqs(key: &[u8], joined: u64, seqs: &[u64]) -> Seqs {
         Seqs { key: Bytes(key.to_vec()), joined, seqs: seqs.iter().copied().collect::<Ranges>() }

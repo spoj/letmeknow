@@ -441,6 +441,8 @@ pub(crate) struct State<P> {
     /// The identities and devices this session read a public log again for, as members' certificates named devices it
     /// did not list.
     unlisted: HashSet<(Vec<u8>, Vec<u8>)>,
+    /// The identities whose public logs could not be read: when each is read again, and the wait before that.
+    unreadable: HashMap<Vec<u8>, (u64, u64)>,
     /// In each identity group, this node's own key there, the device's key on that identity: its seed, and the member.
     device_keys: BTreeMap<Vec<u8>, ([u8; 32], Session)>,
     peers: Peers,
@@ -517,8 +519,7 @@ pub(crate) enum Work {
         settings: bool,
         gone: bool,
     },
-    /// A group's new log: opened, so that the service keeps it a retention from now, and read once, so that its peers'
-    /// entries are taken.
+    /// A group's new log: opened, so that the service keeps it a retention from now, and read if its head moved.
     Entered(Vec<u8>),
     /// A group's duties to run.
     Duties(Vec<u8>),
@@ -867,6 +868,114 @@ pub fn fp(key: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lmk_core::provider::MemoryProvider;
+    use lmk_membership::client::ServeClient;
+    use lmk_proto::membership::Read;
+    use lmk_proto::group::{CHAT, Certificate, IdentityRef, PROTOCOL, Settings, UPDATE};
+    use lmk_testing::Relay;
+    use n0_future::time::sleep;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn node(relay: &Relay, name: &str, post: Post) -> Node<MemoryProvider> {
+        let config = Config {
+            handle: name.into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), post,
+            ca: relay.ca(), home: None, files: None, file_limit: 0,
+        };
+        Node::start(MemoryProvider::default(), config).await.unwrap().0
+    }
+
+    /// While reading waits before a commit, no pass removes a member whose device its identity dropped, and a send to its
+    /// group fails; once reading goes on, the send removes it first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_send_fails_while_a_dropped_device_cannot_be_removed() {
+        let relay = lmk_testing::relay().await;
+        let (alice, tablet) = (node(&relay, "Alice", relay.post()).await, node(&relay, "tablet", relay.post()).await);
+        let (laptop, tablet_key): ([u8; 32], [u8; 32]) = (lmk_core::random(), lmk_core::random());
+        let (id, first) = lmk_core::public::create(&laptop, relay.service.clone());
+        let carol = IdentityRef { id: id.into(), membership: relay.service.clone() };
+        let (directory, address) = (ServeClient::for_service(relay.post(), &carol.membership).unwrap(), lmk_proto::public::address(&carol.id.0));
+        directory.append(&address, &[first], true).await.unwrap();
+        let list = async |devices: &[[u8; 32]]| {
+            let log = alice.read_public(&carol).await.unwrap();
+            let mut writers: Vec<Bytes> = devices.iter().map(|device| lmk_core::device::public(device).into()).collect();
+            writers.sort();
+            directory.append(&address, &[log.next(&laptop, writers)], true).await.unwrap();
+            alice.read_public(&carol).await.unwrap();
+        };
+        list(&[laptop, tablet_key]).await;
+        let settings = Settings { protocol: PROTOCOL, kind: CHAT.into(), name: String::new(), carry: 7, update: UPDATE, membership: relay.service.clone(), public: None, rest: Default::default() };
+        let gid = alice.create(settings, None).unwrap();
+        let device = lmk_core::device::public(&tablet_key);
+        let claim = lmk_proto::public::certified(tablet.key().0.as_slice().try_into().unwrap(), carol.id.0.as_slice().try_into().unwrap(), &device, "Carol", "tablet");
+        let certificate = Certificate { identity: carol.clone(), device: device.into(), name: "Carol".into(), device_name: "tablet".into(), sig: Bytes(lmk_core::device::sign(&tablet_key, &claim)) };
+        tablet.join(&alice.invite(&gid.0, None, INVITE_VALID).await.unwrap(), Some(certificate)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while alice.members(&gid.0).unwrap().len() < 2 {
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("Alice applied the tablet's Add");
+
+        alice.inner.lock().group_mut(&gid.0).unwrap().waiting = true;
+        list(&[laptop]).await;
+        let message = serde_json::json!({ "type": "message", "content": "after" });
+        assert!(alice.send(&gid.0, &message, None).await.is_err(), "a send while the tablet's session stays fails");
+        assert_eq!(alice.members(&gid.0).unwrap().len(), 2);
+        alice.inner.lock().group_mut(&gid.0).unwrap().waiting = false;
+        alice.send(&gid.0, &message, None).await.unwrap();
+        assert_eq!(alice.members(&gid.0).unwrap().len(), 1, "the tablet's session was removed before the message was sealed");
+        alice.shutdown().await.unwrap();
+        tablet.shutdown().await.unwrap();
+    }
+
+    /// A public log that cannot be read is read again 30 seconds after, then after twice the last wait, up to an hour.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unreadable_directory_is_read_again_less_and_less_often() {
+        let relay = lmk_testing::relay().await;
+        let (id, device): ([u8; 32], [u8; 32]) = (lmk_core::random(), lmk_core::random());
+        let ghost = IdentityRef { id: Bytes(id.to_vec()), membership: relay.service.clone() };
+        let address = lmk_proto::public::address(&id);
+        let (counted, base) = (Arc::new(AtomicUsize::new(0)), relay.post());
+        let counting = counted.clone();
+        let post: Post = Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
+            if route == "/membership/2/read" && serde_json::from_slice::<Read>(&body).is_ok_and(|read| read.capability == address) {
+                counting.fetch_add(1, Ordering::SeqCst);
+            }
+            base(domain, route, body)
+        });
+        let (alice, bob) = (node(&relay, "Alice", post).await, node(&relay, "Bob", relay.post()).await);
+        let settings = Settings { protocol: PROTOCOL, kind: CHAT.into(), name: String::new(), carry: 7, update: UPDATE, membership: relay.service.clone(), public: None, rest: Default::default() };
+        let gid = alice.create(settings, None).unwrap();
+        let key = lmk_core::device::public(&device);
+        let claim = lmk_proto::public::certified(bob.key().0.as_slice().try_into().unwrap(), &id, &key, "Ghost", "phone");
+        let certificate = Certificate { identity: ghost.clone(), device: key.into(), name: "Ghost".into(), device_name: "phone".into(), sig: Bytes(lmk_core::device::sign(&device, &claim)) };
+        bob.join(&alice.invite(&gid.0, None, INVITE_VALID).await.unwrap(), Some(certificate)).await.unwrap();
+        let wait = || alice.inner.lock().unreadable.get(id.as_slice()).map(|(_, wait)| *wait);
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while wait().is_none() {
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("Alice tried the directory as Bob joined");
+        // No other task reads it from here on.
+        let tasks: Vec<_> = alice.inner.tasks.lock().unwrap().drain(..).collect();
+        for task in &tasks {
+            task.abort();
+        }
+        let read = counted.load(Ordering::SeqCst);
+        assert_eq!(wait(), Some(30_000));
+        alice.inner.refresh_all().await;
+        assert_eq!(counted.load(Ordering::SeqCst), read, "not read again before its wait is up");
+        for expected in [60_000, 120_000, 240_000, 480_000, 960_000, 1_920_000, 3_600_000, 3_600_000] {
+            alice.inner.lock().unreadable.get_mut(id.as_slice()).unwrap().0 = 0;
+            alice.inner.refresh_all().await;
+            assert_eq!(wait(), Some(expected));
+        }
+        assert_eq!(counted.load(Ordering::SeqCst), read + 8);
+        bob.shutdown().await.unwrap();
+    }
 
     #[test]
     fn a_group_holds_files_linked_within_h() {

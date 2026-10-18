@@ -2,7 +2,7 @@
 //! group logic hands on runs one item at a time (`drive`), the duties run at start and every while (`resume`), and
 //! files are fetched.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -22,7 +22,7 @@ use crate::{COLLECT, Config, Event, G, Inner, MEMBER_WAIT, Node, Out, Rec, State
 
 /// How long a fetch keeps looking for a member that holds the file.
 const FETCH_TRIES: u32 = 12;
-/// How often identities whose public logs could not be read are read again, as their directories may answer by then.
+/// How often the identities whose public logs could not be read are looked at, to read those whose wait is up.
 const READ_RETRY: Duration = Duration::from_secs(30);
 
 impl<P: Provider + Send + 'static> Node<P> {
@@ -105,6 +105,7 @@ impl<P: Provider> State<P> {
             logs,
             public: BTreeMap::new(),
             unlisted: HashSet::new(),
+            unreadable: HashMap::new(),
             device_keys: BTreeMap::new(),
             peers,
             served: BTreeMap::new(),
@@ -293,9 +294,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     self.spawn(async move {
                         if let Err(error) = node.open(&log).await {
                             tracing::debug!("opening log {}: {error:#}", hex(&log));
-                        }
-                        if let Err(error) = node.read(&log).await {
-                            tracing::debug!("reading log {}: {error:#}", hex(&log));
                         }
                     });
                 }

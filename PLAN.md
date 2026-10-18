@@ -20,14 +20,14 @@ For: a revoked device reads nothing sent more than 2 minutes after its revocatio
 - After the pass, a send to a group that still has a member its identity's directory dropped fails, saying so, and sends nothing. SKILL names this failure beside `rate` and `size`.
 - Test: while reading waits before a commit, a send to a group with a dropped device fails; once the device is removed, it goes.
 
-## 3. Requests within "when it sends, and hourly"
+## 3. Requests within "when it sends, and hourly" (done)
 
 For: a session asks the service only when it sends, and hourly.
 
-- The identity kind's duties make three requests a pass (the directory in `duties`, the identity group's log in `caught_up`, the directory again in `publish`), every 10 minutes and at every advance: about 20 an hour per online device. A pass whose held directory already lists the group's devices, but those it dropped, makes none; one that would publish reads all three first, as now.
+- The identity kind's duties make three requests a pass (the directory in `duties`, the identity group's log in `caught_up`, the directory again in `publish`), every 10 minutes and at every advance: about 20 an hour per online device. A pass that the group's duties or the directory's growth start (`Identity::on`) makes none while the directory held lists the group's devices but those it dropped; `duties` called directly, and so a pass that would publish, reads all three first, as now.
 - A public log that cannot be read (a service down, an expired identity, a claim naming none) is read again every 30 seconds while it fails, by every member of every group its claimant is in. Retries back off from 30 seconds to an hour.
 - `Work::Entered` opens a new epoch's log, then reads it; `open` reads it already when its head moved. It only opens.
-- Tests: a device's node passes its duties with nothing to publish and makes no request; on a shifted clock, an unreadable directory is read again at 30 s, then 1, 2, 4 minutes, at most hourly.
+- Tests: a device's passes with nothing to publish make no request; an unreadable directory is not read before its wait is up, and its wait doubles from 30 s to an hour; entering an epoch takes one request.
 
 ## 4. Tests that flake on Windows
 

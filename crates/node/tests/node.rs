@@ -3618,6 +3618,73 @@ fn counting(post: Post) -> (Arc<std::sync::atomic::AtomicUsize>, Post) {
     (asked, post)
 }
 
+/// The domain and route of each request a post passed on.
+type Requests = Arc<std::sync::Mutex<Vec<(String, &'static str)>>>;
+
+/// A post that records the requests it passes on.
+fn recording(post: Post) -> (Requests, Post) {
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    let post: Post = Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
+        recorded.lock().unwrap().push((domain.clone(), route));
+        post(domain, route, body)
+    });
+    (requests, post)
+}
+
+/// Waits until a recording has taken no request for a second: what was under way ended.
+async fn quiet(requests: &Requests) {
+    let mut seen = usize::MAX;
+    while requests.lock().unwrap().len() != seen {
+        seen = requests.lock().unwrap().len();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// A device's passes ask the service nothing while the directory it holds lists its identity group's devices.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_devices_pass_with_nothing_to_publish_asks_nothing() {
+    let relay = relay().await;
+    let (requests, post) = recording(relay.post());
+    let device = Device::new("laptop");
+    let (node, _events) = Node::start(MemoryProvider::default(), Config { post, ..config(&relay, "laptop", Some(device.clone())) }).await.unwrap();
+    let devices = Identity::new(node.clone(), device, Arc::new(|_: &Device| Ok(())));
+    devices.create("Carol", relay.service.clone()).await.unwrap();
+    let gid = devices_group(&node);
+    devices.duties(&gid.0).await.unwrap();
+    quiet(&requests).await;
+    let before = requests.lock().unwrap().len();
+    for _ in 0..3 {
+        assert!(devices.on(Event::Duties { group: gid.clone() }).is_none());
+    }
+    quiet(&requests).await;
+    assert_eq!(requests.lock().unwrap().len(), before, "the passes asked nothing");
+    devices.duties(&gid.0).await.unwrap();
+    assert!(requests.lock().unwrap().len() > before, "duties asked for read the directory");
+    node.shutdown().await.unwrap();
+}
+
+/// A member entering an epoch a peer brought it into asks the service once: it opens the epoch's log.
+#[tokio::test(flavor = "multi_thread")]
+async fn entering_an_epoch_takes_one_request() {
+    let relay = relay().await;
+    let alice = session(&relay, "Alice").await;
+    let (requests, post) = recording(relay.post());
+    let bob = session_with(&relay, "Bob", post).await;
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    eventually("Alice has Bob", || alice.node.members(&gid.0).unwrap().len() == 2).await;
+    quiet(&requests).await;
+    let before = requests.lock().unwrap().len();
+    alice.node.change_settings(&gid.0, |s| Settings { name: "Moved".into(), ..s }).await.unwrap();
+    eventually("Bob applied the commit", || bob.node.settings(&gid.0).unwrap().name == "Moved").await;
+    quiet(&requests).await;
+    let routes: Vec<&str> = requests.lock().unwrap()[before..].iter().map(|(_, route)| *route).collect();
+    assert_eq!(routes, ["/membership/2/append"]);
+    alice.node.shutdown().await.unwrap();
+    bob.node.shutdown().await.unwrap();
+}
+
 /// How long a read of a group's logs stands for a send.
 const FRESH_MS: u64 = 2 * 60 * 1000;
 
