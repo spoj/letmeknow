@@ -11,7 +11,7 @@ For: a removed member reads nothing sent more than 2 minutes after its removal.
 - The refresh reads the group's logs through the current one's end (`read_group`), within its 5 seconds.
 - Test: two commits no peer pushed, the second removing Bob; Carol's send after 2 minutes seals to the members after both.
 
-## 2. A send fails while it cannot remove a revoked device
+## 2. A send fails while it cannot remove a revoked device (done)
 
 For: a revoked device reads nothing sent more than 2 minutes after its revocation.
 
@@ -39,7 +39,7 @@ When a test flakes there, its timing is fixed:
 
 ## 5. Small fixes
 
-- SKILL says `send` answers at once; it answers within seconds, as it may read the group first, up to 5 seconds while the service is down.
+- SKILL says `send` answers at once; it answers within seconds, as it may read the group first, up to 5 seconds while the service is down (done, with step 2).
 - `Store::open` moves live logs' days by the days since the last expiry pass, plus one: a restart across midnight credits two days for minutes down, past "seven to eight". The extra day goes. Test: a start on the day after the last pass moves days by one.
 - CI: the actions off Node 20 (`checkout`, `setup-python`, `setup-node`, the artifact actions); Linux jobs name `ubuntu-24.04` until a release is checked on 26, to which `ubuntu-latest` moves from October 19.
 
