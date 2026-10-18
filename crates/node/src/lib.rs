@@ -3,9 +3,9 @@
 //! against which their credentials' certificates are checked. Held messages travel between members and are delivered
 //! in causal order; commits keep them, by their cuts. Chats and identities see a group's content through the channels
 //! here (held messages as delivered, live ones, and files), and nothing of the rest; the core reads only its own
-//! payloads (`Control`). Identities (`identity`) are built on those channels. It stores everything through
-//! the core's `Provider`, one transaction per step (`Step`): nothing a step produces leaves the node before its
-//! transaction commits.
+//! payloads (`Control`). Identities (`identity`) are built on those channels. It stores everything in one SQLite
+//! database (the core's `SqliteProvider`), one transaction per step (`Step`): nothing a step produces leaves the node
+//! before its transaction commits.
 
 mod admission;
 mod api;
@@ -31,7 +31,7 @@ use iroh::{EndpointId, RelayUrl, SecretKey};
 use lmk_core::device::{Device, signer};
 use lmk_core::group::{self as core, Group, Session};
 use lmk_core::public::{PublicLog, Verdict};
-use lmk_core::provider::Provider;
+use lmk_core::provider::SqliteProvider;
 use lmk_membership::client::{Post, Resolve};
 use lmk_net::peers::Peers;
 use lmk_net::Net;
@@ -420,8 +420,8 @@ impl G {
     }
 }
 
-pub(crate) struct State<P> {
-    provider: P,
+pub(crate) struct State {
+    provider: SqliteProvider,
     /// What the current step produced for the peers, sent once it commits.
     out: Vec<Out>,
     /// The current step deleted what should leave no copy: scrub once it commits.
@@ -469,26 +469,26 @@ pub(crate) enum Out {
 
 /// One step: the state, locked, with a transaction open on its storage; committed when the step ends, and only then
 /// what it produced goes out.
-pub(crate) struct Step<'a, P: Provider + Send + 'static> {
-    guard: MutexGuard<'a, State<P>>,
-    inner: &'a Inner<P>,
+pub(crate) struct Step<'a> {
+    guard: MutexGuard<'a, State>,
+    inner: &'a Inner,
 }
 
-impl<P: Provider + Send + 'static> Deref for Step<'_, P> {
-    type Target = State<P>;
+impl Deref for Step<'_> {
+    type Target = State;
 
-    fn deref(&self) -> &State<P> {
+    fn deref(&self) -> &State {
         &self.guard
     }
 }
 
-impl<P: Provider + Send + 'static> DerefMut for Step<'_, P> {
-    fn deref_mut(&mut self) -> &mut State<P> {
+impl DerefMut for Step<'_> {
+    fn deref_mut(&mut self) -> &mut State {
         &mut self.guard
     }
 }
 
-impl<P: Provider + Send + 'static> Drop for Step<'_, P> {
+impl Drop for Step<'_> {
     fn drop(&mut self) {
         self.guard.gate();
         // Nothing a step produced may leave unless it committed, and its state in memory no longer matches storage.
@@ -534,8 +534,8 @@ pub(crate) enum Work {
 /// A log, and the lengths and hashes of two heads of it that contradict each other.
 type Contradicted = (Vec<u8>, [(u64, Vec<u8>); 2]);
 
-pub(crate) struct Inner<P> {
-    state: Mutex<State<P>>,
+pub(crate) struct Inner {
+    state: Mutex<State>,
     net: OnceLock<Net>,
     clients: logs::Clients,
     resolve: Resolve,
@@ -564,21 +564,21 @@ pub(crate) struct Inner<P> {
 }
 
 /// One member's session. Clones share it.
-pub struct Node<P> {
-    inner: Arc<Inner<P>>,
+pub struct Node {
+    inner: Arc<Inner>,
 }
 
-impl<P> Clone for Node<P> {
+impl Clone for Node {
     fn clone(&self) -> Self {
         Node { inner: self.inner.clone() }
     }
 }
 
-fn get<T: DeserializeOwned>(provider: &impl Provider, key: &[u8]) -> Result<Option<T>> {
+fn get<T: DeserializeOwned>(provider: &SqliteProvider, key: &[u8]) -> Result<Option<T>> {
     Ok(provider.get(key)?.map(|bytes| serde_json::from_slice(&bytes)).transpose()?)
 }
 
-fn put<T: Serialize>(provider: &impl Provider, key: &[u8], value: &T) -> Result<()> {
+fn put<T: Serialize>(provider: &SqliteProvider, key: &[u8], value: &T) -> Result<()> {
     provider.put(key, &serde_json::to_vec(value)?)
 }
 
@@ -595,7 +595,7 @@ fn endpoint_id(key: &[u8]) -> Option<EndpointId> {
     EndpointId::from_bytes(key.try_into().ok()?).ok()
 }
 
-impl<P: Provider> State<P> {
+impl State {
     /// What the credential of the group this session makes or joins next names: the certificate of its identity.
     fn speak(&mut self, identity: Option<Certificate>) {
         self.session.credential.certificate = identity.map(Box::new);
@@ -817,7 +817,7 @@ impl<P: Provider> State<P> {
 }
 
 /// The session's iroh key, made on first use.
-pub fn iroh_key(provider: &impl Provider) -> Result<SecretKey> {
+pub fn iroh_key(provider: &SqliteProvider) -> Result<SecretKey> {
     Ok(match provider.get(b"node/iroh")? {
         Some(bytes) => SecretKey::from_bytes(&bytes.as_slice().try_into().context("an iroh key is 32 bytes")?),
         None => {
@@ -828,7 +828,7 @@ pub fn iroh_key(provider: &impl Provider) -> Result<SecretKey> {
     })
 }
 
-impl<P: Provider + Send + 'static> Inner<P> {
+impl Inner {
     fn net(&self) -> &Net {
         self.net.get().expect("the peers start with the node")
     }
@@ -844,7 +844,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Starts a step.
-    pub(crate) fn lock(&self) -> Step<'_, P> {
+    pub(crate) fn lock(&self) -> Step<'_> {
         let guard = self.state.lock().unwrap();
         // A step outside a transaction could commit half of what it does.
         if let Err(error) = guard.provider.begin() {
@@ -869,7 +869,6 @@ pub fn fp(key: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lmk_core::provider::MemoryProvider;
     use lmk_membership::client::ServeClient;
     use lmk_proto::membership::Read;
     use lmk_proto::group::{CHAT, Certificate, IdentityRef, PROTOCOL, Settings, UPDATE};
@@ -877,12 +876,12 @@ mod tests {
     use n0_future::time::sleep;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    async fn node(relay: &Relay, name: &str, post: Post) -> Node<MemoryProvider> {
+    async fn node(relay: &Relay, name: &str, post: Post) -> Node {
         let config = Config {
             handle: name.into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), post,
             ca: relay.ca(), home: None, files: None, file_limit: 0,
         };
-        Node::start(MemoryProvider::default(), config).await.unwrap().0
+        Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0
     }
 
     /// While reading waits before a commit, no pass removes a member whose device its identity dropped, and a send to its

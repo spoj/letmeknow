@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::{Context, Result};
 use iroh::{EndpointId, RelayUrl};
 use lmk_core::group::{Group, Session};
-use lmk_core::provider::Provider;
+use lmk_core::provider::SqliteProvider;
 use lmk_net::peers::Peers;
 use lmk_net::Net;
 use lmk_proto::group::{Leaf, REVISION};
@@ -25,9 +25,9 @@ const FETCH_TRIES: u32 = 12;
 /// How often the identities whose public logs could not be read are looked at, to read those whose wait is up.
 const READ_RETRY: Duration = Duration::from_secs(30);
 
-impl<P: Provider + Send + 'static> Node<P> {
+impl Node {
     /// Opens the session in `provider`, creating it on first use, and starts its peers.
-    pub async fn start(provider: P, mut config: Config) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
+    pub async fn start(provider: SqliteProvider, mut config: Config) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
         let ca = std::mem::take(&mut config.ca);
         let home = if config.chosen.is_empty() { config.relays.clone() } else { config.chosen.clone() };
         let endpoint = lmk_net::builder(home).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
@@ -65,9 +65,9 @@ impl<P: Provider + Send + 'static> Node<P> {
     }
 }
 
-impl<P: Provider> State<P> {
+impl State {
     /// The session in `provider`, created on first use, with its leaf as `leaf`; its logs, groups and device keys.
-    fn open(provider: P, config: &Config, leaf: Leaf) -> Result<Self> {
+    fn open(provider: SqliteProvider, config: &Config, leaf: Leaf) -> Result<Self> {
         let mut session = match provider.get(b"session")? {
             Some(_) => Session::load(&provider)?,
             None => Session::create(&provider, &config.handle, leaf.clone())?,
@@ -127,7 +127,7 @@ impl<P: Provider> State<P> {
     }
 }
 
-impl<P: Provider + Send + 'static> Inner<P> {
+impl Inner {
     /// Starts the tasks, opens the logs, and picks up where the session stopped: its public logs replayed, and its
     /// groups it was removed from told.
     fn run(

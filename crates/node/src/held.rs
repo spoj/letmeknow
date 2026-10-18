@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use iroh::EndpointId;
 use lmk_core::group::{self as core, MAX_MESSAGE};
-use lmk_core::provider::Provider;
 use lmk_proto::Bytes;
 use lmk_proto::group::{Control, type_of};
 use lmk_proto::held::Header;
@@ -270,7 +269,7 @@ impl G {
     }
 }
 
-impl<P: Provider> State<P> {
+impl State {
     pub(crate) fn record(&self, gid: &[u8], id: &[u8]) -> Result<Option<Record>> {
         get(&self.provider, &record_key(gid, id))
     }
@@ -347,11 +346,11 @@ impl<P: Provider> State<P> {
     }
 }
 
-impl<P: Provider + Send + 'static> Inner<P> {
+impl Inner {
     /// Takes held ciphertexts a peer sent, or that came early: opens what is in order, keeps a while what is not,
     /// passes on what it opened unless they answered this session's `want`, to members that joined before it was sent,
     /// and delivers what is ready.
-    pub(crate) fn take(&self, st: &mut State<P>, gid: &[u8], from: Option<EndpointId>, ciphertexts: Vec<Vec<u8>>, forward: bool) -> Result<()> {
+    pub(crate) fn take(&self, st: &mut State, gid: &[u8], from: Option<EndpointId>, ciphertexts: Vec<Vec<u8>>, forward: bool) -> Result<()> {
         let mut opened = Vec::new();
         for ciphertext in ciphertexts {
             opened.extend(self.take_one(st, gid, from, ciphertext)?);
@@ -376,7 +375,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Takes one ciphertext; the ciphertext and the epoch its message was sent in, if it opened.
-    fn take_one(&self, st: &mut State<P>, gid: &[u8], from: Option<EndpointId>, ciphertext: Vec<u8>) -> Result<Option<(Vec<u8>, u64)>> {
+    fn take_one(&self, st: &mut State, gid: &[u8], from: Option<EndpointId>, ciphertext: Vec<u8>) -> Result<Option<(Vec<u8>, u64)>> {
         let now = st.tick();
         let g = st.group_mut(gid)?;
         let hash: [u8; 32] = Sha256::digest(&ciphertext).into();
@@ -417,7 +416,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Opens the unopened ciphertexts that are now in order, within the window and the buckets.
-    fn open_unopened(&self, st: &mut State<P>, gid: &[u8], opened: &mut Vec<(Vec<u8>, u64)>) -> Result<()> {
+    fn open_unopened(&self, st: &mut State, gid: &[u8], opened: &mut Vec<(Vec<u8>, u64)>) -> Result<()> {
         loop {
             let now = st.tick();
             let g = st.group_mut(gid)?;
@@ -435,7 +434,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Opens every ciphertext kept unopened that is of epoch `epoch`, as its keys are about to go.
-    pub(crate) fn open_all(&self, st: &mut State<P>, gid: &[u8], epoch: u64) -> Result<()> {
+    pub(crate) fn open_all(&self, st: &mut State, gid: &[u8], epoch: u64) -> Result<()> {
         let g = st.group_mut(gid)?;
         let claims: Vec<_> = g.unopened.iter().filter(|(_, (sealed, _))| *sealed <= epoch).map(|(claim, _)| claim.clone()).collect();
         for claim in claims {
@@ -447,7 +446,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Opens a ciphertext and keeps its message, or its newer sealing of a message not kept yet; the ciphertext and the
     /// epoch its message was sent in, if either.
-    fn open_one(&self, st: &mut State<P>, gid: &[u8], ciphertext: Vec<u8>) -> Result<Option<(Vec<u8>, u64)>> {
+    fn open_one(&self, st: &mut State, gid: &[u8], ciphertext: Vec<u8>) -> Result<Option<(Vec<u8>, u64)>> {
         let now = st.tick();
         let g = st.groups.get_mut(gid).context("this session is not in that group")?;
         let opened = match g.mls.open(&st.provider, &ciphertext) {
@@ -523,7 +522,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// A ciphertext of a kept seq that is too old to open: no sealing of it can come that opens, so it is lost.
-    fn unheld(&self, st: &mut State<P>, gid: &[u8], ciphertext: &[u8]) -> Result<()> {
+    fn unheld(&self, st: &mut State, gid: &[u8], ciphertext: &[u8]) -> Result<()> {
         let (claim, _) = core::claim(ciphertext)?;
         let g = st.group_mut(gid)?;
         let Some(author) = g.author_mut(&claim.key.0, claim.joined) else { return Ok(()) };
@@ -540,7 +539,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Acts on one of the core's payloads as it opens, or as this session sends it.
-    pub(crate) fn control(&self, st: &mut State<P>, gid: &[u8], h: &Header) -> Result<()> {
+    pub(crate) fn control(&self, st: &mut State, gid: &[u8], h: &Header) -> Result<()> {
         if !Control::TYPES.contains(&type_of(&h.payload)) {
             return Ok(());
         }
@@ -561,7 +560,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Delivers every held message whose requirements are resolved, each membership's in seq order.
-    pub(crate) fn deliver_ready(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
+    pub(crate) fn deliver_ready(&self, st: &mut State, gid: &[u8]) -> Result<()> {
         loop {
             let g = st.group(gid)?;
             let mut ready = None;
@@ -586,7 +585,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Delivers a held message: its index, its causal past, what its requirements reached that was given up, and an
     /// event for the client unless it is the core's or this session's own.
-    pub(crate) fn deliver(&self, st: &mut State<P>, gid: &[u8], mut record: Record) -> Result<()> {
+    pub(crate) fn deliver(&self, st: &mut State, gid: &[u8], mut record: Record) -> Result<()> {
         let now = st.tick();
         let h = record.header.clone();
         let mut past: BTreeMap<(Bytes, u64), u64> = BTreeMap::new();
@@ -647,7 +646,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// of what it knows was sent: after `HOLD_OFF` once no holder, by summaries, may still be asked, else after
     /// `GIVE_UP`, then held ones too, as two pending messages may require each other. A dep past what it knows was sent
     /// is met after `GIVE_UP` once all it knows was sent is. Then delivers.
-    pub(crate) fn give_up(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
+    pub(crate) fn give_up(&self, st: &mut State, gid: &[u8]) -> Result<()> {
         if !st.at_head(gid) {
             return Ok(());
         }

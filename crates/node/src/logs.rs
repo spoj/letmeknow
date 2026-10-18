@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, ensure};
-use lmk_core::provider::Provider;
+use lmk_core::provider::SqliteProvider;
 use lmk_core::public::{PublicLog, Verdict};
 use lmk_membership::client::{Post, ServeClient};
 use lmk_membership::{Contradiction, Expired, Frontier, Unsupported, VerifiedPage, WrongDirectory};
@@ -131,9 +131,9 @@ pub(crate) fn entry_key(id: &[u8], position: u64) -> Vec<u8> {
     [b"node/entry/".as_slice(), id, b"/", &position.to_be_bytes()].concat()
 }
 
-impl<P: Provider> State<P> {
+impl State {
     /// Loads the logs this session follows.
-    pub(crate) fn load_logs(provider: &P) -> Result<BTreeMap<Vec<u8>, Log>> {
+    pub(crate) fn load_logs(provider: &SqliteProvider) -> Result<BTreeMap<Vec<u8>, Log>> {
         let ids = get::<Vec<Bytes>>(provider, b"node/logs")?.unwrap_or_default();
         ids.into_iter().map(|id| Ok((id.0.clone(), get(provider, &log_key(&id.0))?.context("a log without its record")?))).collect()
     }
@@ -284,7 +284,7 @@ impl<P: Provider> State<P> {
     }
 }
 
-impl<P: Provider + Send + 'static> Inner<P> {
+impl Inner {
     /// Asks about the logs of a group, its current log and the public logs of the identities in it, that this session
     /// has not read or asked about within `FRESH`, and reads the group's logs on through each epoch a commit read moves
     /// it to, waiting at most `FRESH_WAIT`: before it sends to the group.
@@ -495,7 +495,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// Holds entries of a log that follow position `after` and end at `head`, a head its service signed, from the
     /// service or a peer: the new ones, if they chain on to this session's copy; a head that contradicts it is
     /// reported. Hands the new ones to the log's type.
-    pub(crate) fn take_entries(&self, st: &mut State<P>, id: &[u8], after: u64, entries: Vec<Bytes>, head: Head) -> Result<()> {
+    pub(crate) fn take_entries(&self, st: &mut State, id: &[u8], after: u64, entries: Vec<Bytes>, head: Head) -> Result<()> {
         let length = st.log(id)?.length();
         if after > length {
             return Ok(());
@@ -535,7 +535,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// group of it, which this session leaves. A group's current log that stays gone for `WAIT`, with no entry of it
     /// brought meanwhile, is left once it is found gone again: the commit that moves the group on is in it, and no member
     /// can read it.
-    fn lapse(&self, st: &mut State<P>, id: &[u8]) -> Result<()> {
+    fn lapse(&self, st: &mut State, id: &[u8]) -> Result<()> {
         let now = crate::now();
         let log = st.logs.get_mut(id).context(NOT_FOLLOWED)?;
         let length = log.length();
@@ -560,7 +560,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Hands a log's new entries to its log type: a group's, while it is the group's current log.
-    fn check(&self, st: &mut State<P>, id: &[u8]) -> Result<()> {
+    fn check(&self, st: &mut State, id: &[u8]) -> Result<()> {
         match st.log(id)?.of.clone() {
             Of::Group(group) => match st.groups.get(&group.0) {
                 Some(g) if g.rec.log.0 == id => self.advance(st, &group.0),
@@ -571,7 +571,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 }
 
-impl<P: Provider + Send + 'static> Inner<P> {
+impl Inner {
     /// Reads the public logs of the identities in this session's groups that it holds none of, once their wait after a
     /// failed read is up, and once more for each device a member's certificate names that its identity does not list. A
     /// log read is followed from then on.
@@ -649,7 +649,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Replays a public log: an identity's, against which its sessions' certificates are checked.
-    pub(crate) fn replayed(&self, st: &mut State<P>, id: &[u8]) -> Result<()> {
+    pub(crate) fn replayed(&self, st: &mut State, id: &[u8]) -> Result<()> {
         let Some(log) = st.public_log(id) else { return Ok(()) };
         let entries = st.entries(&log, 0);
         if entries.is_empty() {
@@ -682,7 +682,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Reports a log that its service showed differently, here and at `there`, unless it reported those two heads of it
     /// already.
-    pub(crate) fn contradicted(&self, st: &State<P>, log: &[u8], contradiction: &Contradiction, there: &str) {
+    pub(crate) fn contradicted(&self, st: &State, log: &[u8], contradiction: &Contradiction, there: &str) {
         let Contradiction { ours, theirs } = contradiction;
         let mut heads = [(ours.length, ours.hash.to_vec()), (theirs.length, theirs.hash.to_vec())];
         heads.sort();

@@ -1,6 +1,6 @@
 use super::*;
 use crate::Config;
-use lmk_core::provider::MemoryProvider;
+use lmk_core::provider::SqliteProvider;
 use lmk_core::public::{PublicLog, Verdict};
 use lmk_membership::client::{Post, ServeClient};
 use lmk_membership::store::{Log, Store};
@@ -78,13 +78,13 @@ impl std::fmt::Debug for Authority {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("Authority") }
 }
 
-async fn device(relay: &Relay, name: &str, post: Post) -> (Node<MemoryProvider>, Identity<MemoryProvider>) {
+async fn device(relay: &Relay, name: &str, post: Post) -> (Node, Identity) {
     let device = Device::new(name);
     let config = Config {
         handle: name.into(), device: Some(device.clone()), relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), post, ca: relay.ca(),
         home: None, files: None, file_limit: 0,
     };
-    let (node, _events) = Node::start(MemoryProvider::default(), config).await.unwrap();
+    let (node, _events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap();
     let identity = Identity::new(node.clone(), device, Arc::new(|_| Ok(())));
     (node, identity)
 }
@@ -94,12 +94,12 @@ struct Race {
     relay: Relay,
     authority: Arc<Authority>,
     service: AbortOnDropHandle<()>,
-    a: Node<MemoryProvider>,
-    a_identity: Identity<MemoryProvider>,
-    c: Node<MemoryProvider>,
-    c_identity: Identity<MemoryProvider>,
-    b: Node<MemoryProvider>,
-    b_identity: Identity<MemoryProvider>,
+    a: Node,
+    a_identity: Identity,
+    c: Node,
+    c_identity: Identity,
+    b: Node,
+    b_identity: Identity,
     identity: IdentityRef,
     gid: Bytes,
 }

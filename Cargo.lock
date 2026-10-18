@@ -2785,7 +2785,6 @@ dependencies = [
  "lmk-proto",
  "openmls",
  "openmls_basic_credential",
- "openmls_memory_storage",
  "openmls_rust_crypto",
  "openmls_sqlite_storage",
  "openmls_traits",

@@ -68,13 +68,13 @@ Every step ends with `tell_peers`, which rebuilds every group's `Own`, parsing e
 - `Step::drop` keeps the gate's update but no longer refreshes every group; the 250 ms poll does, before `Peers` sends anything. A group is handed to `Peers` as it is added (`add_group`), so a frame for it never finds it missing (`full_mesh` indexes it), and as a commit applies, so a new member's summary is taken at once.
 - Test: a joiner's summary that arrives right after its Add applies is kept; the read-only step's time is measured before and after, for the commit message.
 
-## 9. One storage
+## 9. One storage (done)
 
 For: simplicity.
 
 `MemoryProvider` exists for tests; production stores only in SQLite.
 
-- `MemoryProvider` and the `Provider` trait go, and with them the `P` generics across core, node and session (about 200 mentions), `mod native`, and `openmls_memory_storage`. Tests open SQLite in memory, or in their folders where they restart; the core tests that compare `records()` before and after compare the database's rows.
+- `MemoryProvider` and the `Provider` trait go, and with them the `P` generics across core, node and session (about 200 mentions), `mod native`, and the direct dependency on `openmls_memory_storage`. Tests open SQLite in memory, or in their folders where they restart; the core tests that compared `records()` before and after compare the database's rows (`rows`), and a member's copy copies them (`copy`).
 
 ## 10. Options and checks with no use (done)
 

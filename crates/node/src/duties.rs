@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, ensure};
 use lmk_core::group::{self as core, Change, MAX_CUT_STEP};
-use lmk_core::provider::Provider;
 use lmk_proto::Bytes;
 use lmk_proto::group::IDENTITY;
 use lmk_proto::held::Ref;
@@ -40,7 +39,7 @@ pub(crate) fn next_update(updated: u64, update: u32, key: &[u8]) -> u64 {
     (updated + t - offset) / t * t + offset
 }
 
-impl<P: Provider> State<P> {
+impl State {
     /// The cut a commit this session builds now carries: per member of the epoch, from the cut state on, each seq it
     /// holds sealed in the current epoch whose `prev` chains to the last; its own only as far as another member that
     /// may have them holds them.
@@ -125,7 +124,7 @@ impl<P: Provider> State<P> {
 
 /// What a pass commits on the group as it stands, if anything: the Removes due and this session's update; with the
 /// members removed whose devices were dropped.
-fn due<P: Provider>(st: &State<P>, g: &G) -> Result<Option<(Change, Vec<core::Member>)>> {
+fn due(st: &State, g: &G) -> Result<Option<(Change, Vec<core::Member>)>> {
     let gid = g.mls.id();
     let me = st.me(gid);
     let cut = st.cut_for(gid)?;
@@ -142,7 +141,7 @@ fn due<P: Provider>(st: &State<P>, g: &G) -> Result<Option<(Change, Vec<core::Me
     Ok((update || !remove.is_empty()).then(|| (Change { remove, leaf: Some(leaf.clone()), name, cut, ..Change::default() }, dropped)))
 }
 
-impl<P: Provider + Send + 'static> Inner<P> {
+impl Inner {
     /// Runs a pass of a group's duties; if one runs, another once it ends.
     pub(crate) fn duties(self: &Arc<Self>, gid: &[u8]) {
         {

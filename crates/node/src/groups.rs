@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
 use lmk_core::group::{self as core, Change, Group};
-use lmk_core::provider::Provider;
 use lmk_membership::Refused;
 use lmk_proto::Bytes;
 use lmk_proto::group::{IDENTITY, How, IdentityRef};
@@ -16,13 +15,13 @@ use crate::{Event, G, Inner, Member, State, device_key_key, get, reading, rec_ke
 
 const COMMIT_TRIES: u32 = 5;
 
-impl<P: Provider + Send + 'static> Inner<P> {
+impl Inner {
     /// Commits a change built on the group's current epoch, with the cut this session can make, posts its entry to the
     /// epoch's log, and reads the log until it is known whether it won its epoch; if another commit won, builds it
     /// again. Returns the epoch it ended; none once the change has no effect (`None`), and it commits nothing. An entry
     /// posted before, which the log may or may not have taken, as when the service's answer was lost, is posted again
     /// first: only the service's refusal drops it.
-    pub(crate) async fn commit(&self, gid: &[u8], change: impl Fn(&State<P>, &G) -> Result<Option<Change>>) -> Result<Option<u64>> {
+    pub(crate) async fn commit(&self, gid: &[u8], change: impl Fn(&State, &G) -> Result<Option<Change>>) -> Result<Option<u64>> {
         let lock = self.committing.lock().unwrap().entry(gid.to_vec()).or_default().clone();
         let _committing = lock.lock().await;
         let mut built = None;
@@ -119,7 +118,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Leaves a group behind: its state and records go.
-    pub(crate) fn forget(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
+    pub(crate) fn forget(&self, st: &mut State, gid: &[u8]) -> Result<()> {
         for log in st.group_logs(gid) {
             st.drop_log(&log)?;
         }

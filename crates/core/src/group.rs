@@ -17,7 +17,7 @@ use openmls_traits::storage::StorageProvider as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::provider::Provider;
+use crate::provider::SqliteProvider;
 
 pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519;
 /// The largest message ciphertext taken, and sent.
@@ -112,7 +112,7 @@ struct SessionRecord {
 
 impl Session {
     /// A new session with a fresh MLS key, speaking as no identity; a provider holds one session.
-    pub fn create<P: Provider>(provider: &P, name: &str, leaf: Leaf) -> Result<Self> {
+    pub fn create(provider: &SqliteProvider, name: &str, leaf: Leaf) -> Result<Self> {
         let signer = crate::device::signer(&crate::random());
         let session = Self::with_signer(provider, signer, name, leaf)?;
         session.save(provider)?;
@@ -121,20 +121,20 @@ impl Session {
 
     /// A member with the given MLS key beside the provider's own session, which it does not replace: a device's key in
     /// one identity's group.
-    pub fn with_signer<P: Provider>(provider: &P, signer: SignatureKeyPair, name: &str, leaf: Leaf) -> Result<Self> {
+    pub fn with_signer(provider: &SqliteProvider, signer: SignatureKeyPair, name: &str, leaf: Leaf) -> Result<Self> {
         signer.store(provider.storage())?;
         let credential = Credential { name: name.into(), key: signer.public().into(), certificate: None };
         Ok(Session { credential, signer, leaf })
     }
 
-    pub fn load<P: Provider>(provider: &P) -> Result<Self> {
+    pub fn load(provider: &SqliteProvider) -> Result<Self> {
         let record: SessionRecord = serde_json::from_slice(&provider.get(b"session")?.context("no session here")?)?;
         let signer = SignatureKeyPair::read(provider.storage(), &record.public.0, SignatureScheme::ED25519)
             .context("the session's key is missing")?;
         Ok(Session { signer, credential: record.credential, leaf: record.leaf })
     }
 
-    fn save<P: Provider>(&self, provider: &P) -> Result<()> {
+    fn save(&self, provider: &SqliteProvider) -> Result<()> {
         let record = SessionRecord {
             public: self.signer.public().into(),
             credential: self.credential.clone(),
@@ -154,7 +154,7 @@ impl Session {
     }
 
     /// Changes the leaf that new KeyPackages carry; each group needs a commit with `Change::leaf` too.
-    pub fn set_leaf<P: Provider>(&mut self, provider: &P, leaf: Leaf) -> Result<()> {
+    pub fn set_leaf(&mut self, provider: &SqliteProvider, leaf: Leaf) -> Result<()> {
         self.leaf = leaf;
         self.save(provider)
     }
@@ -167,7 +167,7 @@ impl Session {
     }
 
     /// A KeyPackage, as it travels to a member that admits it. It never expires: that member judges freshness.
-    pub fn key_package<P: Provider>(&self, provider: &P) -> Result<Vec<u8>> {
+    pub fn key_package(&self, provider: &SqliteProvider) -> Result<Vec<u8>> {
         let bundle = KeyPackage::builder()
             .leaf_node_capabilities(capabilities())
             .leaf_node_extensions(leaf_extensions(&self.leaf)?)
@@ -178,7 +178,7 @@ impl Session {
 }
 
 /// Validates a KeyPackage as it arrives at a member that admits it, and returns its credential.
-pub fn key_package_credential<P: Provider>(provider: &P, key_package: &[u8]) -> Result<Credential> {
+pub fn key_package_credential(provider: &SqliteProvider, key_package: &[u8]) -> Result<Credential> {
     let key_package = key_package_in(provider, key_package)?;
     leaf_credential(key_package.leaf_node())
 }
@@ -190,11 +190,11 @@ fn leaf_credential(leaf: &LeafNode) -> Result<Credential> {
     Ok(credential)
 }
 
-pub fn key_package_reference<P: Provider>(provider: &P, key_package: &[u8]) -> Result<[u8; 32]> {
+pub fn key_package_reference(provider: &SqliteProvider, key_package: &[u8]) -> Result<[u8; 32]> {
     Ok(key_package_in(provider, key_package)?.hash_ref(provider.crypto())?.as_slice().try_into()?)
 }
 
-fn key_package_in<P: Provider>(provider: &P, bytes: &[u8]) -> Result<KeyPackage> {
+fn key_package_in(provider: &SqliteProvider, bytes: &[u8]) -> Result<KeyPackage> {
     let MlsMessageBodyIn::KeyPackage(key_package) = parse::<MlsMessageIn>(bytes)?.extract() else {
         bail!("not a KeyPackage")
     };
@@ -389,7 +389,7 @@ fn creator_lifetime() -> Lifetime {
 }
 
 impl Group {
-    pub fn create<P: Provider>(provider: &P, session: &Session, settings: &Settings) -> Result<Self> {
+    pub fn create(provider: &SqliteProvider, session: &Session, settings: &Settings) -> Result<Self> {
         ensure!(settings.protocol == PROTOCOL, "settings name protocol {}", settings.protocol);
         service_key(settings)?;
         let config = MlsGroupCreateConfig::builder()
@@ -415,7 +415,7 @@ impl Group {
     /// the Welcome's sender, its committer, and whose cut, which it cannot judge, is where it starts: the cut state of the
     /// members it names, and every other at seq 0 of the new epoch. OpenMLS consumes a package during `build_from_welcome`,
     /// before `into_group`, so an error here rolls back this call's writes, the package's consumption included.
-    pub fn join<P: Provider>(provider: &P, entry: &[u8], welcome_bytes: &[u8], welcome_sig: &[u8], expected_package: &[u8; 32]) -> Result<Self> {
+    pub fn join(provider: &SqliteProvider, entry: &[u8], welcome_bytes: &[u8], welcome_sig: &[u8], expected_package: &[u8; 32]) -> Result<Self> {
         let Entry { commit, sig } = Entry::parse(entry)?;
         let MlsMessageBodyIn::Welcome(welcome) = parse::<MlsMessageIn>(welcome_bytes)?.extract() else {
             bail!("not a Welcome")
@@ -470,19 +470,19 @@ impl Group {
         result
     }
 
-    pub fn load<P: Provider>(provider: &P, id: &[u8]) -> Result<Self> {
+    pub fn load(provider: &SqliteProvider, id: &[u8]) -> Result<Self> {
         let mls = MlsGroup::load(provider.storage(), &GroupId::from_slice(id))?.context("no such group")?;
         let state = serde_json::from_slice(&provider.get(&state_key(id))?.context("no state for the group")?)?;
         Ok(Group { mls, state })
     }
 
-    fn save<P: Provider>(&self, provider: &P) -> Result<()> {
+    fn save(&self, provider: &SqliteProvider) -> Result<()> {
         provider.put(&state_key(self.id()), &serde_json::to_vec(&self.state)?)
     }
 
     /// Deletes the group's state, once this session has left it. openmls keeps the key pairs of the epoch a removing
     /// commit ends, so the previous epoch's go too.
-    pub fn delete<P: Provider>(mut self, provider: &P) -> Result<()> {
+    pub fn delete(mut self, provider: &SqliteProvider) -> Result<()> {
         let storage = provider.storage();
         self.mls.delete(storage)?;
         let previous = GroupEpoch::from(self.epoch().saturating_sub(1));
@@ -524,7 +524,7 @@ impl Group {
     }
 
     /// Leaf liveness after exact package-reference matching, not a package-identity test.
-    pub fn unchanged<P: Provider>(&self, provider: &P, key_package: &[u8]) -> Result<bool> {
+    pub fn unchanged(&self, provider: &SqliteProvider, key_package: &[u8]) -> Result<bool> {
         let key_package = key_package_in(provider, key_package)?;
         let leaf = key_package.leaf_node();
         let Some(member) = self.mls.members().find(|m| m.signature_key == leaf.signature_key().as_slice()) else { return Ok(false) };
@@ -537,7 +537,7 @@ impl Group {
     }
 
     /// Forgets the records of who added whom that `keep` does not keep.
-    pub fn forget_added<P: Provider>(&mut self, provider: &P, keep: impl Fn(&Added) -> bool) -> Result<()> {
+    pub fn forget_added(&mut self, provider: &SqliteProvider, keep: impl Fn(&Added) -> bool) -> Result<()> {
         self.state.added.retain(keep);
         self.save(provider)
     }
@@ -559,7 +559,7 @@ impl Group {
     }
 
     /// The current epoch's secret that ranks members as one another's neighbours.
-    pub fn neighbour_secret<P: Provider>(&self, provider: &P) -> Result<[u8; 32]> {
+    pub fn neighbour_secret(&self, provider: &SqliteProvider) -> Result<[u8; 32]> {
         Ok(self.mls.export_secret(provider.crypto(), NEIGHBOURS_LABEL, &[], 32)?.try_into().unwrap())
     }
 
@@ -568,12 +568,12 @@ impl Group {
         Ok((service, [self.id(), &self.epoch().to_be_bytes(), &service].concat()))
     }
 
-    pub fn capability<P: Provider>(&self, provider: &P) -> Result<[u8; 32]> {
+    pub fn capability(&self, provider: &SqliteProvider) -> Result<[u8; 32]> {
         let (_, context) = self.epoch_context()?;
         Ok(self.mls.export_secret(provider.crypto(), ADDRESS_LABEL, &context, 32)?.try_into().unwrap())
     }
 
-    fn seal_entry<P: Provider>(&self, provider: &P, inner: &[u8]) -> Result<Vec<u8>> {
+    fn seal_entry(&self, provider: &SqliteProvider, inner: &[u8]) -> Result<Vec<u8>> {
         ensure!(inner.len() <= MAX_INNER, "entry exceeds the 1 MiB envelope limit");
         Entry::parse(inner)?;
         let bucket = (inner.len() + 45).next_power_of_two().max(1024);
@@ -590,7 +590,7 @@ impl Group {
     }
 
     /// Opens only the current epoch's outer envelope, returning the encoded Entry. `judge` checks its inner signature.
-    pub fn open_entry<P: Provider>(&self, provider: &P, wire: &[u8]) -> Result<Vec<u8>> {
+    pub fn open_entry(&self, provider: &SqliteProvider, wire: &[u8]) -> Result<Vec<u8>> {
         let bucket = wire.len();
         ensure!((1024..=1 << 20).contains(&bucket) && bucket.is_power_of_two(), "invalid envelope bucket");
         ensure!(wire[0] == 1, "unsupported envelope version");
@@ -612,7 +612,7 @@ impl Group {
 
     /// Runs `f` under a savepoint, kept if `keep` says so of its result; else rolled back, and the group reloaded from
     /// storage, so that nothing of it is left.
-    fn guarded<P: Provider, T>(&mut self, provider: &P, keep: impl FnOnce(&Result<T>) -> bool, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+    fn guarded<T>(&mut self, provider: &SqliteProvider, keep: impl FnOnce(&Result<T>) -> bool, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         let state = self.state.clone();
         let aad = self.mls.aad().to_vec();
         provider.savepoint()?;
@@ -630,7 +630,7 @@ impl Group {
     }
 
     /// Builds a commit and keeps it pending, with its whole entry saved: post that next, then read the log.
-    pub fn commit<P: Provider>(&mut self, provider: &P, session: &Session, change: Change) -> Result<Commit> {
+    pub fn commit(&mut self, provider: &SqliteProvider, session: &Session, change: Change) -> Result<Commit> {
         ensure!(self.state.posted.is_none(), "a commit is already pending");
         if let Some(settings) = &change.settings {
             service_key(settings)?;
@@ -701,7 +701,7 @@ impl Group {
     }
 
     /// Explicitly abandons a pending commit. A refusal does not prove an earlier attempt was never accepted.
-    pub fn cancel<P: Provider>(&mut self, provider: &P) -> Result<()> {
+    pub fn cancel(&mut self, provider: &SqliteProvider) -> Result<()> {
         self.mls.clear_pending_commit(provider.storage())?;
         self.state.posted = None;
         self.save(provider)
@@ -709,7 +709,7 @@ impl Group {
 
     /// Judges the next log entry in the current epoch: the first valid commit for it, whose signature verifies under its
     /// committer's leaf key, is to be applied (`apply`). What openmls does as it stages a commit leaves no trace.
-    pub fn judge<P: Provider>(&mut self, provider: &P, entry: &[u8]) -> Result<Verdict> {
+    pub fn judge(&mut self, provider: &SqliteProvider, entry: &[u8]) -> Result<Verdict> {
         if !self.mls.is_active() {
             return Ok(Verdict::Skipped { reason: "removed from the group".into(), lost: false });
         }
@@ -742,7 +742,7 @@ impl Group {
     }
 
     /// Applies a commit `judge` found valid.
-    pub fn apply<P: Provider>(&mut self, provider: &P, entry: &[u8]) -> Result<Applied> {
+    pub fn apply(&mut self, provider: &SqliteProvider, entry: &[u8]) -> Result<Applied> {
         let entry = self.open_entry(provider, entry)?;
         self.guarded(provider, Result::is_ok, |g| {
             if g.state.posted.as_ref().is_some_and(|posted| posted.inner.0 == entry) {
@@ -764,7 +764,7 @@ impl Group {
         })
     }
 
-    fn stage<P: Provider>(&mut self, provider: &P, commit: &[u8], sig: &[u8]) -> Result<Staged> {
+    fn stage(&mut self, provider: &SqliteProvider, commit: &[u8], sig: &[u8]) -> Result<Staged> {
         let message = parse::<MlsMessageIn>(commit)?.try_into_protocol_message()?;
         ensure!(message.content_type() == ContentType::Commit, "not a commit");
         let processed = self.mls.process_message(provider, message)?;
@@ -785,7 +785,7 @@ impl Group {
 
     /// Records what a merged commit did: the added members' leaves, and the cut state of the new epoch: the cut, less
     /// the members it removed, with those it added at seq 0.
-    fn merged<P: Provider>(&mut self, provider: &P, mut applied: Applied) -> Result<Applied> {
+    fn merged(&mut self, provider: &SqliteProvider, mut applied: Applied) -> Result<Applied> {
         let members = self.members();
         for member in &mut applied.added {
             member.index = members.iter().find(|m| m.key == member.key).expect("an added member is in the tree").index;
@@ -803,7 +803,7 @@ impl Group {
     /// Seals a held message's plaintext, its header's JSON, as an application message of the current epoch, claiming
     /// its membership and seq. One whose ciphertext could be over `MAX_MESSAGE` fails before it uses any of the sender's
     /// keys.
-    pub fn seal<P: Provider>(&mut self, provider: &P, session: &Session, plaintext: &[u8]) -> Result<Vec<u8>> {
+    pub fn seal(&mut self, provider: &SqliteProvider, session: &Session, plaintext: &[u8]) -> Result<Vec<u8>> {
         let size = plaintext.len() + FRAMING;
         ensure!(size <= MAX_MESSAGE, "the message is {size} bytes, over the 1 MiB members take");
         self.mls.set_aad(serde_json::to_vec(&Header::open(plaintext)?.claim())?);
@@ -814,7 +814,7 @@ impl Group {
     /// the membership its author had in the epoch it was sealed in, and within its final cut if that membership ended.
     /// What openmls does with one it rejects leaves no trace: it advances the claimed sender's keys before it checks the
     /// signature.
-    pub fn open<P: Provider>(&mut self, provider: &P, bytes: &[u8]) -> Result<Opened> {
+    pub fn open(&mut self, provider: &SqliteProvider, bytes: &[u8]) -> Result<Opened> {
         let message = parse::<MlsMessageIn>(bytes)?.try_into_protocol_message()?;
         ensure!(message.content_type() == ContentType::Application, "not an application message");
         let processed = self.guarded(provider, |result| matches!(result, Ok(Ok(_))), |g| Ok(g.mls.process_message(provider, message)))?;
@@ -850,7 +850,7 @@ impl Group {
     /// Seals a live payload under the current epoch's live key, signed by this session: `epoch ‖ nonce ‖ ciphertext` of
     /// `body ‖ sig`, the body `{"author", "nonce", "payload"}`, and its id, as `open_live` gives it. It uses none of the MLS
     /// ratchet.
-    pub fn seal_live<P: Provider>(&self, provider: &P, session: &Session, payload: &Value) -> Result<(Vec<u8>, [u8; 32])> {
+    pub fn seal_live(&self, provider: &SqliteProvider, session: &Session, payload: &Value) -> Result<(Vec<u8>, [u8; 32])> {
         let epoch = self.epoch();
         let context = self.live_context(epoch);
         let nonce = Bytes(crate::random::<16>().to_vec());
@@ -868,7 +868,7 @@ impl Group {
 
     /// Opens a live payload sealed in the current epoch by a current member, its signature checked: the member, the
     /// payload, and its id, the hash of the signature, which a replay sealed anew keeps.
-    pub fn open_live<P: Provider>(&self, provider: &P, wire: &[u8]) -> Result<(Member, Value, [u8; 32])> {
+    pub fn open_live(&self, provider: &SqliteProvider, wire: &[u8]) -> Result<(Member, Value, [u8; 32])> {
         ensure!(wire.len() > 8 + 24 + 64 + 16, "a live payload too short");
         let epoch = u64::from_be_bytes(wire[..8].try_into().unwrap());
         ensure!(epoch == self.epoch(), "a live payload of another epoch");
@@ -904,8 +904,8 @@ enum Staged {
 }
 
 /// Records what a commit does, before it is merged.
-fn observe<P: Provider>(
-    provider: &P,
+fn observe(
+    provider: &SqliteProvider,
     group: &MlsGroup,
     state: &mut State,
     staged: &StagedCommit,

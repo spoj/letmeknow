@@ -5,7 +5,6 @@
 use anyhow::{Context, Result, ensure};
 use iroh::EndpointId;
 use lmk_core::group::{FRAMING, MAX_MESSAGE};
-use lmk_core::provider::Provider;
 use lmk_net::peers::ANSWER;
 use lmk_proto::Bytes;
 use lmk_proto::held::{self, Header};
@@ -16,7 +15,7 @@ use serde_json::Value;
 use crate::held::Record;
 use crate::{Inner, SendError, State};
 
-impl<P: Provider> State<P> {
+impl State {
     /// The summaries of the group's epoch that members connected now sent, other than this session's own.
     fn online_summaries(&self, gid: &[u8]) -> Result<Vec<&Summary>> {
         let g = self.group(gid)?;
@@ -77,11 +76,11 @@ impl<P: Provider> State<P> {
     }
 }
 
-impl<P: Provider + Send + 'static> Inner<P> {
+impl Inner {
     /// Sends a held payload in a step: seals it in the current epoch with this session's next seq, after the messages
     /// it seals again first, and with the deps its client showed; delivers it to this session and pushes it. Answers
     /// its id.
-    pub(crate) fn send(&self, st: &mut State<P>, gid: &[u8], payload: &Value, reply_to: Option<&[u8]>) -> Result<Bytes> {
+    pub(crate) fn send(&self, st: &mut State, gid: &[u8], payload: &Value, reply_to: Option<&[u8]>) -> Result<Bytes> {
         self.reseal(st, gid)?;
         let now = st.tick();
         let me = st.me(gid).to_vec();
@@ -145,7 +144,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// Seals this session's messages past its cut again in the current epoch, in seq order, and pushes them in frames,
     /// to each member that joined before they were sent: once per epoch, at the head of its log, once the log has been
     /// read.
-    pub(crate) fn reseal(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
+    pub(crate) fn reseal(&self, st: &mut State, gid: &[u8]) -> Result<()> {
         let g = st.group(gid)?;
         let epoch = g.mls.epoch();
         let read = st.logs.get(&g.rec.log.0).is_some_and(|log| log.at > 0);

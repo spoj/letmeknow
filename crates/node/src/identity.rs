@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, ensure};
 use lmk_core::device::Device;
-use lmk_core::provider::Provider;
 use lmk_proto::Bytes;
 use lmk_proto::group::{Certificate, IDENTITY, IdentityRef, PROTOCOL, Service, Settings, UPDATE};
 use lmk_proto::links::Invite;
@@ -78,8 +77,8 @@ pub struct Pending {
 pub type Save = Arc<dyn Fn(&Device) -> Result<()> + Send + Sync>;
 
 /// The identity kind, on a device's node.
-pub struct Identity<P> {
-    node: Node<P>,
+pub struct Identity {
+    node: Node,
     device: Device,
     save: Save,
     shared: Arc<Shared>,
@@ -98,15 +97,15 @@ struct Shared {
 /// The ids of the adds taken, with when each expires.
 const TAKEN: &[u8] = b"node/identity-taken";
 
-impl<P> Clone for Identity<P> {
+impl Clone for Identity {
     fn clone(&self) -> Self {
         Identity { node: self.node.clone(), device: self.device.clone(), save: self.save.clone(), shared: self.shared.clone() }
     }
 }
 
-impl<P: Provider + Send + 'static> Identity<P> {
+impl Identity {
     /// The identity kind on `node`, kept by `save`. Its duties run as each identity group's do (`Event::Duties`).
-    pub fn new(node: Node<P>, device: Device, save: Save) -> Self {
+    pub fn new(node: Node, device: Device, save: Save) -> Self {
         Identity { node, device, save, shared: Arc::default() }
     }
 

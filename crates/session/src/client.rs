@@ -16,7 +16,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use lmk_core::device::Device;
-use lmk_core::provider::Provider;
 use lmk_node::identity::{ADD_VALID, Add, Identity, Presence, SessionGroup};
 use lmk_node::{Event, Heard, INVITE_VALID, Member, Message, Node};
 use lmk_proto::Bytes;
@@ -56,14 +55,14 @@ pub struct Config {
 }
 
 /// The device's node, which keeps its identity, and certifies its sessions.
-pub enum Access<P> {
+pub enum Access {
     /// It runs here: the identity kind on it.
-    Here(Identity<P>),
+    Here(Identity),
     /// Another process runs it.
     Elsewhere(Arc<dyn Remote>),
 }
 
-impl<P> Clone for Access<P> {
+impl Clone for Access {
     fn clone(&self) -> Self {
         match self {
             Access::Here(devices) => Access::Here(devices.clone()),
@@ -92,7 +91,7 @@ pub struct DeviceState {
 }
 
 impl DeviceState {
-    pub fn of<P: Provider + Send + 'static>(devices: &Identity<P>) -> Self {
+    pub fn of(devices: &Identity) -> Self {
         DeviceState {
             device: devices.name(),
             identity: devices.identity(),
@@ -243,10 +242,10 @@ pub fn receipts(members: &[Member], me: &Bytes, heard: &[Heard], away: &[Member]
         .collect()
 }
 
-struct Inner<P> {
-    node: Node<P>,
+struct Inner {
+    node: Node,
     config: Config,
-    access: Mutex<Access<P>>,
+    access: Mutex<Access>,
     state: Mutex<State>,
     events: mpsc::UnboundedSender<ClientEvent>,
     refreshing: tokio::sync::Mutex<()>,
@@ -255,18 +254,18 @@ struct Inner<P> {
 }
 
 /// One member's client, on its node. Its methods may run at once.
-pub struct Client<P> {
-    inner: Arc<Inner<P>>,
+pub struct Client {
+    inner: Arc<Inner>,
 }
 
-impl<P> Clone for Client<P> {
+impl Clone for Client {
     fn clone(&self) -> Self {
         Client { inner: self.inner.clone() }
     }
 }
 
-impl<P: Provider + Send + 'static> Client<P> {
-    pub fn new(node: Node<P>, config: Config, access: Access<P>) -> (Self, mpsc::UnboundedReceiver<ClientEvent>) {
+impl Client {
+    pub fn new(node: Node, config: Config, access: Access) -> (Self, mpsc::UnboundedReceiver<ClientEvent>) {
         let (events, told) = mpsc::unbounded_channel();
         let inner = Inner {
             node,
@@ -280,17 +279,17 @@ impl<P: Provider + Send + 'static> Client<P> {
         (Client { inner: Arc::new(inner) }, told)
     }
 
-    pub fn node(&self) -> &Node<P> {
+    pub fn node(&self) -> &Node {
         &self.inner.node
     }
 
     /// The device's node from now on, as when this process takes it over.
-    pub fn set_access(&self, access: Access<P>) {
+    pub fn set_access(&self, access: Access) {
         *self.inner.access.lock().unwrap() = access;
     }
 
     /// The device's node, as it runs here or elsewhere.
-    pub fn access(&self) -> Access<P> {
+    pub fn access(&self) -> Access {
         self.inner.access.lock().unwrap().clone()
     }
 
@@ -329,7 +328,7 @@ impl<P: Provider + Send + 'static> Client<P> {
     }
 
     /// The identity kind, where the device's node runs here.
-    fn devices(&self) -> Result<Identity<P>> {
+    fn devices(&self) -> Result<Identity> {
         match self.access() {
             Access::Here(devices) => Ok(devices),
             Access::Elsewhere(_) => bail!("the device's node runs elsewhere"),
@@ -711,7 +710,7 @@ impl<P: Provider + Send + 'static> Client<P> {
 
     /// Takes an event of the device's node, where it is not this client's node: the identity kind takes its groups'
     /// events, and of the rest only warnings concern the user.
-    pub fn device_event(&self, devices: &Identity<P>, event: Event) {
+    pub fn device_event(&self, devices: &Identity, event: Event) {
         let Some(event) = devices.on(event) else { return };
         if let Some(changed) = Self::devices_changed(devices, &event) {
             self.emit(changed);
@@ -720,7 +719,7 @@ impl<P: Provider + Send + 'static> Client<P> {
         }
     }
 
-    fn devices_changed(devices: &Identity<P>, event: &Event) -> Option<ClientEvent> {
+    fn devices_changed(devices: &Identity, event: &Event) -> Option<ClientEvent> {
         let (Event::Joined { group, .. } | Event::Left { group, .. } | Event::Settings { group, .. } | Event::Heard { group }) = event else { return None };
         Some(ClientEvent::Identity { identity: devices.identity_of(&group.0)?.id })
     }

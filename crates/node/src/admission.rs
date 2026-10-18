@@ -9,7 +9,6 @@ use anyhow::{Context, Result, bail, ensure};
 use iroh::{EndpointId, RelayUrl};
 use lmk_core::group::{Change, Group, key_package_credential, key_package_reference};
 use lmk_core::public::Verdict;
-use lmk_core::provider::Provider;
 use lmk_net::Admit;
 use lmk_proto::group::{Certificate, Control, Credential, IDENTITY, How, Service};
 use lmk_proto::links::Invite;
@@ -46,7 +45,7 @@ struct Joining {
     device: Option<Bytes>,
 }
 
-impl<P: Provider + Send + 'static> Node<P> {
+impl Node {
     /// An invite into a group, valid for `valid` milliseconds, for anyone or `to` an identity, or one of its devices:
     /// shared with the members as a held message, and a link that names this session and up to three members online
     /// that hold it.
@@ -203,7 +202,7 @@ impl<P: Provider + Send + 'static> Node<P> {
     }
 }
 
-impl<P: Provider + Send + 'static> Inner<P> {
+impl Inner {
     /// Joins a group from the Add's answer, a member sent for this session's KeyPackage: an identity group with the
     /// device key `device_key`, and only then, as a link's kind is not authenticated.
     async fn welcomed(self: &Arc<Self>, admitted: Admitted, key_package: &[u8], device_key: Option<[u8; 32]>) -> Result<Bytes> {
@@ -249,7 +248,7 @@ fn admits(g: &G, joiner: &Credential, rule: &Rule) -> Result<()> {
     Ok(())
 }
 
-impl<P: Provider + Send + 'static> Inner<P> {
+impl Inner {
     /// Answers a joiner's request, which brings an invite's secret.
     async fn admit_join(self: &Arc<Self>, join: Join) -> Result<Admitted> {
         let Join { secret, key_package } = join;
@@ -305,7 +304,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if !self.let_go(vec![(epoch.service.clone(), epoch.capability)]).await.contains(&epoch.reference()?) {
             return Ok(());
         }
-        let remove = |_: &State<P>, g: &G| Ok(g.mls.members().into_iter().find(|m| m.key == key).map(|m| Change { remove: vec![m.index], ..Change::default() }));
+        let remove = |_: &State, g: &G| Ok(g.mls.members().into_iter().find(|m| m.key == key).map(|m| Change { remove: vec![m.index], ..Change::default() }));
         self.commit(gid, remove).await?;
         Ok(())
     }
@@ -330,7 +329,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 }
 
-impl<P: Provider> State<P> {
+impl State {
     /// The epoch the Add of the joiner with this KeyPackage moved from, if its leaf has not updated since and this session
     /// made that Add, which keeps its answer.
     fn logged_commit(&self, gid: &[u8], key_package: &[u8]) -> Result<Option<u64>> {
@@ -346,9 +345,9 @@ impl<P: Provider> State<P> {
 }
 
 
-pub(crate) struct Admitter<P>(pub Arc<Inner<P>>);
+pub(crate) struct Admitter(pub Arc<Inner>);
 
-impl<P: Provider + Send + 'static> Admit for Admitter<P> {
+impl Admit for Admitter {
     fn join(&self, _: EndpointId, join: Join) -> BoxFuture<Answer<Admitted>> {
         let inner = self.0.clone();
         Box::pin(async move {

@@ -6,7 +6,6 @@
 
 use anyhow::{Context, Result};
 use lmk_core::group::{self as core, Verdict};
-use lmk_core::provider::Provider;
 use lmk_net::peers::Decision;
 use lmk_proto::Bytes;
 use lmk_proto::clock::corrected;
@@ -21,9 +20,9 @@ pub(crate) fn commit_key(gid: &[u8], epoch: u64) -> Vec<u8> {
     [b"node/commit/".as_slice(), gid, b"/", &epoch.to_be_bytes()].concat()
 }
 
-impl<P: Provider + Send + 'static> Inner<P> {
+impl Inner {
     /// Reads the stored entries of a group's log this session has not judged yet, in order.
-    pub(crate) fn advance(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
+    pub(crate) fn advance(&self, st: &mut State, gid: &[u8]) -> Result<()> {
         while let Some(g) = st.groups.get(gid)
             && g.mls.active()
             && g.rec.position < st.held_to(gid)?
@@ -45,7 +44,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Judges and applies the entry at the next position; false if it waits, or the group is gone from this session.
-    fn judge(&self, st: &mut State<P>, gid: &[u8], position: u64, entry: &[u8]) -> Result<bool> {
+    fn judge(&self, st: &mut State, gid: &[u8], position: u64, entry: &[u8]) -> Result<bool> {
         let g = st.groups.get_mut(gid).unwrap();
         match g.mls.judge(&st.provider, entry)? {
             Verdict::Skipped { .. } => {}
@@ -64,7 +63,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// Whether the commit at `position`, made at `time`, may apply now: while this session lacks messages the last
     /// commit kept, which it deletes the keys of, it waits as `Peers::wait` decides, asking for them meanwhile; not for a
     /// commit made more than H ago, whose kept messages no member carries any more.
-    fn cleared(&self, st: &mut State<P>, gid: &[u8], position: u64, time: u64) -> Result<bool> {
+    fn cleared(&self, st: &mut State, gid: &[u8], position: u64, time: u64) -> Result<bool> {
         let now = st.tick();
         let g = st.group_mut(gid)?;
         let read = match g.reading {
@@ -90,7 +89,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Applies the commit at `position`, unless it waits (`cleared`); false if it waits, or removed this session.
-    fn apply(&self, st: &mut State<P>, gid: &[u8], position: u64, entry: &[u8], removes: bool, time: u64) -> Result<bool> {
+    fn apply(&self, st: &mut State, gid: &[u8], position: u64, entry: &[u8], removes: bool, time: u64) -> Result<bool> {
         if !self.cleared(st, gid, position, time)? {
             return Ok(false);
         }
@@ -154,7 +153,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// What this session lacks of what the last commit kept is lost to it, as the next commit applies.
-    fn lose(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
+    fn lose(&self, st: &mut State, gid: &[u8]) -> Result<()> {
         let lacking = st.group(gid)?.lacking();
         if lacking.is_empty() {
             return Ok(());
@@ -174,7 +173,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// Moves the memberships as an applied commit says: each cut, what it kept above this session's baselines to hold
     /// before the next commit, the kept sealings frozen, the memberships that ended (their messages past their final
     /// cuts dropped, their leaves forgotten) and began.
-    fn cuts(&self, st: &mut State<P>, gid: &[u8], applied: &core::Applied, ending: u64) -> Result<()> {
+    fn cuts(&self, st: &mut State, gid: &[u8], applied: &core::Applied, ending: u64) -> Result<()> {
         let me = st.me(gid).to_vec();
         let g = st.group_mut(gid)?;
         let own = g.mls.joined(&me).or_else(|| applied.cut.iter().find(|r| r.key.0 == me).map(|r| r.joined));
@@ -238,7 +237,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 }
 
-impl<P: Provider> State<P> {
+impl State {
     /// Records that the member with key `key` is at `epoch`, unless this session knows it is past it.
     pub(crate) fn at(&mut self, gid: &[u8], key: &[u8], epoch: u64) -> Result<()> {
         let g = self.group_mut(gid)?;

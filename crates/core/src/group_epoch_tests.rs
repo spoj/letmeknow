@@ -1,7 +1,7 @@
 use super::*;
 use tls_codec::Serialize as _;
 
-fn exports<P: Provider>(member: &Member<P>) -> ([u8; 32], [u8; 32], Vec<u8>) {
+fn exports(member: &Member) -> ([u8; 32], [u8; 32], Vec<u8>) {
     let group = member.group.as_ref().unwrap();
     let Service::Serve { key, .. } = group.settings().membership else { panic!() };
     assert_eq!(group.id().len(), 16);
@@ -13,7 +13,7 @@ fn exports<P: Provider>(member: &Member<P>) -> ([u8; 32], [u8; 32], Vec<u8>) {
     (c, k, context)
 }
 
-fn aad<P: Provider>(member: &Member<P>, bucket: usize) -> Vec<u8> {
+fn aad(member: &Member, bucket: usize) -> Vec<u8> {
     let (c, _, context) = exports(member);
     let reference = Sha256::digest([b"letmeknow log reference v1\0".as_slice(), &context[24..], &c].concat());
     [b"letmeknow epoch envelope v1\0".as_slice(), &context, reference.as_slice(), &(bucket as u32).to_be_bytes()].concat()
@@ -147,7 +147,7 @@ fn envelopes_require_exact_context_framing_and_padding() {
     assert_eq!(&plain[..4], &(inner.len() as u32).to_be_bytes());
     assert_eq!(&plain[4..4 + inner.len()], inner);
     assert!(plain[4 + inner.len()..].iter().all(|b| *b == 0));
-    let original = a.provider.records();
+    let original = a.provider.rows();
     let mut malformed = vec![vec![], inner.clone(), first[..bucket - 1].to_vec(), [first.clone(), vec![0; bucket]].concat()];
     for offset in [0, 1, 24, 25, bucket - 1] {
         let mut changed = first.clone();
@@ -184,16 +184,16 @@ fn envelopes_require_exact_context_framing_and_padding() {
     for wire in malformed {
         assert!(group.open_entry(&a.provider, &wire).is_err());
     }
-    assert_eq!(a.provider.records(), original);
+    assert_eq!(a.provider.rows(), original);
     let b = &mut w.m[1];
     let cut = b.cut();
     let pending = b.commit(Change { cut, ..Change::default() });
-    let original = b.provider.records();
+    let original = b.provider.rows();
     let wrong = wire(&k, &associated, &nonzero_padding);
     assert!(matches!(b.group.as_mut().unwrap().judge(&b.provider, &wrong).unwrap(), Verdict::Skipped { lost: false, .. }));
     assert!(b.group.as_mut().unwrap().apply(&b.provider, &wrong).is_err());
     assert_eq!(b.group.as_ref().unwrap().posted().unwrap(), pending.entry);
-    assert_eq!(b.provider.records(), original);
+    assert_eq!(b.provider.rows(), original);
 }
 
 #[test]
@@ -202,7 +202,7 @@ fn exact_binary_bucket_boundaries() {
     w.found(0, &[1]);
     let a = &w.m[0];
     let group = a.group.as_ref().unwrap();
-    let before = a.provider.records();
+    let before = a.provider.rows();
     for (length, bucket) in [(979, 1024), (980, 2048), (1_048_531, 1_048_576)] {
         let inner = Entry { commit: vec![7; length - 69], sig: vec![8; 64] }.encode();
         assert_eq!(inner.len(), length);
@@ -214,7 +214,7 @@ fn exact_binary_bucket_boundaries() {
     let too_large = Entry { commit: vec![7; 1_048_532 - 69], sig: vec![8; 64] }.encode();
     assert!(group.seal_entry(&a.provider, &too_large).unwrap_err().to_string().contains("1 MiB"));
     assert!(group.seal_entry(&a.provider, b"not an Entry").is_err());
-    assert_eq!(a.provider.records(), before);
+    assert_eq!(a.provider.rows(), before);
 }
 
 #[test]
@@ -248,7 +248,7 @@ fn staged_oversize_and_malformed_builds_restore_everything() {
     group.mls.set_aad(b"transient AAD before a failed build".to_vec());
     group.state.aad = Aad { how: Some(How::Other("future".into())), invite: Some([3; 32].into()), cut: group.cut().to_vec(), time: 1 };
     group.save(&a.provider).unwrap();
-    let before = a.provider.records();
+    let before = a.provider.rows();
     let before_state = serde_json::to_vec(&group.state).unwrap();
     let before_aad = group.mls.aad().to_vec();
     let before_epoch = (group.epoch(), group.epoch_authenticator().to_vec(), group.capability(&a.provider).unwrap());
@@ -262,7 +262,7 @@ fn staged_oversize_and_malformed_builds_restore_everything() {
         if index == 0 {
             assert!(error.to_string().contains("1 MiB envelope limit"), "{error}");
         }
-        assert_eq!(a.provider.records(), before);
+        assert_eq!(a.provider.rows(), before);
         assert_eq!(serde_json::to_vec(&group.state).unwrap(), before_state);
         assert_eq!(group.mls.aad(), before_aad);
         assert!(group.mls.pending_commit().is_none());
@@ -277,7 +277,7 @@ fn staged_oversize_and_malformed_builds_restore_everything() {
         bail!("late failure after posted and MLS writes")
     });
     assert!(failure.is_err());
-    assert_eq!(a.provider.records(), before);
+    assert_eq!(a.provider.rows(), before);
     assert_eq!(serde_json::to_vec(&group.state).unwrap(), before_state);
     assert_eq!(group.mls.aad(), before_aad);
     assert!(group.posted().is_none());
@@ -319,9 +319,9 @@ fn accepted_package_refs_survive_pending_serde_and_reenveloping() {
     assert_eq!(w.m[0].g().state.posted.as_ref().unwrap().add_refs, refs);
     let a = &mut w.m[0];
     let epoch = a.g().epoch();
-    let records = a.provider.records();
+    let records = a.provider.rows();
     assert!(matches!(a.group.as_mut().unwrap().judge(&a.provider, &rewrapped).unwrap(), Verdict::Commit { removes: false, .. }));
-    assert_eq!(a.provider.records(), records);
+    assert_eq!(a.provider.rows(), records);
     let pos = w.post(rewrapped);
     let read = w.read(&[0, 1]);
     assert!(applied(&read[0][0]).own);
@@ -355,30 +355,30 @@ fn welcome_must_use_the_intended_package_and_checkpoint_failure_restores_it() {
     let entry = w.m[0].open_inner(&commit.entry);
     let Admission { welcome, sig } = commit.admission.clone().unwrap();
     let b = &w.m[1];
-    let before = b.provider.records();
+    let before = b.provider.rows();
     b.provider.savepoint().unwrap();
     let error = Group::join(&b.provider, &entry, &welcome, &sig, &intended_ref).err().unwrap();
     assert!(error.to_string().contains("another KeyPackage"), "{error}");
     b.provider.rollback_to().unwrap();
-    assert_eq!(b.provider.records(), before);
+    assert_eq!(b.provider.rows(), before);
 
     // Control: OpenMLS really consumes the other operation's package before into_group.
     b.provider.savepoint().unwrap();
     let MlsMessageBodyIn::Welcome(parsed) = parse::<MlsMessageIn>(&welcome).unwrap().extract() else { panic!() };
     let builder = StagedWelcome::build_from_welcome(&b.provider, &join_config(), parsed).unwrap();
     assert_eq!(builder.processed_welcome().own_key_package().unwrap().hash_ref(b.provider.crypto()).unwrap().as_slice(), other_ref);
-    assert_ne!(b.provider.records(), before);
+    assert_ne!(b.provider.rows(), before);
     drop(builder);
     b.provider.rollback_to().unwrap();
-    assert_eq!(b.provider.records(), before);
+    assert_eq!(b.provider.rows(), before);
 
     b.provider.savepoint().unwrap();
     let joined = Group::join(&b.provider, &entry, &welcome, &sig, &other_ref).unwrap();
     assert_eq!(joined.members().len(), 2);
-    assert_ne!(b.provider.records(), before);
+    assert_ne!(b.provider.rows(), before);
     drop(joined);
     b.provider.rollback_to().unwrap();
-    assert_eq!(b.provider.records(), before, "a bad node checkpoint restores the successfully consumed package and group writes");
+    assert_eq!(b.provider.rows(), before, "a bad node checkpoint restores the successfully consumed package and group writes");
     assert!(Group::join(&b.provider, &entry, &welcome, &sig, &other_ref).is_ok());
 }
 
@@ -400,9 +400,9 @@ fn a_multi_package_welcome_cannot_select_another_saved_operation() {
     let intended = refs.iter().find(|reference| **reference != first).unwrap();
     assert!(parsed.secrets().iter().any(|secret| secret.new_member().as_slice() == intended));
     let b = &w.m[1];
-    let before = b.provider.records();
+    let before = b.provider.rows();
     assert!(Group::join(&b.provider, &entry, &welcome, &sig, intended).err().unwrap().to_string().contains("another KeyPackage"));
-    assert_eq!(b.provider.records(), before);
+    assert_eq!(b.provider.rows(), before);
     assert!(Group::join(&b.provider, &entry, &welcome, &sig, &first).is_ok());
 }
 
@@ -450,9 +450,9 @@ fn identical_leaf_and_signature_keys_are_not_package_identity() {
     assert!(a.group.as_ref().unwrap().unchanged(&a.provider, &p2).unwrap());
     assert_eq!(a.group.as_ref().unwrap().added().last().unwrap().key_package_ref, r2);
     let b = &w.m[1];
-    let before = b.provider.records();
+    let before = b.provider.rows();
     assert!(Group::join(&b.provider, &inner, &welcome, &sig, &r1).err().unwrap().to_string().contains("another KeyPackage"));
-    assert_eq!(b.provider.records(), before);
+    assert_eq!(b.provider.rows(), before);
     let joined = Group::join(&b.provider, &inner, &welcome, &sig, &r2).unwrap();
     assert_eq!(joined.capability(&b.provider).unwrap(), a.group.as_ref().unwrap().capability(&a.provider).unwrap());
 }
@@ -478,14 +478,14 @@ fn last_resort_packages_do_not_bypass_exact_welcome_matching() {
     let entry = w.m[0].open_inner(&commit.entry);
     let Admission { welcome, sig } = commit.admission.clone().unwrap();
     let b = &w.m[1];
-    let before = b.provider.records();
+    let before = b.provider.rows();
     assert!(Group::join(&b.provider, &entry, &welcome, &sig, &intended_ref).err().unwrap().to_string().contains("another KeyPackage"));
-    assert_eq!(b.provider.records(), before);
+    assert_eq!(b.provider.rows(), before);
     b.provider.savepoint().unwrap();
     let MlsMessageBodyIn::Welcome(parsed) = parse::<MlsMessageIn>(&welcome).unwrap().extract() else { panic!() };
     let builder = StagedWelcome::build_from_welcome(&b.provider, &join_config(), parsed).unwrap();
     assert!(builder.processed_welcome().own_key_package().unwrap().last_resort());
-    assert_eq!(b.provider.records(), before, "last resort leaves the saved package present, so consumption is not an identity test");
+    assert_eq!(b.provider.rows(), before, "last resort leaves the saved package present, so consumption is not an identity test");
     drop(builder);
     b.provider.rollback_to().unwrap();
     assert!(Group::join(&b.provider, &entry, &welcome, &sig, &reference).is_ok());
@@ -505,15 +505,15 @@ fn unsupported_authorities_fail_without_partial_state() {
     for membership in authorities {
         let changed = Settings { membership, ..w.m[0].g().settings() };
         let a = &mut w.m[0];
-        let before = a.provider.records();
+        let before = a.provider.rows();
         assert!(Group::create(&a.provider, &a.session, &changed).is_err());
-        assert_eq!(a.provider.records(), before);
+        assert_eq!(a.provider.rows(), before);
         let group = a.group.as_mut().unwrap();
         let epoch = group.epoch_authenticator().to_vec();
         let state = serde_json::to_vec(&group.state).unwrap();
         let cut = group.cut().to_vec();
         assert!(group.commit(&a.provider, &a.session, Change { cut: cut.clone(), settings: Some(changed.clone()), ..Change::default() }).is_err());
-        assert_eq!(a.provider.records(), before);
+        assert_eq!(a.provider.rows(), before);
         assert_eq!(group.epoch_authenticator(), epoch);
         assert_eq!(serde_json::to_vec(&group.state).unwrap(), state);
         group.mls.set_aad(cut_aad(&cut));
@@ -525,13 +525,13 @@ fn unsupported_authorities_fail_without_partial_state() {
         let sealed = group.seal_entry(&a.provider, &inner).unwrap();
         group.mls.clear_pending_commit(a.provider.storage()).unwrap();
         let b = &mut w.m[1];
-        let before = b.provider.records();
+        let before = b.provider.rows();
         let group = b.group.as_mut().unwrap();
         let verdict = group.judge(&b.provider, &sealed).unwrap();
         assert!(matches!(verdict, Verdict::Skipped { reason, .. } if reason.contains("service authority")));
-        assert_eq!(b.provider.records(), before);
+        assert_eq!(b.provider.rows(), before);
         assert!(group.apply(&b.provider, &sealed).is_err());
-        assert_eq!(b.provider.records(), before);
+        assert_eq!(b.provider.rows(), before);
         assert_eq!(group.epoch_authenticator(), epoch);
     }
 }
@@ -558,9 +558,9 @@ fn unsupported_welcome_authority_rolls_back_consumption() {
     let welcome = welcome.unwrap().to_bytes().unwrap();
     let sig = a.session.signer.sign(&welcome_signed(&entry, &welcome)).unwrap();
     let b = &w.m[1];
-    let before = b.provider.records();
+    let before = b.provider.rows();
     assert!(Group::join(&b.provider, &entry, &welcome, &sig, &reference).err().unwrap().to_string().contains("unsupported membership service authority"));
-    assert_eq!(b.provider.records(), before);
+    assert_eq!(b.provider.rows(), before);
 }
 
 #[test]
@@ -621,11 +621,11 @@ fn identity_authority_cannot_change_but_its_route_can() {
     let mut changed = group.settings();
     let Service::Serve { key, .. } = &mut changed.membership else { panic!() };
     *key = ed25519_dalek::SigningKey::from_bytes(&[2; 32]).verifying_key().to_bytes().into();
-    let before = a.provider.records();
+    let before = a.provider.rows();
     let cut = group.cut().to_vec();
     let error = group.commit(&a.provider, &a.session, Change { cut: cut.clone(), settings: Some(changed.clone()), ..Change::default() }).err().unwrap();
     assert!(error.to_string().contains("identity group's service authority changed"));
-    assert_eq!(a.provider.records(), before);
+    assert_eq!(a.provider.rows(), before);
     group.mls.set_aad(cut_aad(&cut));
     let bundle = group.mls.commit_builder().force_self_update(true)
         .propose_group_context_extensions(context_extensions(&changed).unwrap()).unwrap()
@@ -635,12 +635,12 @@ fn identity_authority_cannot_change_but_its_route_can() {
     let sealed = group.seal_entry(&a.provider, &inner).unwrap();
     group.mls.clear_pending_commit(a.provider.storage()).unwrap();
     let b = &mut w.m[1];
-    let before = b.provider.records();
+    let before = b.provider.rows();
     let group = b.group.as_mut().unwrap();
     assert!(matches!(group.judge(&b.provider, &sealed).unwrap(), Verdict::Skipped { reason, .. } if reason.contains("identity group's service authority changed")));
-    assert_eq!(b.provider.records(), before);
+    assert_eq!(b.provider.rows(), before);
     assert!(group.apply(&b.provider, &sealed).is_err());
-    assert_eq!(b.provider.records(), before);
+    assert_eq!(b.provider.rows(), before);
     let mut routed = group.settings();
     let Service::Serve { domain, .. } = &mut routed.membership else { panic!() };
     *domain = "new-route.example".into();
@@ -655,11 +655,10 @@ fn identity_authority_cannot_change_but_its_route_can() {
 
 #[test]
 fn sqlite_welcome_rollback_keeps_both_packages_across_restart() {
-    use crate::provider::SqliteProvider;
     let dir = std::env::temp_dir().join(format!("lmk-core-epoch-join-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("joiner.db");
-    let mut a = Member::new(MemoryProvider::default(), "A");
+    let mut a = Member::new(memory(), "A");
     a.group = Some(Group::create(&a.provider, &a.session, &settings("Plan")).unwrap());
     let b = Member::new(SqliteProvider::open(&path).unwrap(), "B");
     let packages = [b.session.key_package(&b.provider).unwrap(), b.session.key_package(&b.provider).unwrap()];

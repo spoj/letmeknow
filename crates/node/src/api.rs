@@ -5,7 +5,6 @@ use anyhow::{Context, Result, ensure};
 use iroh::RelayUrl;
 use lmk_core::group::{Change, Group};
 use lmk_core::public::{self, PublicLog};
-use lmk_core::provider::Provider;
 use lmk_net::Net;
 use lmk_proto::group::{Certificate, IdentityRef, Settings};
 use lmk_proto::links::FileLink;
@@ -18,7 +17,7 @@ use crate::groups::renaming;
 use crate::held::delivered_key;
 use crate::{G, MEMBER_WAIT, Member, Message, Node, Rec, State, Work, device_key_key, get, put};
 
-impl<P: Provider + Send + 'static> Node<P> {
+impl Node {
     /// Stops the peers and every task, and closes the provider.
     pub async fn shutdown(&self) -> Result<()> {
         for task in self.inner.tasks.lock().unwrap().drain(..) {
@@ -113,13 +112,13 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// Removes a member. Returns whether this session's commit removed it, which it need not once another's did.
     pub async fn remove(&self, gid: &[u8], key: &[u8]) -> Result<bool> {
         ensure!(self.inner.lock().group(gid)?.mls.members().iter().any(|m| m.key == key), "not a member");
-        let remove = |_: &State<P>, g: &G| Ok(g.mls.members().into_iter().find(|m| m.key == key).map(|member| Change { remove: vec![member.index], ..Change::default() }));
+        let remove = |_: &State, g: &G| Ok(g.mls.members().into_iter().find(|m| m.key == key).map(|member| Change { remove: vec![member.index], ..Change::default() }));
         Ok(self.inner.commit(gid, remove).await?.is_some())
     }
 
     /// Removes every other member, in one commit: the group is then this session's alone.
     pub async fn remove_others(&self, gid: &[u8]) -> Result<()> {
-        let others = |_: &State<P>, g: &G| {
+        let others = |_: &State, g: &G| {
             let remove: Vec<u32> = g.mls.members().into_iter().map(|m| m.index).filter(|index| *index != g.mls.own_index()).collect();
             Ok((!remove.is_empty()).then(|| Change { remove, ..Change::default() }))
         };
@@ -365,7 +364,7 @@ impl<P: Provider + Send + 'static> Node<P> {
     }
 
     pub async fn recertify(&self, gid: &[u8], certificate: Certificate) -> Result<()> {
-        let change = |st: &State<P>, g: &G| {
+        let change = |st: &State, g: &G| {
             ensure!(g.mls.settings().kind != lmk_proto::group::IDENTITY, "not a session membership");
             let own = g.mls.members().into_iter().find(|m| m.key == st.session.key()).context("not a member")?;
             let mut credential = own.credential.context("not a letmeknow credential")?;

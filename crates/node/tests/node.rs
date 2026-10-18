@@ -9,7 +9,7 @@ use n0_future::boxed::BoxFuture;
 use n0_future::task::AbortOnDropHandle;
 use lmk_core::device::Device;
 use lmk_core::group::Session as Mls;
-use lmk_core::provider::{MemoryProvider, Provider, SqliteProvider};
+use lmk_core::provider::SqliteProvider;
 use lmk_membership::client::{Post, ServeClient};
 use lmk_membership::store::Store;
 use lmk_testing::{Relay, relay, relay_beside};
@@ -33,33 +33,33 @@ use private_identity::binding_record;
 /// Generous, for slow CI runners with tests running side by side.
 const WAIT: Duration = Duration::from_secs(60);
 
-struct Session<P = MemoryProvider> {
-    node: Node<P>,
+struct Session {
+    node: Node,
     events: UnboundedReceiver<Event>,
 }
 
 async fn session(relay: &Relay, name: &str) -> Session {
-    let (node, events) = Node::start(MemoryProvider::default(), config(relay, name, None)).await.unwrap();
+    let (node, events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(relay, name, None)).await.unwrap();
     Session { node, events }
 }
 
 /// A session that posts to membership services through `post`.
 async fn session_with(relay: &Relay, name: &str, post: Post) -> Session {
-    let (node, events) = Node::start(MemoryProvider::default(), Config { post, ..config(relay, name, None) }).await.unwrap();
+    let (node, events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), Config { post, ..config(relay, name, None) }).await.unwrap();
     Session { node, events }
 }
 
 /// A session that trusts the certificates of several relays, for peers and services on any of them.
 async fn session_trusting(relays: [&Relay; 2], name: &str) -> Session {
     let ca = CaTlsConfig::custom_roots([relays[0].cert.clone(), relays[1].cert.clone()]);
-    let (node, events) = Node::start(MemoryProvider::default(), Config { ca, ..config(relays[0], name, None) }).await.unwrap();
+    let (node, events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), Config { ca, ..config(relays[0], name, None) }).await.unwrap();
     Session { node, events }
 }
 
 /// A device's own node, whose key is the device key, as a session too.
-async fn device(relay: &Relay, name: &str) -> (Session, Identity<MemoryProvider>) {
+async fn device(relay: &Relay, name: &str) -> (Session, Identity) {
     let device = Device::new(name);
-    let (node, events) = Node::start(MemoryProvider::default(), config(relay, name, Some(device.clone()))).await.unwrap();
+    let (node, events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(relay, name, Some(device.clone()))).await.unwrap();
     (Session { node: node.clone(), events }, Identity::new(node, device, Arc::new(|_: &Device| Ok(()))))
 }
 
@@ -78,7 +78,7 @@ fn config(relay: &Relay, name: &str, device: Option<Device>) -> Config {
     }
 }
 
-impl<P: Provider + Send + 'static> Session<P> {
+impl Session {
     /// Waits for the event `wanted` takes. Past `WAIT`, fails naming where it was awaited, and each group's epoch and
     /// members online.
     #[track_caller]
@@ -147,7 +147,7 @@ fn message(text: &str) -> Value {
 
 /// A new identity, its public log on `membership`, whose first writer is a device called laptop, read by `node`: the
 /// identity, and the laptop's key on it.
-async fn identity<P: Provider + Send + 'static>(relay: &Relay, node: &Node<P>, membership: Service) -> (IdentityRef, [u8; 32]) {
+async fn identity(relay: &Relay, node: &Node, membership: Service) -> (IdentityRef, [u8; 32]) {
     let laptop: [u8; 32] = lmk_core::random();
     let (id, first) = lmk_core::public::create(&laptop, membership.clone());
     let identity = IdentityRef { id: id.into(), membership };
@@ -156,7 +156,7 @@ async fn identity<P: Provider + Send + 'static>(relay: &Relay, node: &Node<P>, m
 }
 
 /// Appends a sealed entry to an identity's public log, as a device of it would, and has `node` read the log.
-async fn publish<P: Provider + Send + 'static>(relay: &Relay, node: &Node<P>, identity: &IdentityRef, entry: Vec<u8>) {
+async fn publish(relay: &Relay, node: &Node, identity: &IdentityRef, entry: Vec<u8>) {
     let log = lmk_proto::public::address(&identity.id.0);
     ServeClient::for_service(relay.post(), &identity.membership).unwrap().append(&log, &[entry], true).await.unwrap();
     node.read_public(identity).await.unwrap();
@@ -297,7 +297,7 @@ async fn a_member_is_reached_through_its_groups_service_when_its_own_relay_is_do
     let alice = session_trusting([&own, &service], "Alice").await;
     alice.node.join(&carol.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     let dead: iroh::RelayUrl = "https://127.0.0.1:1".parse().unwrap();
-    let (node, events) = Node::start(MemoryProvider::default(), Config { relays: vec![dead, service.url.clone()], ..config(&service, "Bob", None) }).await.unwrap();
+    let (node, events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), Config { relays: vec![dead, service.url.clone()], ..config(&service, "Bob", None) }).await.unwrap();
     let mut bob = Session { node, events };
     bob.node.join(&carol.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     carol.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
@@ -320,7 +320,7 @@ async fn a_join_reaches_an_inviter_on_another_relay_than_the_services() {
     let mut carol = session(&service, "Carol").await;
     let gid = carol.node.create(settings(CHAT, &service), None).unwrap();
     // Bob's home is his first relay, which is not the service's.
-    let (node, events) = Node::start(MemoryProvider::default(), Config { relays: vec![own.url.clone(), service.url.clone()], ca: CaTlsConfig::custom_roots([own.cert.clone(), service.cert.clone()]), ..config(&service, "Bob", None) }).await.unwrap();
+    let (node, events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), Config { relays: vec![own.url.clone(), service.url.clone()], ca: CaTlsConfig::custom_roots([own.cert.clone(), service.cert.clone()]), ..config(&service, "Bob", None) }).await.unwrap();
     let mut bob = Session { node, events };
     bob.node.join(&carol.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     carol.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
@@ -337,14 +337,14 @@ async fn an_identity_whose_directory_is_down_at_join_is_read_again() {
     let (group_relay, identity_relay) = (relay().await, relay().await);
     let (gate, _reaching) = Gate::new(Some(&identity_relay.service));
     let ca = CaTlsConfig::custom_roots([group_relay.cert.clone(), identity_relay.cert.clone()]);
-    let (node, events) = Node::start(MemoryProvider::default(), Config { ca, post: gate.post("Alice", identity_relay.post()), ..config(&group_relay, "Alice", None) }).await.unwrap();
+    let (node, events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), Config { ca, post: gate.post("Alice", identity_relay.post()), ..config(&group_relay, "Alice", None) }).await.unwrap();
     let alice = Session { node, events };
     let bob = session_trusting([&group_relay, &identity_relay], "Bob").await;
     let (claim, laptop) = identity(&identity_relay, &bob.node, identity_relay.service.clone()).await;
     let gid = bob.node.create(settings(CHAT, &group_relay), Some(certificate(&claim, &laptop, &bob.node.key(), "Bob", "laptop"))).unwrap();
     gate.set(false);
     alice.node.join(&bob.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
-    let unread = |node: &Node<MemoryProvider>| node.members(&gid.0).unwrap().iter().any(|m| m.key == bob.node.key() && m.identity.as_ref().is_some_and(|c| c.error.is_some()));
+    let unread = |node: &Node| node.members(&gid.0).unwrap().iter().any(|m| m.key == bob.node.key() && m.identity.as_ref().is_some_and(|c| c.error.is_some()));
     eventually("Alice cannot verify Bob's identity yet", || unread(&alice.node)).await;
     gate.set(true);
     eventually("Alice verifies Bob's identity once its directory answers", || {
@@ -364,7 +364,7 @@ async fn a_join_survives_an_unresolved_link_domain() {
     let unresolved: lmk_membership::client::Resolve = Arc::new(|domain: String| -> BoxFuture<anyhow::Result<Directory>> {
         Box::pin(async move { anyhow::bail!("no directory for {domain}") })
     });
-    let (node, events) = Node::start(MemoryProvider::default(), Config { resolve: unresolved, ..config(&relay, "Bob", None) }).await.unwrap();
+    let (node, events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), Config { resolve: unresolved, ..config(&relay, "Bob", None) }).await.unwrap();
     let bob = Session { node, events };
     bob.node.join(&link, None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
@@ -762,7 +762,7 @@ fn a_directory_naming_another_key_is_reported_once() {
     });
 }
 
-impl<P: Provider + Send + 'static> Session<P> {
+impl Session {
     /// Waits until a member's identity checks out, or not.
     async fn checked(&self, gid: &Bytes, name: &str, valid: bool) -> lmk_node::Member {
         tokio::time::timeout(WAIT, async {
@@ -780,7 +780,7 @@ impl<P: Provider + Send + 'static> Session<P> {
 }
 
 /// Has the identity kind take a device's events first, as a client does.
-fn routed<P: Provider + Send + 'static>(session: &mut Session<P>, devices: Identity<P>) {
+fn routed(session: &mut Session, devices: Identity) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut events = std::mem::replace(&mut session.events, rx);
     tokio::spawn(async move {
@@ -793,7 +793,7 @@ fn routed<P: Provider + Send + 'static>(session: &mut Session<P>, devices: Ident
 }
 
 /// A device's own node on SQLite at `db`, which survives a restart, with the identity kind taking its events first.
-async fn stored_device(relay: &Relay, name: &str, db: &Path) -> (Session<SqliteProvider>, Identity<SqliteProvider>) {
+async fn stored_device(relay: &Relay, name: &str, db: &Path) -> (Session, Identity) {
     let device = Device::new(name);
     let (node, events) = Node::start(SqliteProvider::open(db).unwrap(), config(relay, name, Some(device.clone()))).await.unwrap();
     let devices = Identity::new(node.clone(), device, Arc::new(|_: &Device| Ok(())));
@@ -803,7 +803,7 @@ async fn stored_device(relay: &Relay, name: &str, db: &Path) -> (Session<SqliteP
 }
 
 /// Waits until the keys-only directory lists exactly these devices.
-async fn lists<P: Provider + Send + 'static>(node: &Node<P>, identity: &IdentityRef, keys: &[Bytes]) -> lmk_core::public::PublicLog {
+async fn lists(node: &Node, identity: &IdentityRef, keys: &[Bytes]) -> lmk_core::public::PublicLog {
     tokio::time::timeout(WAIT, async {
         loop {
             let log = node.read_public(identity).await.unwrap();
@@ -820,7 +820,7 @@ async fn lists<P: Provider + Send + 'static>(node: &Node<P>, identity: &Identity
 }
 
 /// The identity group of a device's only identity.
-fn devices_group<P: Provider + Send + 'static>(node: &Node<P>) -> Bytes {
+fn devices_group(node: &Node) -> Bytes {
     node.groups().into_iter().find(|gid| node.settings(&gid.0).unwrap().kind == IDENTITY).unwrap()
 }
 
@@ -1004,7 +1004,6 @@ async fn the_list_does_not_drop_a_device_just_linked() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_updates_an_older_leaf_as_it_starts() {
     use lmk_core::group::{Change, Group, Session as Mls};
-    use lmk_core::provider::SqliteProvider;
     let relay = relay().await;
     let dir = folder("revision");
     std::fs::create_dir_all(&dir).unwrap();
@@ -1047,7 +1046,6 @@ async fn a_session_updates_an_older_leaf_as_it_starts() {
 /// A device keeps its identity across restarts, from its database.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_keeps_its_identity_across_restarts() {
-    use lmk_core::provider::SqliteProvider;
     let relay = relay().await;
     let dir = folder("restart");
     std::fs::create_dir_all(&dir).unwrap();
@@ -1081,7 +1079,6 @@ async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
 /// A `leave` sent while the membership service is unreachable reaches the other member, which removes the leaver once the
 /// service is back: the leaver is restarted meanwhile with `restart_leaver`.
 async fn held_leave(test: &str, restart_leaver: bool) {
-    use lmk_core::provider::SqliteProvider;
     let relay = relay().await;
     let dir = folder(test);
     let (membership, _service) = served(&relay, &dir).await;
@@ -1117,7 +1114,6 @@ async fn held_leave(test: &str, restart_leaver: bool) {
 /// A `leave` sealed before its sender was removed and added again removes it no more.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_old_leave_does_not_remove_a_member_added_again() {
-    use lmk_core::provider::SqliteProvider;
     let relay = relay().await;
     let dir = folder("leave-again");
     std::fs::create_dir_all(&dir).unwrap();
@@ -1296,7 +1292,7 @@ async fn a_change_made_moot_commits_nothing() {
     eventually("Bob is at the rename", || bob.node.epoch(&gid.0).unwrap() == epoch + 1).await;
 
     let carol_key = carol.node.key();
-    let remove = |node: &Node<MemoryProvider>| {
+    let remove = |node: &Node| {
         let (node, gid, key) = (node.clone(), gid.clone(), carol_key.clone());
         tokio::spawn(async move { node.remove(&gid.0, &key.0).await })
     };
@@ -1880,12 +1876,12 @@ fn a_device_last_online_a_day_after_its_identitys_last_commit_keeps_it_six_and_a
 }
 
 /// A session on SQLite at `db`, which survives a restart.
-async fn stored(relay: &Relay, name: &str, db: &Path) -> Session<SqliteProvider> {
+async fn stored(relay: &Relay, name: &str, db: &Path) -> Session {
     stored_with(relay, name, db, relay.post()).await
 }
 
 /// A session on SQLite at `db` that posts to membership services through `post`.
-async fn stored_with(relay: &Relay, name: &str, db: &Path, post: Post) -> Session<SqliteProvider> {
+async fn stored_with(relay: &Relay, name: &str, db: &Path, post: Post) -> Session {
     let (node, events) = Node::start(SqliteProvider::open(db).unwrap(), Config { post, ..config(relay, name, None) }).await.unwrap();
     Session { node, events }
 }
@@ -2076,7 +2072,7 @@ struct Hand {
     recv: iroh::endpoint::RecvStream,
 }
 
-async fn hand<P: Provider + Send + 'static>(relay: &Relay, key: iroh::SecretKey, to: &Node<P>) -> Hand {
+async fn hand(relay: &Relay, key: iroh::SecretKey, to: &Node) -> Hand {
     let endpoint = lmk_net::builder([relay.url.clone()]).secret_key(key).ca_tls_config(CaTlsConfig::custom_roots([relay.cert.clone()])).bind().await.unwrap();
     let (id, relays) = to.address();
     let addr = relays.into_iter().fold(iroh::EndpointAddr::new(iroh::EndpointId::from_bytes(&id).unwrap()), iroh::EndpointAddr::with_relay_url);
@@ -2169,7 +2165,7 @@ async fn a_member_waits_for_the_kept_message_its_only_holder_gives() {
     }).await;
     assert_eq!(got.id, sent);
     let sam_key = sam.node.key();
-    let held = |node: &Node<SqliteProvider>| node.heard(&gid.0).unwrap().iter().any(|h| h.held.iter().any(|s| s.key == sam_key && s.seqs.contains(got.seq)));
+    let held = |node: &Node| node.heard(&gid.0).unwrap().iter().any(|h| h.held.iter().any(|s| s.key == sam_key && s.seqs.contains(got.seq)));
     eventually("Sam hears that Quinn holds it", || held(&sam.node)).await;
     sam.node.change_settings(&gid.0, |s| Settings { name: "One".into(), ..s }).await.unwrap();
 
@@ -2380,7 +2376,7 @@ async fn a_commit_waiting_in_one_group_holds_up_no_other() {
 async fn a_joiner_asks_again_once_the_committers_answer_is_late() {
     let relay = relay().await;
     let (late, _landing, post) = late_append(relay.post(), Duration::from_secs(35));
-    let (node, events) = Node::start(MemoryProvider::default(), Config { post, ..config(&relay, "Alice", None) }).await.unwrap();
+    let (node, events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), Config { post, ..config(&relay, "Alice", None) }).await.unwrap();
     let alice = Session { node, events };
     let bob = session(&relay, "Bob").await;
     let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
@@ -2400,7 +2396,7 @@ async fn a_joiner_asks_its_committer_again_past_a_silent_member() {
     use lmk_proto::links::Invite;
     let relay = relay().await;
     let (late, _landing, post) = late_append(relay.post(), Duration::from_secs(35));
-    let (node, events) = Node::start(MemoryProvider::default(), Config { post, ..config(&relay, "Alice", None) }).await.unwrap();
+    let (node, events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), Config { post, ..config(&relay, "Alice", None) }).await.unwrap();
     let alice = Session { node, events };
     let bob = session(&relay, "Bob").await;
     let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
@@ -2707,7 +2703,7 @@ async fn a_commit_keeps_what_an_online_member_holds() {
     dave.node.shutdown().await.unwrap();
     let m2 = alice.node.send(&gid.0, &message("two"), None).await.unwrap();
     bob.until(|e| matches!(e, Event::Message(message) if message.id == m2).then_some(())).await;
-    let held = |node: &Node<SqliteProvider>| node.only_here(&gid.0).unwrap().into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+    let held = |node: &Node| node.only_here(&gid.0).unwrap().into_iter().map(|(id, _)| id).collect::<Vec<_>>();
     eventually("Alice hears that Bob holds both", || held(&alice.node).is_empty()).await;
 
     assert!(alice.node.remove(&gid.0, &dave_key.0).await.unwrap());
@@ -3329,7 +3325,7 @@ async fn members_learn_each_others_relays() {
 async fn chosen_relays_replace_the_directorys() {
     let relay = relay().await;
     let dead = "https://127.0.0.1:1".parse().unwrap();
-    let (node, events) = Node::start(MemoryProvider::default(), Config { relays: vec![dead], chosen: vec![relay.url.clone()], ..config(&relay, "Alice", None) })
+    let (node, events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), Config { relays: vec![dead], chosen: vec![relay.url.clone()], ..config(&relay, "Alice", None) })
         .await
         .unwrap();
     let alice = Session { node, events };
@@ -3616,7 +3612,7 @@ async fn a_devices_pass_with_nothing_to_publish_asks_nothing() {
     let relay = relay().await;
     let (requests, post) = recording(relay.post());
     let device = Device::new("laptop");
-    let (node, _events) = Node::start(MemoryProvider::default(), Config { post, ..config(&relay, "laptop", Some(device.clone())) }).await.unwrap();
+    let (node, _events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), Config { post, ..config(&relay, "laptop", Some(device.clone())) }).await.unwrap();
     let devices = Identity::new(node.clone(), device, Arc::new(|_: &Device| Ok(())));
     devices.create("Carol", relay.service.clone()).await.unwrap();
     let gid = devices_group(&node);

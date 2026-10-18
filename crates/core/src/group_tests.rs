@@ -2,7 +2,7 @@
 //! records, forged messages that leave no trace, commits from one's own leaf, and two epochs of keys.
 
 use super::*;
-use crate::provider::MemoryProvider;
+use crate::provider::SqliteProvider;
 use lmk_proto::group::{CHAT, ChatMessage, REVISION, Service};
 use std::path::Path;
 use sha2::{Digest, Sha256};
@@ -32,8 +32,8 @@ pub(crate) fn leaf(name: &str) -> Leaf {
 /// An entry as a member read it: its verdict, and for a commit what applying it did.
 type Read = (Verdict, Option<Applied>);
 
-pub(crate) struct Member<P: Provider = MemoryProvider> {
-    pub provider: P,
+pub(crate) struct Member {
+    pub provider: SqliteProvider,
     pub session: Session,
     pub group: Option<Group>,
     /// Next log position to read (0-based here).
@@ -43,8 +43,8 @@ pub(crate) struct Member<P: Provider = MemoryProvider> {
     sent: Vec<([u8; 32], u64)>,
 }
 
-impl<P: Provider> Member<P> {
-    pub fn new(provider: P, name: &str) -> Self {
+impl Member {
+    pub fn new(provider: SqliteProvider, name: &str) -> Self {
         let session = Session::create(&provider, name, leaf(name)).unwrap();
         Member { provider, session, group: None, pos: 0, sent: Vec::new() }
     }
@@ -131,14 +131,19 @@ impl<P: Provider> Member<P> {
     }
 }
 
-impl Member<MemoryProvider> {
+impl Member {
     /// A copy of this member, its storage and all, as a stolen or restored device holds it.
     fn copy(&self) -> Self {
-        let provider = MemoryProvider::load(self.provider.records());
+        let provider = self.provider.copy();
         let session = Session::load(&provider).unwrap();
         let group = self.group.as_ref().map(|group| Group::load(&provider, group.id()).unwrap());
         Member { provider, session, group, pos: self.pos, sent: self.sent.clone() }
     }
+}
+
+/// A database in memory.
+pub(crate) fn memory() -> SqliteProvider {
+    SqliteProvider::open(Path::new(":memory:")).unwrap()
 }
 
 pub(crate) fn message(text: &str) -> serde_json::Value {
@@ -259,7 +264,7 @@ struct World {
 
 impl World {
     fn new(names: &[&str]) -> Self {
-        World { m: names.iter().map(|name| Member::new(MemoryProvider::default(), name)).collect(), log: Vec::new() }
+        World { m: names.iter().map(|name| Member::new(memory(), name)).collect(), log: Vec::new() }
     }
 
     fn post(&mut self, entry: Vec<u8>) -> usize {
@@ -487,9 +492,10 @@ fn two_epochs_of_keys() {
 /// Proof: a message that openmls rejects after it advanced the claimed sender's keys leaves no trace, so the sender's
 /// real messages still open. The forger, a copy of B's state, seals as B but signs with another key: valid AEAD, bad
 /// signature, B's leaf index and generation.
-fn a_forged_message_leaves_no_trace<P: Provider>(providers: impl Fn(&str) -> P) {
-    let mut a = Member::new(providers("a"), "A");
-    let mut b = Member::new(MemoryProvider::default(), "B");
+#[test]
+fn a_forged_message_leaves_no_trace() {
+    let mut a = Member::new(memory(), "A");
+    let mut b = Member::new(memory(), "B");
     a.group = Some(Group::create(&a.provider, &a.session, &settings("Plan")).unwrap());
     let kp = b.session.key_package(&b.provider).unwrap();
     let cut = a.cut();
@@ -520,28 +526,14 @@ fn a_forged_message_leaves_no_trace<P: Provider>(providers: impl Fn(&str) -> P) 
     assert!(a.open(&third).is_err());
 }
 
-#[test]
-fn a_forged_message_leaves_no_trace_in_memory() {
-    a_forged_message_leaves_no_trace(|_| MemoryProvider::default());
-}
-
-#[test]
-fn a_forged_message_leaves_no_trace_in_sqlite() {
-    let dir = std::env::temp_dir().join(format!("lmk-core-forged-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    a_forged_message_leaves_no_trace(|name| crate::provider::SqliteProvider::open(&dir.join(format!("{name}.db"))).unwrap());
-    std::fs::remove_dir_all(dir).ok();
-}
-
 /// Proof: one SQLite connection, openmls's storage borrowing it. A step's openmls writes and our own records commit
 /// together, or are lost together; after a rollback to a savepoint, `MlsGroup::load` gives the group as it was before.
 #[test]
 fn a_step_commits_or_rolls_back_with_openmls() {
-    use crate::provider::SqliteProvider;
     let dir = std::env::temp_dir().join(format!("lmk-core-step-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut a = Member::new(SqliteProvider::open(&dir.join("a.db")).unwrap(), "A");
-    let mut b = Member::new(MemoryProvider::default(), "B");
+    let mut b = Member::new(memory(), "B");
     a.group = Some(Group::create(&a.provider, &a.session, &settings("Plan")).unwrap());
     let kp = b.session.key_package(&b.provider).unwrap();
     let cut = a.cut();
@@ -807,18 +799,18 @@ fn private_certificates_refresh_but_cannot_rebind_a_membership() {
     forged.name = "unsigned label".into();
     for certificate in [forged, of(crate::random(), &device, key, "Ann Lee", "pocket"), of(id, &crate::random(), key, "Ann Lee", "pocket"), of(id, &device, crate::random(), "Ann Lee", "pocket")] {
         let a = &mut w.m[0];
-        let before: std::collections::BTreeMap<_, _> = a.provider.records().into_iter().collect();
+        let before = a.provider.rows();
         let cut = a.cut();
         assert!(refused(a, Change { cut, certificate: Some(certificate), ..Change::default() }).contains("authorization"));
         assert!(a.g().posted().is_none());
-        assert_eq!(a.provider.records().into_iter().collect::<std::collections::BTreeMap<_, _>>(), before, "refused refresh leaves no stored residue");
+        assert_eq!(a.provider.rows(), before, "refused refresh leaves no stored residue");
     }
     let b = &mut w.m[1];
-    let before: std::collections::BTreeMap<_, _> = b.provider.records().into_iter().collect();
+    let before = b.provider.rows();
     let attached = of(id, &device, b.session.key().try_into().unwrap(), "Ann", "phone");
     let cut = b.cut();
     assert!(refused(b, Change { cut, certificate: Some(attached), ..Change::default() }).contains("authorization"));
-    assert_eq!(b.provider.records().into_iter().collect::<std::collections::BTreeMap<_, _>>(), before, "an anonymous leaf cannot acquire an identity");
+    assert_eq!(b.provider.rows(), before, "an anonymous leaf cannot acquire an identity");
     let cut = w.m[0].cut();
     let losing = w.m[0].commit(Change { cut, certificate: Some(refreshed.clone()), ..Change::default() });
     let cut = w.m[1].cut();
@@ -968,7 +960,6 @@ fn another_protocol_is_refused_at_join() {
 
 #[test]
 fn state_survives_a_restart() {
-    use crate::provider::SqliteProvider;
     let dir = std::env::temp_dir().join(format!("lmk-core-restart-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut log = Vec::new();
@@ -986,7 +977,7 @@ fn state_survives_a_restart() {
     let mut b = Member { pos: 1, ..b };
     b.join(&inner, &admission, 1, &kp);
     // B adds C, then restarts before reading a separately re-enveloped copy of its pending inner Entry.
-    let mut c = Member::new(MemoryProvider::default(), "C");
+    let mut c = Member::new(memory(), "C");
     let c_package = c.session.key_package(&c.provider).unwrap();
     let c_ref = key_package_reference(&c.provider, &c_package).unwrap();
     let cut = b.cut();
@@ -1205,22 +1196,22 @@ fn a_joiner_starts_at_the_commits_cut() {
     expected.sort();
 
     let Entry { commit: bytes, .. } = Entry::parse(&inner).unwrap();
-    let before = w.m[2].provider.records();
+    let before = w.m[2].provider.rows();
     let forged = entry_of(&stranger(), bytes.clone());
     assert!(join_error(&w.m[2], &forged, &admission, &kp_c).contains("did not sign"));
-    assert_eq!(w.m[2].provider.records(), before);
+    assert_eq!(w.m[2].provider.rows(), before);
     let by_another_member = entry_of(&w.m[1].session.signer, bytes.clone());
     assert!(join_error(&w.m[2], &by_another_member, &admission, &kp_c).contains("did not sign"), "only the committer vouches for its cut");
-    assert_eq!(w.m[2].provider.records(), before);
+    assert_eq!(w.m[2].provider.rows(), before);
     let welcome = Admission { sig: stranger().sign(&welcome_signed(&inner, &admission.welcome)).unwrap(), ..admission.clone() };
     assert!(join_error(&w.m[2], &inner, &welcome, &kp_c).contains("a Welcome its sender did not sign"));
-    assert_eq!(w.m[2].provider.records(), before);
+    assert_eq!(w.m[2].provider.rows(), before);
     let kp_d = w.key_package(3);
     let mut other = w.m[0].copy();
     let cut = other.cut();
     let theirs = other.commit(Change { cut, add: vec![kp_d], how: Some(How::Invite), ..Change::default() });
     join_error(&w.m[2], &inner, &theirs.admission.unwrap(), &kp_c);
-    assert_eq!(w.m[2].provider.records(), before);
+    assert_eq!(w.m[2].provider.rows(), before);
 
     w.m[2].join(&inner, &admission, pos, &kp_c);
     assert_eq!(w.m[2].cut(), expected);
@@ -1355,7 +1346,6 @@ fn held_messages_open_in_ascending_order_past_the_window() {
 /// except those of the epoch a removing commit ends.
 #[test]
 fn a_forgotten_group_leaves_no_epoch_keys() {
-    use crate::provider::SqliteProvider;
     let dir = std::env::temp_dir().join(format!("lmk-core-forget-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let (path, other) = (dir.join("a.db"), dir.join("b.db"));

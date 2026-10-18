@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use iroh::{EndpointId, RelayUrl};
-use lmk_core::provider::Provider;
 use lmk_membership::Contradiction;
 use lmk_net::Groups;
 use lmk_net::peers::{self, Own};
@@ -82,7 +81,7 @@ fn group_of(frame: &Frame) -> Option<&Bytes> {
     }
 }
 
-impl<P: Provider> State<P> {
+impl State {
     /// Now, never before an earlier step's now.
     pub(crate) fn tick(&mut self) -> u64 {
         self.time = self.time.max(now());
@@ -419,7 +418,7 @@ impl<P: Provider> State<P> {
     }
 }
 
-impl<P: Provider + Send + 'static> Inner<P> {
+impl Inner {
     /// Polls every `POLL`: signs summaries, seals this session's messages again in a new epoch, reads on in groups
     /// that wait before a commit, opens what waited unopened, gives up what holds dependents too long, and sends what
     /// `Peers` has due.
@@ -433,7 +432,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    fn poll(&self, st: &mut State<P>) -> Result<()> {
+    fn poll(&self, st: &mut State) -> Result<()> {
         let gids: Vec<Vec<u8>> = st.groups.keys().cloned().collect();
         let now = st.tick();
         for gid in &gids {
@@ -450,7 +449,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         Ok(())
     }
 
-    fn poll_group(&self, st: &mut State<P>, gid: &[u8], now: u64) -> Result<()> {
+    fn poll_group(&self, st: &mut State, gid: &[u8], now: u64) -> Result<()> {
         let Some(g) = st.groups.get(gid) else { return Ok(()) };
         if !g.mls.active() {
             return Ok(());
@@ -470,7 +469,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         Ok(())
     }
 
-    fn out(&self, st: &mut State<P>, out: peers::Out) -> Result<()> {
+    fn out(&self, st: &mut State, out: peers::Out) -> Result<()> {
         let endpoint = |key: [u8; 32]| EndpointId::from_bytes(&key).expect("peers are connected by their iroh keys");
         match out {
             peers::Out::Frame(key, frame) => st.out.push(Out::Frame { peer: endpoint(key), frame }),
@@ -515,7 +514,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    fn frame(self: &Arc<Self>, st: &mut State<P>, peer: EndpointId, frame: Frame) -> Result<()> {
+    fn frame(self: &Arc<Self>, st: &mut State, peer: EndpointId, frame: Frame) -> Result<()> {
         let (key, now) = (*peer.as_bytes(), st.tick());
         if let Frame::Hello { groups, heads } = frame {
             let heads: Vec<Head> = heads.into_iter().filter(|head| self.vouched(st, head, &peer)).collect();
@@ -583,7 +582,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Whether a head a peer showed of a log this session follows is signed by its service and agrees with this
     /// session's copy; a contradiction is reported.
-    fn vouched(&self, st: &State<P>, head: &Head, peer: &EndpointId) -> bool {
+    fn vouched(&self, st: &State, head: &Head, peer: &EndpointId) -> bool {
         let id = head.log_ref.as_slice();
         let Some(log) = st.logs.get(id) else { return false };
         let checked = log.frontier(id).and_then(|frontier| frontier.check(head, st.hash_at(id, head.length)?));
@@ -600,7 +599,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// A neighbour's `hello` shows this session's head of the group's log.
-    fn synced(self: &Arc<Self>, st: &mut State<P>, gid: &[u8], peer: EndpointId) -> Result<()> {
+    fn synced(self: &Arc<Self>, st: &mut State, gid: &[u8], peer: EndpointId) -> Result<()> {
         let member = st.by_iroh(gid, &peer);
         st.events.push(Event::Synced { group: Bytes(gid.to_vec()), member });
         st.out.push(Out::WantFiles { peer, group: gid.to_vec() });
@@ -622,7 +621,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Seals a live payload and sends it to the neighbours, or to one member alone.
-    pub(crate) fn send_live(&self, st: &mut State<P>, gid: &[u8], payload: &serde_json::Value, to: Option<EndpointId>) -> Result<()> {
+    pub(crate) fn send_live(&self, st: &mut State, gid: &[u8], payload: &serde_json::Value, to: Option<EndpointId>) -> Result<()> {
         if !st.at_head(gid) {
             return Ok(());
         }
@@ -642,7 +641,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 }
 
-impl<P: Provider + Send + 'static> Node<P> {
+impl Node {
     /// The relay a member last said it was on, which a dial to it tries first.
     pub fn hint(&self, key: &[u8]) -> Option<String> {
         self.inner.lock().hints.get(&Bytes(key.to_vec())).map(|hint| hint.relay.clone())
@@ -721,7 +720,7 @@ impl<P: Provider + Send + 'static> Node<P> {
     }
 }
 
-impl<P: Provider + Send + 'static> Groups for Inner<P> {
+impl Groups for Inner {
     fn groups(&self) -> Vec<Vec<u8>> {
         self.lock().groups.keys().cloned().collect()
     }

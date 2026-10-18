@@ -41,8 +41,6 @@ const PRESENCE: Duration = Duration::from_secs(2);
 /// How often a session forgets the messages it took in more than H ago.
 const FORGET: Duration = Duration::from_secs(3600);
 
-pub type SessionNode = Node<SqliteProvider>;
-
 pub struct Config {
     pub handle: String,
     pub dir: PathBuf,
@@ -95,13 +93,13 @@ impl Remote for Published {
 
 pub struct Session {
     db: Connection,
-    client: Client<SqliteProvider>,
+    client: Client,
     /// What the client tells.
     told: mpsc::UnboundedReceiver<ClientEvent>,
     /// The session's lock, held while this process runs it.
     _held: std::fs::File,
     /// The device's node, when this process holds the device's lock.
-    device: Option<SessionNode>,
+    device: Option<Node>,
     device_lock: std::fs::File,
     device_retry: Instant,
     /// When this session next checks its device's identity.
@@ -163,7 +161,7 @@ impl Session {
     pub async fn open(
         config: Config,
         db: Connection,
-        node: SessionNode,
+        node: Node,
         home: &Path,
         network: Network,
         inbound: mpsc::UnboundedSender<Inbound>,
