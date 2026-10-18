@@ -25,11 +25,8 @@ use crate::{Epoch, Inner, State, Work, get, hex, put};
 
 pub(crate) const NOT_FOLLOWED: &str = "this session does not follow that log";
 
-/// How long a read of a log stands for a send: a session sends to a group once it read the group's logs within this, or
-/// tried to.
-const FRESH: u64 = 2 * 60 * 1000;
 /// How long a send waits for the service: chat works while it is down.
-const FRESH_WAIT: Duration = Duration::from_secs(5);
+const SEND_WAIT: Duration = Duration::from_secs(5);
 /// How often a session opens its groups' logs, asks about the logs members are behind in, and runs its groups' duties.
 pub(crate) const OPEN: Duration = Duration::from_secs(60 * 60);
 
@@ -78,14 +75,11 @@ pub(crate) struct Log {
     pub at: u64,
     /// When the service first answered that it let the log go, and the length held then.
     pub lapsed: Option<(u64, u64)>,
-    /// When this session last asked its service about it for a send, by the service's clock; not kept.
-    #[serde(skip)]
-    pub asked: u64,
 }
 
 impl Log {
     pub fn new(group: Bytes, service: Service) -> Self {
-        Log { group, service, head: None, at: 0, lapsed: None, asked: 0 }
+        Log { group, service, head: None, at: 0, lapsed: None }
     }
 
     /// The entries held, positions 1 to this.
@@ -242,27 +236,21 @@ impl State {
 }
 
 impl Inner {
-    /// Asks about a group's current log, unless this session read or asked about it within `FRESH`, and reads the
-    /// group's logs on through each epoch a commit read moves it to, waiting at most `FRESH_WAIT`: before it sends to the
-    /// group.
+    /// Asks about a group's current log, and reads the group's logs on through each epoch a commit read moves it to,
+    /// waiting at most `SEND_WAIT`: before it sends to the group.
     pub(crate) async fn refresh(self: &Arc<Self>, gid: &[u8]) {
-        let (stale, log) = {
-            let mut st = self.lock();
-            let now = corrected();
-            let stale: Vec<_> = st.followed(gid).into_iter().filter(|(id, ..)| st.logs[id].at.max(st.logs[id].asked) + FRESH <= now).collect();
-            for (id, ..) in &stale {
-                st.logs.get_mut(id).unwrap().asked = now;
-            }
-            (stale, st.group(gid).map(|g| g.rec.log.clone()).ok())
+        let (followed, log) = {
+            let st = self.lock();
+            (st.followed(gid).into_iter().collect(), st.group(gid).map(|g| g.rec.log.clone()).ok())
         };
         let asked = async {
-            self.ask(stale).await;
+            self.ask(followed).await;
             let moved = self.lock().group(gid).is_ok_and(|g| Some(&g.rec.log) != log.as_ref());
             if moved && let Err(error) = self.read_group(gid).await {
                 self.report(&error);
             }
         };
-        timeout(FRESH_WAIT, asked).await.ok();
+        timeout(SEND_WAIT, asked).await.ok();
     }
 
     /// Asks each service for the heads of these logs, and reads those that moved. A log the answer leaves out is unchanged

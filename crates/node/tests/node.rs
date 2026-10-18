@@ -2687,46 +2687,35 @@ async fn entering_an_epoch_takes_one_request() {
     bob.node.shutdown().await.unwrap();
 }
 
-/// How long a read of a group's logs stands for a send.
-const FRESH_MS: u64 = 2 * 60 * 1000;
+/// Each send asks the service about its group's log, and reads on through each epoch a commit moves the group to: a
+/// member that the second of two commits no peer pushed removed gets nothing sealed after the send reads them.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_send_reads_the_group_first() {
+    // Alice reaches peers through one relay only, Carol through another, and Bob through either: Alice and Carol meet
+    // only through Bob.
+    let (relay, other) = (relay().await, relay().await);
+    let mut alice = session(&relay).await;
+    let bob = session_trusting([&other, &relay]).await;
+    let bob_key = bob.node.key();
+    let (asked, post) = counting(other.post());
+    let mut carol = session_with(&other, post).await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    let spares = strangers(&mut alice, &gid, &relay, 1).await;
+    bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID).await.unwrap()).await.unwrap();
+    carol.node.join(&bob.node.invite(&gid.0, INVITE_VALID).await.unwrap()).await.unwrap();
+    eventually("Carol holds the four members", || carol.node.members(&gid.0).unwrap().len() == 4).await;
 
-/// A send asks the service about its group's logs when this session has not read them within 2 minutes, and then only,
-/// and reads on through each epoch a commit moves the group to: a member that the second of two commits no peer pushed
-/// removed gets nothing sealed after the send reads them.
-#[test]
-fn a_send_reads_the_group_first_when_its_copy_is_older_than_2_minutes() {
-    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    fn shifted() -> u64 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
-    }
-    on_clock(shifted, async {
-        // Alice reaches peers through one relay only, Carol through another, and Bob through either: Alice and Carol meet
-        // only through Bob.
-        let (relay, other) = (relay().await, relay().await);
-        let mut alice = session(&relay).await;
-        let bob = session_trusting([&other, &relay]).await;
-        let bob_key = bob.node.key();
-        let (asked, post) = counting(other.post());
-        let mut carol = session_with(&other, post).await;
-        let gid = alice.node.create(settings(&relay)).unwrap();
-        let spares = strangers(&mut alice, &gid, &relay, 1).await;
-        bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID).await.unwrap()).await.unwrap();
-        carol.node.join(&bob.node.invite(&gid.0, INVITE_VALID).await.unwrap()).await.unwrap();
-        eventually("Carol holds the four members", || carol.node.members(&gid.0).unwrap().len() == 4).await;
-
-        bob.node.shutdown().await.unwrap();
-        alice.node.remove(&gid.0, &spares[0].0).await.unwrap();
-        alice.node.remove(&gid.0, &bob.node.key().0).await.unwrap();
-        SHIFT.fetch_add(FRESH_MS, std::sync::atomic::Ordering::Relaxed);
-        let before = asked.load(std::sync::atomic::Ordering::Relaxed);
-        carol.node.send(&gid.0, &message("after"), None).await.unwrap();
-        assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), before + 1, "the send asked about the group's log");
-        assert_eq!(carol.node.members(&gid.0).unwrap().len(), 2, "the message was sealed without Bob");
-        carol.until(|e| matches!(&e, Event::Left { member, .. } if member.key == bob_key).then_some(())).await;
-        let read = asked.load(std::sync::atomic::Ordering::Relaxed);
-        carol.node.send(&gid.0, &message("again"), None).await.unwrap();
-        assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), read, "a send within 2 minutes of a read asks nothing");
-        alice.node.shutdown().await.unwrap();
-        carol.node.shutdown().await.unwrap();
-    });
+    bob.node.shutdown().await.unwrap();
+    alice.node.remove(&gid.0, &spares[0].0).await.unwrap();
+    alice.node.remove(&gid.0, &bob.node.key().0).await.unwrap();
+    let before = asked.load(std::sync::atomic::Ordering::Relaxed);
+    carol.node.send(&gid.0, &message("after"), None).await.unwrap();
+    assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), before + 1, "the send asked about the group's log");
+    assert_eq!(carol.node.members(&gid.0).unwrap().len(), 2, "the message was sealed without Bob");
+    carol.until(|e| matches!(&e, Event::Left { member, .. } if member.key == bob_key).then_some(())).await;
+    let read = asked.load(std::sync::atomic::Ordering::Relaxed);
+    carol.node.send(&gid.0, &message("again"), None).await.unwrap();
+    assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), read + 1, "the next send asks again");
+    alice.node.shutdown().await.unwrap();
+    carol.node.shutdown().await.unwrap();
 }
