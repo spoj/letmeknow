@@ -137,7 +137,7 @@ impl Inner {
     pub(crate) async fn applied(self: &Arc<Self>, gid: &[u8], by: Option<core::Member>, added: Vec<core::Member>, removed: Vec<core::Member>, gone: bool) {
         let group = Bytes(gid.to_vec());
         let mut st = self.lock();
-        let by = by.map(|by| st.member(gid, &by));
+        let by = by.map(|by| Member::from(&by));
         if gone {
             drop(st);
             self.gone(gid, by);
@@ -148,11 +148,11 @@ impl Inner {
         }
         let Some(by) = by else { return };
         for member in &added {
-            let member = st.member(gid, member);
+            let member = Member::from(member);
             st.events.push(Event::Joined { group: group.clone(), member, by: by.clone() });
         }
         for member in &removed {
-            let member = st.member(gid, member);
+            let member = Member::from(member);
             st.events.push(Event::Left { group: group.clone(), member, by: by.clone() });
         }
     }

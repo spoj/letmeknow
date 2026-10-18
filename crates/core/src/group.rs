@@ -292,12 +292,11 @@ pub struct Opened {
     pub plaintext: Vec<u8>,
 }
 
-/// Who added whom, as the log showed it.
+/// An Add, as the log showed it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Added {
-    /// Session keys.
+    /// The session key of the member it added.
     pub member: Bytes,
-    pub by: Bytes,
     /// SHA-256 of the secret of the invite it came in by.
     pub invite: Bytes,
     /// The epoch the Add moves into.
@@ -486,7 +485,7 @@ impl Group {
         &self.state.added
     }
 
-    /// Forgets the records of who added whom that `keep` does not keep.
+    /// Forgets the records of Adds that `keep` does not keep.
     pub fn forget_added(&mut self, provider: &SqliteProvider, keep: impl Fn(&Added) -> bool) -> Result<()> {
         self.state.added.retain(keep);
         self.save(provider)
@@ -781,7 +780,6 @@ fn observe(
     aad: Aad,
     own: bool,
 ) -> Result<Applied> {
-    let committer = group.member_at(by).map(|member| Bytes(member.signature_key));
     let removed: Vec<Member> =
         staged.remove_proposals().filter_map(|remove| Member::of(group, remove.remove_proposal().removed())).collect();
     let added: Vec<Member> = staged
@@ -793,7 +791,7 @@ fn observe(
         })
         .collect();
     let epoch = staged.epoch().as_u64();
-    if let (Some(committer), Some(invite)) = (&committer, &aad.invite) {
+    if let Some(invite) = &aad.invite {
         let records = staged.add_proposals().enumerate().map(|(index, add)| {
             let key_package_ref = if own {
                 state.posted.as_ref().unwrap().add_refs[index]
@@ -801,7 +799,7 @@ fn observe(
                 add.add_proposal().key_package().hash_ref(provider.crypto())?.as_slice().try_into()?
             };
             let member = Bytes(add.add_proposal().key_package().leaf_node().signature_key().as_slice().to_vec());
-            Ok(Added { member, by: committer.clone(), invite: invite.clone(), epoch, key_package_ref, at: now() })
+            Ok(Added { member, invite: invite.clone(), epoch, key_package_ref, at: now() })
         }).collect::<Result<Vec<_>>>()?;
         state.added.extend(records);
     }

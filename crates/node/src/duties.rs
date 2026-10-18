@@ -77,7 +77,7 @@ impl State {
         let g = self.group_mut(gid)?;
         g.rec.invites.retain(|rule| rule.expires >= before);
         let g = self.group(gid)?;
-        // A record of who added whom stays while its member is in the group, while its invite admits, and for H, so that
+        // A record of an Add stays while its member is in the group, while its invite admits, and for H, so that
         // an invite told late finds itself used.
         let members: Vec<Vec<u8>> = g.mls.members().into_iter().map(|m| m.key).collect();
         let usable: Vec<Bytes> = g.rec.invites.iter().filter(|rule| rule.expires > now()).map(|rule| rule.hash.clone()).collect();

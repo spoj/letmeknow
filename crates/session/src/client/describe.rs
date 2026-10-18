@@ -1,4 +1,4 @@
-//! Members as this client shows them: by their fingerprints, and who added them.
+//! Members as this client shows them: by their fingerprints.
 
 use lmk_node::Member;
 use lmk_proto::Bytes;
@@ -14,9 +14,6 @@ pub struct Described {
     pub fp: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub you: bool,
-    /// The fingerprint of the member that added it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub added_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iroh: Option<Bytes>,
 }
@@ -32,7 +29,7 @@ impl Describer {
         if member.key.0.is_empty() {
             return Described { iroh: Some(member.iroh.clone()), ..Described::default() };
         }
-        Described { fp: Some(fp(&member.key.0)), you: member.key == self.me, added_by: member.added.as_ref().map(|by| fp(&by.0)), iroh: None }
+        Described { fp: Some(fp(&member.key.0)), you: member.key == self.me, iroh: None }
     }
 
     /// The member with this key, or else its fingerprint: a former member's, or this client's before it is one.
@@ -58,15 +55,15 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn a_member_shows_by_its_fingerprint_and_who_added_it() {
-        let member = |key: u8, added: Option<u8>| Member { key: Bytes(vec![key]), iroh: Bytes(vec![key]), revision: 1, added: added.map(|by| Bytes(vec![by])) };
-        let describer = Describer { me: Bytes(vec![1]), members: vec![member(1, None), member(2, Some(1))] };
+    fn a_member_shows_by_its_fingerprint() {
+        let member = |key: u8| Member { key: Bytes(vec![key]), iroh: Bytes(vec![key]), revision: 1 };
+        let describer = Describer { me: Bytes(vec![1]), members: vec![member(1), member(2)] };
         let shows = |m: &Member| serde_json::to_value(describer.describe(m)).unwrap();
         assert_eq!(shows(&describer.members[0]), json!({ "fp": fp(&[1]), "you": true }));
-        assert_eq!(shows(&describer.members[1]), json!({ "fp": fp(&[2]), "added_by": fp(&[1]) }));
+        assert_eq!(shows(&describer.members[1]), json!({ "fp": fp(&[2]) }));
         assert_eq!(shown(&shows(&describer.members[0])), "you");
         assert_eq!(shown(&shows(&describer.members[1])), fp(&[2]));
-        let peer = Member { key: Bytes::default(), ..member(9, None) };
+        let peer = Member { key: Bytes::default(), ..member(9) };
         assert_eq!(shows(&peer), json!({ "iroh": "CQ" }));
     }
 }

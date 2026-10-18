@@ -68,7 +68,7 @@ mod tests {
 
     #[test]
     fn members_show_by_fingerprint_and_ids_by_their_beginning() {
-        let member = |fp: &str, you: bool| json!({ "fp": fp, "you": you, "added_by": "f0" });
+        let member = |fp: &str, you: bool| json!({ "fp": fp, "you": you });
         let mut item = json!({
             "type": "message",
             "group": "g",

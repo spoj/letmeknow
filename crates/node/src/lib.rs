@@ -73,8 +73,16 @@ pub struct Member {
     pub iroh: Bytes,
     /// The protocol revision its leaf names.
     pub revision: u32,
-    /// The session key of the member that added it; none for the group's creator and this session.
-    pub added: Option<Bytes>,
+}
+
+impl From<&core::Member> for Member {
+    fn from(member: &core::Member) -> Self {
+        Member {
+            key: Bytes(member.key.clone()),
+            iroh: member.leaf.as_ref().map(|leaf| leaf.key.clone()).unwrap_or_default(),
+            revision: member.leaf.as_ref().map_or(0, |leaf| leaf.revision),
+        }
+    }
 }
 
 /// A held message of the group as this session delivered it: a chat message, or one of the core's.
@@ -471,20 +479,8 @@ impl State {
         put(&self.provider, b"node/groups", &gids)
     }
 
-    /// A member as events show it.
-    fn member(&self, gid: &[u8], member: &core::Member) -> Member {
-        let added = self.groups.get(gid).and_then(|g| g.mls.added().iter().rev().find(|added| added.member.0 == member.key)).map(|added| added.by.clone());
-        Member {
-            key: Bytes(member.key.clone()),
-            iroh: member.leaf.as_ref().map(|leaf| leaf.key.clone()).unwrap_or_default(),
-            revision: member.leaf.as_ref().map_or(0, |leaf| leaf.revision),
-            added,
-        }
-    }
-
     fn members(&self, gid: &[u8]) -> Result<Vec<Member>> {
-        let g = self.group(gid)?;
-        Ok(g.mls.members().iter().map(|member| self.member(gid, member)).collect())
+        Ok(self.group(gid)?.mls.members().iter().map(Member::from).collect())
     }
 
     /// The member of a group whose leaf names an iroh key.

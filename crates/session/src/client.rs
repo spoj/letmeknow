@@ -355,7 +355,7 @@ impl Client {
         Ok(Describer { me: self.inner.node.key(), members: self.inner.node.members(&gid.0).unwrap_or_default() })
     }
 
-    /// A member as this client shows it: its fingerprint, and who added it.
+    /// A member as this client shows it: by its fingerprint.
     pub fn describe(&self, gid: &Bytes, member: &Member) -> Result<Described> {
         Ok(self.describer(gid)?.describe(member))
     }

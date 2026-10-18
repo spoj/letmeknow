@@ -329,7 +329,7 @@ fn commit_race() {
     w.m[3].join(&inner, &admission, pos, &kp_d);
     w.agree(&[0, 1, 2, 3]);
     let added = w.m[0].g().added().last().unwrap().clone();
-    assert_eq!((added.member.0, added.by.0, added.epoch), (w.m[3].session.key().to_vec(), w.m[1].session.key().to_vec(), e + 2));
+    assert_eq!((added.member.0, added.epoch), (w.m[3].session.key().to_vec(), e + 2));
 
     // A commit the log never took is cancelled, and the group carries on.
     let cut = w.m[2].cut();

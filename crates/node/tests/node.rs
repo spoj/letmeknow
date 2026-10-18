@@ -834,10 +834,10 @@ fn on_clock(clock: fn() -> u64, test: impl std::future::Future<Output = ()>) {
 
 const DAY_MS: u64 = 24 * 3600 * 1000;
 
-/// The records of who added whom keep the group's members, the joins of the last H and those whose invites still admit:
-/// a member removed longer than H ago leaves none.
+/// The records of Adds keep the group's members, the joins of the last H and those whose invites still admit: a member
+/// removed longer than H ago leaves none.
 #[test]
-fn a_group_forgets_who_added_its_members_once_they_are_gone_past_h() {
+fn a_group_forgets_the_adds_of_members_gone_past_h() {
     static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     fn shifted() -> u64 {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
@@ -1606,7 +1606,7 @@ async fn two_asks_with_one_key_package_add_it_once() {
     assert_eq!(alice.node.epoch(&gid.0).unwrap(), epoch + 1, "one Add");
 }
 
-/// A member connected is online, though not heard from yet; a member's adder keeps its key once gone.
+/// A member connected is online, though not heard from yet.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_member_connected_is_online() {
     let relay = relay().await;
@@ -1632,10 +1632,6 @@ async fn a_member_connected_is_online() {
     let key = lmk_node::iroh_key(&SqliteProvider::open(&carol_db).unwrap()).unwrap();
     let _carol = hand(&relay, key, &alice.node).await;
     eventually("Carol is online", || alice.node.online(&gid.0).unwrap().iter().any(|m| m.key == carol_key)).await;
-
-    alice.node.remove(&gid.0, &bob.node.key().0).await.unwrap();
-    let carol = alice.node.members(&gid.0).unwrap().into_iter().find(|m| m.key == carol_key).unwrap();
-    assert_eq!(carol.added.unwrap(), bob.node.key());
     alice.node.shutdown().await.unwrap();
 }
 

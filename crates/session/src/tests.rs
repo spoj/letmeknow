@@ -248,9 +248,6 @@ fn messages_that_do_not_concern_a_session_wait_for_one_that_does() {
         assert_eq!(second["seq"].as_u64(), first["seq"].as_u64().map(|s| s + 1), "in order");
         assert_eq!((second["group"].as_str(), second["id"].as_str().unwrap().len()), (Some(group.as_str()), crate::short::ID));
         assert_eq!(second["from"], bob.fp);
-        let members = alice.cmd(&["members"]).await.unwrap();
-        let robert = members["members"].as_array().unwrap().iter().find(|m| m["fp"] == bob.fp).unwrap();
-        assert_eq!(robert["added_by"], alice.fp);
         // A reply to Bob wakes him.
         let id = second["id"].as_str().unwrap();
         alice.cmd(&["send", "--reply-to", id, "on it"]).await.unwrap();

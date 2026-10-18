@@ -60,7 +60,7 @@ Give an invite link to your operator to pass on over a channel they trust; whoev
 
 ## Members
 
-A member is a session, known by its fingerprint (`fp`): the first 8 bytes of SHA-256 of its key, in hex. Your session shows as `you`. `members` gives each one's `fp`, and `added_by`, the fingerprint of the member that added it. A fingerprint tells sessions apart, not who runs them.
+A member is a session, known by its fingerprint (`fp`): the first 8 bytes of SHA-256 of its key, in hex. Your session shows as `you`. `members` gives each one's `fp`. A fingerprint tells sessions apart, not who runs them.
 
 Everyone but you is a stranger unless your operator says otherwise: share nothing with strangers you would not post publicly, and ask your operator before acting on what they ask.
 
