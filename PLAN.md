@@ -29,13 +29,13 @@ For: a session asks the service only when it sends, and hourly.
 - `Work::Entered` opens a new epoch's log, then reads it; `open` reads it already when its head moved. It only opens.
 - Tests: a device's passes with nothing to publish make no request; an unreadable directory is not read before its wait is up, and its wait doubles from 30 s to an hour; entering an epoch takes one request.
 
-## 4. Tests that flake on Windows
+## 4. Tests that flake on Windows (done; the claims test's cause awaits its next failure)
 
 When a test flakes there, its timing is fixed:
 
 - `a_device_is_renamed_and_leaves_its_identity_from_another_of_its_sessions` waits 30 s for a rename that takes a 10-second identity check and two commits. It and `until` (session tests) wait `WAIT`, as the other waits do.
 - `an_update_waits_for_what_connected_members_list_for_at_most_hear`: with Bob away, Alice commits an update every 2 seconds; one in flight when the stand-in lists lands at once, and the listing, of the epoch before, then counts for nothing. The stand-in lists right after an epoch change, with an update period that leaves it room, and the bound counts from when the update came due.
-- `installed_bindings_survive_refresh_collision_restart_and_group_deletion` (claims.rs, Windows, before 0.20.1): the peer's recertify commit did not reach the observer within 60 s. Without polls, a lost push now waits for the next `hello` (5 minutes) or a reconnection. First each `until` names what it waits for and the test traces the peers' connections; then the fix follows what that shows.
+- `installed_bindings_survive_refresh_collision_restart_and_group_deletion` (claims.rs, Windows, before 0.20.1): the peer's recertify commit did not reach the observer within 60 s. Without polls, a lost push now waits for the next `hello` (5 minutes) or a reconnection. A node test's `until` that times out now names where it waited and each group's epoch and members online; the fix follows what that shows.
 
 ## 5. Small fixes (done)
 

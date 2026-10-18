@@ -427,14 +427,14 @@ fn a_leaving_member_is_removed_by_another() {
 /// Asks again, a quarter of a second apart, until `accept` takes what `ask` answers or 30 seconds pass; returns the last
 /// answer.
 async fn until(ask: impl AsyncFn() -> Value, accept: impl Fn(&Value) -> bool) -> Value {
-    for _ in 0..120 {
+    let end = std::time::Instant::now() + WAIT;
+    loop {
         let answer = ask().await;
-        if accept(&answer) {
+        if accept(&answer) || std::time::Instant::now() > end {
             return answer;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    ask().await
 }
 
 #[test]
@@ -852,14 +852,9 @@ fn a_device_is_renamed_and_leaves_its_identity_from_another_of_its_sessions() {
         let listed = alice.cmd(&["identity", "list"]).await.unwrap();
         assert_eq!(listed["devices"][0]["name"], "studio");
         assert_eq!(lmk_core::device::Device::load(&alice.home.join("device.json")).unwrap().name, "studio");
-        let device = || async { carol.cmd(&["members"]).await.unwrap()["members"].as_array().unwrap().iter().any(|m| m["device"] == "studio") };
-        for _ in 0..120 {
-            if device().await {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-        assert!(device().await, "carol sees the device's new name in its refreshed signed leaf");
+        let studio = |members: &Value| members["members"].as_array().unwrap().iter().any(|m| m["device"] == "studio");
+        let members = until(|| async { carol.cmd(&["members"]).await.unwrap() }, studio).await;
+        assert!(studio(&members), "carol sees the device's new name in its refreshed signed leaf");
 
         let left = desk.cmd(&["identity", "leave"]).await.unwrap();
         assert_eq!((&left["left"][0], &left["ended"]), (&invite["group"], &json!(true)));

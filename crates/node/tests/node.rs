@@ -79,20 +79,32 @@ fn config(relay: &Relay, name: &str, device: Option<Device>) -> Config {
 }
 
 impl<P: Provider + Send + 'static> Session<P> {
-    async fn until<T>(&mut self, mut wanted: impl FnMut(Event) -> Option<T>) -> T {
-        tokio::time::timeout(WAIT, async {
-            loop {
-                let event = self.events.recv().await.unwrap();
-                if let Event::Warning { text, .. } = &event {
-                    eprintln!("warning: {text}");
+    /// Waits for the event `wanted` takes. Past `WAIT`, fails naming where it was awaited, and each group's epoch and
+    /// members online.
+    #[track_caller]
+    fn until<T>(&mut self, mut wanted: impl FnMut(Event) -> Option<T>) -> impl Future<Output = T> {
+        let at = std::panic::Location::caller();
+        async move {
+            let waited = tokio::time::timeout(WAIT, async {
+                loop {
+                    let event = self.events.recv().await.unwrap();
+                    if let Event::Warning { text, .. } = &event {
+                        eprintln!("warning: {text}");
+                    }
+                    if let Some(found) = wanted(event) {
+                        return found;
+                    }
                 }
-                if let Some(found) = wanted(event) {
-                    return found;
-                }
-            }
-        })
-        .await
-        .expect("the event came")
+            })
+            .await;
+            waited.unwrap_or_else(|_| {
+                let groups: Vec<_> = self.node.groups().into_iter().map(|gid| {
+                    let online: Vec<String> = self.node.online(&gid.0).unwrap_or_default().into_iter().map(|m| m.name).collect();
+                    (self.node.epoch(&gid.0).ok(), online)
+                }).collect();
+                panic!("the event awaited at {at} did not come; each group's epoch and members online: {groups:?}")
+            })
+        }
     }
 }
 
@@ -2778,16 +2790,18 @@ async fn a_message_an_online_member_holds_is_kept_by_the_next_commit() {
 }
 
 /// An update waiting for what connected members list commits once HEAR is up, not later: Bob's stand-in lists seqs that
-/// Alice never got, and nothing sends them.
+/// Alice never got, and nothing sends them. It lists right after one of Alice's updates, so that the next, due within T,
+/// waits in the epoch it lists for.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_update_waits_for_what_connected_members_list_for_at_most_hear() {
+    const T: u32 = 10;
     let relay = relay().await;
     let dir = folder("fetch-hear");
     std::fs::create_dir_all(&dir).unwrap();
     let bob_db = dir.join("bob.db");
     let alice = session(&relay, "Alice").await;
     let bob = stored(&relay, "Bob", &bob_db).await;
-    let gid = alice.node.create(Settings { update: 2, ..settings(CHAT, &relay) }, None).unwrap();
+    let gid = alice.node.create(Settings { update: T, ..settings(CHAT, &relay) }, None).unwrap();
     bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     eventually("Alice hears Bob", || alice.node.heard(&gid.0).unwrap().iter().any(|heard| heard.member.name == "Bob")).await;
     let joined = alice.node.heard(&gid.0).unwrap().iter().find(|heard| heard.member.name == "Bob").unwrap().joined;
@@ -2796,10 +2810,12 @@ async fn an_update_waits_for_what_connected_members_list_for_at_most_hear() {
 
     let (iroh, mls) = member_of(&bob_db);
     let mut bob_hand = hand(&relay, iroh, &alice.node).await;
+    let before = alice.node.epoch(&gid.0).unwrap();
+    eventually("Alice updates", || alice.node.epoch(&gid.0).unwrap() > before).await;
     let epoch = alice.node.epoch(&gid.0).unwrap();
     let listed_at = std::time::Instant::now();
     list(&mut bob_hand, &mls, &gid, joined, epoch, lmk_node::now() + 3_600_000, vec![seqs(&Bytes(mls.key().to_vec()), joined, &[1, 2, 3])]).await;
-    tokio::time::timeout(Duration::from_millis(lmk_net::peers::HEAR + 5_000), async {
+    tokio::time::timeout(Duration::from_millis(T as u64 * 1000 + lmk_net::peers::HEAR + 5_000), async {
         while alice.node.epoch(&gid.0).unwrap() == epoch {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
