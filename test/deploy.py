@@ -170,6 +170,7 @@ def release(tmp, before, version, mock_dir):
     assert f'version = "{version}"' in git("show", "main:Cargo.toml", cwd=origin), version
     assert pins == {name: f"@letmeknow/cli@{pinned}\n" for name in PIN_FILES}, pins
     assert ("MINOR = \"" + minor + "\"" in result.stdout) == patch, result.stdout
+    assert (f"@letmeknow/cli@{minor} in hooks/letmeknow.js" in result.stdout) == patch, result.stdout
     assert f"v{version}" in git("tag", cwd=origin).split(), version
     print(f"ok - release {version} from {before}: pins at {pinned}")
 
