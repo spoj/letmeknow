@@ -110,7 +110,6 @@ impl World {
             hold: HOUR,
             keep_log: false,
             membership: self.domain.clone(),
-            registry: "http://127.0.0.1:1".into(),
         }
     }
 
@@ -707,62 +706,6 @@ fn a_home_of_another_format_is_refused_and_names_its_release() {
             assert!(!home.join("sessions").exists());
         }
     });
-}
-
-/// `ready` names a newer minor version the registry has, and the command to run it; the same minor is no news.
-#[test]
-fn ready_names_a_newer_minor_version_and_the_command_to_run_it() {
-    local(async {
-        let world = world("newer").await;
-        let newer = registry(r#"{"dist-tags":{"latest":"0.21.0"}}"#, Duration::ZERO).await;
-        let alice = world.launch(Config { registry: newer, ..world.config("alice", "alice") }, usize::MAX).await;
-        let home = world.root.path().join("alice");
-        assert_eq!(alice.ready["newer"], "0.21.0");
-        assert_eq!(alice.ready["update"], format!("LETMEKNOW_HOME={} npx -y @letmeknow/cli@0.21 --session alice listen", home.display()));
-        let same = registry(r#"{"dist-tags":{"latest":"0.20.4"}}"#, Duration::ZERO).await;
-        let bob = world.launch(Config { registry: same, ..world.config("bob", "bob") }, usize::MAX).await;
-        assert!(bob.ready.get("newer").is_none(), "{}", bob.ready);
-    });
-}
-
-/// A registry that does not answer within the lookup's bound leaves `ready` without a notice, and `ready` comes once
-/// the bound passes.
-#[test]
-fn a_slow_registry_leaves_ready_without_a_notice() {
-    local(async {
-        let world = world("slow").await;
-        let slow = registry(r#"{"dist-tags":{"latest":"0.21.0"}}"#, Duration::from_secs(60)).await;
-        let started = std::time::Instant::now();
-        let alice = world.launch(Config { registry: slow, ..world.config("alice", "alice") }, usize::MAX).await;
-        assert!(alice.ready.get("newer").is_none(), "{}", alice.ready);
-        // Well short of the registry's answer, with room for a slow start beside the bound.
-        assert!(started.elapsed() < Duration::from_secs(30), "{:?}", started.elapsed());
-    });
-}
-
-/// A registry answering each request with `body` after `delay`; returns its address.
-async fn registry(body: &'static str, delay: Duration) -> String {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let address = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
-            tokio::spawn(async move {
-                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-                {
-                    let mut lines = BufReader::new(&mut stream).lines();
-                    while let Some(line) = lines.next_line().await.unwrap() {
-                        if line.is_empty() {
-                            break;
-                        }
-                    }
-                }
-                tokio::time::sleep(delay).await;
-                let answer = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-                stream.write_all(answer.as_bytes()).await.unwrap();
-            });
-        }
-    });
-    address
 }
 
 /// A session refuses a membership service that is not a domain, names one its home has pinned another key for, or has

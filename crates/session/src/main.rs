@@ -1,4 +1,4 @@
-use letmeknow::cli::{Cli, Command, Request, call, home_dir, new_handle, running_session, session_dir};
+use letmeknow::cli::{Cli, Command, call, home_dir, new_handle, running_session, session_dir};
 use letmeknow::session::Config;
 use letmeknow::Network;
 use std::process::ExitCode;
@@ -21,11 +21,6 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Where the newer-release notice looks: the registry, or `LETMEKNOW_REGISTRY`, which tests point at a mock.
-fn registry() -> String {
-    std::env::var("LETMEKNOW_REGISTRY").unwrap_or_else(|_| letmeknow::REGISTRY.to_owned())
-}
-
 async fn run(cli: Cli) -> anyhow::Result<()> {
     let home = home_dir(cli.home)?;
     match cli.command {
@@ -41,7 +36,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 hold: Duration::from_secs(hold),
                 keep_log,
                 membership,
-                registry: registry(),
             };
             let print = |line: String| {
                 use std::io::Write;
@@ -65,12 +59,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 Some(session) => session,
                 None => running_session(&home).await?,
             };
-            let qr = matches!(request, Request::Client(letmeknow::client::Request::Invite { qr: true, .. }));
             let answer = call(&home, &session, request).await?;
             println!("{}", letmeknow::short::line(&answer));
-            if qr && let Some(link) = answer["link"].as_str() {
-                eprintln!("{}", letmeknow::cli::qr(link)?);
-            }
             Ok(())
         }
     }

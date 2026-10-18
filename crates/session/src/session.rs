@@ -30,8 +30,6 @@ pub struct Config {
     pub keep_log: bool,
     /// The domain of the membership service for groups this session creates.
     pub membership: String,
-    /// Where it looks for a newer release.
-    pub registry: String,
 }
 
 /// A request on a command channel, and where its answer goes.
@@ -51,7 +49,6 @@ pub struct Session {
     forget_at: Instant,
     /// The groups as last written to `groups.json`.
     groups: String,
-    home: PathBuf,
     config: Config,
     outbox: Outbox,
     catching_up: Option<Instant>,
@@ -64,7 +61,7 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 impl Session {
-    pub async fn open(config: Config, db: Connection, node: Node, home: &Path, held: std::fs::File, membership: Service) -> Result<Self> {
+    pub async fn open(config: Config, db: Connection, node: Node, held: std::fs::File, membership: Service) -> Result<Self> {
         let (client, told) = Client::new(node, membership);
         let mut session = Self {
             db,
@@ -73,7 +70,6 @@ impl Session {
             _held: held,
             forget_at: Instant::now() + FORGET,
             groups: String::new(),
-            home: home.to_path_buf(),
             config,
             outbox: Outbox::default(),
             catching_up: Some(Instant::now() + CATCH_UP_WINDOW),
@@ -430,19 +426,12 @@ pub async fn run(
     mut events: mpsc::UnboundedReceiver<Event>,
     mut print: impl FnMut(String) -> std::io::Result<()>,
     shutdown: impl std::future::Future<Output = ()>,
-    newer: Option<String>,
 ) -> Result<()> {
     let fp = crate::client::fp(&session.client.node().key().0);
     // Termux may run a program through Android's linker, which /proc/self/exe then names; it names the program in
     // TERMUX_EXEC__PROC_SELF_EXE.
     let bin = std::env::var_os("TERMUX_EXEC__PROC_SELF_EXE").map_or_else(std::env::current_exe, |exe| Ok(exe.into()))?;
-    let mut ready = json!({ "type": "ready", "session": session.config.handle, "fp": fp, "bin": bin, "membership": session.config.membership });
-    if let Some(version) = newer {
-        let minor = version.split('.').take(2).collect::<Vec<_>>().join(".");
-        let home = if session.home == crate::cli::home_dir(None)? { String::new() } else { format!("LETMEKNOW_HOME={} ", session.home.display()) };
-        ready["newer"] = json!(version);
-        ready["update"] = json!(format!("{home}npx -y @letmeknow/cli@{minor} --session {} listen", session.config.handle));
-    }
+    let ready = json!({ "type": "ready", "session": session.config.handle, "fp": fp, "bin": bin, "membership": session.config.membership });
     let mut shutdown = std::pin::pin!(shutdown);
     let client = session.client.clone();
     if print(short::line(&ready)).is_ok() {

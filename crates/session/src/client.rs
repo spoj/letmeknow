@@ -143,7 +143,7 @@ impl Client {
 
     pub async fn request(&self, request: Request) -> Result<Value> {
         match request {
-            Request::Invite { group, carry, qr: _ } => self.invite(group, carry).await,
+            Request::Invite { group, carry } => self.invite(group, carry).await,
             Request::Join { target } => self.join(target).await,
             Request::Members { group } => {
                 let gid = self.resolve(group)?;

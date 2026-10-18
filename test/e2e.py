@@ -6,8 +6,7 @@ import json, os, queue, shutil, socket, subprocess, sys, tempfile, threading, ti
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.environ.get("LMK_E2E_BIN") or os.path.join(ROOT, os.environ.get("CARGO_TARGET_DIR", "target"), "debug", "letmeknow" + (".exe" if os.name == "nt" else ""))
 TMP = tempfile.mkdtemp(prefix="lmk-e2e-")
-# No session asks the real registry whether a newer release is out.
-ENV = {**os.environ, "NO_PROXY": "localhost,127.0.0.1", "LETMEKNOW_REGISTRY": "http://127.0.0.1:1"}
+ENV = {**os.environ, "NO_PROXY": "localhost,127.0.0.1"}
 ENV.pop("LETMEKNOW_SESSION", None)
 
 

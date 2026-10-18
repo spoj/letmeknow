@@ -31,13 +31,11 @@ rand.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rusqlite.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-semver = "1"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "rt", "macros", "net", "io-util", "sync", "time", "signal"] }
 dirs = "7"
-qrcode = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 lmk-testing.workspace = true

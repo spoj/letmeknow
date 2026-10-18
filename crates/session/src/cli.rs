@@ -184,22 +184,10 @@ pub fn session_dir(home: &Path, session: &str) -> Result<PathBuf> {
     Ok(home.join("sessions").join(session))
 }
 
-const ADJECTIVES: [&str; 32] = [
-    "amber", "bold", "brave", "brisk", "calm", "clever", "cosmic", "crisp", "eager", "fancy", "gentle", "glad", "golden",
-    "happy", "jolly", "keen", "lively", "lucky", "mellow", "merry", "nimble", "proud", "quick", "quiet", "rapid", "shiny",
-    "silver", "steady", "sunny", "swift", "tidy", "witty",
-];
-const NOUNS: [&str; 32] = [
-    "badger", "beaver", "bison", "crane", "dolphin", "eagle", "falcon", "ferret", "finch", "fox", "gecko", "heron", "ibis",
-    "jaguar", "koala", "lemur", "lynx", "marten", "moose", "newt", "otter", "owl", "panda", "puffin", "quail", "raven",
-    "robin", "seal", "stoat", "tapir", "walrus", "wren",
-];
-
-/// A two-word handle not used by any existing session.
+/// A handle of 8 hex digits not used by any existing session.
 pub fn new_handle(home: &Path) -> Result<String> {
     loop {
-        let [a, b]: [u8; 2] = rand::random();
-        let handle = format!("{}-{}", ADJECTIVES[a as usize % 32], NOUNS[b as usize % 32]);
+        let handle = format!("{:08x}", rand::random::<u32>());
         if !session_dir(home, &handle)?.exists() {
             return Ok(handle);
         }
@@ -358,12 +346,6 @@ pub fn private_file(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(std::fs::write(path, contents)?)
 }
 
-/// The QR code of a link, in text.
-pub fn qr(link: &str) -> Result<String> {
-    let code = qrcode::QrCode::new(link)?;
-    Ok(code.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(true).build())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{Command, Request, parse};
@@ -393,11 +375,5 @@ mod tests {
         assert_eq!(retention(&[]).unwrap(), 7);
         assert_eq!(retention(&["--retention", "25"]).unwrap(), 25);
         assert!(retention(&["--retention", "6"]).is_err() && retention(&["--retention", "26"]).is_err());
-    }
-
-    #[test]
-    fn a_link_shows_as_a_qr_code() {
-        let code = super::qr("https://letmeknow.dev/i#9.AAAA.BBBB").unwrap();
-        assert!(code.lines().count() > 10);
     }
 }

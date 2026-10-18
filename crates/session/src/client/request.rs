@@ -15,10 +15,6 @@ pub enum Request {
         #[arg(long, default_value_t = 7, conflicts_with = "group")]
         #[serde(default = "carry")]
         carry: u32,
-        /// Also show the link as a QR code, on stderr
-        #[arg(long)]
-        #[serde(default)]
-        qr: bool,
     },
     /// Join a group through an invite link
     #[command(display_order = 11)]

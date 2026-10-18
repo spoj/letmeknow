@@ -22,10 +22,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Where letmeknow's releases are published.
-pub const REGISTRY: &str = "https://registry.npmjs.org";
-/// How long `ready` may wait for the registry to say whether a newer minor version is out.
-const LOOKUP: Duration = Duration::from_secs(2);
 /// How long a fetched directory answers without another fetch, and how long a fetch of one may take.
 const FRESH: Duration = Duration::from_secs(10 * 60);
 const FETCH: Duration = Duration::from_secs(5);
@@ -66,7 +62,6 @@ pub struct Network {
     pub ca: iroh::tls::CaTlsConfig,
     pub resolve: Resolve,
     pub post: Post,
-    http: reqwest::Client,
 }
 
 impl Network {
@@ -88,8 +83,7 @@ impl Network {
             relays: Vec::new(),
             ca,
             resolve: cached(home.join("directories"), fetch(http.clone())),
-            post: https(http.clone()),
-            http,
+            post: https(http),
         })
     }
 }
@@ -265,18 +259,8 @@ pub async fn listen(
         ca: network.ca.clone(),
     };
     let (node, events) = Node::start(provider, node_config).await?;
-    let lookup = newer_minor(network, config.registry.clone());
-    let (session, newer) = tokio::join!(session::Session::open(config, db, node, home, held, membership), lookup);
-    session::run(session?, queue, events, print, shutdown, newer).await
-}
-
-/// The version of the newest release on `registry`, if its minor version is newer than this one's. Nothing if the registry
-/// does not answer within `LOOKUP`.
-async fn newer_minor(network: Network, registry: String) -> Option<String> {
-    let body = network.http.get(format!("{registry}/@letmeknow/cli")).timeout(LOOKUP).send().await.ok()?.text().await.ok()?;
-    let latest = semver::Version::parse(serde_json::from_str::<Value>(&body).ok()?["dist-tags"]["latest"].as_str()?).ok()?;
-    let own = semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("this crate's version");
-    ((latest.major, latest.minor) > (own.major, own.minor)).then(|| latest.to_string())
+    let session = session::Session::open(config, db, node, held, membership).await?;
+    session::run(session, queue, events, print, shutdown).await
 }
 
 /// This machine's sessions: each one's handle, whether its process answers, and its groups as it last wrote them.
