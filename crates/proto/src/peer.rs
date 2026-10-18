@@ -112,9 +112,6 @@ pub struct Summary {
     /// Per membership with any, the unkept seqs it holds sealed in `epoch`: a commit of that epoch keeps them on its word.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sealed: Vec<Seqs>,
-    /// Per membership with any, the seqs its client has shown.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub shown: Vec<Seqs>,
     /// Per membership with any, the seqs it lost.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lost: Vec<Seqs>,

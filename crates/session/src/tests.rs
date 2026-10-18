@@ -397,38 +397,6 @@ async fn until(ask: impl AsyncFn() -> Value, accept: impl Fn(&Value) -> bool) ->
     }
 }
 
-#[test]
-fn a_message_printed_is_read_and_one_waiting_only_held() {
-    local(async {
-        let world = world("read").await;
-        let (mut alice, bob, _) = pair(&world, HOUR).await;
-        let quiet = bob.cmd(&["send", "fyi"]).await.unwrap();
-        let id = quiet["id"].as_str().unwrap();
-        let alice_shown = json!([alice.fp]);
-        let read = until(|| async { bob.cmd(&["read", id]).await.unwrap() }, |read| read["held_by"] == alice_shown).await;
-        assert_eq!((&read["held_by"], &read["read_by"]), (&alice_shown, &Value::Null), "Alice holds it, unprinted");
-        bob.cmd(&["send", "--to", &alice.fp, "look"]).await.unwrap();
-        assert_eq!(alice.expect("message").await["id"], id);
-        alice.expect("message").await;
-        let read = until(|| async { bob.cmd(&["read", id]).await.unwrap() }, |read| read["read_by"] == alice_shown).await;
-        assert_eq!(read["read_by"], alice_shown, "printed, so read");
-    });
-}
-
-/// Waits until the member named `by` holds a message of `alice`'s, as her `read` shows.
-async fn held(alice: &Agent, sent: &Value, by: &str) {
-    let read = until(|| async { alice.cmd(&["read", sent["id"].as_str().unwrap()]).await.unwrap() }, |read| read["held_by"] == json!([by])).await;
-    assert_eq!(read["held_by"], json!([by]), "{read}");
-}
-
-static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// The system's clock, moved on by `SHIFT`.
-fn shifted() -> u64 {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-    now + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// A message taken in leaves nothing in the session's tables once H has passed, and its attachment's copy goes with it.
 #[test]
 fn a_message_taken_in_is_forgotten_after_h_with_its_attachments_copy() {
@@ -458,39 +426,25 @@ fn a_message_taken_in_is_forgotten_after_h_with_its_attachments_copy() {
     });
 }
 
+/// `status` lists this session's sends that no other member holds yet, with a warning, until a member online holds them.
 #[test]
-fn status_lists_sends_held_only_here_and_members_away() {
+fn status_lists_sends_held_only_here() {
     local(async {
-        lmk_proto::clock::set(shifted);
         let world = world("only-here").await;
         let (mut alice, mut bob, group) = pair(&world, HOUR).await;
-        let hello = alice.cmd(&["send", "hello"]).await.unwrap();
-        // Bob was shown it, so his summary that says so shows that he holds it and the invite before it: Alice's next
-        // commit keeps both.
+        alice.cmd(&["send", "hello"]).await.unwrap();
+        // Bob takes it, and the invite before it: once his summary tells Alice, her next commit keeps both.
         bob.told(&["message"]).await;
-        let read = until(|| async { alice.cmd(&["read", hello["id"].as_str().unwrap()]).await.unwrap() }, |read| read["read_by"] == json!([bob.fp])).await;
-        assert_eq!(read["read_by"], json!([bob.fp]), "{read}");
+        until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["only_here"].is_null()).await;
         add_and_remove(&world, &mut alice, &group).await;
-        let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["only_here"].is_null()).await;
-        assert!(status["groups"][0]["only_here"].is_null(), "{status}");
         bob.stop().await;
         let sent = alice.cmd(&["send", "anyone?"]).await.unwrap();
         let status = alice.cmd(&["status"]).await.unwrap();
         assert_eq!(status["groups"][0]["only_here"], json!([{ "what": "message", "id": sent["id"] }]));
         assert!(status["warning"].is_string());
-        assert!(status["groups"][0]["away"].is_null(), "Bob was heard from just now");
-        let mut bob = world.start("bob", HOUR).await;
-        held(&alice, &sent, &bob.fp).await;
-        add_and_remove(&world, &mut alice, &group).await;
+        let _bob = world.start("bob", HOUR).await;
         let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["only_here"].is_null()).await;
-        assert!(status["groups"][0]["only_here"].is_null(), "Bob holds it");
-        assert!(status.get("warning").is_none());
-        bob.stop().await;
-        SHIFT.store(8 * 24 * 3600 * 1000, std::sync::atomic::Ordering::Relaxed);
-        // Once Bob's close reaches Alice.
-        let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["away"][0] == bob.fp.as_str()).await;
-        assert_eq!(status["groups"][0]["away"][0], bob.fp.as_str(), "not heard from for longer than members carry messages");
-        assert_eq!(alice.cmd(&["members"]).await.unwrap()["members"].as_array().unwrap().len(), 2, "away, not removed");
+        assert!(status["groups"][0]["only_here"].is_null() && status.get("warning").is_none(), "Bob holds it: {status}");
     });
 }
 
@@ -727,10 +681,10 @@ fn a_restarted_session_prints_what_came_after_the_last_it_showed() {
         assert_eq!(alice.expect("message").await["content"], "before");
         assert_eq!(alice.expect("message").await["content"], "to alice");
         bob.cmd(&["send", "after one"]).await.unwrap();
-        let last = bob.cmd(&["send", "after two"]).await.unwrap();
-        // Alice holds both and, unaddressed, prints neither.
-        let read = until(|| async { bob.cmd(&["read", last["id"].as_str().unwrap()]).await.unwrap() }, |read| read["held_by"] == json!([alice.fp])).await;
-        assert_eq!(read["held_by"], json!([alice.fp]));
+        bob.cmd(&["send", "after two"]).await.unwrap();
+        // Alice holds both, as Bob's status shows, and, unaddressed, prints neither.
+        let status = until(|| async { bob.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["only_here"].is_null()).await;
+        assert!(status["groups"][0]["only_here"].is_null(), "{status}");
         alice.stop().await;
         let mut alice = world.start("alice", HOUR).await;
         assert_eq!(alice.expect("message").await["content"], "after one");

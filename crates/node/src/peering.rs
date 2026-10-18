@@ -16,7 +16,7 @@ use lmk_proto::peer::{At, Frame, SUMMARY, Seqs, Signed, Summary};
 use n0_future::time::{Duration, sleep};
 use serde::{Deserialize, Serialize};
 
-use crate::{Event, Inner, Lost, LostOf, Member, Node, Out, State, days, get, now, put};
+use crate::{Event, Inner, Lost, LostOf, Member, Node, Out, State, get, now, put};
 
 /// How often `Peers` is polled.
 const POLL: Duration = Duration::from_millis(250);
@@ -25,14 +25,12 @@ const RESIGN: u64 = 60 * 60 * 1000;
 /// How many summaries of memberships not known yet a group keeps.
 const UNVERIFIED: usize = 32;
 
-/// A member's latest summary of a group: what it holds, what its client showed, and when it was signed, at most when
-/// it came.
+/// A member's latest summary of a group: what it holds, and when it was signed, at most when it came.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Heard {
     pub member: Member,
     pub joined: u64,
     pub held: Vec<Seqs>,
-    pub shown: Vec<Seqs>,
     pub at: u64,
 }
 
@@ -209,7 +207,6 @@ impl State {
             relay: self.home.clone(),
             held: list(|a| &a.servable),
             sealed,
-            shown: list(|a| &a.shown),
             lost: list(|a| &a.lost),
         };
         let body = serde_json::to_vec(&summary)?;
@@ -274,7 +271,6 @@ impl State {
                 }
             }
             self.told(gid, &summary)?;
-            self.events.push(Event::Heard { group: group.clone() });
         }
         self.save(gid)
     }
@@ -565,17 +561,9 @@ impl Node {
             member: st.member_by_key(gid, &heard.summary.member.0),
             joined: heard.summary.joined,
             held: heard.summary.held.clone(),
-            shown: heard.summary.shown.clone(),
             at: heard.summary.time.min(heard.at),
         });
         Ok(heard.collect())
-    }
-
-    /// The other members not connected that no summary was heard from for H: away.
-    pub fn away(&self, gid: &[u8]) -> Result<Vec<Member>> {
-        let (heard, since, me, online) = (self.heard(gid)?, self.carried_since(gid)?, self.key(), self.online(gid)?);
-        let away = |m: &Member| m.key != me && !online.iter().any(|o| o.key == m.key) && !heard.iter().any(|h| h.member.key == m.key && h.at >= since);
-        Ok(self.members(gid)?.into_iter().filter(away).collect())
     }
 
     /// This session's held messages no other member that may have them holds yet: they need this session until one does.
@@ -596,18 +584,13 @@ impl Node {
         Ok(unkept)
     }
 
-    /// Marks held messages of the group shown, as its client printed or displayed them: its summaries carry them, and
-    /// its next messages depend on them.
+    /// Marks held messages of the group shown, as its client printed or displayed them: its next messages depend on them.
     pub fn mark_shown(&self, gid: &[u8], ids: &[Bytes]) -> Result<()> {
         let mut st = self.inner.lock();
         for id in ids {
             let Some(record) = st.record(gid, &id.0)? else { continue };
-            let g = st.group_mut(gid)?;
-            if let Some(author) = g.author_mut(&record.header.author.0, record.header.joined)
-                && !author.shown.contains(record.header.seq)
-            {
+            if let Some(author) = st.group_mut(gid)?.author_mut(&record.header.author.0, record.header.joined) {
                 author.shown.insert(record.header.seq);
-                g.changed = true;
             }
         }
         st.save(gid)
@@ -619,11 +602,6 @@ impl Node {
         let Some(record) = st.record(gid, id)? else { return Ok(false) };
         let g = st.group(gid)?;
         Ok(g.author(&record.header.author.0, record.header.joined).is_some_and(|a| a.shown.contains(record.header.seq)))
-    }
-
-    /// H ago.
-    fn carried_since(&self, gid: &[u8]) -> Result<u64> {
-        Ok(now().saturating_sub(days(self.settings(gid)?.carry)))
     }
 }
 

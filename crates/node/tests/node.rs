@@ -1355,7 +1355,6 @@ async fn list(hand: &mut Hand, mls: &Mls, gid: &Bytes, joined: u64, epoch: u64, 
         relay: None,
         held: listed.clone(),
         sealed: listed,
-        shown: Vec::new(),
         lost: Vec::new(),
     };
     let body = serde_json::to_vec(&summary).unwrap();
@@ -1602,9 +1601,9 @@ async fn two_asks_with_one_key_package_add_it_once() {
     assert_eq!(alice.node.epoch(&gid.0).unwrap(), epoch + 1, "one Add");
 }
 
-/// A member online is not away, though not heard from yet; a member's adder keeps its key once gone.
+/// A member connected is online, though not heard from yet; a member's adder keeps its key once gone.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_member_online_is_not_away() {
+async fn a_member_connected_is_online() {
     let relay = relay().await;
     let dir = folder("online");
     std::fs::create_dir_all(&dir).unwrap();
@@ -1625,11 +1624,9 @@ async fn a_member_online_is_not_away() {
     // Alice comes back; Carol, by hand, connects and says nothing.
     let alice = stored(&relay, &alice_db).await;
     eventually("Alice has Carol's Add", || alice.node.members(&gid.0).unwrap().len() == 3).await;
-    assert!(alice.node.away(&gid.0).unwrap().iter().any(|m| m.key == carol_key), "never heard from");
     let key = lmk_node::iroh_key(&SqliteProvider::open(&carol_db).unwrap()).unwrap();
     let _carol = hand(&relay, key, &alice.node).await;
     eventually("Carol is online", || alice.node.online(&gid.0).unwrap().iter().any(|m| m.key == carol_key)).await;
-    assert!(!alice.node.away(&gid.0).unwrap().iter().any(|m| m.key == carol_key), "online, though not heard from");
 
     alice.node.remove(&gid.0, &bob.node.key().0).await.unwrap();
     let carol = alice.node.members(&gid.0).unwrap().into_iter().find(|m| m.key == carol_key).unwrap();
@@ -1696,10 +1693,10 @@ async fn three_members_chat_in_causal_order() {
     assert_eq!(taken.iter().find(|m| m.id == b3).unwrap().reply_to, Some(a3.clone()));
     assert!(taken.iter().all(|m| m.index >= 1 && m.missing.is_empty() && !m.late));
 
-    // Heard, Alice sees what Bob holds and showed.
+    // Heard, Alice sees what Bob holds.
     let alice_key = alice.node.key();
-    eventually("Alice hears that Bob showed a1", || {
-        alice.node.heard(&gid.0).unwrap().iter().any(|h| h.member.key == bob.node.key() && h.shown.iter().any(|s| s.key == alice_key && s.seqs.contains(first.seq)))
+    eventually("Alice hears that Bob holds a1", || {
+        alice.node.heard(&gid.0).unwrap().iter().any(|h| h.member.key == bob.node.key() && h.held.iter().any(|s| s.key == alice_key && s.seqs.contains(first.seq)))
     })
     .await;
     bob.node.shutdown().await.unwrap();
@@ -2489,7 +2486,7 @@ async fn a_summary_without_relay_keeps_the_hint() {
 
     // Bob's stopped session, standing in for itself, signs a newer summary that names no relay.
     let (iroh, mls) = member_of(&bob_db);
-    let shown = seqs(&Bytes(mls.key().to_vec()), joined, &[1]);
+    let held = seqs(&Bytes(mls.key().to_vec()), joined, &[1]);
     let summary = Summary {
         group: gid.clone(),
         member: Bytes(mls.key().to_vec()),
@@ -2498,16 +2495,15 @@ async fn a_summary_without_relay_keeps_the_hint() {
         time: lmk_node::now(),
         epoch: alice.node.epoch(&gid.0).unwrap(),
         relay: None,
-        held: Vec::new(),
+        held: vec![held.clone()],
         sealed: Vec::new(),
-        shown: vec![shown.clone()],
         lost: Vec::new(),
     };
     let body = serde_json::to_vec(&summary).unwrap();
     let sig = mls.sign(&[SUMMARY, &body].concat());
     let mut bob_hand = hand(&relay, iroh, &alice.node).await;
     bob_hand.send(&Frame::Summaries { group: gid.clone(), items: vec![Signed { body: Bytes(body), sig: Bytes(sig) }] }).await;
-    eventually("Alice takes the summary", || alice.node.heard(&gid.0).unwrap().iter().any(|heard| heard.shown == [shown.clone()])).await;
+    eventually("Alice takes the summary", || alice.node.heard(&gid.0).unwrap().iter().any(|heard| heard.held == [held.clone()])).await;
     assert_eq!(alice.node.hint(&bob_iroh), Some(url));
 }
 
@@ -2529,7 +2525,7 @@ async fn a_summary_relay_must_be_https() {
     drop(bob);
 
     let (iroh, mls) = member_of(&bob_db);
-    let shown = seqs(&Bytes(mls.key().to_vec()), joined, &[1]);
+    let held = seqs(&Bytes(mls.key().to_vec()), joined, &[1]);
     let summary = Summary {
         group: gid.clone(),
         member: Bytes(mls.key().to_vec()),
@@ -2538,16 +2534,15 @@ async fn a_summary_relay_must_be_https() {
         time: lmk_node::now(),
         epoch: alice.node.epoch(&gid.0).unwrap(),
         relay: Some("http://127.0.0.1:1".into()),
-        held: Vec::new(),
+        held: vec![held.clone()],
         sealed: Vec::new(),
-        shown: vec![shown.clone()],
         lost: Vec::new(),
     };
     let body = serde_json::to_vec(&summary).unwrap();
     let sig = mls.sign(&[SUMMARY, &body].concat());
     let mut bob_hand = hand(&relay, iroh, &alice.node).await;
     bob_hand.send(&Frame::Summaries { group: gid.clone(), items: vec![Signed { body: Bytes(body), sig: Bytes(sig) }] }).await;
-    eventually("Alice takes the summary", || alice.node.heard(&gid.0).unwrap().iter().any(|heard| heard.shown == [shown.clone()])).await;
+    eventually("Alice takes the summary", || alice.node.heard(&gid.0).unwrap().iter().any(|heard| heard.held == [held.clone()])).await;
     assert_eq!(alice.node.hint(&bob_iroh), Some(url));
 }
 
@@ -2572,7 +2567,7 @@ async fn a_hint_is_saved_when_the_relay_changes() {
     drop(bob);
 
     let (iroh, mls) = member_of(&bob_db);
-    let shown = seqs(&Bytes(mls.key().to_vec()), joined, &[1]);
+    let held = seqs(&Bytes(mls.key().to_vec()), joined, &[1]);
     let summary = Summary {
         group: gid.clone(),
         member: Bytes(mls.key().to_vec()),
@@ -2581,16 +2576,15 @@ async fn a_hint_is_saved_when_the_relay_changes() {
         time: lmk_node::now(),
         epoch: alice.node.epoch(&gid.0).unwrap(),
         relay: Some(url.clone()),
-        held: Vec::new(),
+        held: vec![held.clone()],
         sealed: Vec::new(),
-        shown: vec![shown.clone()],
         lost: Vec::new(),
     };
     let body = serde_json::to_vec(&summary).unwrap();
     let sig = mls.sign(&[SUMMARY, &body].concat());
     let mut bob_hand = hand(&relay, iroh, &alice.node).await;
     bob_hand.send(&Frame::Summaries { group: gid.clone(), items: vec![Signed { body: Bytes(body), sig: Bytes(sig) }] }).await;
-    eventually("Alice takes the summary", || alice.node.heard(&gid.0).unwrap().iter().any(|heard| heard.shown == [shown.clone()])).await;
+    eventually("Alice takes the summary", || alice.node.heard(&gid.0).unwrap().iter().any(|heard| heard.held == [held.clone()])).await;
     assert_eq!(hint_records(&alice_db), saved);
 }
 

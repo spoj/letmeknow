@@ -119,11 +119,7 @@ impl Inner {
         st.moved(gid, &applied, ended)?;
         st.scrub = true;
         st.gate = true;
-        let gone = applied.gone;
-        if !gone {
-            st.events.push(Event::Heard { group: Bytes(gid.to_vec()) });
-        }
-        let core::Applied { added, removed, .. } = applied;
+        let core::Applied { added, removed, gone, .. } = applied;
         for member in &removed {
             st.unhear(gid, &member.key)?;
         }

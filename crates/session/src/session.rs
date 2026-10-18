@@ -386,17 +386,11 @@ impl Session {
         Ok(())
     }
 
-    /// A chat message; this session's own says who holds it and who was shown it.
+    /// A chat message.
     fn read(&self, id: &str) -> Result<Value> {
         let message = self.find(id)?;
-        let gid = message.group.clone();
-        let mut item = self.message_item(self.message_event(&message)?)?;
-        if message.sender.key == self.client.node().key() {
-            let (receipts, describer) = (self.client.receipts(&gid)?, self.client.describer(&gid)?);
-            item["held_by"] = json!(receipts.iter().filter(|r| r.holds(&message)).map(|r| describer.describe(&r.member)).collect::<Vec<_>>());
-            item["read_by"] = json!(receipts.iter().filter(|r| r.showed(&message)).map(|r| describer.describe(&r.member)).collect::<Vec<_>>());
-        }
-        self.show(&gid, &message.id.0)?;
+        let item = self.message_item(self.message_event(&message)?)?;
+        self.show(&message.group, &message.id.0)?;
         Ok(self.compact(item))
     }
 

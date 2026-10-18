@@ -152,10 +152,6 @@ pub enum Event {
     Message(Message),
     /// Losses: this session's own, and those members' summaries tell, each seq once.
     Lost(Lost),
-    /// Receipts changed: a member's summary, or a commit applied.
-    Heard {
-        group: Bytes,
-    },
     Warning {
         group: Option<Bytes>,
         text: String,
@@ -166,7 +162,7 @@ impl Event {
     /// The group an event concerns, if one.
     pub fn group(&self) -> Option<&Bytes> {
         match self {
-            Event::Joined { group, .. } | Event::Left { group, .. } | Event::Removed { group, .. } | Event::Heard { group } => Some(group),
+            Event::Joined { group, .. } | Event::Left { group, .. } | Event::Removed { group, .. } => Some(group),
             Event::Message(message) => Some(&message.group),
             Event::Lost(lost) => Some(&lost.group),
             Event::Warning { group, .. } => group.as_ref(),
