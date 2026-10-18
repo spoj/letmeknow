@@ -62,11 +62,16 @@ pub struct SqliteProvider {
 // only ever used from one thread at a time: the node holds the provider under a lock.
 unsafe impl Send for SqliteProvider {}
 
+/// How long a write waits for another connection to the file, as the session's: a step holds its transaction while it
+/// works, and a checkpoint holds off writers, both slow on a slow disk.
+pub const BUSY: std::time::Duration = std::time::Duration::from_secs(60);
+
 const PRAGMAS: &str = "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA fullfsync = ON; PRAGMA secure_delete = ON;";
 
 impl SqliteProvider {
     pub fn open(path: &Path) -> Result<Self> {
         let mut connection = Connection::open(path)?;
+        connection.busy_timeout(BUSY)?;
         connection.execute_batch(PRAGMAS)?;
         SqliteStorageProvider::<Cbor, &mut Connection>::new(&mut connection).run_migrations()?;
         connection.execute_batch("CREATE TABLE IF NOT EXISTS lmk (key BLOB PRIMARY KEY, value BLOB NOT NULL)")?;

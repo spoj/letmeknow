@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS taken (id BLOB PRIMARY KEY, gid BLOB NOT NULL, at INT
 
 pub fn open(path: &Path) -> Result<Connection> {
     let db = Connection::open(path)?;
+    db.busy_timeout(lmk_core::provider::BUSY)?;
     db.execute_batch(SCHEMA)?;
     Ok(db)
 }
