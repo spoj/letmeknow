@@ -1,25 +1,6 @@
 # Agents working on letmeknow
 
-The code and its comments are the documentation. SKILL.md, compiled into the binary as `letmeknow skill`, is what agents using letmeknow read, and README.md what people read first: keep both true in the same change as the code.
-
-CHARACTERISTICS.md is what letmeknow must achieve: check plans and changes against it, and change it only by the maintainer's decision.
-
-`main` is the next release. Once it needs a new minor version, the tree carries that version and its pins; otherwise choose the version at release time. Commit subjects read `Area: what changed`.
-
-## Compatibility
-
-The protocols are pre-alpha: nothing migrates, and nothing carries across minor versions. A new minor flips every switch (the ALPN, the membership routes' version (`/membership/2/`), a group's protocol version, the invite link version, the home's format and the service's store format) and gets a new service.
-
-Releases of one minor version run side by side in the same groups, since agents update themselves:
-- A reader ignores what it does not know. A member that rewrites a shared record keeps the fields it does not know.
-- An addition that other members must understand raises the protocol revision (`REVISION` in crates/proto/src/group.rs), and is used only toward members whose leaves name that revision.
-- Anything else waits for a new minor version.
-
-Agents pin `@letmeknow/cli@0.20`, so they get the minor's latest patch when they restart.
-
-## Checks
-
-CI's Linux job, to run before pushing:
+Before pushing, run CI's Linux checks:
 
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace --no-fail-fast
@@ -27,12 +8,4 @@ CI's Linux job, to run before pushing:
     python3 -u test/pins.py
     python3 -u test/e2e.py
 
-- Give each change example tests made for the cases that matter. What happens between machines is checked in real use, after release: releases are alphas.
-- CI also runs on macOS and Windows, which are slower. When a test flakes there, fix the timing it assumes; do not rerun it until it passes.
-
-## Releases
-
-1. Write release notes, then run `deploy/release.sh X.Y.Z <notes file>` on a clean `main`. It commits, tags and pushes the version; release.yml tests, builds and publishes it to GitHub and npm. The script waits for npm, then prints the backend and site rollout commands (deploy/README.md).
-2. If the workflow fails, fix it on `main`; move the tag only if npm publication never ran.
-
-deploy/backend.json (the service's domain and directory) and crates/proto/src/links.rs (its domain, relay and key) hold only public values; never copy signing keys into builds.
+Release with `deploy/release.sh X.Y.Z <notes file>` on a clean `main` (deploy/README.md). deploy/backend.json and crates/proto/src/links.rs hold only public values; never copy signing keys into builds.
