@@ -20,9 +20,6 @@ pub enum Request {
         #[arg(long, default_value_t = 7, conflicts_with = "group")]
         #[serde(default = "carry")]
         carry: u32,
-        /// The new group's membership service [default: listen's]
-        #[arg(long, conflicts_with = "group")]
-        membership: Option<String>,
         /// Only the identity with this id, as `members` shows it, can redeem the link
         #[arg(long, value_name = "IDENTITY")]
         to: Option<String>,
@@ -97,12 +94,7 @@ pub enum Request {
 #[serde(rename_all = "snake_case")]
 pub enum IdentityOp {
     /// Start an identity with this device as its first device; a device is on one identity at a time
-    Create {
-        name: String,
-        /// The membership service that keeps its public log [default: listen's]
-        #[arg(long)]
-        membership: Option<String>,
-    },
+    Create { name: String },
     /// Make a device link, valid for 10 minutes, for another device to join this identity
     Invite {
         /// Also show the link as a QR code, on stderr

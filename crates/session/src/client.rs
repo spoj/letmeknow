@@ -20,7 +20,7 @@ use lmk_core::provider::Provider;
 use lmk_node::identity::{ADD_VALID, Add, Identity, Presence, SessionGroup};
 use lmk_node::{Event, Heard, INVITE_VALID, Member, Message, Node};
 use lmk_proto::Bytes;
-use lmk_proto::group::{Attachment, CHAT, Certificate, ChatMessage, IDENTITY, How, IdentityRef, PROTOCOL, Service, Settings, UPDATE};
+use lmk_proto::group::{Attachment, CHAT, Certificate, ChatMessage, How, IdentityRef, PROTOCOL, Service, Settings, UPDATE};
 use lmk_proto::links::{FileLink, Invite};
 use lmk_proto::peer::Seqs;
 use n0_future::time::{Duration, timeout};
@@ -47,12 +47,6 @@ pub fn message_id(hex_id: &str) -> Result<[u8; 32]> {
 pub fn letmeknow_dev() -> Service {
     let key = hex::decode(lmk_proto::links::MEMBERSHIP_KEY).unwrap();
     Service::Serve { key: Bytes(key), domain: lmk_proto::links::DOMAIN.into(), rest: Default::default() }
-}
-
-/// A membership service from its address: its domain, which only letmeknow.dev's is for now.
-pub fn service(address: &str) -> Result<Service> {
-    ensure!(address == lmk_proto::links::DOMAIN, "a membership service is named by its domain, such as {}: --membership <domain>, not {address}", lmk_proto::links::DOMAIN);
-    Ok(letmeknow_dev())
 }
 
 pub struct Config {
@@ -359,7 +353,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             return remote.request(request).await;
         }
         match request {
-            Request::Invite { group, name, carry, membership, to, qr: _ } => self.invite(group, name, carry, membership, to).await,
+            Request::Invite { group, name, carry, to, qr: _ } => self.invite(group, name, carry, to).await,
             Request::Join { target } => self.join(target).await,
             Request::Add { target, group } => self.add(&target, group).await,
             Request::Deliver { add } => {
@@ -394,13 +388,13 @@ impl<P: Provider + Send + 'static> Client<P> {
 
     // Groups.
 
-    async fn invite(&self, group: Option<String>, name: Option<String>, carry: u32, membership: Option<String>, to: Option<String>) -> Result<Value> {
+    async fn invite(&self, group: Option<String>, name: Option<String>, carry: u32, to: Option<String>) -> Result<Value> {
         let to = to.map(|to| URL_SAFE_NO_PAD.decode(&to).ok().filter(|id| id.len() == 32).map(Bytes).context("--to takes an identity's id, as `members` shows it")).transpose()?;
         let mut answer = json!({ "expires_in": INVITE_VALID / 1000 });
         let gid = match group {
             Some(group) => self.resolve(Some(group))?,
             None => {
-                let membership = membership.map(|m| service(&m)).transpose()?.unwrap_or(self.inner.config.membership.clone());
+                let membership = self.inner.config.membership.clone();
                 let settings = Settings { protocol: PROTOCOL, kind: CHAT.into(), name: name.unwrap_or_default(), carry, update: UPDATE, membership, public: None, rest: Default::default() };
                 self.inner.node.create(settings, self.speaking_as().await?)?
             }
@@ -602,26 +596,6 @@ impl<P: Provider + Send + 'static> Client<P> {
         }
     }
 
-    /// Whether a group is a chat.
-    pub fn chats(&self, gid: &Bytes) -> bool {
-        self.inner.node.settings(&gid.0).is_ok_and(|s| s.kind == CHAT)
-    }
-
-    /// The chat a request acts on: the one it names, or else the client's one chat.
-    pub fn chat(&self, group: Option<String>) -> Result<Bytes> {
-        if group.is_some() {
-            let gid = self.resolve(group)?;
-            ensure!(self.chats(&gid), "{} is not a chat", b64(&gid.0));
-            return Ok(gid);
-        }
-        let found: Vec<Bytes> = self.inner.node.groups().into_iter().filter(|gid| self.chats(gid)).collect();
-        match &found[..] {
-            [gid] => Ok(gid.clone()),
-            [] => bail!("this session is in no chat; create one with `invite`, or join one with `join`"),
-            _ => bail!("this session is in several chats; pass --group"),
-        }
-    }
-
     // Messages.
 
     /// Sends a chat message, a reply to `reply_to` if given; returns its id and the answer to `send`.
@@ -778,8 +752,8 @@ impl<P: Provider + Send + 'static> Client<P> {
                 let by = self.describe(&group, &by)?;
                 self.emit(ClientEvent::Settings { group, settings, by });
             }
-            Event::Message(message) if message.payload["type"] == "message" && self.chats(&message.group) => {
-                // Chat holds the file a message attaches.
+            Event::Message(message) if message.payload["type"] == "message" => {
+                // A session holds the file a message attaches.
                 if let Some(link) = message.payload["attachment"]["link"].as_str() {
                     node.hold(&message.group.0, &[link.to_owned()])?;
                 }
@@ -791,9 +765,9 @@ impl<P: Provider + Send + 'static> Client<P> {
                 let (seq, late, reply_outside) = (message.seq, message.late, message.reply_outside);
                 self.emit(ClientEvent::Message { group: message.group, id, from, seq, missing, late, reply_outside, reply_to, payload: message.payload });
             }
-            // No other kind holds messages.
+            // The others are the node's: invites and leaves.
             Event::Message(_) => {}
-            // A chat has no live payloads, and an identity group's are the identity kind's.
+            // A chat has no live payloads; an identity group's, on the device's node, are the identity kind's.
             Event::Live { .. } | Event::Synced { .. } => {}
             Event::Lost(lost) => {
                 let describer = self.describer(&lost.group)?;
@@ -845,17 +819,14 @@ impl<P: Provider + Send + 'static> Client<P> {
         Ok(describer.members.iter().map(|m| describer.describe(m)).collect())
     }
 
-    /// This client's groups but identity groups, as its identity's devices hear of them: each one's id and name, and its
-    /// other members as they show.
+    /// This client's groups, as its identity's devices hear of them: each one's id and name, and its other members as
+    /// they show.
     pub fn session_groups(&self) -> Result<Vec<SessionGroup>> {
         let node = &self.inner.node;
         let mut groups = Vec::new();
         for gid in node.groups() {
             // None for a group left since it was listed.
             let Ok(settings) = node.settings(&gid.0) else { continue };
-            if settings.kind == IDENTITY {
-                continue;
-            }
             let members = self.described_members(&gid)?.into_iter().filter(|m| !m.you);
             let members = members.map(|m| Ok(shown(&serde_json::to_value(m)?))).collect::<Result<_>>()?;
             groups.push(SessionGroup { session: None, group: gid, name: settings.name, members });
@@ -881,9 +852,6 @@ impl<P: Provider + Send + 'static> Client<P> {
         let node = &self.inner.node;
         for gid in node.groups() {
             let refresh = async {
-                if node.settings(&gid.0)?.kind == IDENTITY {
-                    return Ok(());
-                }
                 let own = node.members(&gid.0)?.into_iter().find(|m| m.key == node.key()).and_then(|m| m.identity);
                 let Some(own) = own else { return Ok(()) };
                 // None is published before the device manager first runs.
@@ -944,9 +912,8 @@ impl<P: Provider + Send + 'static> Client<P> {
     async fn identity(&self, op: IdentityOp) -> Result<Value> {
         let devices = self.devices()?;
         match op {
-            IdentityOp::Create { name, membership } => {
-                let membership = membership.map(|m| service(&m)).transpose()?.unwrap_or(self.inner.config.membership.clone());
-                let identity = devices.create(&name, membership).await?;
+            IdentityOp::Create { name } => {
+                let identity = devices.create(&name, self.inner.config.membership.clone()).await?;
                 Ok(json!({ "identity": identity.id, "name": name }))
             }
             IdentityOp::Invite { .. } => {

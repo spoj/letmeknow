@@ -76,12 +76,12 @@ For: simplicity.
 
 - `MemoryProvider` and the `Provider` trait go, and with them the `P` generics across core, node and session (about 200 mentions), `mod native`, and `openmls_memory_storage`. Tests open SQLite in memory, or in their folders where they restart; the core tests that compare `records()` before and after compare the database's rows.
 
-## 10. Options and checks with no use
+## 10. Options and checks with no use (done)
 
 For: simplicity.
 
 - `invite --membership` and `identity create --membership` take only letmeknow.dev's domain (`client::service`): groups and identities use the session's service, and the flags go.
-- A session's node holds chats only: a group link cannot admit to an identity group, and device links join the device's node. `Client::chats`, `chat` and their checks go; `resolve` serves.
+- A session's node holds chats only: a group link cannot admit to an identity group, and device links join the device's node. `Client::chats`, `chat` and their checks go, with `session_groups`' and `refresh_identity`'s skips of identity groups; `resolve` serves.
 - Comments from the kinds: lib.rs's module doc (a state link for joiners), `Event`'s ("of the group's kind", `Synced` comparing "the kind's state"), the client's ("No other kind holds messages"), ci.yml's "client core".
 
 ## 11. Delivery measured (from 0.20's step 5)

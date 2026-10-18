@@ -26,7 +26,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --no-fail-fast
-      # The client core, and the binary released for Termux, build for Android, with the runner's NDK.
+      # The binary released for Termux builds for Android, with the runner's NDK.
       - if: runner.os == 'Linux'
         run: |
           rustup target add aarch64-linux-android

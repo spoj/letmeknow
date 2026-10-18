@@ -206,9 +206,6 @@ impl Session {
         }
         session.client.start();
         for gid in groups {
-            if !session.client.chats(&gid) {
-                continue;
-            }
             // What was delivered after the last message shown, as when the session stopped before printing it.
             let (node, me) = (session.client.node(), session.client.node().key());
             let mut unshown = Vec::new();
@@ -542,7 +539,7 @@ impl Session {
         attach: Option<(String, String)>,
         text: String,
     ) -> Result<(Bytes, Chat)> {
-        let gid = self.client.chat(group)?;
+        let gid = self.client.resolve(group)?;
         let reply_to: Option<[u8; 32]> = match reply_to {
             Some(id) => {
                 let target = self.find(&id)?;

@@ -124,7 +124,7 @@ impl Race {
         }
         a.inner.caught_up(&gid.0).await.unwrap();
         a.read_public(&identity).await.unwrap();
-        // Keep A's service client, but no peer pump, follow, polling or automatic duties can apply C's later commit.
+        // Keep A's service client, but no peer pump, upkeep or automatic duties can apply C's later commit.
         let tasks: Vec<_> = a.inner.tasks.lock().unwrap().drain(..).collect();
         for task in &tasks { task.abort(); }
         for task in tasks { let _ = task.await; }

@@ -1,9 +1,9 @@
 //! One member's session over lmk-core, lmk-net and lmk-membership: its groups and their logs of commits, its held
 //! messages and files, the invites it shares and the joiners it admits, and its members' identities: their public logs,
 //! against which their credentials' certificates are checked. Held messages travel between members and are delivered
-//! in causal order; commits keep them, by their cuts. A group's kind sees its content through the channels here (held
-//! messages as delivered, live ones, files, and a state link for joiners), and nothing of the rest; the core reads only
-//! its own payloads (`Control`). The identity kind (`devices`) is built on those channels. It stores everything through
+//! in causal order; commits keep them, by their cuts. Chats and identities see a group's content through the channels
+//! here (held messages as delivered, live ones, and files), and nothing of the rest; the core reads only its own
+//! payloads (`Control`). Identities (`identity`) are built on those channels. It stores everything through
 //! the core's `Provider`, one transaction per step (`Step`): nothing a step produces leaves the node before its
 //! transaction commits.
 
@@ -215,18 +215,18 @@ pub enum Event {
         settings: Settings,
         by: Member,
     },
-    /// A held payload of the group's kind, delivered, in causal order; never one of this session's own.
+    /// A held payload, delivered, in causal order; never one of this session's own.
     Message(Message),
     /// Losses: this session's own, and those members' summaries tell, each seq once.
     Lost(Lost),
-    /// A live payload of the group's kind: not held.
+    /// A live payload: not held.
     Live {
         group: Bytes,
         sender: Member,
         payload: Value,
     },
-    /// A neighbour's `hello` shows the same head of the group's log as this session's: a time to compare the kind's
-    /// state.
+    /// A neighbour's `hello` shows the same head of the group's log as this session's: a time to tell it what is not
+    /// held, as devices tell which of their sessions run.
     Synced {
         group: Bytes,
         member: Member,
