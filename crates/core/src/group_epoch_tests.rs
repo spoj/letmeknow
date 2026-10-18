@@ -187,7 +187,7 @@ fn envelopes_require_exact_context_framing_and_padding() {
     let pending = b.commit(Change { cut, ..Change::default() });
     let original = b.provider.rows();
     let wrong = wire(&k, &associated, &nonzero_padding);
-    assert!(matches!(b.group.as_mut().unwrap().judge(&b.provider, &wrong).unwrap(), Verdict::Skipped { lost: false, .. }));
+    assert!(matches!(b.group.as_mut().unwrap().judge(&b.provider, &wrong).unwrap(), Verdict::Skipped { .. }));
     assert!(b.group.as_mut().unwrap().apply(&b.provider, &wrong).is_err());
     assert_eq!(b.group.as_ref().unwrap().posted().unwrap(), pending.entry);
     assert_eq!(b.provider.rows(), original);

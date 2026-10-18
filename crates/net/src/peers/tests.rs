@@ -393,7 +393,7 @@ fn the_commit_wait_dials_four_holders_at_a_time() {
     for n in 1..=6 {
         p.summary(&id(), heard(n, 1, 0, vec![seqs(1, &[(10 - u64::from(n), 9)])]), Some(key(n)));
     }
-    assert_eq!(p.wait(&id(), &lacking, 0, 0), Decision::Wait);
+    assert!(p.wait(&id(), &lacking, 0, 0));
     assert_eq!(dials(&p.poll(0)), vec![key(5), key(6), key(4), key(3)]);
 }
 
@@ -475,7 +475,7 @@ fn a_wanted_seq_held_only_by_an_unconnected_member_is_dialed() {
 fn wait_applies_when_nothing_is_lacking() {
     let mut p = peers();
     p.group(id(), own(1, &[1]), 0);
-    assert_eq!(p.wait(&id(), &[], 0, 0), Decision::Apply);
+    assert!(!p.wait(&id(), &[], 0, 0));
 }
 
 /// A wait holds while a connected holder has not been asked for a lacking seq, and asks for it at once.
@@ -486,7 +486,7 @@ fn wait_holds_while_a_connected_holder_is_untried() {
     p.connect(key(1), gs(), false, 0);
     let lacking = vec![seqs(1, &[(5, 5)])];
     p.summary(&id(), heard(1, 1, 0, lacking.clone()), Some(key(1)));
-    assert_eq!(p.wait(&id(), &lacking, 0, 1_000), Decision::Wait);
+    assert!(p.wait(&id(), &lacking, 0, 1_000));
     assert_eq!(wants(&p.poll(1_000)), vec![(key(1), lacking.clone())]);
 }
 
@@ -498,10 +498,10 @@ fn wait_loses_once_every_holder_is_struck() {
     p.connect(key(1), gs(), false, 0);
     let lacking = vec![seqs(1, &[(5, 5)])];
     p.summary(&id(), heard(1, 1, 0, lacking.clone()), Some(key(1)));
-    assert_eq!(p.wait(&id(), &lacking, 0, 0), Decision::Wait);
+    assert!(p.wait(&id(), &lacking, 0, 0));
     p.poll(0);
     p.frame(&key(1), &Frame::Held { group: id(), items: vec![], answers: Some(lacking.clone()) }, 100);
-    assert_eq!(p.wait(&id(), &lacking, 0, HEAR), Decision::Lose(lacking.clone()));
+    assert!(!p.wait(&id(), &lacking, 0, HEAR));
 }
 
 /// A wait holds `HEAR` after the member came online though no summary shows a holder yet: a member back from offline
@@ -512,12 +512,12 @@ fn a_wait_holds_for_summaries_after_coming_online() {
     p.group(id(), own(1, &[1]), 0);
     let lacking = vec![seqs(1, &[(5, 5)])];
     p.connect(key(1), gs(), false, 1_000);
-    assert_eq!(p.wait(&id(), &lacking, 0, 1_000), Decision::Wait);
+    assert!(p.wait(&id(), &lacking, 0, 1_000));
     p.summary(&id(), heard(1, 1, 1_500, lacking.clone()), Some(key(1)));
-    assert_eq!(p.wait(&id(), &lacking, 0, 1_000 + HEAR), Decision::Wait, "a holder is untried");
+    assert!(p.wait(&id(), &lacking, 0, 1_000 + HEAR), "a holder is untried");
     p.disconnect(&key(1));
     p.dialed(&key(1), false, 1_000 + HEAR);
-    assert_eq!(p.wait(&id(), &lacking, 0, 1_000 + HEAR), Decision::Lose(lacking.clone()));
+    assert!(!p.wait(&id(), &lacking, 0, 1_000 + HEAR));
 }
 
 /// A wait gives up two minutes after the commit was read, even with an untried holder.
@@ -528,8 +528,8 @@ fn wait_gives_up_two_minutes_after_the_commit_was_read() {
     p.connect(key(1), gs(), false, 0);
     let lacking = vec![seqs(1, &[(5, 5)])];
     p.summary(&id(), heard(1, 1, 0, lacking.clone()), Some(key(1)));
-    assert_eq!(p.wait(&id(), &lacking, 0, WAIT - 1), Decision::Wait);
-    assert_eq!(p.wait(&id(), &lacking, 0, WAIT), Decision::Lose(lacking.clone()));
+    assert!(p.wait(&id(), &lacking, 0, WAIT - 1));
+    assert!(!p.wait(&id(), &lacking, 0, WAIT));
 }
 
 /// A holder whose backoff has ended is untried again: a wait that starts then dials it.
@@ -540,8 +540,8 @@ fn a_holder_past_its_backoff_is_dialed_when_the_wait_starts() {
     let lacking = vec![seqs(1, &[(5, 5)])];
     p.summary(&id(), heard(1, 1, 0, lacking.clone()), Some(key(1)));
     p.dialed(&key(1), false, HEAR - 1);
-    assert_eq!(p.wait(&id(), &lacking, 0, HEAR), Decision::Lose(lacking.clone()), "backing off");
-    assert_eq!(p.wait(&id(), &lacking, 31_000, 31_000), Decision::Wait);
+    assert!(!p.wait(&id(), &lacking, 0, HEAR), "backing off");
+    assert!(p.wait(&id(), &lacking, 31_000, 31_000));
     assert_eq!(dials(&p.poll(31_000)), vec![key(1)]);
 }
 

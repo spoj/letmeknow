@@ -16,7 +16,7 @@ mod reading;
 mod sending;
 mod tasks;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -321,9 +321,7 @@ pub(crate) struct State {
     /// The logs this session follows, by id.
     logs: BTreeMap<Vec<u8>, logs::Log>,
     peers: Peers,
-    /// The peers connected now, and the groups the gate admits each to.
-    served: BTreeMap<EndpointId, BTreeSet<Bytes>>,
-    /// The rosters changed since `served` was worked out.
+    /// The rosters changed since the groups the gate admits each connected peer to were worked out.
     gate: bool,
     /// This endpoint's home relay, as net last reported it.
     home: Option<String>,

@@ -214,8 +214,7 @@ pub async fn listen(
     let format = home.join("format");
     let found = std::fs::read_to_string(&format).ok().map(|found| found.trim().to_owned());
     match found.as_deref() {
-        Some("9") => {}
-        None if !home.join("device.json").exists() => {}
+        Some("9") | None => {}
         Some("8") => bail!(
             "{home} holds state that letmeknow 0.19 wrote (format 8), which this one cannot read: to keep using it, run `npx -y @letmeknow/cli@0.19 --home {home} listen`, or use another --home for this one",
             home = home.display()

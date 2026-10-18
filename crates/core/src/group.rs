@@ -254,11 +254,7 @@ pub enum Verdict {
     },
     /// A commit from this session's own leaf, signed with its key, that this session did not make: its state was copied.
     Copied,
-    Skipped {
-        reason: String,
-        /// This session's own commit was invalid and was cleared.
-        lost: bool,
-    },
+    Skipped { reason: String },
 }
 
 /// What a commit did.
@@ -268,8 +264,6 @@ pub struct Applied {
     pub by: u32,
     /// This session's own commit.
     pub own: bool,
-    /// This session's pending commit lost the race and was cleared: redo its change.
-    pub lost: bool,
     /// As their KeyPackages show them; `index` is their new leaf.
     pub added: Vec<Member>,
     pub removed: Vec<Member>,
@@ -632,9 +626,9 @@ impl Group {
     /// committer's leaf key, is to be applied (`apply`). What openmls does as it stages a commit leaves no trace.
     pub fn judge(&mut self, provider: &SqliteProvider, entry: &[u8]) -> Result<Verdict> {
         if !self.mls.is_active() {
-            return Ok(Verdict::Skipped { reason: "removed from the group".into(), lost: false });
+            return Ok(Verdict::Skipped { reason: "removed from the group".into() });
         }
-        let skipped = |error: anyhow::Error| Verdict::Skipped { reason: format!("{error:#}"), lost: false };
+        let skipped = |error: anyhow::Error| Verdict::Skipped { reason: format!("{error:#}") };
         let entry = match self.open_entry(provider, entry) {
             Ok(entry) => entry,
             Err(error) => return Ok(skipped(error)),
@@ -645,7 +639,7 @@ impl Group {
                 self.state.posted = None;
                 self.mls.clear_pending_commit(provider.storage())?;
                 self.save(provider)?;
-                return Ok(Verdict::Skipped { reason: error.to_string(), lost: true });
+                return Ok(Verdict::Skipped { reason: error.to_string() });
             }
             return Ok(Verdict::Commit { removes: false, time: self.state.aad.time });
         }
@@ -806,7 +800,6 @@ fn observe(
     Ok(Applied {
         by: by.u32(),
         own,
-        lost: !own && state.posted.is_some(),
         added,
         removed,
         gone: staged.self_removed(),

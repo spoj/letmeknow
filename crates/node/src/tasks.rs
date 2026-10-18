@@ -92,7 +92,6 @@ impl State {
             groups,
             logs,
             peers,
-            served: BTreeMap::new(),
             gate: true,
             home: None,
             hints,

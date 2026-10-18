@@ -310,9 +310,9 @@ fn commit_race() {
     w.post(a.entry);
     w.post(b.entry);
     let read = w.read(&[0, 1, 2]);
-    assert!(matches!(applied(&read[0][0]), Applied { own: true, lost: false, .. }));
-    assert!(matches!(applied(&read[1][0]), Applied { own: false, lost: true, .. }));
-    assert!(matches!(read[1][1].0, Verdict::Skipped { lost: false, .. }));
+    assert!(matches!(applied(&read[0][0]), Applied { own: true, .. }));
+    assert!(matches!(applied(&read[1][0]), Applied { own: false, .. }));
+    assert!(matches!(read[1][1].0, Verdict::Skipped { .. }));
     assert!(matches!(read[2][1].0, Verdict::Skipped { .. }));
     assert!(w.m[1].g().posted().is_none() && w.m[1].g().epoch() == e + 1);
     w.agree(&[0, 1, 2]);
@@ -387,7 +387,7 @@ fn junk_is_skipped() {
         let commits: Vec<bool> = reader.iter().map(is_commit).collect();
         assert_eq!(commits, [false, false, false, false, true, false, false]);
     }
-    assert!(matches!(applied(&read[3][4]), Applied { gone: true, lost: true, .. }));
+    assert!(matches!(applied(&read[3][4]), Applied { gone: true, .. }));
     assert!(!w.m[2].g().active());
     w.agree(&[0, 1, 3]);
     let hi = w.m[1].send("after the junk");
@@ -651,7 +651,7 @@ fn rules_bind_everyone() {
     let wire = unruled(&mut w.m[1], cut, Some(changed));
     w.post(wire);
     let read = w.read(&[0, 1, 2]);
-    assert!(matches!(&read[1][0].0, Verdict::Skipped { lost: true, reason } if reason.contains("GroupContextExtensions")));
+    assert!(matches!(&read[1][0].0, Verdict::Skipped { reason } if reason.contains("GroupContextExtensions")));
     assert!(read.iter().all(|reader| !is_commit(&reader[0])));
     w.agree(&[0, 1, 2]);
 
@@ -677,7 +677,7 @@ fn rules_bind_everyone() {
     w.post(wire);
     let read = w.read(&[0, 1, 2]);
     assert!(read.iter().all(|reader| reader.iter().all(|a| !is_commit(a))));
-    assert!(matches!(&read[2][1].0, Verdict::Skipped { lost: true, reason } if reason.contains("reference")));
+    assert!(matches!(&read[2][1].0, Verdict::Skipped { reason } if reason.contains("reference")));
     w.agree(&[0, 1, 2]);
 }
 

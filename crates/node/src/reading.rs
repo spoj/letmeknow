@@ -6,7 +6,6 @@
 
 use anyhow::{Context, Result};
 use lmk_core::group::{self as core, Verdict};
-use lmk_net::peers::Decision;
 use lmk_proto::Bytes;
 use lmk_proto::clock::corrected;
 use lmk_proto::peer::{Admitted, Frame, Seqs};
@@ -80,7 +79,7 @@ impl Inner {
         let g = st.group(gid)?;
         let carried = time + days(g.mls.settings().carry) >= corrected();
         let lacking = if carried { g.lacking() } else { Vec::new() };
-        let waiting = st.peers.wait(&Bytes(gid.to_vec()), &lacking, read, now) == Decision::Wait;
+        let waiting = st.peers.wait(&Bytes(gid.to_vec()), &lacking, read, now);
         if waiting {
             tracing::debug!("waiting at position {position} for {} memberships' kept messages", lacking.len());
         }
@@ -127,7 +126,7 @@ impl Inner {
         // The members it removed that are connected are told at once: no peer brings them later commits.
         let ended = st.group(gid)?.rec.log.0.clone();
         let (entries, head) = (st.entries(&ended, 0), st.log(&ended)?.head.clone().context("an applied entry without its head")?);
-        for peer in removed.iter().filter_map(|member| crate::endpoint_id(&member.leaf.as_ref()?.key.0)).filter(|peer| st.served.contains_key(peer)) {
+        for peer in removed.iter().filter_map(|member| crate::endpoint_id(&member.leaf.as_ref()?.key.0)).filter(|peer| st.peers.is_connected(peer.as_bytes())) {
             st.out.push(Out::Frame { peer, frame: Frame::Entries { log: Bytes(ended.clone()), entries: entries.clone(), head: head.clone() } });
         }
         self.work.send(Work::Applied { group: gid.to_vec(), by, added, removed, gone }).ok();

@@ -27,7 +27,7 @@ pub const PERIOD: u64 = 300_000;
 pub const TIMEOUT: u64 = 10_000;
 pub const ANSWER: usize = 1 << 20;
 pub const K: usize = 6;
-pub const MESH: usize = 7;
+const MESH: usize = 7;
 pub const REDIAL: u64 = 10_000;
 pub const BACKOFF: u64 = 10_000;
 pub const MAX_BACKOFF: u64 = 600_000;
@@ -78,14 +78,6 @@ pub struct Heard {
     pub signed: Signed,
     pub summary: Summary,
     pub at: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Decision {
-    Wait,
-    Apply,
-    /// Apply, and record these seqs as known losses.
-    Lose(Vec<Seqs>),
 }
 
 pub struct Peers {
@@ -231,7 +223,7 @@ impl Peers {
 
     /// The groups the gate admits the peer to now.
     pub fn served(&mut self, peer: &Key, served: BTreeSet<Bytes>, now: u64) {
-        let Some(c) = self.conns.get_mut(peer) else { return };
+        let Some(c) = self.conns.get_mut(peer).filter(|c| c.served != served) else { return };
         let newly: Vec<Bytes> = served.difference(&c.served).cloned().collect();
         if !newly.is_empty() {
             c.hello = true;
@@ -248,6 +240,20 @@ impl Peers {
                 g.request.take_if(|r| r.holder == *peer);
             }
         }
+    }
+
+    /// The peers connected now.
+    pub fn connected(&self) -> Vec<Key> {
+        self.conns.keys().copied().collect()
+    }
+
+    pub fn is_connected(&self, peer: &Key) -> bool {
+        self.conns.contains_key(peer)
+    }
+
+    /// Whether a peer is connected, and the gate admits it to the group.
+    pub fn serves(&self, peer: &Key, group: &Bytes) -> bool {
+        self.conns.get(peer).is_some_and(|c| c.served.contains(group))
     }
 
     /// A dial `Out::Dial` asked for has ended.
@@ -364,21 +370,15 @@ impl Peers {
         self.groups[group].own.members.len() < MESH
     }
 
-    /// Whether to apply a commit that deletes the keys of an epoch, given the seqs of that epoch the member lacks
-    /// (kept ones of the epoch the commit ends). `read` is when the node read the commit.
-    pub fn wait(&mut self, group: &Bytes, lacking: &[Seqs], read: u64, now: u64) -> Decision {
+    /// Whether to wait before applying a commit that deletes the keys of an epoch, given the seqs of that epoch the
+    /// member lacks (kept ones of the epoch the commit ends): not once the holders were tried. `read` is when the node
+    /// read the commit.
+    pub fn wait(&mut self, group: &Bytes, lacking: &[Seqs], read: u64, now: u64) -> bool {
         let lack = to_set(lacking);
         let since = read.max(self.online);
         let untried = !lack.is_empty() && now < since + WAIT && (now < since + HEAR || self.holder(group, lacking, now));
-        let decision = if lack.is_empty() {
-            Decision::Apply
-        } else if untried {
-            Decision::Wait
-        } else {
-            Decision::Lose(lacking.to_vec())
-        };
-        self.groups.get_mut(group).expect("a group of ours").waiting = if decision == Decision::Wait { lack } else { Set::new() };
-        decision
+        self.groups.get_mut(group).expect("a group of ours").waiting = if untried { lack } else { Set::new() };
+        untried
     }
 
     /// Whether a holder of any of `lacking`, by its summary, may still be asked: connected and not struck, or not

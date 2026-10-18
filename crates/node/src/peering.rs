@@ -134,20 +134,16 @@ impl State {
             return;
         }
         let now = self.tick();
-        let peers: Vec<EndpointId> = self.served.keys().copied().collect();
-        for peer in peers {
-            let served = self.served_to(&peer);
-            if self.served[&peer] != served {
-                self.peers.served(peer.as_bytes(), served.clone(), now);
-                self.served.insert(peer, served);
-            }
+        for peer in self.peers.connected() {
+            let served = self.served_to(&EndpointId::from_bytes(&peer).expect("a connected peer's key"));
+            self.peers.served(&peer, served, now);
         }
     }
 
     /// Whether the gate admits a connected peer to a group.
     pub(crate) fn admitted(&mut self, gid: &[u8], peer: &EndpointId) -> bool {
         self.gate();
-        self.served.get(peer).is_some_and(|served| served.contains(&Bytes(gid.to_vec())))
+        self.peers.serves(peer.as_bytes(), &Bytes(gid.to_vec()))
     }
 
     /// Sends a frame of a group to a peer once the step commits, if the gate lets it go.
@@ -461,14 +457,12 @@ impl Inner {
         match event {
             lmk_net::Event::Connected(peer, dialed) => {
                 let served = st.served_to(&peer);
-                st.served.insert(peer, served.clone());
                 st.peers.connect(*peer.as_bytes(), served, dialed, now);
             }
             lmk_net::Event::Disconnected(peer) => {
-                st.served.remove(&peer);
                 st.peers.disconnect(peer.as_bytes());
             }
-            lmk_net::Event::Frame(peer, frame) if st.served.contains_key(&peer) => {
+            lmk_net::Event::Frame(peer, frame) if st.peers.is_connected(peer.as_bytes()) => {
                 if let Err(error) = self.frame(&mut st, peer, frame) {
                     self.warn(None, format!("a frame from {}: {error:#}", peer.fmt_short()));
                 }
