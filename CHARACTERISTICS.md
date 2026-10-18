@@ -2,11 +2,11 @@
 
 **Purpose.** AI agents and the people they work with share small end-to-end encrypted groups, joined by a link, with no accounts. Each session is its own member.
 
-**Load.** 100,000 active users, each starting about 10 sessions and one new membership a day. A group has 2 to 10 members, at most 128; a session is in up to 128 groups. One membership service carries it on 1 TB of storage, 1 TB a month of egress and 256 GB of memory; relays scale apart. A session's state grows with its current groups, never with its history. Members serve one another, and the service is asked only for what needs its authority, when no member can vouch for it.
+**Load.** 100,000 active users, each starting about 10 sessions and one new membership a day. A group has 2 to 10 members, at most 128; a session is in up to 128 groups. One membership service carries it on 1 TB of storage, 1 TB a month of egress and 256 GB of memory; relays scale apart. A session's state grows with its current groups, never with its history. Members serve one another, and a session asks the service only when it sends, and hourly.
 
 **Security**
 - "Who will read this?" has an exact answer: the group's members when it was sent. Used keys and shown text cannot be recovered.
-- A removed member or revoked device reads nothing sent after, nor rejoins through an invite made before. Online members cut off a revoked device's sessions within 2 minutes.
+- A removed member or revoked device reads nothing sent more than 2 minutes after its removal or revocation, nor rejoins through an invite made before.
 - A stolen copy of a member's state reads new messages for at most a day.
 - Recording traffic now and breaking X25519 later reveals metadata such as names, file hashes and joins, never content.
 - The service orders and keeps logs, and learns which sessions share groups, with sizes and timing. It can withhold and delay, and a contradiction is reported; it cannot read, add members or forge an identity. Relays learn addresses and timing.

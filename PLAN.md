@@ -38,15 +38,15 @@ For: "Who will read this?" has an exact answer: the group's members when it was 
 - A joiner tells by a cut's epoch, a `prev`'s or a dep's that what it names is not its to have: it neither waits for it nor reports it `missing` or `lost`. An author's message sent before every other member joined needs no holder before a cut keeps it.
 - Test: a message sent while an Add is in flight never reaches the joiner, whose next message from the same author comes at once, missing nothing.
 
-## 5. Polls on kept connections (done but the measurement, after release)
+## 5. Polls on kept connections (done but the delivery measurement)
 
 For: the service's egress, within 1 TB a month.
 
 A poll on a new TLS connection takes about 3.3 KB of egress, and on a kept one about 0.4 KB: with about 10,000 sessions online at once in the reference load, 27 GB a day against 3, of a 33 GB budget. Today the client drops idle connections after 90 seconds (reqwest's default) while it polls every 90 to 120; the server's `header_read_timeout` of 10 seconds (`crates/serve/src/lib.rs`) may close idle ones sooner; and the server's rustls keeps its default cache of 256 sessions, with no ticketer, so few clients resume.
 
-- A running session keeps an idle connection 140 seconds, past `POLL`; the server waits 150 for a request's headers, idle included. Waiting that long for stalled headers costs nothing more: a client could hold a connection idle anyway.
+- A running session keeps an idle connection 140 seconds, past the 2 minutes it polled at; the server waits 150 for a request's headers, idle included. Waiting that long for stalled headers costs nothing more: a client could hold a connection idle anyway.
 - Test: the server answers a second request on a connection idle past the old 10 seconds.
-- Measure egress per poll at letmeknow.dev, on 0.19's service before and on 0.20's after, and with it the delivery time between online members at p99, which no test measures yet.
+- Measure the delivery time between online members at p99 at letmeknow.dev, which no test measures yet. Step 11 ended the polls whose egress this step was to measure.
 
 ## 6. No browser (done)
 
@@ -96,17 +96,17 @@ The `lmk-client` crate held what the browser and the agent's session shared. Nat
 - Fold `crates/client` into `crates/session`, and delete its single-node paths, which only the browser took: `Client::event`'s `Access::Here` branch, `take_adds` and its `taking` lock, and the harness of `crates/client/tests/client.rs`, whose tests move to the session's where they test something the session's do not.
 - The node tests' device nodes that joined chats as their own sessions give the chats to session nodes the devices certify, as natively; `device()` stays for the device's own node.
 
-## 11. Freshness passed between peers (0.20 patch, after step 5's measurement)
+## 11. Freshness on send (0.20 patch)
 
-For: members serve one another, and the service is asked only for what needs its authority, when no member can vouch for it.
+For: a removed member or revoked device reads nothing sent more than 2 minutes after; the service is asked only by a session that sends, and hourly.
 
-Today every online session asks its service about every log it follows each 90 to 120 seconds. Peers already pass each other entries with heads the service signed, but not that nothing changed: the service signs heads only for logs that moved, so an unchanged log's freshness comes only from asking.
+Every online session asked its service about every log it follows each 90 to 120 seconds, though messages never touch the service: its logs hold commits, which online members already push one another at once. Staleness matters to what a session seals, so the sender pays for freshness.
 
-- The service signs, for each chunk of up to `HEAD_LOGS` (256) logs asked, its time and the root of a Merkle tree over the logs that did not move, at their lengths and hashes, padded to `HEAD_LOGS` leaves so that a proof shows neither how many logs its prover follows nor which.
-- After each answer, a session passes its peers the proofs for the logs they share. It counts a valid proof as its own read while it is younger than `POLL` by its estimate of the service's clock, and asks the service only about logs no peer vouched for, or not at all when none is left.
-- A revocation or a commit reaches an online member within `POLL` and a peer's hop, the 2 minutes of today. A peer can withhold a proof but not forge one; the service's answer grows by one signature a chunk.
-- Tests: three online members of a group make about one request per `POLL` between them for its logs; a member cut off from the others still learns of a revocation within 2 minutes; a stale or forged proof is ignored, and one that contradicts a held head is reported.
-- Older 0.20 releases skip the new frame (`read_known`) and keep polling.
+- No polling. Before a held payload is sealed (`Node::send`, and so invites and identity adds), the session asks the service about the group's logs, its current log and the public logs of the identities in it, that it has not read or asked about within 2 minutes (`FRESH`), waiting at most 5 seconds, so that chat goes on while the service is down. A member the refresh shows revoked is removed (`cut_off`) before the payload is sealed to it; the send fails if that commit does.
+- The hourly open answers the log's head: a log that moved is read, one unchanged counts as read, and one the service let go lapses. It runs at start, so a session catches up as it comes back, and it asks about the logs members are behind in, which had a poll of their own.
+- Cleanup needs no timing of its own: a group's current log found gone is left when it is found gone again, `WAIT` or more later, at an open or a send, if no member brought its entries meanwhile.
+- Sends do not fail when the refresh brings new members: the payload goes to the members as of the send, as it would had a peer pushed the commit a moment earlier, and the session tells the joins.
+- Tests: a send after 2 minutes asks once, and one within them not; a send seals to a member removed by a commit no peer pushed only after reading it; a send removes a revoked device's session first.
 
 ## Held without a step
 
@@ -121,3 +121,4 @@ Today every online session asks its service about every log it follows each 90 t
 - Bounded peer `Entries`: a group log holds one epoch's commits, and a directory only its device changes; neither nears 16 MiB.
 - Expiring group-log references: a service lives one minor, and at the reference load they grow by under 10 GB a year.
 - Live relays: nothing above needs them, and a relay change reaches sessions as they restart.
+- Freshness passed between peers, as service-signed proofs that logs did not move: once sessions stopped polling, only senders ask, and a proof would save little.

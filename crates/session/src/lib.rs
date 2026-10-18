@@ -30,8 +30,8 @@ const LOOKUP: Duration = Duration::from_secs(2);
 /// How long a fetched directory answers without another fetch, and how long a fetch of one may take.
 const FRESH: Duration = Duration::from_secs(10 * 60);
 const FETCH: Duration = Duration::from_secs(5);
-/// How long a connection to a service is kept idle: past the 2 minutes between polls, within the 150 seconds the service
-/// waits.
+/// How long a connection to a service is kept idle: past the 2 minutes after which a send asks the service again, within
+/// the 150 seconds the service waits.
 const IDLE: Duration = Duration::from_secs(140);
 /// How long a domain whose last fetch failed, or is still under way, is not fetched again.
 const RETRY: Duration = Duration::from_secs(60);

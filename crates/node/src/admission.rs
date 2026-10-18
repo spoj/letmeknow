@@ -63,7 +63,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             st.group(gid)?.mls.settings().kind == IDENTITY
         };
         let rule = serde_json::to_value(Control::Invite { hash, expires, to })?;
-        let id = self.send(gid, &rule, None)?;
+        let id = self.send(gid, &rule, None).await?;
         let seq = self.inner.lock().record(gid, &id.0)?.context("the invite's message")?.header.seq;
         // The members online whose summaries hold the invite's message admit by it too: a member asked before its push
         // arrived would refuse the joiner.

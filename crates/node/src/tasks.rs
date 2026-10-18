@@ -127,7 +127,7 @@ impl<P: Provider> State<P> {
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Starts the tasks, polls the logs, and picks up where the session stopped: its public logs replayed, and its
+    /// Starts the tasks, opens the logs, and picks up where the session stopped: its public logs replayed, and its
     /// groups it was removed from told.
     fn run(
         self: &Arc<Self>,
@@ -146,8 +146,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
         });
         self.spawn(self.clone().drive(work));
         self.spawn(self.clone().send_out(outbox));
-        self.spawn(self.clone().ask_heads_forever());
-        self.spawn(self.clone().ask_members_forever());
         self.spawn(self.clone().open_forever());
         let mut st = self.lock();
         let public: Vec<Bytes> = st.logs.values().filter_map(|log| match &log.of {

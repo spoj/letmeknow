@@ -2,7 +2,8 @@
 //! entries, and the public logs of the identities its groups' members speak as. A capability names each at its
 //! membership service, which keeps it under the reference `head::reference` derives from it, the log's id here. Each is
 //! read from its service, chained, held entry by entry, shown to peers by its newest signed head and caught up from
-//! them; what its entries mean is its log type's (`Of`), to which `Inner::check` hands them once held.
+//! them; what its entries mean is its log type's (`Of`), to which `Inner::check` hands them once held. A session asks a
+//! service about its logs only before it sends, and as it opens them hourly: online members bring it the rest.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -17,7 +18,7 @@ use lmk_proto::Bytes;
 use lmk_proto::group::{IDENTITY, IdentityRef, Service};
 use lmk_proto::head::{self, Head};
 use lmk_proto::membership::Known;
-use lmk_proto::clock::now;
+use lmk_proto::clock::corrected;
 use n0_future::time::{Duration, sleep, timeout};
 use serde::{Deserialize, Serialize};
 
@@ -25,12 +26,13 @@ use crate::{Epoch, Event, Inner, MEMBER_WAIT, State, Work, get, hex, put};
 
 pub(crate) const NOT_FOLLOWED: &str = "this session does not follow that log";
 
-/// How often, at most, a session asks its services for the heads of the logs it follows: a random time between three
-/// quarters of it and all of it.
-const POLL: Duration = Duration::from_secs(2 * 60);
-/// How often the logs members are behind in are asked of their services: a member whose log its service let go is removed.
-const MEMBERS_POLL: Duration = Duration::from_secs(60 * 60);
-/// How often a session opens its groups' logs and touches its identities' directories.
+/// How long a read of a log stands for a send: a session sends to a group once it read the group's logs within this, or
+/// tried to.
+const FRESH: u64 = 2 * 60 * 1000;
+/// How long a send waits for the service: chat works while it is down.
+const FRESH_WAIT: Duration = Duration::from_secs(5);
+/// How often a session opens its groups' logs, touches its identities' directories, and asks about the logs members are
+/// behind in.
 const OPEN: Duration = Duration::from_secs(60 * 60);
 
 /// The logs asked of one service, each with the length held.
@@ -86,11 +88,14 @@ pub(crate) struct Log {
     pub at: u64,
     /// When the service first answered that it let the log go, and the length held then.
     pub lapsed: Option<(u64, u64)>,
+    /// When this session last asked its service about it for a send, by the service's clock; not kept.
+    #[serde(skip)]
+    pub asked: u64,
 }
 
 impl Log {
     pub fn new(of: Of, service: Service) -> Self {
-        Log { of, service, head: None, at: 0, lapsed: None }
+        Log { of, service, head: None, at: 0, lapsed: None, asked: 0 }
     }
 
     /// The entries held, positions 1 to this.
@@ -282,6 +287,26 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// leaves out is unchanged as of the request, which counts as a read of it; one it lets go is lapsed.
     pub(crate) async fn ask_heads(self: &Arc<Self>) {
         let followed = self.lock().followed();
+        self.ask(followed).await;
+    }
+
+    /// Asks about the logs of a group, its current log and the public logs of the identities in it, that this session
+    /// has not read or asked about within `FRESH`, waiting at most `FRESH_WAIT`: before it sends to the group.
+    pub(crate) async fn refresh(self: &Arc<Self>, gid: &[u8]) {
+        let stale = {
+            let mut st = self.lock();
+            let now = corrected();
+            let mut followed = st.followed();
+            followed.retain(|(id, ..)| st.groups_of(id).iter().any(|g| g == gid) && st.logs[id].at.max(st.logs[id].asked) + FRESH <= now);
+            for (id, ..) in &followed {
+                st.logs.get_mut(id).unwrap().asked = now;
+            }
+            followed
+        };
+        timeout(FRESH_WAIT, self.ask(stale)).await.ok();
+    }
+
+    async fn ask(self: &Arc<Self>, followed: Vec<(Vec<u8>, Service, Known)>) {
         let mut services: Vec<Asked> = Vec::new();
         for (id, service, known) in followed {
             match services.iter_mut().find(|(s, _)| *s == service) {
@@ -290,7 +315,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
         }
         for (service, logs) in services {
-            let sent = now();
+            let sent = corrected();
             let known: Vec<Known> = logs.iter().map(|(_, known)| *known).collect();
             let moved = match self.clients.client(&service) {
                 Ok(client) => client.heads(&known).await,
@@ -377,13 +402,23 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Opens a group's log: the service keeps it a retention from its last open while it is empty, so a group whose
-    /// members were all away that long ends.
+    /// members were all away that long ends. The head it answers shows whether the log moved, when it is read; one it
+    /// let go is lapsed.
     pub(crate) async fn open(&self, id: &[u8]) -> Result<()> {
-        let (service, capability) = {
+        let (service, capability, length) = {
             let st = self.lock();
-            (st.log(id)?.service.clone(), st.capability(id)?)
+            (st.log(id)?.service.clone(), st.capability(id)?, st.log(id)?.length())
         };
-        self.clients.client(&service)?.append(&capability, &[], false).await.map(drop)
+        match self.clients.client(&service)?.append(&capability, &[], false).await {
+            Ok(appended) if appended.head.length > length => self.read(id).await,
+            Ok(_) => self.lock().read_as_of(id, corrected()),
+            Err(error) => {
+                if error.is::<Expired>() {
+                    self.lapse(&mut self.lock(), id)?;
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Opens the current log of each group this session is in, and touches the directory of each identity whose group it
@@ -406,40 +441,24 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Opens the logs every `OPEN`, from now on.
+    /// Opens the logs and asks about the members' every `OPEN`, from now on.
     pub(crate) async fn open_forever(self: Arc<Self>) {
         loop {
             self.open_logs().await;
+            if let Err(error) = self.ask_members().await {
+                self.report(&error);
+            }
             sleep(OPEN).await;
         }
     }
 
-    /// Asks for the members' logs every `MEMBERS_POLL`, from an hour on.
-    pub(crate) async fn ask_members_forever(self: Arc<Self>) {
-        loop {
-            sleep(MEMBERS_POLL).await;
-            if let Err(error) = self.ask_members().await {
-                self.report(&error);
-            }
-        }
-    }
-
-    /// Asks for the heads every `POLL`, from now on.
-    pub(crate) async fn ask_heads_forever(self: Arc<Self>) {
-        loop {
-            self.ask_heads().await;
-            let jitter = u64::from_be_bytes(lmk_proto::random::random::<8>()) % (POLL.as_millis() as u64 / 4);
-            sleep(POLL - Duration::from_millis(jitter)).await;
-        }
-    }
-
     /// Warns once of what the service answered that it is not the group's, or runs another minor. Other failures are
-    /// retried at the next poll.
+    /// retried at the next send or open.
     fn report(&self, error: &anyhow::Error) {
         if (error.is::<WrongDirectory>() || error.is::<Unsupported>()) && self.warned.lock().unwrap().insert(error.to_string()) {
             self.warn(None, error.to_string());
         }
-        tracing::debug!("polling the membership service: {error:#}");
+        tracing::debug!("asking the membership service: {error:#}");
     }
 
     /// Reads a log from its service, through its end; a group's only while the group is in its epoch.
@@ -467,7 +486,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             self.stored(id, page)?;
             if !more {
                 let mut st = self.lock();
-                st.logs.get_mut(id).context("dropped the log")?.at = crate::now();
+                st.logs.get_mut(id).context("dropped the log")?.at = corrected();
                 return st.save_log(id);
             }
         }
@@ -520,7 +539,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// The service let a log go, as it answered. A public log's directory is closed from then on, and so is every identity
     /// group of it, which this session leaves. A group's current log that stays gone for `WAIT`, with no entry of it
-    /// brought meanwhile, is left: the commit that moves the group on is in it, and no member can read it.
+    /// brought meanwhile, is left once it is found gone again: the commit that moves the group on is in it, and no member
+    /// can read it.
     fn lapse(&self, st: &mut State<P>, id: &[u8]) -> Result<()> {
         let now = crate::now();
         let log = st.logs.get_mut(id).context(NOT_FOLLOWED)?;

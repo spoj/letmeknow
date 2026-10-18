@@ -653,7 +653,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             attachment: attachment.as_ref().map(|(_, a)| a.clone()),
             sent_at: Some(lmk_proto::clock::corrected()),
         };
-        let id = node.send(&gid.0, &serde_json::to_value(payload)?, chat.reply_to.as_ref().map(|id| &id[..]))?;
+        let id = node.send(&gid.0, &serde_json::to_value(payload)?, chat.reply_to.as_ref().map(|id| &id[..])).await?;
         let describer = self.describer(gid)?;
         let mut answer = json!({ "id": hex::encode(&id.0) });
         if !addressed.is_empty() {

@@ -172,6 +172,19 @@ impl<P: Provider + Send + 'static> Inner<P> {
         });
     }
 
+    /// Runs a pass of a group's duties now if it would remove members whose devices their identities' directories dropped:
+    /// before a payload is sealed to them.
+    pub(crate) async fn cut_off(self: &Arc<Self>, gid: &[u8]) -> Result<()> {
+        let dropped = {
+            let st = self.lock();
+            due(&st, st.group(gid)?)?.is_some_and(|(_, dropped)| !dropped.is_empty())
+        };
+        if dropped {
+            self.pass(gid).await?;
+        }
+        Ok(())
+    }
+
     async fn pass(self: &Arc<Self>, gid: &[u8]) -> Result<()> {
         let (commit, next) = {
             let mut st = self.lock();

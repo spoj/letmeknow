@@ -173,7 +173,7 @@ impl<P: Provider + Send + 'static> Identity<P> {
     pub async fn deliver(&self, add: &Add) -> Result<()> {
         let gid = self.group().context(NO_IDENTITY)?;
         self.duties(&gid.0).await?;
-        self.node.send(&gid.0, &serde_json::to_value(add)?, None)?;
+        self.node.send(&gid.0, &serde_json::to_value(add)?, None).await?;
         Ok(())
     }
 

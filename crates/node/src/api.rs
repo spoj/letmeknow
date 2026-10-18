@@ -162,11 +162,14 @@ impl<P: Provider + Send + 'static> Node<P> {
         }
     }
 
-    /// Sends a held payload, a reply to the delivered message `reply_to` if given: the node seals it, keeps it, delivers
-    /// it to this session and pushes it to the members online, and seals it again in each epoch until a cut keeps it.
-    /// Answers its id. Fails with `SendError` when this session sends faster than members take, or the message is too
-    /// large.
-    pub fn send(&self, gid: &[u8], payload: &Value, reply_to: Option<&[u8]>) -> Result<Bytes> {
+    /// Sends a held payload, a reply to the delivered message `reply_to` if given. The node first asks the membership
+    /// service about the group's logs it has not read within 2 minutes, and removes the members whose devices their
+    /// identities' directories dropped; then it seals the payload to the members as of then, keeps it, delivers it to
+    /// this session and pushes it to the members online, and seals it again in each epoch until a cut keeps it. Answers
+    /// its id. Fails with `SendError` when this session sends faster than members take, or the message is too large.
+    pub async fn send(&self, gid: &[u8], payload: &Value, reply_to: Option<&[u8]>) -> Result<Bytes> {
+        self.inner.refresh(gid).await;
+        self.inner.cut_off(gid).await?;
         self.inner.send(&mut self.inner.lock(), gid, payload, reply_to)
     }
 
@@ -318,8 +321,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         holders
     }
 
-    /// Asks the services for the heads of the logs this session follows, and reads those that moved, as the session does
-    /// every 2 minutes.
+    /// Asks the services for the heads of the logs this session follows, and reads those that moved.
     pub async fn sync(&self) {
         self.inner.ask_heads().await;
     }
