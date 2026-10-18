@@ -15,10 +15,10 @@ jobs:
     strategy:
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, npm: linux-x64 }
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-musl, npm: linux-x64 }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, npm: linux-arm64 }
           # Termux may run programs only through Android's linker, which takes no static binary.
-          - { os: ubuntu-latest, target: aarch64-linux-android, npm: android-arm64 }
+          - { os: ubuntu-24.04, target: aarch64-linux-android, npm: android-arm64 }
           - { os: macos-latest, target: aarch64-apple-darwin, npm: darwin-arm64 }
           - { os: macos-latest, target: x86_64-apple-darwin, npm: darwin-x64 }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, npm: win32-x64 }
@@ -27,7 +27,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -52,27 +52,27 @@ jobs:
           cp README.md SKILL.md LICENSE deploy/letmeknow.service deploy/backend.json "$exe" "$name/"
           cp "$exe" "npm/${{ matrix.npm }}/bin/"
           if [[ -n "$suffix" ]]; then 7z a "$name.zip" "$name"; else tar czf "$name.tar.gz" "$name"; fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: archive-${{ matrix.target }}
           path: |
             letmeknow-*.tar.gz
             letmeknow-*.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: npm-${{ matrix.npm }}
           path: npm/${{ matrix.npm }}
 
   publish:
     needs: [ci, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
       - name: GitHub release

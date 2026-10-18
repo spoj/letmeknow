@@ -37,7 +37,7 @@ When a test flakes there, its timing is fixed:
 - `an_update_waits_for_what_connected_members_list_for_at_most_hear`: with Bob away, Alice commits an update every 2 seconds; one in flight when the stand-in lists lands at once, and the listing, of the epoch before, then counts for nothing. The stand-in lists right after an epoch change, with an update period that leaves it room, and the bound counts from when the update came due.
 - `installed_bindings_survive_refresh_collision_restart_and_group_deletion` (claims.rs, Windows, before 0.20.1): the peer's recertify commit did not reach the observer within 60 s. Without polls, a lost push now waits for the next `hello` (5 minutes) or a reconnection. First each `until` names what it waits for and the test traces the peers' connections; then the fix follows what that shows.
 
-## 5. Small fixes
+## 5. Small fixes (done)
 
 - SKILL says `send` answers at once; it answers within seconds, as it may read the group first, up to 5 seconds while the service is down (done, with step 2).
 - `Store::open` moves live logs' days by the days since the last expiry pass, plus one: a restart across midnight credits two days for minutes down, past "seven to eight". The extra day goes. Test: a start on the day after the last pass moves days by one.
