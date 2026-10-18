@@ -193,7 +193,7 @@ fn unlimited() -> Policy {
     let big = 1 << 40;
     Policy {
         appends_per_minute: u32::MAX, append_bytes_per_day: big, reads_per_minute: u32::MAX, read_bytes_per_minute: big,
-        new_logs_per_day: big, new_public_logs_per_day: big, public_appends_per_day: big,
+        new_logs_per_day: big,
         requests_at_once: 1 << 20, bytes_at_once: big, bytes_at_once_in_all: big, ..Policy::default()
     }
 }

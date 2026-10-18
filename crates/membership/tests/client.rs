@@ -67,7 +67,7 @@ async fn appends_reads_and_heads_check_against_the_service_key() {
     let membership = Membership::new();
     let client = membership.client();
     let capability = log(1);
-    let appended = client.append(&capability, &[b"one".to_vec(), b"two".to_vec()], false).await.unwrap();
+    let appended = client.append(&capability, &[b"one".to_vec(), b"two".to_vec()]).await.unwrap();
     assert_eq!(appended.position, 1);
     let page = client.read(&capability, &anchor(&membership.key, &capability)).await.unwrap();
     assert_eq!(page.page().entries, [Bytes(b"one".to_vec()), Bytes(b"two".to_vec())]);
@@ -91,7 +91,7 @@ async fn heads_ask_256_logs_to_a_request_and_leave_unmoved_logs_out() {
     };
     let client = ServeClient::for_service(counting, &membership.wire("membership.example")).unwrap();
     let client_for_appends = membership.client();
-    client_for_appends.append(&log(7), &[b"x".to_vec()], false).await.unwrap();
+    client_for_appends.append(&log(7), &[b"x".to_vec()]).await.unwrap();
     let distinct = |i: u16| { let mut capability = [0; 32]; capability[..2].copy_from_slice(&i.to_be_bytes()); capability };
     let known: Vec<Known> = (0..600).map(|i| Known(distinct(i), 0)).chain([Known(log(7), 0)]).collect();
     let moved = client.heads(&known).await.unwrap();
@@ -112,13 +112,13 @@ async fn a_head_signed_by_another_key_is_the_directorys_name() {
 #[tokio::test]
 async fn a_refusal_acts_only_when_the_service_signed_it() {
     let membership = Membership::new();
-    let request = serde_json::to_vec(&membership::Append { capability: log(1), entries: vec![Bytes(b"x".to_vec())], public: false }).unwrap();
+    let request = serde_json::to_vec(&membership::Append { capability: log(1), entries: vec![Bytes(b"x".to_vec())] }).unwrap();
     let refused = |sig: [u8; 64]| serde_json::to_vec(&Answer::<()>::Refused { refusal: Refusal::Rate, sig: Bytes(sig.to_vec()) }).unwrap();
     let signed = membership.key.sign(&refusal_message(Refusal::Rate, &request)).to_bytes();
     let client = |reply: Vec<u8>| ServeClient::for_service(answering(reply), &membership.wire("membership.example")).unwrap();
-    let error = client(refused(signed)).append(&log(1), &[b"x".to_vec()], false).await.unwrap_err();
+    let error = client(refused(signed)).append(&log(1), &[b"x".to_vec()]).await.unwrap_err();
     assert!(error.downcast_ref::<Refused>().is_some_and(|refused| refused.0 == "rate"), "{error}");
-    let error = client(refused([9; 64])).append(&log(1), &[b"x".to_vec()], false).await.unwrap_err();
+    let error = client(refused([9; 64])).append(&log(1), &[b"x".to_vec()]).await.unwrap_err();
     assert!(error.is::<Forged>(), "a refusal another key signed is no refusal: {error}");
 }
 
@@ -134,7 +134,7 @@ fn answering(reply: Vec<u8>) -> Post {
 async fn an_expiry_acts_only_when_the_service_signed_it() {
     let membership = Membership::new();
     let (capability, other) = (log(1), log(2));
-    membership.client().append(&capability, &[b"one".to_vec()], false).await.unwrap();
+    membership.client().append(&capability, &[b"one".to_vec()]).await.unwrap();
     clock::set(|| FAR);
     while membership.service.expire().await {}
     let key = membership.key.verifying_key().to_bytes();
@@ -143,7 +143,7 @@ async fn an_expiry_acts_only_when_the_service_signed_it() {
     let expired = membership.client();
     let error = expired.read(&capability, &anchored).await.unwrap_err();
     assert_eq!(error.downcast_ref::<Expired>().map(|e| e.0), Some(reference));
-    assert_eq!(expired.append(&capability, &[b"two".to_vec()], false).await.unwrap_err().downcast_ref::<Expired>().map(|e| e.0), Some(reference));
+    assert_eq!(expired.append(&capability, &[b"two".to_vec()]).await.unwrap_err().downcast_ref::<Expired>().map(|e| e.0), Some(reference));
     let heads = expired.heads(&[Known(capability, 0)]).await.unwrap();
     assert_eq!(heads.len(), 1);
     assert_eq!(heads[0].as_ref().unwrap_err().0, reference);
@@ -198,7 +198,7 @@ fn replies_are_bounded_and_only_200_is_an_answer() {
 async fn a_page_that_does_not_chain_to_the_anchor_is_refused() {
     let membership = Membership::new();
     let capability = log(3);
-    membership.client().append(&capability, &[b"one".to_vec()], false).await.unwrap();
+    membership.client().append(&capability, &[b"one".to_vec()]).await.unwrap();
     let post = membership.post();
     let tampered: Post = Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
         let post = post.clone();

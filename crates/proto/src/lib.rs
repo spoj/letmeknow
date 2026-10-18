@@ -7,7 +7,6 @@ pub mod frame;
 pub mod group;
 pub mod head;
 pub mod held;
-pub mod public;
 pub mod links;
 pub mod membership;
 pub mod peer;

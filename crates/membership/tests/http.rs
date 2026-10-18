@@ -38,8 +38,8 @@ impl Http {
         serde_json::from_slice(&answer).unwrap()
     }
 
-    async fn append(&self, from: &str, capability: u8, entries: &[Vec<u8>], public: bool) -> Option<Refusal> {
-        let body = append_body(capability, entries, public);
+    async fn append(&self, from: &str, capability: u8, entries: &[Vec<u8>]) -> Option<Refusal> {
+        let body = append_body(capability, entries);
         match self.post::<Appended>(Route::Append, from, &body).await {
             Answer::Ok(_) => None,
             Answer::Refused { refusal, .. } => Some(refusal),
@@ -61,9 +61,9 @@ impl Http {
     }
 }
 
-fn append_body(capability: u8, entries: &[Vec<u8>], public: bool) -> Vec<u8> {
+fn append_body(capability: u8, entries: &[Vec<u8>]) -> Vec<u8> {
     let entries = entries.iter().map(|e| Bytes(e.clone())).collect();
-    serde_json::to_vec(&Append { capability: [capability; 32], entries, public }).unwrap()
+    serde_json::to_vec(&Append { capability: [capability; 32], entries }).unwrap()
 }
 
 fn one(entry: &[u8]) -> Vec<Vec<u8>> { vec![entry.to_vec()] }
@@ -73,7 +73,7 @@ async fn routes_answer_appends_reads_and_heads_with_signed_heads() {
     let http = Http::new(Policy::default());
     assert!(Route::parse("/membership/3/append").is_none());
     assert!(matches!(Route::parse("/membership/2/heads"), Some(Route::Heads)));
-    let Answer::Ok(appended) = http.post::<Appended>(Route::Append, "192.0.2.1", &append_body(7, &one(b"one"), false)).await else {
+    let Answer::Ok(appended) = http.post::<Appended>(Route::Append, "192.0.2.1", &append_body(7, &one(b"one"))).await else {
         panic!("append refused")
     };
     assert_eq!(appended.position, 1);
@@ -99,14 +99,14 @@ async fn routes_answer_appends_reads_and_heads_with_signed_heads() {
 async fn expired_logs_answer_signed_expiries_on_every_route() {
     let http = Http::new(Policy::default());
     let reference = head::reference(http.key.as_bytes(), &[7; 32]);
-    let Answer::Ok(_) = http.post::<Appended>(Route::Append, "192.0.2.1", &append_body(7, &one(b"one"), false)).await else {
+    let Answer::Ok(_) = http.post::<Appended>(Route::Append, "192.0.2.1", &append_body(7, &one(b"one"))).await else {
         panic!("append refused")
     };
     http.expire_all().await;
     let read = serde_json::to_vec(&Read { capability: [7; 32], after: 0 }).unwrap();
     let Answer::<Page>::Expired { sig } = http.post(Route::Read, "192.0.2.1", &read).await else { panic!("read answered") };
     assert!(http.expiry_signed(&reference, &sig));
-    let Answer::<Appended>::Expired { sig } = http.post(Route::Append, "192.0.2.1", &append_body(7, &one(b"two"), false)).await else {
+    let Answer::<Appended>::Expired { sig } = http.post(Route::Append, "192.0.2.1", &append_body(7, &one(b"two"))).await else {
         panic!("append answered")
     };
     assert!(http.expiry_signed(&reference, &sig));
@@ -126,10 +126,10 @@ async fn refusals_are_signed_over_their_request_and_code() {
     assert!(http.signed(Refusal::Policy, b"{}", &sig));
     assert!(!http.signed(Refusal::Policy, b"{ }", &sig));
     assert!(!http.signed(Refusal::Busy, b"{}", &sig));
-    let public = append_body(7, &[vec![1; (16 << 10) + 1]], true);
-    let Answer::<()>::Refused { refusal, sig } = http.post(Route::Append, "192.0.2.1", &public).await else { panic!("accepted") };
-    assert!(matches!(refusal, Refusal::Size));
-    assert!(http.signed(Refusal::Size, &public, &sig));
+    let oversized = append_body(7, &[vec![1; (1 << 20) + 1]]);
+    let Answer::<()>::Refused { refusal, sig } = http.post(Route::Append, "192.0.2.1", &oversized).await else { panic!("accepted") };
+    assert!(matches!(refusal, Refusal::Policy));
+    assert!(http.signed(Refusal::Policy, &oversized, &sig));
     let heads = serde_json::to_vec(&Heads { logs: vec![Known([1; 32], 0); 257] }).unwrap();
     let Answer::<()>::Refused { refusal, .. } = http.post(Route::Heads, "192.0.2.1", &heads).await else { panic!("accepted") };
     assert!(matches!(refusal, Refusal::Policy));
@@ -138,67 +138,34 @@ async fn refusals_are_signed_over_their_request_and_code() {
 #[tokio::test]
 async fn appends_per_minute_count_an_ipv4_address_and_its_mapped_form_alike() {
     let http = Http::new(Policy { appends_per_minute: 2, ..Policy::default() });
-    assert!(http.append("192.0.2.1", 1, &one(b"x"), false).await.is_none());
-    assert!(http.append("192.0.2.1", 1, &one(b"x"), false).await.is_none());
-    assert!(matches!(http.append("192.0.2.1", 1, &one(b"x"), false).await, Some(Refusal::Rate)));
-    assert!(matches!(http.append("::ffff:192.0.2.1", 1, &one(b"x"), false).await, Some(Refusal::Rate)));
-    assert!(http.append("192.0.2.2", 1, &one(b"x"), false).await.is_none());
+    assert!(http.append("192.0.2.1", 1, &one(b"x")).await.is_none());
+    assert!(http.append("192.0.2.1", 1, &one(b"x")).await.is_none());
+    assert!(matches!(http.append("192.0.2.1", 1, &one(b"x")).await, Some(Refusal::Rate)));
+    assert!(matches!(http.append("::ffff:192.0.2.1", 1, &one(b"x")).await, Some(Refusal::Rate)));
+    assert!(http.append("192.0.2.2", 1, &one(b"x")).await.is_none());
 }
 
 #[tokio::test]
 async fn ipv6_budgets_are_per_slash_64_and_a_slash_48_holds_16_of_them() {
     let http = Http::new(Policy { appends_per_minute: 1, ..Policy::default() });
-    assert!(http.append("2001:db8:1:1::1", 1, &one(b"x"), false).await.is_none());
-    assert!(matches!(http.append("2001:db8:1:1::2", 1, &one(b"x"), false).await, Some(Refusal::Rate)));
+    assert!(http.append("2001:db8:1:1::1", 1, &one(b"x")).await.is_none());
+    assert!(matches!(http.append("2001:db8:1:1::2", 1, &one(b"x")).await, Some(Refusal::Rate)));
     for i in 2..=16 {
-        assert!(http.append(&format!("2001:db8:1:{i:x}::1"), 1, &one(b"x"), false).await.is_none(), "/64 {i:x}");
+        assert!(http.append(&format!("2001:db8:1:{i:x}::1"), 1, &one(b"x")).await.is_none(), "/64 {i:x}");
     }
-    assert!(matches!(http.append("2001:db8:1:11::1", 1, &one(b"x"), false).await, Some(Refusal::Rate)));
-    assert!(http.append("2001:db8:2:1::1", 1, &one(b"x"), false).await.is_none());
+    assert!(matches!(http.append("2001:db8:1:11::1", 1, &one(b"x")).await, Some(Refusal::Rate)));
+    assert!(http.append("2001:db8:2:1::1", 1, &one(b"x")).await.is_none());
 }
 
 #[tokio::test]
 async fn new_logs_are_budgeted_per_address() {
     let http = Http::new(Policy { new_logs_per_day: 2, ..Policy::default() });
-    assert!(http.append("192.0.2.1", 1, &one(b"x"), false).await.is_none());
-    assert!(http.append("192.0.2.1", 2, &one(b"x"), false).await.is_none());
-    assert!(matches!(http.append("192.0.2.1", 3, &one(b"x"), false).await, Some(Refusal::Rate)));
-    assert!(http.append("192.0.2.1", 1, &one(b"y"), false).await.is_none(), "an existing log is not new");
-    assert!(http.append("192.0.2.2", 3, &one(b"x"), false).await.is_none());
-    assert!(http.append("192.0.2.2", 4, &one(b"x"), false).await.is_none());
-}
-
-#[tokio::test]
-async fn public_logs_take_small_entries_and_few_new_and_stored_appends() {
-    let http = Http::new(Policy { new_public_logs_per_day: 1, public_appends_per_day: 2, ..Policy::default() });
-    assert!(http.append("192.0.2.1", 1, &one(&[1; 16 << 10]), true).await.is_none());
-    assert!(matches!(http.append("192.0.2.1", 2, &one(b"x"), true).await, Some(Refusal::Rate)));
-    assert!(http.append("192.0.2.1", 2, &one(b"x"), false).await.is_none(), "a private log is not public");
-    assert!(http.append("192.0.2.1", 1, &one(b"x"), true).await.is_none());
-    assert!(http.append("192.0.2.1", 1, &one(b"x"), true).await.is_none(), "a touch of the last entry stores nothing, and is not charged");
-    assert!(matches!(http.append("192.0.2.1", 1, &one(b"z"), true).await, Some(Refusal::Rate)));
-    assert!(http.append("192.0.2.2", 3, &one(b"x"), true).await.is_none());
-}
-
-#[tokio::test]
-async fn a_public_log_counts_its_stored_appends_per_address() {
-    let http = Http::new(Policy::default());
-    for i in 0..10u8 {
-        assert!(http.append("192.0.2.1", 1, &one(&[i]), true).await.is_none());
-    }
-    assert!(matches!(http.append("192.0.2.1", 1, &one(b"x"), true).await, Some(Refusal::Rate)));
-    assert!(http.append("192.0.2.2", 1, &one(b"y"), true).await.is_none());
-}
-
-#[tokio::test]
-async fn a_public_log_keeps_its_caps_whatever_flag_an_append_sends() {
-    let http = Http::new(Policy { public_appends_per_day: 2, ..Policy::default() });
-    assert!(http.append("192.0.2.1", 1, &one(b"x"), true).await.is_none());
-    assert!(matches!(http.append("192.0.2.1", 1, &one(&[1; (16 << 10) + 1]), false).await, Some(Refusal::Policy)));
-    assert!(matches!(http.append("192.0.2.1", 1, &one(b"x"), false).await, Some(Refusal::Policy)));
-    assert!(matches!(http.append("192.0.2.1", 1, &[b"y".to_vec(), b"z".to_vec()], true).await, Some(Refusal::Rate)));
-    assert!(http.append("192.0.2.1", 1, &one(b"y"), true).await.is_none());
-    assert!(matches!(http.append("192.0.2.1", 1, &one(b"z"), true).await, Some(Refusal::Rate)));
+    assert!(http.append("192.0.2.1", 1, &one(b"x")).await.is_none());
+    assert!(http.append("192.0.2.1", 2, &one(b"x")).await.is_none());
+    assert!(matches!(http.append("192.0.2.1", 3, &one(b"x")).await, Some(Refusal::Rate)));
+    assert!(http.append("192.0.2.1", 1, &one(b"y")).await.is_none(), "an existing log is not new");
+    assert!(http.append("192.0.2.2", 3, &one(b"x")).await.is_none());
+    assert!(http.append("192.0.2.2", 4, &one(b"x")).await.is_none());
 }
 
 #[tokio::test]
@@ -213,7 +180,7 @@ async fn reads_and_heads_share_a_request_budget_and_a_byte_budget() {
     assert!(matches!(http.post::<Moved>(Route::Heads, "192.0.2.1", &heads).await, Answer::Refused { refusal: Refusal::Rate, .. }));
 
     let http = Http::new(Policy { read_bytes_per_minute: 1, ..Policy::default() });
-    assert!(http.append("192.0.2.1", 1, &one(b"x"), false).await.is_none());
+    assert!(http.append("192.0.2.1", 1, &one(b"x")).await.is_none());
     let read = serde_json::to_vec(&Read { capability: [1; 32], after: 0 }).unwrap();
     assert!(matches!(http.post::<Page>(Route::Read, "192.0.2.1", &read).await, Answer::Ok(_)));
     assert!(matches!(http.post::<Page>(Route::Read, "192.0.2.1", &read).await, Answer::Refused { refusal: Refusal::Rate, .. }));
@@ -227,8 +194,8 @@ fn stepped() -> u64 { NOW.load(Ordering::SeqCst) }
 async fn budgets_renew_with_their_window() {
     let http = Http::new(Policy { appends_per_minute: 1, ..Policy::default() });
     clock::set(stepped);
-    assert!(http.append("192.0.2.1", 1, &one(b"x"), false).await.is_none());
-    assert!(matches!(http.append("192.0.2.1", 1, &one(b"x"), false).await, Some(Refusal::Rate)));
+    assert!(http.append("192.0.2.1", 1, &one(b"x")).await.is_none());
+    assert!(matches!(http.append("192.0.2.1", 1, &one(b"x")).await, Some(Refusal::Rate)));
     NOW.fetch_add(60_000, Ordering::SeqCst);
-    assert!(http.append("192.0.2.1", 1, &one(b"x"), false).await.is_none());
+    assert!(http.append("192.0.2.1", 1, &one(b"x")).await.is_none());
 }

@@ -1,6 +1,6 @@
 //! The node's side of the peer protocol (`lmk_net::peers`): it hands `Peers` this session's state of each group and the
 //! frames peers send, takes those frames by the gate, signs this session's summaries and checks members', answers
-//! `want` from the sealings it holds, passes live payloads on, and sends what `Peers` produces once the step commits.
+//! `want` from the sealings it holds, and sends what `Peers` produces once the step commits.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -19,15 +19,10 @@ use n0_future::task::spawn;
 use n0_future::time::{Duration, sleep};
 use serde::{Deserialize, Serialize};
 
-use crate::logs::Of;
 use crate::{Event, Inner, Lost, LostOf, Member, Node, Out, State, days, get, now, put};
 
 /// How often `Peers` is polled.
 const POLL: Duration = Duration::from_millis(250);
-/// How long a live payload goes on, in hops.
-const HOPS: u8 = 6;
-/// A membership's live payloads are allowed ten times what its held messages are.
-const LIVE_SCALE: f64 = 10.0;
 /// A member signs its summary at least this often.
 const RESIGN: u64 = 60 * 60 * 1000;
 /// How many summaries of memberships not known yet a group keeps.
@@ -76,8 +71,7 @@ fn group_of(frame: &Frame) -> Option<&Bytes> {
         | Frame::Held { group, .. }
         | Frame::Want { group, .. }
         | Frame::WantFiles { group, .. }
-        | Frame::Have { group, .. }
-        | Frame::Live { group, .. } => Some(group),
+        | Frame::Have { group, .. } => Some(group),
     }
 }
 
@@ -99,10 +93,9 @@ impl State {
         let log = logs.pop().unwrap();
         let heads = |logs: &[Vec<u8>]| logs.iter().filter_map(|log| self.logs.get(log)?.head.clone()).collect();
         let (head, earlier) = (self.logs[&log].head.clone(), heads(&logs));
-        let me = self.me(gid).to_vec();
+        let me = self.me().to_vec();
         let g = self.groups.get_mut(gid).unwrap();
         let (wanted, stale) = g.wanted(now, &me);
-        let public = g.public.iter().filter_map(|log| self.logs.get(log)?.head.clone()).collect();
         let members = g.mls.members().into_iter().filter(|m| m.key != me).filter_map(|m| {
             let iroh = m.leaf.as_ref()?.key.0.as_slice().try_into().ok()?;
             Some(((Bytes(m.key.clone()), g.mls.joined(&m.key)?), iroh))
@@ -112,7 +105,6 @@ impl State {
             epoch: g.mls.epoch(),
             log: log.as_slice().try_into().unwrap(),
             head,
-            public,
             earlier,
             members: members.collect(),
             wanted,
@@ -146,20 +138,12 @@ impl State {
         self.groups.keys().filter(|gid| self.serves(gid, peer)).map(|gid| Bytes(gid.clone())).collect()
     }
 
-    /// Works out again, once the rosters or the public logs changed, which groups the gate admits each connected peer to,
-    /// and which public logs each group follows.
+    /// Works out again, once the rosters changed, which groups the gate admits each connected peer to.
     pub(crate) fn gate(&mut self) {
         if !std::mem::take(&mut self.gate) {
             return;
         }
         let now = self.tick();
-        let gids: Vec<Vec<u8>> = self.groups.keys().cloned().collect();
-        for gid in &gids {
-            let mut public: Vec<Vec<u8>> = self.identities(gid).iter().filter_map(|identity| self.public_log(&identity.id.0)).collect();
-            public.sort();
-            public.dedup();
-            self.groups.get_mut(gid).unwrap().public = public;
-        }
         let peers: Vec<EndpointId> = self.served.keys().copied().collect();
         for peer in peers {
             let served = self.served_to(&peer);
@@ -178,7 +162,7 @@ impl State {
 
     /// Sends a frame of a group to a peer once the step commits, if the gate lets it go.
     pub(crate) fn emit(&mut self, gid: &[u8], peer: EndpointId, frame: Frame) {
-        if peers::sends(&frame, self.admitted(gid, &peer), self.at_head(gid)) {
+        if self.admitted(gid, &peer) {
             self.out.push(Out::Frame { peer, frame });
         }
     }
@@ -186,23 +170,20 @@ impl State {
     /// What of a frame goes to a peer as it is written, by the gate as it is then: a step may have removed the peer
     /// since another queued the frame.
     pub(crate) fn admissible(&mut self, peer: &EndpointId, frame: Frame) -> Option<Frame> {
-        if let Frame::Hello { groups, heads } = frame {
+        if let Frame::Hello { groups } = frame {
             let groups = groups.into_iter().filter(|at| self.admitted(&at.group.0, peer)).collect();
-            return Some(Frame::Hello { groups, heads });
+            return Some(Frame::Hello { groups });
         }
         let group = match &frame {
             // Every `want` is answered, with nothing if the gate refuses it.
             Frame::Held { items, answers: Some(_), .. } if items.is_empty() => None,
             // A group's earlier logs go to whom they were queued for: a peer that showed it holds the log, or a member
             // its last commit removed.
-            Frame::Entries { log, .. } => match self.logs.get(&log.0).map(|log| &log.of) {
-                Some(Of::Group(group)) if self.groups.get(&group.0).is_some_and(|g| g.rec.log == *log) => Some(group),
-                _ => None,
-            },
+            Frame::Entries { log, .. } => self.logs.get(&log.0).map(|l| &l.group).filter(|group| self.groups.get(&group.0).is_some_and(|g| g.rec.log == *log)),
             frame => group_of(frame),
         };
         let Some(gid) = group.map(|group| group.0.clone()) else { return Some(frame) };
-        peers::sends(&frame, self.admitted(&gid, peer), self.at_head(&gid)).then_some(frame)
+        self.admitted(&gid, peer).then_some(frame)
     }
 
     /// Sends a frame of a group to every neighbour the gate lets it go to.
@@ -222,7 +203,7 @@ impl State {
         if !g.mls.active() || !(g.changed && now >= g.rec.signed + gap || now >= g.rec.signed + RESIGN) {
             return Ok(());
         }
-        let me = self.me(gid).to_vec();
+        let me = self.me().to_vec();
         let epoch = g.mls.epoch();
         let list = |of: fn(&crate::Author) -> &lmk_proto::ranges::Ranges| g.rec.authors.iter().filter_map(|a| a.seqs(of(a))).collect();
         let sealed = g.rec.authors.iter().filter_map(|a| a.seqs(&a.sealed.iter().filter(|(_, sealed)| **sealed == epoch).map(|(seq, _)| *seq).collect())).collect();
@@ -240,7 +221,7 @@ impl State {
             lost: list(|a| &a.lost),
         };
         let body = serde_json::to_vec(&summary)?;
-        let sig = self.session_of(gid).sign(&[SUMMARY, &body].concat());
+        let sig = self.session.sign(&[SUMMARY, &body].concat());
         let g = self.group_mut(gid)?;
         (g.rec.version, g.rec.signed, g.changed) = (summary.version, now, false);
         self.save(gid)?;
@@ -256,7 +237,7 @@ impl State {
         let group = Bytes(gid.to_vec());
         for signed in items {
             let Ok(summary) = serde_json::from_slice::<Summary>(&signed.body.0) else { continue };
-            if summary.group != group || summary.member.0 == self.me(gid) {
+            if summary.group != group || summary.member.0 == self.me() {
                 continue;
             }
             let g = self.groups.get_mut(gid).unwrap();
@@ -266,7 +247,7 @@ impl State {
                 }
                 continue;
             }
-            if !lmk_core::device::verify(&summary.member.0, SUMMARY, &signed.body.0, &signed.sig.0) {
+            if !lmk_core::group::verify(&summary.member.0, SUMMARY, &signed.body.0, &signed.sig.0) {
                 continue;
             }
             let heard = peers::Heard { signed: signed.clone(), summary: summary.clone(), at: now };
@@ -308,7 +289,7 @@ impl State {
 
     /// The losses a member's summary tells that it did not tell before: each seq once.
     fn told(&mut self, gid: &[u8], summary: &Summary) -> Result<()> {
-        let me = self.me(gid).to_vec();
+        let me = self.me().to_vec();
         let g = self.group_mut(gid)?;
         let mut messages = Vec::new();
         // Losses are told to their author alone, and only of seqs it knows it sent.
@@ -516,12 +497,11 @@ impl Inner {
 
     fn frame(self: &Arc<Self>, st: &mut State, peer: EndpointId, frame: Frame) -> Result<()> {
         let (key, now) = (*peer.as_bytes(), st.tick());
-        if let Frame::Hello { groups, heads } = frame {
-            let heads: Vec<Head> = heads.into_iter().filter(|head| self.vouched(st, head, &peer)).collect();
+        if let Frame::Hello { groups } = frame {
             // An `at` of a log this session does not hold, of an epoch it has not reached or has dropped, is taken unchecked.
             let shown = |at: &At| at.head.as_ref().is_none_or(|head| head.log_ref == at.log && (!st.logs.contains_key(at.log.as_slice()) || self.vouched(st, head, &peer)));
             let groups: Vec<At> = groups.into_iter().filter(|at| st.groups.contains_key(&at.group.0) && shown(at)).collect();
-            for out in st.peers.frame(&key, &Frame::Hello { groups: groups.clone(), heads }, now) {
+            for out in st.peers.frame(&key, &Frame::Hello { groups: groups.clone() }, now) {
                 self.out(st, out)?;
             }
             let shows = |head: &Option<Head>| head.as_ref().map(|head| (head.length, head.hash));
@@ -542,7 +522,7 @@ impl Inner {
         }
         let Some(gid) = group_of(&frame).map(|gid| gid.0.clone()) else { return Ok(()) };
         let held = st.groups.contains_key(&gid);
-        if !held || !peers::takes(&frame, st.admitted(&gid, &peer), st.at_head(&gid)) {
+        if !held || !peers::takes(&frame, st.admitted(&gid, &peer)) {
             // A `want` refused, or of a group this session does not hold, is answered with nothing, so its asker moves on.
             if let Frame::Want { group, wants, .. } = frame {
                 st.out.push(Out::Frame { peer, frame: Frame::Held { group, items: Vec::new(), answers: Some(wants) } });
@@ -559,21 +539,6 @@ impl Inner {
                 st.peers.used(&key, now);
                 let answer = st.answer(&gid, peer, epoch, &wants)?;
                 st.out.push(Out::Frame { peer, frame: answer });
-            }
-            Frame::Live { group, hops, item } => {
-                let g = st.group(&gid)?;
-                let Ok((sender, payload, id)) = g.mls.open_live(&st.provider, &item.0) else { return Ok(()) };
-                let membership = (Bytes(sender.key.clone()), g.mls.joined(&sender.key).context("a live payload's sender has no membership")?);
-                let Some(forward) = st.peers.live(&group, id, Some(key), hops, now) else { return Ok(()) };
-                if !st.group_mut(&gid)?.live.entry(membership).or_default().take(item.0.len(), LIVE_SCALE, now) {
-                    return Ok(());
-                }
-                for to in forward {
-                    let frame = Frame::Live { group: group.clone(), hops: hops.min(HOPS) - 1, item: item.clone() };
-                    st.out.push(Out::Frame { peer: EndpointId::from_bytes(&to)?, frame });
-                }
-                let sender = st.member(&gid, &sender).context("the sender has no letmeknow credential")?;
-                st.events.push(Event::Live { group, sender, payload });
             }
             _ => {}
         }
@@ -600,8 +565,6 @@ impl Inner {
 
     /// A neighbour's `hello` shows this session's head of the group's log.
     fn synced(self: &Arc<Self>, st: &mut State, gid: &[u8], peer: EndpointId) -> Result<()> {
-        let member = st.by_iroh(gid, &peer);
-        st.events.push(Event::Synced { group: Bytes(gid.to_vec()), member });
         st.out.push(Out::WantFiles { peer, group: gid.to_vec() });
         // A file only this session held may have reached the peer since.
         let pending = st.group(gid)?.rec.pending.clone();
@@ -619,26 +582,6 @@ impl Inner {
         }
         Ok(())
     }
-
-    /// Seals a live payload and sends it to the neighbours, or to one member alone.
-    pub(crate) fn send_live(&self, st: &mut State, gid: &[u8], payload: &serde_json::Value, to: Option<EndpointId>) -> Result<()> {
-        if !st.at_head(gid) {
-            return Ok(());
-        }
-        let now = st.tick();
-        let g = st.group(gid)?;
-        let (item, id) = g.mls.seal_live(&st.provider, st.session_of(gid), payload)?;
-        let group = Bytes(gid.to_vec());
-        match to {
-            Some(peer) => st.emit(gid, peer, Frame::Live { group, hops: 0, item: Bytes(item) }),
-            None => {
-                for peer in st.peers.live(&group, id, None, HOPS, now).unwrap_or_default() {
-                    st.emit(gid, EndpointId::from_bytes(&peer)?, Frame::Live { group: group.clone(), hops: HOPS, item: Bytes(item.clone()) });
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 impl Node {
@@ -651,7 +594,7 @@ impl Node {
     pub fn heard(&self, gid: &[u8]) -> Result<Vec<Heard>> {
         let st = self.inner.lock();
         let g = st.group(gid)?;
-        let me = st.me(gid);
+        let me = st.me();
         let group = Bytes(gid.to_vec());
         let heard = st.peers.heard(&group).filter(|heard| heard.summary.member.0 != me && g.mls.joined(&heard.summary.member.0) == Some(heard.summary.joined));
         let heard = heard.map(|heard| Heard {
@@ -666,7 +609,7 @@ impl Node {
 
     /// The other members not connected that no summary was heard from for H: away.
     pub fn away(&self, gid: &[u8]) -> Result<Vec<Member>> {
-        let (heard, since, me, online) = (self.heard(gid)?, self.carried_since(gid)?, self.key_in(gid), self.online(gid)?);
+        let (heard, since, me, online) = (self.heard(gid)?, self.carried_since(gid)?, self.key(), self.online(gid)?);
         let away = |m: &Member| m.key != me && !online.iter().any(|o| o.key == m.key) && !heard.iter().any(|h| h.member.key == m.key && h.at >= since);
         Ok(self.members(gid)?.into_iter().filter(away).collect())
     }
@@ -676,7 +619,7 @@ impl Node {
     pub fn only_here(&self, gid: &[u8]) -> Result<Vec<(Bytes, serde_json::Value)>> {
         let st = self.inner.lock();
         let g = st.group(gid)?;
-        let me = st.me(gid);
+        let me = st.me();
         let Some(mine) = g.current(me) else { return Ok(Vec::new()) };
         let mut unkept = Vec::new();
         for seq in mine.cut + 1..=mine.last() {

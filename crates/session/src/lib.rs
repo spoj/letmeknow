@@ -8,7 +8,6 @@ mod store;
 mod tests;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use lmk_core::device::Device;
 use lmk_core::provider::SqliteProvider;
 use lmk_membership::client::{Post, Resolve, https};
 use lmk_node::Node;
@@ -30,8 +29,7 @@ const LOOKUP: Duration = Duration::from_secs(2);
 /// How long a fetched directory answers without another fetch, and how long a fetch of one may take.
 const FRESH: Duration = Duration::from_secs(10 * 60);
 const FETCH: Duration = Duration::from_secs(5);
-/// How long a connection to a service is kept idle: past the 2 minutes after which a send asks the service again, within
-/// the 150 seconds the service waits.
+/// How long a connection to a service is kept idle: within the 150 seconds the service waits.
 const IDLE: Duration = Duration::from_secs(140);
 /// How long a domain whose last fetch failed, or is still under way, is not fetched again.
 const RETRY: Duration = Duration::from_secs(60);
@@ -211,8 +209,7 @@ async fn own_directory(home: &Path, network: &Network, domain: &str) -> Result<D
     Ok(directory)
 }
 
-/// Runs a session process until `shutdown`: opens its command channel and its node; the session acts for the device
-/// too while no other session process of the device does.
+/// Runs a session process until `shutdown`: opens its command channel and its node.
 pub async fn listen(
     config: session::Config,
     home: &Path,
@@ -257,17 +254,22 @@ pub async fn listen(
         Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
     }
     let (inbound, queue) = tokio::sync::mpsc::unbounded_channel();
-    cli::open_channel(&config.dir.join("endpoint"), inbound.clone()).await?;
-    let device_file = home.join("device.json");
-    if !device_file.exists() {
-        Device::new(&gethostname::gethostname().to_string_lossy()).save(&device_file)?;
-    }
+    cli::open_channel(&config.dir.join("endpoint"), inbound).await?;
     let db = store::open(&config.dir.join("session.db"))?;
     let provider = SqliteProvider::open(&config.dir.join("session.db"))?;
-    let node_config = node_config(&network, home, &config.handle, None, config.dir.join("files"));
+    let node_config = lmk_node::Config {
+        relays: network.relays.clone(),
+        chosen: network.chosen.clone(),
+        resolve: network.resolve.clone(),
+        post: network.post.clone(),
+        ca: network.ca.clone(),
+        home: Some(home.to_path_buf()),
+        files: Some(config.dir.join("files")),
+        file_limit: 100 << 20,
+    };
     let (node, events) = Node::start(provider, node_config).await?;
-    let lookup = newer_minor(network.clone(), config.registry.clone());
-    let (session, newer) = tokio::join!(session::Session::open(config, db, node, home, network, inbound, held, membership), lookup);
+    let lookup = newer_minor(network, config.registry.clone());
+    let (session, newer) = tokio::join!(session::Session::open(config, db, node, home, held, membership), lookup);
     session::run(session?, queue, events, print, shutdown, newer).await
 }
 
@@ -327,15 +329,14 @@ pub async fn remove(config: session::Config, home: &Path, network: Network) -> R
         for group in groups.as_array().context("groups are a list")? {
             let leave = crate::client::Request::Leave { group: group["group"].as_str().map(str::to_owned), end: false };
             if cli::call(home, &handle, cli::Request::Client(leave)).await?["pending"] == true {
-                waiting.push((group["group"].clone(), group["name"].clone()));
+                waiting.push(group["group"].clone());
             }
         }
         let held = async {
             while !waiting.is_empty() {
                 let line: Value = serde_json::from_str(&printed.recv().await.context("the session stopped")?)?;
-                // A line names a group by its name where no other group of the session's has it, else by its id.
                 if line["type"] == "removed" {
-                    waiting.retain(|(id, name)| *id != line["group"] && *name != line["group"]);
+                    waiting.retain(|id| *id != line["group"]);
                 }
             }
             anyhow::Ok(())
@@ -349,21 +350,6 @@ pub async fn remove(config: session::Config, home: &Path, network: Network) -> R
     let groups = left?;
     std::fs::remove_dir_all(&dir)?;
     Ok(json!({ "removed": handle, "left": groups.as_array().unwrap().iter().map(|g| &g["group"]).collect::<Vec<_>>() }))
-}
-
-fn node_config(network: &Network, home: &Path, handle: &str, device: Option<Device>, files: PathBuf) -> lmk_node::Config {
-    lmk_node::Config {
-        handle: handle.into(),
-        device,
-        relays: network.relays.clone(),
-        chosen: network.chosen.clone(),
-        resolve: network.resolve.clone(),
-        post: network.post.clone(),
-        ca: network.ca.clone(),
-        home: Some(home.to_path_buf()),
-        files: Some(files),
-        file_limit: 100 << 20,
-    }
 }
 
 /// Resolves on Ctrl-C or, on Unix, SIGTERM.

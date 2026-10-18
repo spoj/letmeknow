@@ -136,7 +136,6 @@ pub struct Append {
     pub capability: [u8; 32],
     #[serde(deserialize_with = "append_entries")]
     pub entries: Vec<Bytes>,
-    pub public: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,7 +222,7 @@ mod tests {
     #[test]
     fn counts_are_bounded_while_decoding() {
         let entries = |n| format!("[{}]", vec!["\"\""; n].join(","));
-        let text = format!(r#"{{"capability":"{}","entries":{},"public":false}}"#, URL_SAFE_NO_PAD.encode([7; 32]), entries(100_000));
+        let text = format!(r#"{{"capability":"{}","entries":{}}}"#, URL_SAFE_NO_PAD.encode([7; 32]), entries(100_000));
         let Err(error) = serde_json::from_str::<Append>(&text) else { panic!("an oversized append decoded") };
         assert!(error.column() < 512, "must stop before decoding the oversized list");
         let text = format!(r#"{{"ok":{{"after":0,"entries":{}}}}}"#, entries(100_000));
@@ -254,7 +253,7 @@ mod tests {
 
     #[test]
     fn the_largest_append_fits_a_body() {
-        let append = Append { capability: [7; 32], entries: vec![Bytes(vec![9; MAX_ENTRY])], public: false };
+        let append = Append { capability: [7; 32], entries: vec![Bytes(vec![9; MAX_ENTRY])] };
         let body = serde_json::to_vec(&append).unwrap();
         assert!(body.len() < MAX_BODY);
         assert!(serde_json::from_slice::<Append>(&body).unwrap() == append);

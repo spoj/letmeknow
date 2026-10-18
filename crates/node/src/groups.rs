@@ -4,14 +4,12 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
-use lmk_core::group::{self as core, Change, Group};
+use lmk_core::group::{self as core, Change};
 use lmk_membership::Refused;
 use lmk_proto::Bytes;
-use lmk_proto::group::{IDENTITY, How, IdentityRef};
 
 use crate::held::delivered_key;
-use crate::identity::LEFT_IDENTITY;
-use crate::{Event, G, Inner, Member, State, device_key_key, get, reading, rec_key};
+use crate::{Event, G, Inner, Member, State, get, reading, rec_key};
 
 const COMMIT_TRIES: u32 = 5;
 
@@ -38,14 +36,13 @@ impl Inner {
                         let Some(mut change) = change(st, g)? else { return Ok(None) };
                         change.cut = st.cut_for(gid)?;
                         let g = st.groups.get_mut(gid).unwrap();
-                        let session = st.device_keys.get(gid).map_or(&st.session, |(_, session)| session);
-                        let commit = g.mls.commit(&st.provider, session, change)?;
+                        let commit = g.mls.commit(&st.provider, &st.session, change)?;
                         built = Some(commit.entry.clone());
                         (commit.entry, service, capability, epoch)
                     }
                 }
             };
-            match self.clients.client(&service)?.append(&capability, std::slice::from_ref(&entry), false).await {
+            match self.clients.client(&service)?.append(&capability, std::slice::from_ref(&entry)).await {
                 Ok(_) => {}
                 // A refusal that may pass keeps the entry posted, as an earlier attempt may have landed.
                 Err(error) if error.downcast_ref::<Refused>().is_some_and(|refused| matches!(refused.0.as_str(), "busy" | "rate" | "quota")) => return Err(error),
@@ -64,24 +61,6 @@ impl Inner {
             }
         }
         bail!("the group kept changing over {COMMIT_TRIES} tries; try again")
-    }
-
-    /// Touches the directory of an identity group: its last entry again, which its service keeps for another retention
-    /// instead of storing it. The directory is read first, so that its last entry is held.
-    pub(crate) async fn touch_directory(&self, gid: &[u8]) -> Result<()> {
-        let identity = {
-            let st = self.lock();
-            let settings = st.group(gid)?.mls.settings();
-            IdentityRef { id: settings.public.context("an identity group without a directory")?, membership: settings.membership }
-        };
-        self.read_public(&identity).await?;
-        let entry = {
-            let st = self.lock();
-            let log = st.public_log(&identity.id.0).context("the directory is not followed")?;
-            st.entry(&log, st.log(&log)?.length())?.context("the directory's last entry is not held")?
-        };
-        let address = lmk_proto::public::address(&identity.id.0);
-        self.clients.client(&identity.membership)?.append(&address, &[entry], true).await.map(drop)
     }
 
     /// Reads a group's logs from their service, each epoch's it moves to, through the current one's end.
@@ -147,8 +126,6 @@ impl Inner {
         st.peers.forget(&Bytes(gid.to_vec()));
         st.gate = true;
         st.provider.delete(&rec_key(gid))?;
-        st.provider.delete(&device_key_key(gid))?;
-        st.device_keys.remove(gid);
         self.committing.lock().unwrap().remove(gid);
         g.mls.delete(&st.provider)?;
         st.save_groups()?;
@@ -157,23 +134,10 @@ impl Inner {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn applied(
-        self: &Arc<Self>,
-        gid: &[u8],
-        by: Option<core::Member>,
-        added: Vec<core::Member>,
-        how: Option<How>,
-        removed: Vec<core::Member>,
-        settings: bool,
-        gone: bool,
-    ) {
-        if !added.is_empty() {
-            self.refresh_all().await;
-        }
+    pub(crate) async fn applied(self: &Arc<Self>, gid: &[u8], by: Option<core::Member>, added: Vec<core::Member>, removed: Vec<core::Member>, gone: bool) {
         let group = Bytes(gid.to_vec());
         let mut st = self.lock();
-        let by = by.and_then(|by| st.member(gid, &by));
+        let by = by.map(|by| st.member(gid, &by));
         if gone {
             drop(st);
             self.gone(gid, by);
@@ -183,20 +147,13 @@ impl Inner {
             st.reverify(gid).ok();
         }
         let Some(by) = by else { return };
-        let how = how.unwrap_or(How::Invite);
         for member in &added {
-            if let Some(member) = st.member(gid, member) {
-                st.events.push(Event::Joined { group: group.clone(), member, by: by.clone(), how: how.clone() });
-            }
+            let member = st.member(gid, member);
+            st.events.push(Event::Joined { group: group.clone(), member, by: by.clone() });
         }
         for member in &removed {
-            if let Some(member) = st.member(gid, member) {
-                st.events.push(Event::Left { group: group.clone(), member, by: by.clone() });
-            }
-        }
-        if settings && let Ok(g) = st.group(gid) {
-            let settings = g.mls.settings();
-            st.events.push(Event::Settings { group, settings, by });
+            let member = st.member(gid, member);
+            st.events.push(Event::Left { group: group.clone(), member, by: by.clone() });
         }
     }
 
@@ -204,27 +161,16 @@ impl Inner {
     /// kept, which its records still show.
     pub(crate) fn gone(&self, gid: &[u8], by: Option<Member>) {
         let mut st = self.lock();
-        let Some((kind, leaving)) = st.groups.get(gid).map(|g| (g.mls.settings().kind, g.rec.leaving)) else { return };
+        if !st.groups.contains_key(gid) {
+            return;
+        }
         let not_kept = match st.not_kept(gid) {
             Ok(not_kept) => not_kept,
             Err(error) => return self.warn(Some(gid), format!("{error:#}")),
         };
         match self.forget(&mut st, gid) {
-            Ok(()) => {
-                let warn = kind == IDENTITY && !leaving;
-                st.events.push(Event::Removed { group: Bytes(gid.to_vec()), kind, by, not_kept });
-                if warn {
-                    st.events.push(Event::Warning { group: Some(Bytes(gid.to_vec())), text: LEFT_IDENTITY.into() });
-                }
-            }
+            Ok(()) => st.events.push(Event::Removed { group: Bytes(gid.to_vec()), by, not_kept }),
             Err(error) => self.warn(Some(gid), format!("{error:#}")),
         }
     }
-}
-
-/// The name this session takes in a group: in an identity group, the device's, where its credential names another.
-pub(crate) fn renaming(g: &Group, device: Option<&str>) -> Option<String> {
-    let own = g.members().into_iter().find(|m| m.index == g.own_index())?.credential?;
-    let device = device.filter(|device| g.settings().kind == IDENTITY && own.name != *device)?;
-    Some(device.to_owned())
 }

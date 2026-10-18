@@ -19,7 +19,7 @@ impl State {
     /// The summaries of the group's epoch that members connected now sent, other than this session's own.
     fn online_summaries(&self, gid: &[u8]) -> Result<Vec<&Summary>> {
         let g = self.group(gid)?;
-        let (me, epoch) = (self.me(gid), g.mls.epoch());
+        let (me, epoch) = (self.me(), g.mls.epoch());
         let connected = self.peers.neighbours(&Bytes(gid.to_vec()));
         let members = g.mls.members();
         let reached = |member: &Bytes| members.iter().find(|m| m.key == member.0).and_then(|m| m.leaf.as_ref()).is_some_and(|leaf| connected.iter().any(|key| key.as_slice() == leaf.key.0.as_slice()));
@@ -31,7 +31,7 @@ impl State {
     /// The memberships whose summaries show that they hold this session's message `seq` sealed in this epoch, from
     /// members connected now: a commit may keep the message on their word.
     pub(crate) fn holders_of(&self, gid: &[u8], seq: u64) -> Result<Vec<Bytes>> {
-        let me = self.me(gid);
+        let me = self.me();
         let joined = self.group(gid)?.mls.joined(me).context("a member of its group")?;
         let holds = |summary: &&Summary| summary.sealed.iter().any(|sealed| sealed.key.0 == me && sealed.joined == joined && sealed.seqs.contains(seq));
         Ok(self.online_summaries(gid)?.into_iter().filter(holds).map(|summary| summary.member.clone()).collect())
@@ -41,7 +41,7 @@ impl State {
     /// sent in, and none connected shows it held. One sent before the others joined is no one else's to have.
     pub(crate) fn unheld(&self, gid: &[u8], record: &Record) -> Result<bool> {
         let g = self.group(gid)?;
-        let me = self.me(gid);
+        let me = self.me();
         let entitled = g.mls.members().iter().any(|m| m.key != me && g.mls.joined(&m.key).is_some_and(|joined| joined <= record.header.epoch));
         Ok(entitled && self.holders_of(gid, record.header.seq)?.is_empty())
     }
@@ -51,7 +51,7 @@ impl State {
     /// fetches before it commits.
     pub(crate) fn fetchable(&self, gid: &[u8]) -> Result<Vec<Seqs>> {
         let g = self.group(gid)?;
-        let (me, epoch) = (self.me(gid), g.mls.epoch());
+        let (me, epoch) = (self.me(), g.mls.epoch());
         let online = self.online_summaries(gid)?;
         let mut fetch = g.lacking();
         for cut in g.mls.cut().iter().filter(|cut| cut.key.0 != me) {
@@ -66,7 +66,7 @@ impl State {
 
     /// This session's messages of its latest membership of the group that no cut kept, by id.
     pub(crate) fn not_kept(&self, gid: &[u8]) -> Result<Vec<Bytes>> {
-        let me = self.me(gid);
+        let me = self.me();
         let Some(mine) = self.group(gid)?.rec.authors.iter().filter(|a| a.key.0 == me).max_by_key(|a| a.joined) else { return Ok(Vec::new()) };
         let mut ids = Vec::new();
         for seq in mine.cut + 1..=mine.last() {
@@ -83,7 +83,7 @@ impl Inner {
     pub(crate) fn send(&self, st: &mut State, gid: &[u8], payload: &Value, reply_to: Option<&[u8]>) -> Result<Bytes> {
         self.reseal(st, gid)?;
         let now = st.tick();
-        let me = st.me(gid).to_vec();
+        let me = st.me().to_vec();
         let g = st.group(gid)?;
         let joined = g.mls.joined(&me).context("a member of its group")?;
         let seq = g.current(&me).context("its own membership")?.last() + 1;
@@ -101,7 +101,7 @@ impl Inner {
             }
         };
         let control = lmk_proto::group::Control::TYPES.contains(&lmk_proto::group::type_of(payload));
-        let deps = if control || st.group(gid)?.mls.settings().kind == lmk_proto::group::IDENTITY { Vec::new() } else { st.deps(gid)? };
+        let deps = if control { Vec::new() } else { st.deps(gid)? };
         let header = Header {
             group: Bytes(gid.to_vec()),
             author: Bytes(me.clone()),
@@ -122,8 +122,7 @@ impl Inner {
         if !g.sending.take(plaintext.len(), 1.0, now) {
             return Err(SendError::Rate.into());
         }
-        let session = st.device_keys.get(gid).map_or(&st.session, |(_, session)| session);
-        let ciphertext = g.mls.seal(&st.provider, session, &plaintext)?;
+        let ciphertext = g.mls.seal(&st.provider, &st.session, &plaintext)?;
         let epoch = g.mls.epoch();
         let author = g.author_mut(&me, joined).unwrap();
         author.held.insert(seq);
@@ -151,15 +150,14 @@ impl Inner {
         if g.rec.resealed >= epoch || !read || !st.at_head(gid) {
             return Ok(());
         }
-        let me = st.me(gid).to_vec();
+        let me = st.me().to_vec();
         let Some(mine) = g.current(&me).cloned() else { return Ok(()) };
         let mut items = Vec::new();
         for seq in mine.cut + 1..=mine.last() {
             let mut record = st.record_at(gid, &me, mine.joined, seq)?.context("this session's message past its cut")?;
             let plaintext = record.plaintext.clone().context("this session's plaintext past its cut")?;
             let g = st.groups.get_mut(gid).unwrap();
-            let session = st.device_keys.get(gid).map_or(&st.session, |(_, session)| session);
-            let ciphertext = g.mls.seal(&st.provider, session, &plaintext.0)?;
+            let ciphertext = g.mls.seal(&st.provider, &st.session, &plaintext.0)?;
             g.author_mut(&me, mine.joined).unwrap().sealed.insert(seq, epoch);
             record.sealing = Some((epoch, Bytes(ciphertext.clone())));
             st.store(gid, &record)?;

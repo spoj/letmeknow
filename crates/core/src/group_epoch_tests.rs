@@ -39,7 +39,7 @@ fn filler() -> Vec<u8> {
 fn epoch_zero_and_every_accepted_commit_rotate_once() {
     let mut w = World::new(&["A", "B", "C"]);
     let a = &mut w.m[0];
-    a.group = Some(Group::create(&a.provider, &a.session, &settings("Plan")).unwrap());
+    a.group = Some(Group::create(&a.provider, &a.session, &settings()).unwrap());
     let zero = exports(a);
     assert_eq!(a.g().epoch(), 0);
     for (i, label) in [(1, "Add-first"), (2, "Add-observed")] {
@@ -48,7 +48,7 @@ fn epoch_zero_and_every_accepted_commit_rotate_once() {
         let before = exports(&w.m[0]);
         let epoch = w.m[0].g().epoch();
         let cut = w.m[0].cut();
-        let commit = w.m[0].commit(Change { cut, add: vec![package.clone()], how: Some(How::Invite), ..Change::default() });
+        let commit = w.m[0].commit(Change { cut, add: vec![package.clone()], invite: Some(INVITE.into()), ..Change::default() });
         assert_eq!(exports(&w.m[0]), before, "staging must not select successor exporters");
         let inner = w.m[0].open_inner(&commit.entry);
         let admission = commit.admission.clone().unwrap();
@@ -72,11 +72,8 @@ fn epoch_zero_and_every_accepted_commit_rotate_once() {
         }
     }
     assert_ne!(exports(&w.m[0]).0, zero.0);
-    let changed = Settings { name: "Plan renamed".into(), ..w.m[0].g().settings() };
     let changes = [
         ("update", Change::default()),
-        ("name", Change { name: Some("A renamed".into()), ..Change::default() }),
-        ("settings", Change { settings: Some(changed), ..Change::default() }),
         ("leaf", Change { leaf: Some(leaf("new route")), ..Change::default() }),
     ];
     for (label, change) in changes {
@@ -222,31 +219,14 @@ fn staged_oversize_and_malformed_builds_restore_everything() {
     let mut w = World::new(&["A", "B"]);
     w.found(0, &[1]);
     let a = &mut w.m[0];
+    let padded = |n: usize| Leaf { key: Bytes(vec![b'x'; n]), revision: REVISION };
     let cut = a.cut();
-    let probe = a.commit(Change { cut, name: Some("x".into()), ..Change::default() });
-    let minimum = a.group.as_ref().unwrap().open_entry(&a.provider, &probe.entry).unwrap().len();
+    let top = a.commit(Change { cut, leaf: Some(padded(700_000)), ..Change::default() });
+    assert_eq!(top.entry.len(), 1 << 20);
     a.cancel();
-    for (length, bucket) in [(8147, 8192), (8148, 16384)] {
-        let cut = a.cut();
-        let commit = a.commit(Change { cut, name: Some("x".repeat(1 + length - minimum)), ..Change::default() });
-        assert_eq!(a.group.as_ref().unwrap().open_entry(&a.provider, &commit.entry).unwrap().len(), length);
-        assert_eq!(commit.entry.len(), bucket);
-        a.cancel();
-    }
-    let cut = a.cut();
-    let probe = a.commit(Change { cut, name: Some("x".repeat(1_040_000)), ..Change::default() });
     let group = a.group.as_mut().unwrap();
-    let probe_size = group.open_entry(&a.provider, &probe.entry).unwrap().len();
-    group.cancel(&a.provider).unwrap();
-    let largest_name = 1_040_000 + MAX_INNER - probe_size;
-    let cut = a.cut();
-    let largest = a.commit(Change { cut, name: Some("x".repeat(largest_name)), ..Change::default() });
-    let group = a.group.as_mut().unwrap();
-    assert_eq!(group.open_entry(&a.provider, &largest.entry).unwrap().len(), MAX_INNER);
-    assert_eq!(largest.entry.len(), 1 << 20);
-    group.cancel(&a.provider).unwrap();
     group.mls.set_aad(b"transient AAD before a failed build".to_vec());
-    group.state.aad = Aad { how: Some(How::Other("future".into())), invite: Some([3; 32].into()), cut: group.cut().to_vec(), time: 1 };
+    group.state.aad = Aad { invite: Some([3; 32].into()), cut: group.cut().to_vec(), time: 1 };
     group.save(&a.provider).unwrap();
     let before = a.provider.rows();
     let before_state = serde_json::to_vec(&group.state).unwrap();
@@ -254,9 +234,9 @@ fn staged_oversize_and_malformed_builds_restore_everything() {
     let before_epoch = (group.epoch(), group.epoch_authenticator().to_vec(), group.capability(&a.provider).unwrap());
     let cut = group.cut().to_vec();
     for (index, change) in [
-        Change { cut: cut.clone(), name: Some("x".repeat(largest_name + 1)), ..Change::default() },
-        Change { cut: cut.clone(), add: vec![b"malformed package".to_vec()], how: Some(How::Invite), ..Change::default() },
-        Change { cut: cut.clone(), settings: Some(Settings { kind: "another kind".into(), ..group.settings() }), how: Some(How::Invite), ..Change::default() },
+        Change { cut: cut.clone(), leaf: Some(padded(800_000)), ..Change::default() },
+        Change { cut: cut.clone(), add: vec![b"malformed package".to_vec()], invite: Some(INVITE.into()), ..Change::default() },
+        Change { cut: cut.clone(), invite: Some([3; 32].into()), ..Change::default() },
     ].into_iter().enumerate() {
         let error = group.commit(&a.provider, &a.session, change).err().unwrap();
         if index == 0 {
@@ -306,7 +286,7 @@ fn accepted_package_refs_survive_pending_serde_and_reenveloping() {
         reference
     }).collect();
     let cut = w.m[0].cut();
-    let commit = w.m[0].commit(Change { cut, add: packages.to_vec(), how: Some(How::Other("future method".into())), invite: Some([5; 32].into()), ..Change::default() });
+    let commit = w.m[0].commit(Change { cut, add: packages.to_vec(), invite: Some([5; 32].into()), ..Change::default() });
     let admission = commit.admission.clone().unwrap();
     let a = &w.m[0];
     assert_eq!(a.group.as_ref().unwrap().state.posted.as_ref().unwrap().add_refs, refs);
@@ -330,7 +310,7 @@ fn accepted_package_refs_survive_pending_serde_and_reenveloping() {
         assert_eq!(w.m[i].g().epoch(), epoch + 1);
         let added: Vec<_> = w.m[i].g().added().iter().filter(|add| add.epoch == epoch + 1).cloned().collect();
         assert_eq!(added.iter().map(|add| add.key_package_ref).collect::<Vec<_>>(), refs);
-        assert!(added.iter().all(|add| add.how == Some(How::Other("future method".into())) && add.invite == Some([5; 32].into())));
+        assert!(added.iter().all(|add| add.invite == [5; 32].into()));
         w.m[i] = w.m[i].copy();
         assert!(w.m[i].g().posted().is_none());
         assert_eq!(w.m[i].g().added().iter().filter(|add| add.epoch == epoch + 1).cloned().collect::<Vec<_>>(), added);
@@ -345,13 +325,13 @@ fn accepted_package_refs_survive_pending_serde_and_reenveloping() {
 fn welcome_must_use_the_intended_package_and_checkpoint_failure_restores_it() {
     let mut w = World::new(&["A", "B"]);
     let a = &mut w.m[0];
-    a.group = Some(Group::create(&a.provider, &a.session, &settings("Plan")).unwrap());
+    a.group = Some(Group::create(&a.provider, &a.session, &settings()).unwrap());
     let intended = w.key_package(1);
     let other = w.key_package(1);
     let intended_ref = key_package_reference(&w.m[1].provider, &intended).unwrap();
     let other_ref = key_package_reference(&w.m[1].provider, &other).unwrap();
     let cut = w.m[0].cut();
-    let commit = w.m[0].commit(Change { cut, add: vec![other], how: Some(How::Invite), ..Change::default() });
+    let commit = w.m[0].commit(Change { cut, add: vec![other], invite: Some(INVITE.into()), ..Change::default() });
     let entry = w.m[0].open_inner(&commit.entry);
     let Admission { welcome, sig } = commit.admission.clone().unwrap();
     let b = &w.m[1];
@@ -383,16 +363,22 @@ fn welcome_must_use_the_intended_package_and_checkpoint_failure_restores_it() {
 }
 
 #[test]
-fn a_multi_package_welcome_cannot_select_another_saved_operation() {
+fn a_multi_package_welcome_cannot_select_another_saved_package() {
     let mut w = World::new(&["A", "B"]);
     let a = &mut w.m[0];
-    a.group = Some(Group::create(&a.provider, &a.session, &settings("Plan")).unwrap());
+    a.group = Some(Group::create(&a.provider, &a.session, &settings()).unwrap());
     let b = &w.m[1];
-    let other_session = Session::with_signer(&b.provider, stranger(), "B's other operation", leaf("other")).unwrap();
-    let packages = [b.session.key_package(&b.provider).unwrap(), other_session.key_package(&b.provider).unwrap()];
+    let other = stranger();
+    let other_package = KeyPackage::builder()
+        .leaf_node_capabilities(capabilities())
+        .leaf_node_extensions(leaf_extensions(&leaf("other")).unwrap())
+        .key_package_lifetime(Lifetime::init(0, u64::MAX))
+        .build(CIPHERSUITE, &b.provider, &other, CredentialWithKey { credential: BasicCredential::new(other.public().to_vec()).into(), signature_key: other.public().into() })
+        .unwrap();
+    let packages = [b.session.key_package(&b.provider).unwrap(), MlsMessageOut::from(other_package.key_package().clone()).to_bytes().unwrap()];
     let refs: Vec<_> = packages.iter().map(|kp| key_package_reference(&b.provider, kp).unwrap()).collect();
     let cut = w.m[0].cut();
-    let commit = w.m[0].commit(Change { cut, add: packages.to_vec(), how: Some(How::Invite), ..Change::default() });
+    let commit = w.m[0].commit(Change { cut, add: packages.to_vec(), invite: Some(INVITE.into()), ..Change::default() });
     let entry = w.m[0].open_inner(&commit.entry);
     let Admission { welcome, sig } = commit.admission.clone().unwrap();
     let MlsMessageBodyIn::Welcome(parsed) = parse::<MlsMessageIn>(&welcome).unwrap().extract() else { panic!() };
@@ -410,7 +396,7 @@ fn a_multi_package_welcome_cannot_select_another_saved_operation() {
 fn identical_leaf_and_signature_keys_are_not_package_identity() {
     let mut w = World::new(&["A", "B"]);
     let a = &mut w.m[0];
-    a.group = Some(Group::create(&a.provider, &a.session, &settings("Plan")).unwrap());
+    a.group = Some(Group::create(&a.provider, &a.session, &settings()).unwrap());
     let p1 = w.key_package(1);
     let p2 = w.key_package(1);
     let b = &w.m[1];
@@ -440,7 +426,7 @@ fn identical_leaf_and_signature_keys_are_not_package_identity() {
     let r2 = key_package_reference(&b.provider, &p2).unwrap();
     assert_ne!(r1, r2);
     let cut = w.m[0].cut();
-    let commit = w.m[0].commit(Change { cut, add: vec![p2.clone()], how: Some(How::Invite), ..Change::default() });
+    let commit = w.m[0].commit(Change { cut, add: vec![p2.clone()], invite: Some(INVITE.into()), ..Change::default() });
     let inner = w.m[0].open_inner(&commit.entry);
     let Admission { welcome, sig } = commit.admission.clone().unwrap();
     w.post(commit.entry);
@@ -461,7 +447,7 @@ fn identical_leaf_and_signature_keys_are_not_package_identity() {
 fn last_resort_packages_do_not_bypass_exact_welcome_matching() {
     let mut w = World::new(&["A", "B"]);
     let a = &mut w.m[0];
-    a.group = Some(Group::create(&a.provider, &a.session, &settings("Plan")).unwrap());
+    a.group = Some(Group::create(&a.provider, &a.session, &settings()).unwrap());
     let intended = w.key_package(1);
     let b = &w.m[1];
     let intended_ref = key_package_reference(&b.provider, &intended).unwrap();
@@ -474,7 +460,7 @@ fn last_resort_packages_do_not_bypass_exact_welcome_matching() {
     let package = MlsMessageOut::from(bundle.key_package().clone()).to_bytes().unwrap();
     let reference = key_package_reference(&b.provider, &package).unwrap();
     let cut = w.m[0].cut();
-    let commit = w.m[0].commit(Change { cut, add: vec![package], how: Some(How::Invite), ..Change::default() });
+    let commit = w.m[0].commit(Change { cut, add: vec![package], invite: Some(INVITE.into()), ..Change::default() });
     let entry = w.m[0].open_inner(&commit.entry);
     let Admission { welcome, sig } = commit.admission.clone().unwrap();
     let b = &w.m[1];
@@ -493,8 +479,7 @@ fn last_resort_packages_do_not_bypass_exact_welcome_matching() {
 
 #[test]
 fn unsupported_authorities_fail_without_partial_state() {
-    let mut w = World::new(&["A", "B"]);
-    w.found(0, &[1]);
+    let a = Member::new(memory(), "A");
     let invalid = (0..=255).map(|byte| [byte; 32]).find(|bytes| ed25519_dalek::VerifyingKey::from_bytes(bytes).is_err()).unwrap();
     let authorities = [
         Service::Newer(serde_json::json!({"future": {"key": "unknown"}})),
@@ -502,37 +487,11 @@ fn unsupported_authorities_fail_without_partial_state() {
         Service::Serve { key: invalid.into(), domain: "r.example".into(), rest: Default::default() },
         Service::Serve { key: [0; 32].into(), domain: "r.example".into(), rest: Default::default() },
     ];
+    let before = a.provider.rows();
     for membership in authorities {
-        let changed = Settings { membership, ..w.m[0].g().settings() };
-        let a = &mut w.m[0];
-        let before = a.provider.rows();
+        let changed = Settings { membership, ..settings() };
         assert!(Group::create(&a.provider, &a.session, &changed).is_err());
         assert_eq!(a.provider.rows(), before);
-        let group = a.group.as_mut().unwrap();
-        let epoch = group.epoch_authenticator().to_vec();
-        let state = serde_json::to_vec(&group.state).unwrap();
-        let cut = group.cut().to_vec();
-        assert!(group.commit(&a.provider, &a.session, Change { cut: cut.clone(), settings: Some(changed.clone()), ..Change::default() }).is_err());
-        assert_eq!(a.provider.rows(), before);
-        assert_eq!(group.epoch_authenticator(), epoch);
-        assert_eq!(serde_json::to_vec(&group.state).unwrap(), state);
-        group.mls.set_aad(cut_aad(&cut));
-        let bundle = group.mls.commit_builder().force_self_update(true)
-            .propose_group_context_extensions(context_extensions(&changed).unwrap()).unwrap()
-            .load_psks(a.provider.storage()).unwrap().build(a.provider.rand(), a.provider.crypto(), &a.session.signer, |_| true).unwrap()
-            .stage_commit(&a.provider).unwrap();
-        let inner = entry_of(&a.session.signer, bundle.into_messages().0.to_bytes().unwrap());
-        let sealed = group.seal_entry(&a.provider, &inner).unwrap();
-        group.mls.clear_pending_commit(a.provider.storage()).unwrap();
-        let b = &mut w.m[1];
-        let before = b.provider.rows();
-        let group = b.group.as_mut().unwrap();
-        let verdict = group.judge(&b.provider, &sealed).unwrap();
-        assert!(matches!(verdict, Verdict::Skipped { reason, .. } if reason.contains("service authority")));
-        assert_eq!(b.provider.rows(), before);
-        assert!(group.apply(&b.provider, &sealed).is_err());
-        assert_eq!(b.provider.rows(), before);
-        assert_eq!(group.epoch_authenticator(), epoch);
     }
 }
 
@@ -540,7 +499,7 @@ fn unsupported_authorities_fail_without_partial_state() {
 fn unsupported_welcome_authority_rolls_back_consumption() {
     let mut w = World::new(&["A", "B"]);
     let a = &mut w.m[0];
-    a.group = Some(Group::create(&a.provider, &a.session, &settings("Plan")).unwrap());
+    a.group = Some(Group::create(&a.provider, &a.session, &settings()).unwrap());
     let package = w.key_package(1);
     let reference = key_package_reference(&w.m[1].provider, &package).unwrap();
     let a = &mut w.m[0];
@@ -564,107 +523,17 @@ fn unsupported_welcome_authority_rolls_back_consumption() {
 }
 
 #[test]
-fn private_service_changes_bind_both_authorities_and_keep_future_settings() {
-    let mut w = World::new(&["A", "B"]);
-    w.found(0, &[1]);
-    let (old_c, old_k, old_context) = exports(&w.m[0]);
-    let new_service = ed25519_dalek::SigningKey::from_bytes(&[2; 32]).verifying_key().to_bytes();
-    let mut changed = w.m[0].g().settings();
-    changed.membership = Service::Serve {
-        key: new_service.into(), domain: "new.example".into(),
-        rest: [("future-service-setting".into(), serde_json::json!(7))].into_iter().collect(),
-    };
-    changed.rest.insert("future-group-setting".into(), serde_json::json!({"x": true}));
-    let cut = w.m[0].cut();
-    let commit = w.m[0].commit(Change { cut, settings: Some(changed.clone()), ..Change::default() });
-    let a = &w.m[0];
-    let associated = aad(a, commit.entry.len());
-    assert!(decrypt(&old_k, &associated, &commit.entry).is_ok());
-    let mut new_context = old_context;
-    new_context[24..].copy_from_slice(&new_service);
-    let wrong_k: [u8; 32] = a.group.as_ref().unwrap().mls.export_secret(a.provider.crypto(), SEALING_LABEL, &new_context, 32).unwrap().try_into().unwrap();
-    assert!(decrypt(&wrong_k, &associated, &commit.entry).is_err(), "the source commit uses old S");
-    w.post(commit.entry);
-    w.read(&[0, 1]);
-    assert_eq!(exports(&w.m[0]), exports(&w.m[1]));
-    let (new_c, new_k, context) = exports(&w.m[1]);
-    assert_eq!(&context[24..], new_service);
-    assert_ne!(old_c, new_c);
-    assert_ne!(old_k, new_k);
-    let later = w.m[1].seal_inner(&filler());
-    assert!(decrypt(&new_k, &aad(&w.m[1], later.len()), &later).is_ok());
-    assert_eq!(w.m[1].g().settings(), changed);
-    changed.name = "renamed later".into();
-    let cut = w.m[1].cut();
-    let commit = w.m[1].commit(Change { cut, settings: Some(changed.clone()), ..Change::default() });
-    w.post(commit.entry);
-    w.read(&[0, 1]);
-    assert_eq!(w.m[0].g().settings(), changed);
-}
-
-#[test]
-fn identity_authority_cannot_change_but_its_route_can() {
-    let mut w = World::new(&["A", "B"]);
-    let a = &mut w.m[0];
-    let identity = Settings { kind: IDENTITY.into(), public: Some([6; 32].into()), ..settings("identity") };
-    a.group = Some(Group::create(&a.provider, &a.session, &identity).unwrap());
-    let package = w.key_package(1);
-    let cut = w.m[0].cut();
-    let commit = w.m[0].commit(Change { cut, add: vec![package.clone()], how: Some(How::Invite), ..Change::default() });
-    let inner = w.m[0].open_inner(&commit.entry);
-    let admission = commit.admission.clone().unwrap();
-    let pos = w.post(commit.entry);
-    w.read(&[0]);
-    w.m[1].join(&inner, &admission, pos, &package);
-    let a = &mut w.m[0];
-    let group = a.group.as_mut().unwrap();
-    let mut changed = group.settings();
-    let Service::Serve { key, .. } = &mut changed.membership else { panic!() };
-    *key = ed25519_dalek::SigningKey::from_bytes(&[2; 32]).verifying_key().to_bytes().into();
-    let before = a.provider.rows();
-    let cut = group.cut().to_vec();
-    let error = group.commit(&a.provider, &a.session, Change { cut: cut.clone(), settings: Some(changed.clone()), ..Change::default() }).err().unwrap();
-    assert!(error.to_string().contains("identity group's service authority changed"));
-    assert_eq!(a.provider.rows(), before);
-    group.mls.set_aad(cut_aad(&cut));
-    let bundle = group.mls.commit_builder().force_self_update(true)
-        .propose_group_context_extensions(context_extensions(&changed).unwrap()).unwrap()
-        .load_psks(a.provider.storage()).unwrap().build(a.provider.rand(), a.provider.crypto(), &a.session.signer, |_| true).unwrap()
-        .stage_commit(&a.provider).unwrap();
-    let inner = entry_of(&a.session.signer, bundle.into_messages().0.to_bytes().unwrap());
-    let sealed = group.seal_entry(&a.provider, &inner).unwrap();
-    group.mls.clear_pending_commit(a.provider.storage()).unwrap();
-    let b = &mut w.m[1];
-    let before = b.provider.rows();
-    let group = b.group.as_mut().unwrap();
-    assert!(matches!(group.judge(&b.provider, &sealed).unwrap(), Verdict::Skipped { reason, .. } if reason.contains("identity group's service authority changed")));
-    assert_eq!(b.provider.rows(), before);
-    assert!(group.apply(&b.provider, &sealed).is_err());
-    assert_eq!(b.provider.rows(), before);
-    let mut routed = group.settings();
-    let Service::Serve { domain, .. } = &mut routed.membership else { panic!() };
-    *domain = "new-route.example".into();
-    let cut = w.m[0].cut();
-    let commit = w.m[0].commit(Change { cut, settings: Some(routed.clone()), ..Change::default() });
-    w.post(commit.entry);
-    w.read(&[0, 1]);
-    assert_eq!(w.m[0].g().settings(), routed);
-    assert_eq!(w.m[1].g().settings(), routed);
-    assert_eq!(exports(&w.m[0]), exports(&w.m[1]));
-}
-
-#[test]
 fn sqlite_welcome_rollback_keeps_both_packages_across_restart() {
     let dir = std::env::temp_dir().join(format!("lmk-core-epoch-join-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("joiner.db");
     let mut a = Member::new(memory(), "A");
-    a.group = Some(Group::create(&a.provider, &a.session, &settings("Plan")).unwrap());
+    a.group = Some(Group::create(&a.provider, &a.session, &settings()).unwrap());
     let b = Member::new(SqliteProvider::open(&path).unwrap(), "B");
     let packages = [b.session.key_package(&b.provider).unwrap(), b.session.key_package(&b.provider).unwrap()];
     let refs: Vec<_> = packages.iter().map(|kp| key_package_in(&b.provider, kp).unwrap().hash_ref(b.provider.crypto()).unwrap()).collect();
     let cut = a.cut();
-    let commit = a.commit(Change { cut, add: vec![packages[1].clone()], how: Some(How::Invite), ..Change::default() });
+    let commit = a.commit(Change { cut, add: vec![packages[1].clone()], invite: Some(INVITE.into()), ..Change::default() });
     let entry = a.open_inner(&commit.entry);
     let Admission { welcome, sig } = commit.admission.clone().unwrap();
     let id = a.g().id().to_vec();

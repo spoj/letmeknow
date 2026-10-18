@@ -26,7 +26,7 @@ fn the_binary_prints_the_skill_and_needs_a_session_for_requests() {
     assert!(String::from_utf8(groups.stderr).unwrap().contains("no session is running"));
     let send = letmeknow(&home, &["--session", "swift-koala", "send", "hi"]);
     assert!(String::from_utf8(send.stderr).unwrap().contains("swift-koala is not running"));
-    let bad = letmeknow(&home, &["invite", "--kind", "spreadsheet"]);
+    let bad = letmeknow(&home, &["invite", "--no-such-flag"]);
     assert!(!bad.status.success());
 }
 

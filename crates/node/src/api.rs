@@ -4,18 +4,16 @@
 use anyhow::{Context, Result, ensure};
 use iroh::RelayUrl;
 use lmk_core::group::{Change, Group};
-use lmk_core::public::{self, PublicLog};
 use lmk_net::Net;
-use lmk_proto::group::{Certificate, IdentityRef, Settings};
+use lmk_proto::group::Settings;
 use lmk_proto::links::FileLink;
 use lmk_proto::Bytes;
 use n0_future::{FutureExt, MergeUnbounded, StreamExt};
 use n0_future::time::{Duration, sleep, timeout};
 use serde_json::{Value, json};
 
-use crate::groups::renaming;
 use crate::held::delivered_key;
-use crate::{G, MEMBER_WAIT, Member, Message, Node, Rec, State, Work, device_key_key, get, put};
+use crate::{G, MEMBER_WAIT, Member, Message, Node, Rec, State, Work, get};
 
 impl Node {
     /// Stops the peers and every task, and closes the provider.
@@ -71,42 +69,16 @@ impl Node {
         Ok(self.inner.lock().group(gid)?.rec.pending.clone())
     }
 
-    /// A new group with this session its only member, speaking as `identity`.
-    pub fn create(&self, settings: Settings, identity: Option<Certificate>) -> Result<Bytes> {
+    /// A new group with this session its only member.
+    pub fn create(&self, settings: Settings) -> Result<Bytes> {
         let gid = {
             let mut st = self.inner.lock();
             let st = &mut *st;
-            st.speak(identity);
             let mls = Group::create(&st.provider, &st.session, &settings)?;
             st.add_group(mls, Rec::default())?
         };
         self.inner.work.send(Work::Entered(self.log(&gid)?.0)).ok();
         Ok(Bytes(gid))
-    }
-
-    /// Creates an identity's group, with a new device key of this node's its first member, and the identity's
-    /// public log, whose first entry lists that key as its writer, and whose id the group's settings carry. Leaves the
-    /// group if the entry cannot be appended.
-    pub async fn create_identity(&self, mut settings: Settings) -> Result<IdentityRef> {
-        let (gid, identity, first) = {
-            let mut st = self.inner.lock();
-            let st = &mut *st;
-            let (seed, session) = st.device_key()?;
-            let (id, first) = public::create(&seed, settings.membership.clone());
-            settings.public = Some(Bytes(id.to_vec()));
-            let mls = Group::create(&st.provider, &session, &settings)?;
-            let gid = st.add_group(mls, Rec::default())?;
-            put(&st.provider, &device_key_key(&gid), &Bytes(seed.to_vec()))?;
-            st.device_keys.insert(gid.clone(), (seed, session));
-            (gid, IdentityRef { id: Bytes(id.to_vec()), membership: settings.membership }, first)
-        };
-        self.inner.work.send(Work::Entered(self.log(&gid)?.0)).ok();
-        let address = lmk_proto::public::address(&identity.id.0);
-        if let Err(error) = self.inner.clients.client(&identity.membership)?.append(&address, &[first], true).await {
-            self.leave(&gid)?;
-            return Err(error);
-        }
-        Ok(identity)
     }
 
     /// Removes a member. Returns whether this session's commit removed it, which it need not once another's did.
@@ -126,17 +98,6 @@ impl Node {
         Ok(())
     }
 
-    /// Changes the group's settings, from the current ones.
-    pub async fn change_settings(&self, gid: &[u8], change: impl Fn(Settings) -> Settings) -> Result<Settings> {
-        self.inner
-            .commit(gid, |_, g| {
-                let settings = change(g.mls.settings());
-                Ok((settings != g.mls.settings()).then(|| Change { settings: Some(settings), ..Change::default() }))
-            })
-            .await?;
-        self.settings(gid)
-    }
-
     /// Whether this session asked to leave the group, which it is in until a member removes it.
     pub fn leaving(&self, gid: &[u8]) -> bool {
         self.inner.lock().groups.get(gid).is_some_and(|g| g.rec.leaving)
@@ -150,7 +111,7 @@ impl Node {
         st.group_mut(gid)?.rec.leaving = true;
         st.save(gid)?;
         let g = st.group(gid)?;
-        let me = st.me(gid).to_vec();
+        let me = st.me().to_vec();
         if g.mls.members().len() == 1 {
             self.inner.forget(&mut st, gid)?;
             Ok(None)
@@ -161,23 +122,14 @@ impl Node {
         }
     }
 
-    /// Sends a held payload, a reply to the delivered message `reply_to` if given. The node first asks the membership
-    /// service about the group's logs it has not read within 2 minutes, and removes the members whose devices their
-    /// identities' directories dropped; then it seals the payload to the members as of then, keeps it, delivers it to
-    /// this session and pushes it to the members online, and seals it again in each epoch until a cut keeps it. Answers
-    /// its id. Fails with `SendError` when this session sends faster than members take, or the message is too large.
+    /// Sends a held payload, a reply to the delivered message `reply_to` if given. The node first reads the group's log
+    /// from the membership service, waiting for it at most 5 seconds; then it seals the payload to the members as of then,
+    /// keeps it, delivers it to this session and pushes it to the members online, and seals it again in each epoch until
+    /// a cut keeps it. Answers its id. Fails with `SendError` when this session sends faster than members take, or
+    /// the message is too large.
     pub async fn send(&self, gid: &[u8], payload: &Value, reply_to: Option<&[u8]>) -> Result<Bytes> {
         self.inner.refresh(gid).await;
-        self.inner.cut_off(gid).await?;
         self.inner.send(&mut self.inner.lock(), gid, payload, reply_to)
-    }
-
-    /// Seals a live payload, not held, and sends it to the members online, or to the one with fingerprint `to`; none
-    /// while this session has not applied the group's log to its head.
-    pub fn send_live(&self, gid: &[u8], payload: &Value, to: Option<&str>) -> Result<()> {
-        let mut st = self.inner.lock();
-        let peer = to.map(|fp| st.by_fp(gid, fp)).transpose()?;
-        self.inner.send_live(&mut st, gid, payload, peer)
     }
 
     /// Holds files for the group's H from now, as those a held message links, unless it holds them already; fetches
@@ -325,91 +277,9 @@ impl Node {
         self.inner.ask_members().await
     }
 
-    /// Opens the groups' current logs and touches the identities' directories, as every hour does.
+    /// Opens the groups' current logs, as every hour does.
     pub async fn open_logs(&self) {
         self.inner.open_logs().await
-    }
-
-    /// An identity's public log, read from its service now.
-    pub async fn read_public(&self, identity: &IdentityRef) -> Result<PublicLog> {
-        self.inner.read_public(identity).await
-    }
-
-    /// Publishes an intent derived after reading `predecessor`, never rebasing it onto a later directory. Unchanged
-    /// writers publish nothing: each device touches the directory every hour instead.
-    pub async fn publish(&self, gid: &[u8], predecessor: &PublicLog, mut writers: Vec<Bytes>) -> Result<PublicLog> {
-        writers.sort();
-        writers.dedup();
-        let settings = self.settings(gid)?;
-        let identity = IdentityRef { id: settings.public.context("a group without a public log")?, membership: settings.membership };
-        let latest = self.inner.read_public(&identity).await?;
-        ensure!(latest == *predecessor, crate::Advanced);
-        let listed = writers.len();
-        writers.retain(|writer| !latest.is_dropped(writer));
-        if writers.len() < listed {
-            self.inner.warn(Some(gid), "a device the directory dropped is left out of this directory update".into());
-        }
-        let entry = {
-            let st = self.inner.lock();
-            let (seed, session) = st.device_keys.get(gid).context("not an identity group of this node")?;
-            ensure!(latest.writers.contains(&Bytes(session.key().to_vec())), "this device is not a directory writer");
-            if latest.writers == writers {
-                return Ok(latest);
-            }
-            latest.next(seed, writers)
-        };
-        let address = lmk_proto::public::address(&identity.id.0);
-        self.inner.clients.client(&identity.membership)?.append(&address, &[entry], true).await?;
-        self.inner.read_public(&identity).await
-    }
-
-    pub async fn recertify(&self, gid: &[u8], certificate: Certificate) -> Result<()> {
-        let change = |st: &State, g: &G| {
-            ensure!(g.mls.settings().kind != lmk_proto::group::IDENTITY, "not a session membership");
-            let own = g.mls.members().into_iter().find(|m| m.key == st.session.key()).context("not a member")?;
-            let mut credential = own.credential.context("not a letmeknow credential")?;
-            let before = credential.certificate.as_ref().context("an anonymous membership cannot acquire an identity")?;
-            ensure!(before.identity.id == certificate.identity.id && before.device == certificate.device, "a refresh cannot change identity or device");
-            let unchanged = **before == certificate;
-            credential.certificate = Some(Box::new(certificate.clone()));
-            ensure!(credential.key.0 == st.session.key() && public::verify_certificate(&credential), "invalid signed identity claims");
-            Ok((!unchanged).then(|| Change { certificate: Some(certificate.clone()), ..Change::default() }))
-        };
-        let needed = {
-            let st = self.inner.lock();
-            change(&st, st.group(gid)?)?.is_some()
-        };
-        if needed {
-            self.inner.commit(gid, change).await?;
-        }
-        Ok(())
-    }
-
-    /// The identities this session speaks as in its groups.
-    pub fn spoken(&self) -> Vec<IdentityRef> {
-        let st = self.inner.lock();
-        let mut spoken: Vec<IdentityRef> = Vec::new();
-        for g in st.groups.values() {
-            let me = g.mls.members().into_iter().find(|m| m.key == st.session.key());
-            if let Some(identity) = me.and_then(|me| Some(me.credential?.certificate?.identity))
-                && !spoken.contains(&identity)
-            {
-                spoken.push(identity);
-            }
-        }
-        spoken
-    }
-
-    /// This session's key in a group: in an identity group, the device's key on its identity.
-    pub fn key_in(&self, gid: &[u8]) -> Bytes {
-        Bytes(self.inner.lock().me(gid).to_vec())
-    }
-
-    /// A signature over `bytes` by the device's key in an identity group.
-    pub fn sign(&self, gid: &[u8], bytes: &[u8]) -> Result<Vec<u8>> {
-        let st = self.inner.lock();
-        let (seed, _) = st.device_keys.get(gid).context("not an identity group of this node")?;
-        Ok(lmk_core::device::sign(seed, bytes))
     }
 
     /// The reference of a group's current log, its epoch's, at its membership service.
@@ -420,19 +290,5 @@ impl Node {
     /// Reads a group's logs from their service through the current one's end, applying what they hold.
     pub async fn read_group(&self, gid: &[u8]) -> Result<()> {
         self.inner.read_group(gid).await
-    }
-
-    /// The device's name, where this is a device's node.
-    pub fn device_name(&self) -> Option<String> {
-        self.inner.lock().device.clone()
-    }
-
-    /// Renames the device, in its credential in each identity group.
-    pub async fn rename_device(&self, name: &str) -> Result<()> {
-        self.inner.lock().device = Some(name.into());
-        for gid in self.groups() {
-            self.inner.commit(&gid.0, |_, g| Ok(renaming(&g.mls, Some(name)).map(|name| Change { name: Some(name), ..Change::default() }))).await?;
-        }
-        Ok(())
     }
 }

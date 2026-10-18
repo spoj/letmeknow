@@ -1,43 +1,26 @@
-//! The session process: the client core on this session's node, and, holding the device's lock, the device's node with
-//! the identity kind; and what concerns the agent, printed. The session process that holds the lock publishes the device's identity and its key on it to
-//! `device-state.json`, and answers the requests only the device's node can on the command channel `device-endpoint`,
-//! both in `LETMEKNOW_HOME`; the device's other session processes read the one and send such
-//! requests to the other, among them for the certificates their credentials carry. It also finds which of the device's
-//! sessions run, for the identity's other devices to hear, and hands each the adds for it.
+//! The session process: the client core on this session's node, and what concerns the agent, printed.
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use crate::client::{Access, BoxFuture, Chat, Client, ClientEvent, DeviceState, File, Missing, Remote, message_id};
-use lmk_core::device::Device;
-use lmk_core::provider::SqliteProvider;
-use lmk_node::identity::{Identity, Pending, Presence, SessionGroup};
+use crate::client::{Chat, Client, ClientEvent, File, Missing, message_id};
 use lmk_node::{Event, Message, Node};
 use lmk_proto::Bytes;
 use lmk_proto::group::Service;
 use lmk_proto::links::FileLink;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use crate::Network;
 use crate::cli::{Request, private_file};
-use crate::policy::{Outbox, mentions, wakes};
+use crate::policy::{Outbox, wakes};
 use crate::short;
 
 /// How long after starting what arrives counts as catching up.
 const CATCH_UP_WINDOW: Duration = Duration::from_secs(3);
-/// How often a session process that does not act for the device tries its lock.
-const DEVICE_RETRY: Duration = Duration::from_secs(10);
-/// How often a session checks that its device is still on the identity it speaks as.
-const IDENTITY_CHECK: Duration = Duration::from_secs(10);
-/// How often the session acting for the device finds which of the device's sessions run.
-const PRESENCE: Duration = Duration::from_secs(2);
 /// How often a session forgets the messages it took in more than H ago.
 const FORGET: Duration = Duration::from_secs(3600);
 
@@ -46,7 +29,7 @@ pub struct Config {
     pub dir: PathBuf,
     pub hold: Duration,
     pub keep_log: bool,
-    /// The domain of the membership service for groups and identities this session creates.
+    /// The domain of the membership service for groups this session creates.
     pub membership: String,
     /// Where it looks for a newer release.
     pub registry: String,
@@ -55,41 +38,8 @@ pub struct Config {
 /// A request on a command channel, and where its answer goes.
 pub type Inbound = (Request, oneshot::Sender<Value>);
 
-/// Work the session loop started, finished.
-pub enum Done {
-    /// A request's answer, and where it goes.
-    Answered(Result<Value>, oneshot::Sender<Value>),
-    /// What failed of leaving the groups of identities this device left.
-    IdentityRefreshed(Vec<anyhow::Error>),
-    /// The handles of the device's sessions that run.
-    Found(Vec<String>),
-    /// How handing a session the add with this id went.
-    Handed(Bytes, u64, Result<Value>),
-}
-
-/// The device's node, as another session process runs it: its state as published in `LETMEKNOW_HOME`, and its command
-/// channel.
-struct Published(PathBuf);
-
-impl Remote for Published {
-    fn state(&self) -> Result<DeviceState> {
-        match std::fs::read(self.0.join("device-state.json")) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DeviceState::default()),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    fn request(&self, request: crate::client::Request) -> BoxFuture<Result<Value>> {
-        let endpoint = self.0.join("device-endpoint");
-        Box::pin(async move {
-            let channel = crate::cli::connect(&endpoint)
-                .await
-                .context("no session process acts for this device just now; another is taking over: retry in a moment")?;
-            crate::cli::exchange(channel, Request::Client(request)).await
-        })
-    }
-}
+/// A request's answer that work the session loop started gave, and where it goes.
+pub struct Answered(Result<Value>, oneshot::Sender<Value>);
 
 pub struct Session {
     db: Connection,
@@ -98,33 +48,16 @@ pub struct Session {
     told: mpsc::UnboundedReceiver<ClientEvent>,
     /// The session's lock, held while this process runs it.
     _held: std::fs::File,
-    /// The device's node, when this process holds the device's lock.
-    device: Option<Node>,
-    device_lock: std::fs::File,
-    device_retry: Instant,
-    /// When this session next checks its device's identity.
-    identity_at: Instant,
-    /// When the session acting for the device next finds which of the device's sessions run, and hands them their adds.
-    presence_at: Instant,
     /// When the session next forgets the messages it took in more than H ago.
     forget_at: Instant,
-    /// The adds handed to a session, by id, while it runs: one that failed goes again once the session starts again.
-    handed: HashMap<Bytes, String>,
-    /// The device's state as last published.
-    published: String,
     /// The groups as last written to `groups.json`.
     groups: String,
-    /// How each group this session has been in shows to the agent: by its name where none of its other groups has that
-    /// name, or else by its id. Kept once the session leaves a group, for the events that tell of that.
-    names: HashMap<String, String>,
     home: PathBuf,
-    network: Network,
     config: Config,
     outbox: Outbox,
     catching_up: Option<Instant>,
-    inbound: mpsc::UnboundedSender<Inbound>,
     /// Work in flight: the loop takes each as it finishes, and never waits on one.
-    running: JoinSet<Done>,
+    running: JoinSet<Answered>,
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -157,52 +90,26 @@ fn save(dir: &Path, link: &FileLink, name: Option<&str>, bytes: &[u8]) -> Result
 }
 
 impl Session {
-    #[allow(clippy::too_many_arguments)]
-    pub async fn open(
-        config: Config,
-        db: Connection,
-        node: Node,
-        home: &Path,
-        network: Network,
-        inbound: mpsc::UnboundedSender<Inbound>,
-        held: std::fs::File,
-        membership: Service,
-    ) -> Result<Self> {
-        let device = Device::load(&home.join("device.json"))?;
-        let client_config = crate::client::Config { device, membership };
-        let access = Access::Elsewhere(Arc::new(Published(home.to_path_buf())));
-        let (client, told) = Client::new(node, client_config, access);
-        let device_lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(home.join("device.lock"))?;
+    pub async fn open(config: Config, db: Connection, node: Node, home: &Path, held: std::fs::File, membership: Service) -> Result<Self> {
+        let (client, told) = Client::new(node, membership);
         let mut session = Self {
             db,
             client,
             told,
             _held: held,
-            device: None,
-            device_lock,
-            device_retry: Instant::now(),
-            identity_at: Instant::now(),
-            presence_at: Instant::now(),
             forget_at: Instant::now() + FORGET,
-            handed: HashMap::new(),
-            published: String::new(),
             groups: String::new(),
-            names: HashMap::new(),
             home: home.to_path_buf(),
-            network,
             config,
             outbox: Outbox::default(),
             catching_up: Some(Instant::now() + CATCH_UP_WINDOW),
-            inbound,
             running: JoinSet::new(),
         };
-        session.take_device().await?;
         session.forget_old()?;
         let groups = session.client.node().groups();
         for gid in &groups {
             session.outbox.catch_up(&b64(&gid.0));
         }
-        session.client.start();
         for gid in groups {
             // What was delivered after the last message shown, as when the session stopped before printing it.
             let (node, me) = (session.client.node(), session.client.node().key());
@@ -223,97 +130,30 @@ impl Session {
         Ok(session)
     }
 
-    /// Acts for the device if no other session process does: runs its node and answers its command channel.
-    async fn take_device(&mut self) -> Result<()> {
-        self.device_retry = Instant::now() + DEVICE_RETRY;
-        match self.device_lock.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
-            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
-        }
-        let device = Device::load(&self.home.join("device.json"))?;
-        let provider = SqliteProvider::open(&self.home.join("device.db"))?;
-        let config = crate::node_config(&self.network, &self.home, "", Some(device.clone()), self.home.join("device-files"));
-        let (node, mut events) = Node::start(provider, config).await?;
-        let path = self.home.join("device.json");
-        let devices = Identity::new(node.clone(), device, Arc::new(move |device: &Device| device.save(&path)));
-        let (client, taking) = (self.client.clone(), devices.clone());
-        tokio::spawn(async move {
-            while let Some(event) = events.recv().await {
-                client.device_event(&taking, event);
-            }
-        });
-        crate::cli::open_channel(&self.home.join("device-endpoint"), self.inbound.clone()).await?;
-        self.client.set_access(Access::Here(devices));
-        self.device = Some(node);
-        Ok(())
-    }
-
-    /// Writes what changed of what other processes read: this session's groups to `groups.json` in its directory, for
-    /// `sessions` and the session acting for the device; and, if this process acts for it, the device's state where its
-    /// other session processes read it.
+    /// Writes this session's groups, by id, to `groups.json` in its directory, for `sessions`, when they changed.
     fn publish(&mut self) {
-        let replace = |path: PathBuf, text: &str| {
-            let new = path.with_extension("new");
-            private_file(&new, text.as_bytes())?;
-            anyhow::Ok(std::fs::rename(&new, &path)?)
-        };
-        let written = (|| {
-            let named = self.client.session_groups()?;
-            let groups = serde_json::to_string(&named)?;
-            if groups != self.groups {
-                for group in &named {
-                    let unique = !group.name.is_empty() && named.iter().filter(|other| other.name == group.name).count() == 1;
-                    let id = b64(&group.group.0);
-                    self.names.insert(id.clone(), if unique { group.name.clone() } else { id });
-                }
-                replace(self.config.dir.join("groups.json"), &groups)?;
-                self.groups = groups;
-            }
-            if self.device.is_some() {
-                let state = serde_json::to_string(&self.client.device_state()?)?;
-                if state != self.published {
-                    replace(self.home.join("device-state.json"), &state)?;
-                    self.published = state;
-                }
-            }
-            anyhow::Ok(())
-        })();
-        if let Err(error) = written {
-            self.warn(format!("publishing this session's state: {error:#}"));
+        let groups: Vec<String> = self.client.node().groups().iter().map(|gid| b64(&gid.0)).collect();
+        let groups = serde_json::to_string(&groups).expect("JSON");
+        if groups == self.groups {
+            return;
+        }
+        let path = self.config.dir.join("groups.json");
+        let new = path.with_extension("new");
+        match private_file(&new, groups.as_bytes()).and_then(|()| Ok(std::fs::rename(&new, &path)?)) {
+            Ok(()) => self.groups = groups,
+            Err(error) => self.warn(format!("writing this session's groups: {error:#}")),
         }
     }
 
     /// When something is next due without anything arriving.
     pub fn next_due(&self) -> Instant {
         let held = self.outbox.deadline(self.config.hold);
-        let device = self.device.is_none().then_some(self.device_retry);
-        let presence = self.device.is_some().then_some(self.presence_at);
         let later = Instant::now() + Duration::from_secs(3600);
-        let due = held.into_iter().chain(device).chain(presence).chain([self.identity_at, self.forget_at]);
-        due.chain(self.catching_up).fold(later, Instant::min)
+        held.into_iter().chain([self.forget_at]).chain(self.catching_up).fold(later, Instant::min)
     }
 
     pub async fn tick(&mut self) {
         let now = Instant::now();
-        if self.device.is_none()
-            && self.device_retry <= now
-            && let Err(error) = self.take_device().await
-        {
-            self.warn(format!("acting for this device: {error:#}"));
-        }
-        if self.device.is_some() && self.presence_at <= now {
-            // Not due again until this pass finishes.
-            self.presence_at = now + Duration::from_secs(3600);
-            let home = self.home.clone();
-            self.running.spawn_local(async move { Done::Found(crate::cli::running(&home).await) });
-        }
-        if self.identity_at <= now {
-            // Not due again until this check finishes.
-            self.identity_at = now + Duration::from_secs(3600);
-            let client = self.client.clone();
-            self.running.spawn_local(async move { Done::IdentityRefreshed(client.refresh_identity().await) });
-        }
         if self.forget_at <= now {
             self.forget_at = now + FORGET;
             if let Err(error) = self.forget_old() {
@@ -347,22 +187,14 @@ impl Session {
         Ok(())
     }
 
-    /// An item as the agent reads it: made short, with its group by name where that name is its alone.
+    /// An item as the agent reads it: made short.
     fn compact(&self, mut item: Value) -> Value {
-        if let Some(name) = item["group"].as_str().and_then(|group| self.names.get(group)) {
-            item["group"] = json!(name);
-        }
         short::compact(&mut item);
         item
     }
 
     /// Takes a request: what may wait on the network goes on in `running`, and is answered once done.
-    pub async fn handle(&mut self, (request, reply): Inbound) {
-        if self.device.is_none()
-            && let Err(error) = self.take_device().await
-        {
-            self.warn(format!("acting for this device: {error:#}"));
-        }
+    pub fn handle(&mut self, (request, reply): Inbound) {
         let client = self.client.clone();
         match request {
             Request::Read { id, ancestors } => {
@@ -373,7 +205,7 @@ impl Session {
                 match self.message(group, to, reply_to, urgent, attach.map(|data| (data, attach_name)), text) {
                     Ok((gid, chat)) => _ = self.running.spawn_local(async move {
                         let sent = client.send(&gid, chat).await.map(|(_, answer)| answer);
-                        Done::Answered(sent, reply)
+                        Answered(sent, reply)
                     }),
                     Err(error) => self.answer(Err(error), reply),
                 }
@@ -386,76 +218,19 @@ impl Session {
                             let bytes = client.fetched(&gid, &link).await?;
                             anyhow::Ok(json!({ "path": save(&dir, &link, name.as_deref(), &bytes)?, "bytes": bytes.len() }))
                         };
-                        Done::Answered(fetched.await, reply)
+                        Answered(fetched.await, reply)
                     });
                 }
                 Err(error) => self.answer(Err(error), reply),
             },
-            Request::Client(request) => _ = self.running.spawn_local(async move { Done::Answered(client.request(request).await, reply) }),
-            Request::IdentityJoin { .. } | Request::Status { .. } => unreachable!("the CLI sends these as the client's requests"),
+            Request::Client(request) => _ = self.running.spawn_local(async move { Answered(client.request(request).await, reply) }),
+            Request::Status { .. } => unreachable!("the CLI sends it as the client's request"),
             Request::Stop => unreachable!("`run` stops on it"),
-            Request::Added { link, group, device } => {
-                _ = self.running.spawn_local(async move { Done::Answered(client.added(&link, &group, &device).await, reply) })
-            }
         }
-    }
-
-    /// Takes work in `running` that finished.
-    pub fn done(&mut self, done: Done) {
-        match done {
-            Done::Answered(answer, reply) => self.answer(answer, reply),
-            Done::IdentityRefreshed(failed) => {
-                self.identity_at = Instant::now() + IDENTITY_CHECK;
-                for error in failed {
-                    self.warn(format!("refreshing identity claims: {error:#}"));
-                }
-            }
-            Done::Found(running) => {
-                self.presence_at = Instant::now() + PRESENCE;
-                if let Err(error) = self.hand_adds(running) {
-                    self.warn(format!("handing this device's sessions their adds: {error:#}"));
-                }
-            }
-            Done::Handed(id, expires, handed) => {
-                let Access::Here(devices) = self.client.access() else { return };
-                if let Err(error) = handed.and_then(|_| devices.take(&id, expires)) {
-                    self.warn(format!("handing a session of this device an add: {error:#}"));
-                }
-            }
-        }
-    }
-
-    /// Tells the identity's other devices which of this device's sessions run, with the groups each last wrote, and hands
-    /// each running session the adds for it it was not handed while it runs; an add for no session in particular goes to
-    /// this one.
-    fn hand_adds(&mut self, running: Vec<String>) -> Result<()> {
-        let Access::Here(devices) = self.client.access() else { return Ok(()) };
-        let mut groups = Vec::new();
-        for session in &running {
-            // None before the session first wrote its groups.
-            let Ok(written) = std::fs::read(crate::cli::session_dir(&self.home, session)?.join("groups.json")) else { continue };
-            let written: Vec<SessionGroup> = serde_json::from_slice(&written)?;
-            groups.extend(written.into_iter().map(|group| SessionGroup { session: Some(session.clone()), ..group }));
-        }
-        devices.set_presence(Presence { sessions: running.clone(), groups });
-        self.handed.retain(|_, session| running.contains(session));
-        for Pending { id, by, add } in devices.adds()? {
-            let session = if add.session.is_empty() { self.config.handle.clone() } else { add.session };
-            if !running.contains(&session) || self.handed.contains_key(&id) {
-                continue;
-            }
-            self.handed.insert(id.clone(), session.clone());
-            let home = self.home.clone();
-            self.running.spawn_local(async move {
-                let request = Request::Added { link: add.link, group: add.group, device: by };
-                Done::Handed(id, add.expires, crate::cli::call(&home, &session, request).await)
-            });
-        }
-        Ok(())
     }
 
     fn answer(&mut self, answer: Result<Value>, reply: oneshot::Sender<Value>) {
-        // Before the answer, so that the device's other session processes read what the request changed.
+        // Before the answer, so that `sessions` shows what the request changed.
         self.publish();
         let _ = reply.send(answer.unwrap_or_else(|e| json!({ "error": format!("{e:#}") })));
         self.outbox.flush_held();
@@ -469,12 +244,7 @@ impl Session {
     }
 
     async fn on(&mut self, event: ClientEvent) -> Result<()> {
-        if let ClientEvent::Joined { .. }
-        | ClientEvent::Left { .. }
-        | ClientEvent::Revoked { .. }
-        | ClientEvent::Removed { .. }
-        | ClientEvent::Settings { .. }
-        | ClientEvent::Lost { .. } = &event
+        if let ClientEvent::Joined { .. } | ClientEvent::Left { .. } | ClientEvent::Removed { .. } | ClientEvent::Lost { .. } = &event
         {
             let mut item = serde_json::to_value(&event)?;
             if let ClientEvent::Lost { member, messages, .. } = &event
@@ -500,13 +270,6 @@ impl Session {
         match event {
             ClientEvent::Warning { .. } => self.outbox.print(serde_json::to_value(&event)?),
             ClientEvent::Gone { group } => self.forget(&group)?,
-            ClientEvent::Added { device, mut joined } => {
-                joined["type"] = json!("joined");
-                joined["how"] = json!("add");
-                joined["device"] = json!(device);
-                let wake = wakes(&joined, |id| self.mine(id));
-                self.outbox.deliver(joined, wake);
-            }
             ClientEvent::File { hash } => self.arrived(hex::decode(hash)?.try_into().ok().context("a hash is 32 bytes")?).await?,
             _ => {}
         }
@@ -641,7 +404,7 @@ impl Session {
         let to: Vec<String> = to.iter().map(|fp| hex::encode(&fp.0)).collect();
         let forgotten = !self.config.keep_log && self.client.node().shown(&gid.0, &id)?;
         let content = if forgotten { Value::Null } else { payload.get("content").cloned().unwrap_or(Value::Null) };
-        let direct = to.iter().any(|fp| me["fp"] == fp.as_str()) || content.as_str().is_some_and(|text| mentions(text, &me));
+        let direct = to.iter().any(|fp| me["fp"] == fp.as_str());
         item["content"] = content;
         item["direct"] = json!(direct);
         if !to.is_empty() {
@@ -765,15 +528,7 @@ impl Session {
 
     pub async fn shutdown(&self) {
         let _ = std::fs::remove_file(self.config.dir.join("endpoint"));
-        if self.device.is_some() {
-            let _ = std::fs::remove_file(self.home.join("device-endpoint"));
-        }
-        let device = async {
-            if let Some(device) = &self.device {
-                let _ = device.shutdown().await;
-            }
-        };
-        let _ = tokio::join!(self.client.node().shutdown(), device);
+        let _ = self.client.node().shutdown().await;
     }
 }
 
@@ -787,15 +542,11 @@ pub async fn run(
     shutdown: impl std::future::Future<Output = ()>,
     newer: Option<String>,
 ) -> Result<()> {
-    let me = session.client.me()?;
+    let fp = crate::client::fp(&session.client.node().key().0);
     // Termux may run a program through Android's linker, which /proc/self/exe then names; it names the program in
     // TERMUX_EXEC__PROC_SELF_EXE.
     let bin = std::env::var_os("TERMUX_EXEC__PROC_SELF_EXE").map_or_else(std::env::current_exe, |exe| Ok(exe.into()))?;
-    let mut ready = json!({ "type": "ready", "session": session.config.handle, "name": me["device"]["name"], "fp": me["fp"], "bin": bin });
-    ready["membership"] = json!(session.config.membership);
-    if let Some(identity) = me["identity"]["name"].as_str() {
-        ready["identity"] = json!(identity);
-    }
+    let mut ready = json!({ "type": "ready", "session": session.config.handle, "fp": fp, "bin": bin, "membership": session.config.membership });
     if let Some(version) = newer {
         let minor = version.split('.').take(2).collect::<Vec<_>>().join(".");
         let home = if session.home == crate::cli::home_dir(None)? { String::new() } else { format!("LETMEKNOW_HOME={} ", session.home.display()) };
@@ -818,9 +569,12 @@ pub async fn run(
                         stopped = Some(reply);
                         break;
                     }
-                    item => session.handle(item).await,
+                    item => session.handle(item),
                 },
-                Some(done) = session.running.join_next() => session.done(done.expect("work in flight runs until shutdown")),
+                Some(done) = session.running.join_next() => {
+                    let Answered(answer, reply) = done.expect("work in flight runs until shutdown");
+                    session.answer(answer, reply);
+                }
                 Some(event) = events.recv() => client.event(event).await,
                 Some(event) = session.told.recv() => session.client_event(event).await,
                 _ = tokio::time::sleep_until(due) => session.tick().await,

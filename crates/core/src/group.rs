@@ -1,13 +1,13 @@
 //! Sessions and groups on OpenMLS: epoch-sealed commit entries judged strictly in order, each carrying the cut of the
 //! epoch it ends; held messages as application messages whose plaintext is their header, claiming in the clear whose
-//! they are; and live payloads sealed under a key exported from the epoch.
+//! they are.
 
 use anyhow::{Context, Result, bail, ensure};
 use chacha20poly1305::{XChaCha20Poly1305, aead::{Aead, KeyInit, Payload}};
 use lmk_proto::Bytes;
 use lmk_proto::clock::{corrected, now};
 use lmk_proto::entry::{Entry, signed, welcome_signed};
-use lmk_proto::group::{Certificate, Credential, How, IDENTITY, LEAF_EXTENSION, Leaf, PROTOCOL, SETTINGS_EXTENSION, Service, Settings};
+use lmk_proto::group::{LEAF_EXTENSION, Leaf, PROTOCOL, SETTINGS_EXTENSION, Service, Settings};
 use lmk_proto::held::{self, Claim, Header, Ref};
 use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
 use openmls::prelude::*;
@@ -15,7 +15,6 @@ use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::signatures::Signer;
 use openmls_traits::storage::StorageProvider as _;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::provider::SqliteProvider;
 
@@ -30,9 +29,6 @@ const ADDRESS_LABEL: &str = "letmeknow epoch log address v1";
 const SEALING_LABEL: &str = "letmeknow epoch log sealing v1";
 const ENVELOPE_DOMAIN: &[u8] = b"letmeknow epoch envelope v1\0";
 const MAX_INNER: usize = (1 << 20) - 45;
-const LIVE_LABEL: &str = "letmeknow live";
-/// What a live payload's key is bound to, and its author's signature covers, before the group and epoch.
-const LIVE: &[u8] = b"letmeknow live v1\0";
 const NEIGHBOURS_LABEL: &str = "letmeknow neighbours";
 
 fn service_key(settings: &Settings) -> Result<[u8; 32]> {
@@ -78,12 +74,6 @@ fn join_config() -> MlsGroupJoinConfig {
         .build()
 }
 
-/// Our credential inside an MLS credential, if it is one.
-pub fn credential_of(credential: &openmls::prelude::Credential) -> Option<Credential> {
-    let basic = BasicCredential::try_from(credential.clone()).ok()?;
-    serde_json::from_slice(basic.identity()).ok()
-}
-
 /// Whose a held message's ciphertext claims to be, and the epoch it was sealed in, as its clear framing shows them:
 /// `open` checks the claim.
 pub fn claim(bytes: &[u8]) -> Result<(Claim, u64)> {
@@ -96,50 +86,37 @@ fn parse<T: tls_codec::DeserializeBytes>(bytes: &[u8]) -> Result<T> {
     Ok(T::tls_deserialize_exact_bytes(bytes)?)
 }
 
-/// One MLS member: its signature key, its credential, and its leaf data.
+/// One MLS member: its signature key, which is all its credential says, and its leaf data.
 pub struct Session {
     signer: SignatureKeyPair,
-    pub credential: Credential,
     pub leaf: Leaf,
 }
 
 #[derive(Serialize, Deserialize)]
 struct SessionRecord {
     public: Bytes,
-    credential: Credential,
     leaf: Leaf,
 }
 
 impl Session {
-    /// A new session with a fresh MLS key, speaking as no identity; a provider holds one session.
-    pub fn create(provider: &SqliteProvider, name: &str, leaf: Leaf) -> Result<Self> {
-        let signer = crate::device::signer(&crate::random());
-        let session = Self::with_signer(provider, signer, name, leaf)?;
+    /// A new session with a fresh MLS key; a provider holds one session.
+    pub fn create(provider: &SqliteProvider, leaf: Leaf) -> Result<Self> {
+        let signer = SignatureKeyPair::new(SignatureScheme::ED25519)?;
+        signer.store(provider.storage())?;
+        let session = Session { signer, leaf };
         session.save(provider)?;
         Ok(session)
-    }
-
-    /// A member with the given MLS key beside the provider's own session, which it does not replace: a device's key in
-    /// one identity's group.
-    pub fn with_signer(provider: &SqliteProvider, signer: SignatureKeyPair, name: &str, leaf: Leaf) -> Result<Self> {
-        signer.store(provider.storage())?;
-        let credential = Credential { name: name.into(), key: signer.public().into(), certificate: None };
-        Ok(Session { credential, signer, leaf })
     }
 
     pub fn load(provider: &SqliteProvider) -> Result<Self> {
         let record: SessionRecord = serde_json::from_slice(&provider.get(b"session")?.context("no session here")?)?;
         let signer = SignatureKeyPair::read(provider.storage(), &record.public.0, SignatureScheme::ED25519)
             .context("the session's key is missing")?;
-        Ok(Session { signer, credential: record.credential, leaf: record.leaf })
+        Ok(Session { signer, leaf: record.leaf })
     }
 
     fn save(&self, provider: &SqliteProvider) -> Result<()> {
-        let record = SessionRecord {
-            public: self.signer.public().into(),
-            credential: self.credential.clone(),
-            leaf: self.leaf.clone(),
-        };
+        let record = SessionRecord { public: self.signer.public().into(), leaf: self.leaf.clone() };
         provider.put(b"session", &serde_json::to_vec(&record)?)
     }
 
@@ -161,7 +138,7 @@ impl Session {
 
     fn with_key(&self) -> CredentialWithKey {
         CredentialWithKey {
-            credential: BasicCredential::new(serde_json::to_vec(&self.credential).unwrap()).into(),
+            credential: BasicCredential::new(self.signer.public().to_vec()).into(),
             signature_key: self.signer.public().into(),
         }
     }
@@ -177,17 +154,9 @@ impl Session {
     }
 }
 
-/// Validates a KeyPackage as it arrives at a member that admits it, and returns its credential.
-pub fn key_package_credential(provider: &SqliteProvider, key_package: &[u8]) -> Result<Credential> {
-    let key_package = key_package_in(provider, key_package)?;
-    leaf_credential(key_package.leaf_node())
-}
-
-/// A leaf's credential, which must name the leaf's own signature key.
-fn leaf_credential(leaf: &LeafNode) -> Result<Credential> {
-    let credential = credential_of(leaf.credential()).context("not a letmeknow credential")?;
-    ensure!(credential.key.0 == leaf.signature_key().as_slice(), "a credential that names another key");
-    Ok(credential)
+/// Validates a KeyPackage as it arrives at a member that admits it, and returns its session key.
+pub fn key_package_key(provider: &SqliteProvider, key_package: &[u8]) -> Result<Vec<u8>> {
+    Ok(key_package_in(provider, key_package)?.leaf_node().signature_key().as_slice().to_vec())
 }
 
 pub fn key_package_reference(provider: &SqliteProvider, key_package: &[u8]) -> Result<[u8; 32]> {
@@ -205,28 +174,20 @@ fn key_package_in(provider: &SqliteProvider, bytes: &[u8]) -> Result<KeyPackage>
 #[derive(Clone, Debug, Default)]
 pub struct Change {
     pub add: Vec<Vec<u8>>,
-    /// How the added members came in, carried in the commit's authenticated data.
-    pub how: Option<How>,
     /// SHA-256 of the secret of the invite the added member came in by, carried in the commit's authenticated data.
     pub invite: Option<Bytes>,
     /// Leaf indices.
     pub remove: Vec<u32>,
-    pub settings: Option<Settings>,
     pub leaf: Option<Leaf>,
-    /// A new name in the committer's credential.
-    pub name: Option<String>,
-    pub certificate: Option<Certificate>,
     /// The cut of the epoch the commit ends: for each member, by key, the seq up to which the committer holds every
     /// held message, sealed in this epoch, and the id there (see `Group::cut`).
     pub cut: Vec<Ref>,
 }
 
-/// A commit's authenticated data, inside its sealed entry: how the members it adds came in, the cut of the epoch it
-/// ends, and when it was made, by the committer's corrected clock.
+/// A commit's authenticated data, inside its sealed entry: the invite the member it adds came in by, the cut of the
+/// epoch it ends, and when it was made, by the committer's corrected clock.
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Aad {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    how: Option<How>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     invite: Option<Bytes>,
     #[serde(default)]
@@ -267,7 +228,6 @@ pub struct Admission {
 pub struct Member {
     pub index: u32,
     pub key: Vec<u8>,
-    pub credential: Option<Credential>,
     pub leaf: Option<Leaf>,
 }
 
@@ -275,12 +235,7 @@ impl Member {
     fn of(group: &MlsGroup, index: LeafNodeIndex) -> Option<Self> {
         let member = group.member_at(index)?;
         let leaf = group.public_group().leaf(index)?;
-        Some(Member {
-            index: index.u32(),
-            key: member.signature_key,
-            credential: credential_of(&member.credential),
-            leaf: leaf_of(leaf.extensions()),
-        })
+        Some(Member { index: index.u32(), key: member.signature_key, leaf: leaf_of(leaf.extensions()) })
     }
 }
 
@@ -318,9 +273,7 @@ pub struct Applied {
     pub lost: bool,
     /// As their KeyPackages show them; `index` is their new leaf.
     pub added: Vec<Member>,
-    pub how: Option<How>,
     pub removed: Vec<Member>,
-    pub settings: bool,
     /// This session was removed.
     pub gone: bool,
     /// The cut of the epoch it ended, by the members of that epoch: the removed ones' last.
@@ -336,7 +289,6 @@ pub struct Opened {
     pub id: [u8; 32],
     /// The epoch it was sealed in.
     pub epoch: u64,
-    pub sender: Credential,
     pub header: Header,
     pub plaintext: Vec<u8>,
 }
@@ -344,11 +296,11 @@ pub struct Opened {
 /// Who added whom, as the log showed it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Added {
-    pub member: Credential,
-    pub by: Credential,
-    pub how: Option<How>,
+    /// Session keys.
+    pub member: Bytes,
+    pub by: Bytes,
     /// SHA-256 of the secret of the invite it came in by.
-    pub invite: Option<Bytes>,
+    pub invite: Bytes,
     /// The epoch the Add moves into.
     pub epoch: u64,
     pub key_package_ref: [u8; 32],
@@ -439,8 +391,7 @@ impl Group {
             service_key(&settings)?;
             ensure!(staged.group_context().group_id().as_slice().len() == 16, "group ID is not 16 bytes");
             let mls = staged.into_group(provider)?;
-            let named = |m: &openmls::group::Member| credential_of(&m.credential).is_some_and(|c| c.key.0 == m.signature_key);
-            ensure!(mls.members().all(|m| named(&m)), "a member whose credential names another key than its leaf's");
+            ensure!(mls.members().all(|m| names_its_key(&m.credential, &m.signature_key)), "a member whose credential names another key");
             let epoch = mls.epoch().as_u64();
             ensure!(message.group_id() == mls.group_id() && message.epoch().as_u64() + 1 == epoch, "a commit entry of another group or epoch");
             ensure!(
@@ -544,7 +495,7 @@ impl Group {
 
     /// Whether a commit this session applied added a member by the invite whose secret hashes to `hash`.
     pub fn used(&self, hash: &[u8]) -> bool {
-        self.state.added.iter().any(|added| added.invite.as_ref().is_some_and(|invite| invite.0 == hash))
+        self.state.added.iter().any(|added| added.invite.0 == hash)
     }
 
     /// The cut state: per current member, by key, the seq up to which the group keeps its held messages, and the id
@@ -632,47 +583,24 @@ impl Group {
     /// Builds a commit and keeps it pending, with its whole entry saved: post that next, then read the log.
     pub fn commit(&mut self, provider: &SqliteProvider, session: &Session, change: Change) -> Result<Commit> {
         ensure!(self.state.posted.is_none(), "a commit is already pending");
-        if let Some(settings) = &change.settings {
-            service_key(settings)?;
-        }
         self.guarded(provider, Result::is_ok, |g| {
             // One staged but never saved, so never posted.
             g.mls.clear_pending_commit(provider.storage())?;
             let adds = change.add.iter().map(|bytes| key_package_in(provider, bytes)).collect::<Result<Vec<_>>>()?;
-            let aad = Aad { how: change.how, invite: change.invite, cut: change.cut, time: corrected() };
+            let aad = Aad { invite: change.invite, cut: change.cut, time: corrected() };
             g.mls.set_aad(serde_json::to_vec(&aad)?);
             let mut parameters = LeafNodeParameters::builder();
             if let Some(leaf) = &change.leaf {
                 parameters = parameters.with_extensions(leaf_extensions(leaf)?);
             }
-            if change.name.is_some() || change.certificate.is_some() {
-                let own = g.mls.own_leaf_node().context("no leaf of its own")?;
-                let mut credential = credential_of(own.credential()).context("not a letmeknow credential")?;
-                if let Some(name) = change.name {
-                    credential.name = name;
-                }
-                if let Some(certificate) = change.certificate {
-                    let unchanged = credential.certificate.as_deref() == Some(&certificate);
-                    let same = credential.certificate.as_ref().is_some_and(|old| old.identity.id == certificate.identity.id && old.device == certificate.device);
-                    credential.certificate = Some(Box::new(certificate));
-                    ensure!(unchanged || (same && crate::public::verify_certificate(&credential)), "an update changed the member's authorization or has invalid claims");
-                }
-                parameters = parameters.with_credential_with_key(CredentialWithKey {
-                    credential: BasicCredential::new(serde_json::to_vec(&credential)?).into(),
-                    signature_key: session.signer.public().into(),
-                });
-            }
-            let mut builder = g
+            let builder = g
                 .mls
                 .commit_builder()
                 .consume_proposal_store(false)
                 .force_self_update(true)
                 .propose_adds(adds)
-                .propose_removals(change.remove.into_iter().map(LeafNodeIndex::new));
-            if let Some(settings) = &change.settings {
-                builder = builder.propose_group_context_extensions(context_extensions(settings)?)?;
-            }
-            builder = builder.leaf_node_parameters(parameters.build());
+                .propose_removals(change.remove.into_iter().map(LeafNodeIndex::new))
+                .leaf_node_parameters(parameters.build());
             let bundle = builder
                 .load_psks(provider.storage())?
                 .build(provider.rand(), provider.crypto(), &session.signer, |_| true)?
@@ -826,75 +754,21 @@ impl Group {
         };
         let epoch = processed.epoch().as_u64();
         let claim: Claim = serde_json::from_slice(processed.aad()).context("a held message's claim")?;
-        let sender = credential_of(processed.credential()).context("the sender has no letmeknow credential")?;
+        let sender = processed.credential().serialized_content().to_vec();
         let ProcessedMessageContent::ApplicationMessage(message) = processed.into_content() else {
             bail!("not an application message")
         };
         let plaintext = message.into_bytes();
         let header = Header::open(&plaintext)?;
         ensure!(header.group.0 == self.id(), "a held message of another group");
-        ensure!(header.author == sender.key && header.claim() == claim, "a held message its sender did not author, or claimed otherwise");
+        ensure!(header.author.0 == sender && header.claim() == claim, "a held message its sender did not author, or claimed otherwise");
         let cuts = if epoch == self.epoch() { &self.state.cut } else { &self.state.ended };
         let membership = cuts.iter().find(|r| r.key == header.author).context("a held message of no membership")?;
         ensure!(membership.joined == header.joined, "a held message of another membership of its author");
         let ended = self.joined(&header.author.0) != Some(header.joined);
         ensure!(!ended || header.seq <= membership.seq, "a held message past its membership's final cut");
-        Ok(Opened { id: held::id(&plaintext), epoch, sender, header, plaintext })
+        Ok(Opened { id: held::id(&plaintext), epoch, header, plaintext })
     }
-
-    /// What a live payload's key and signature are bound to: the group and the current epoch.
-    fn live_context(&self, epoch: u64) -> Vec<u8> {
-        [LIVE, self.id(), &epoch.to_be_bytes()].concat()
-    }
-
-    /// Seals a live payload under the current epoch's live key, signed by this session: `epoch ‖ nonce ‖ ciphertext` of
-    /// `body ‖ sig`, the body `{"author", "nonce", "payload"}`, and its id, as `open_live` gives it. It uses none of the MLS
-    /// ratchet.
-    pub fn seal_live(&self, provider: &SqliteProvider, session: &Session, payload: &Value) -> Result<(Vec<u8>, [u8; 32])> {
-        let epoch = self.epoch();
-        let context = self.live_context(epoch);
-        let nonce = Bytes(crate::random::<16>().to_vec());
-        let body = serde_json::to_vec(&Live { author: Bytes(session.key().to_vec()), nonce, payload: payload.clone() })?;
-        let sig = session.sign(&[&context, &body[..]].concat());
-        let id = held::id(&sig);
-        let plaintext = [body, sig].concat();
-        let size = plaintext.len() + FRAMING;
-        ensure!(size <= MAX_MESSAGE, "the payload is {size} bytes, over the 1 MiB members take");
-        let key = self.mls.export_secret(provider.crypto(), LIVE_LABEL, &context, 32)?;
-        let nonce = crate::random::<24>();
-        let ciphertext = XChaCha20Poly1305::new_from_slice(&key).unwrap().encrypt((&nonce).into(), Payload { msg: &plaintext, aad: &context })?;
-        Ok(([&epoch.to_be_bytes()[..], &nonce, &ciphertext].concat(), id))
-    }
-
-    /// Opens a live payload sealed in the current epoch by a current member, its signature checked: the member, the
-    /// payload, and its id, the hash of the signature, which a replay sealed anew keeps.
-    pub fn open_live(&self, provider: &SqliteProvider, wire: &[u8]) -> Result<(Member, Value, [u8; 32])> {
-        ensure!(wire.len() > 8 + 24 + 64 + 16, "a live payload too short");
-        let epoch = u64::from_be_bytes(wire[..8].try_into().unwrap());
-        ensure!(epoch == self.epoch(), "a live payload of another epoch");
-        let context = self.live_context(epoch);
-        let key = self.mls.export_secret(provider.crypto(), LIVE_LABEL, &context, 32)?;
-        let nonce: &[u8; 24] = wire[8..32].try_into().unwrap();
-        let plaintext = XChaCha20Poly1305::new_from_slice(&key).unwrap().decrypt(nonce.into(), Payload { msg: &wire[32..], aad: &context })
-            .map_err(|_| anyhow::anyhow!("a live payload that does not open in this epoch"))?;
-        ensure!(plaintext.len() > 64, "a live payload without its signature");
-        let (body, sig) = plaintext.split_at(plaintext.len() - 64);
-        let live: Live = serde_json::from_slice(body)?;
-        let index = self.mls.members().find(|m| m.signature_key == live.author.0).context("a live payload from no current member")?.index;
-        let member = Member::of(&self.mls, index).context("a live payload from no current member")?;
-        ensure!(crate::device::verify(&live.author.0, &context, body, sig), "a live payload its author did not sign");
-        ensure!(live.payload["type"].is_string(), "a payload without a type");
-        Ok((member, live.payload, held::id(sig)))
-    }
-}
-
-/// A live payload's signed body.
-#[derive(Serialize, Deserialize)]
-struct Live {
-    author: Bytes,
-    /// Random: a payload sent again is another payload, which dedup lets through; a replay keeps its id.
-    nonce: Bytes,
-    payload: Value,
 }
 
 /// A commit entry staged, or found to be from a copy of this session's state.
@@ -913,34 +787,27 @@ fn observe(
     aad: Aad,
     own: bool,
 ) -> Result<Applied> {
-    let committer = group.member_at(by).and_then(|member| credential_of(&member.credential));
+    let committer = group.member_at(by).map(|member| Bytes(member.signature_key));
     let removed: Vec<Member> =
         staged.remove_proposals().filter_map(|remove| Member::of(group, remove.remove_proposal().removed())).collect();
     let added: Vec<Member> = staged
         .add_proposals()
         .map(|add| {
             let leaf = add.add_proposal().key_package().leaf_node();
-            Member {
-                // Set once merged.
-                index: 0,
-                key: leaf.signature_key().as_slice().to_vec(),
-                credential: credential_of(leaf.credential()),
-                leaf: leaf_of(leaf.extensions()),
-            }
+            // `index` is set once merged.
+            Member { index: 0, key: leaf.signature_key().as_slice().to_vec(), leaf: leaf_of(leaf.extensions()) }
         })
         .collect();
     let epoch = staged.epoch().as_u64();
-    if let Some(committer) = &committer {
+    if let (Some(committer), Some(invite)) = (&committer, &aad.invite) {
         let records = staged.add_proposals().enumerate().map(|(index, add)| {
             let key_package_ref = if own {
                 state.posted.as_ref().unwrap().add_refs[index]
             } else {
                 add.add_proposal().key_package().hash_ref(provider.crypto())?.as_slice().try_into()?
             };
-            Ok(Added {
-                member: leaf_credential(add.add_proposal().key_package().leaf_node())?,
-                by: committer.clone(), how: aad.how.clone(), invite: aad.invite.clone(), epoch, key_package_ref, at: now(),
-            })
+            let member = Bytes(add.add_proposal().key_package().leaf_node().signature_key().as_slice().to_vec());
+            Ok(Added { member, by: committer.clone(), invite: invite.clone(), epoch, key_package_ref, at: now() })
         }).collect::<Result<Vec<_>>>()?;
         state.added.extend(records);
     }
@@ -949,9 +816,7 @@ fn observe(
         own,
         lost: !own && state.posted.is_some(),
         added,
-        how: aad.how,
         removed,
-        settings: staged.queued_proposals().any(|p| matches!(p.proposal(), Proposal::GroupContextExtensions(_))),
         gone: staged.self_removed(),
         cut: aad.cut,
         admission: None,
@@ -968,24 +833,24 @@ fn well_formed(r: &Ref) -> bool {
 }
 
 /// The app's rules on a commit, from MLS state alone, binding the committer too: changes inline only, of the kinds we
-/// make; added members whose credentials name their own keys, and none it removes; settings that parse, at this
-/// protocol, with the kind and the public log unchanged; only name or signed same-identity/device claim updates to the
-/// committer's credential; and a cut that names every member of the cut state `cut`, by key, in order, at its
-/// membership, never below it nor more than `MAX_CUT_STEP` past it.
+/// make: Adds, which name the invite they came in by, and none of a key it removes, and Removes; the committer's key
+/// unchanged; and a cut that names every member of the cut state `cut`, by key, in order, at its membership, never below
+/// it nor more than `MAX_CUT_STEP` past it.
 fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad, cut: &[Ref]) -> Result<()> {
     let removed: Vec<Vec<u8>> = staged.remove_proposals().filter_map(|r| group.member_at(r.remove_proposal().removed())).map(|m| m.signature_key).collect();
     for proposal in staged.queued_proposals() {
         ensure!(proposal.proposal_or_ref_type() == ProposalOrRefType::Proposal, "a proposal by reference");
         match proposal.proposal() {
             Proposal::Add(add) => {
-                let credential = leaf_credential(add.key_package().leaf_node())?;
-                ensure!(!removed.contains(&credential.key.0), "a commit that adds a key it removes");
+                let leaf = add.key_package().leaf_node();
+                ensure!(names_its_key(leaf.credential(), leaf.signature_key().as_slice()), "a credential that names another key");
+                ensure!(!removed.iter().any(|key| key == leaf.signature_key().as_slice()), "a commit that adds a key it removes");
             }
-            Proposal::Remove(_) | Proposal::GroupContextExtensions(_) => {}
+            Proposal::Remove(_) => {}
             other => bail!("a {:?} proposal", other.proposal_type()),
         }
     }
-    ensure!(aad.how.is_some() || staged.add_proposals().next().is_none(), "an Add that does not say how its members came in");
+    ensure!(aad.invite.is_some() == staged.add_proposals().next().is_some(), "an Add that names no invite, or an invite with no Add");
     let named = aad.cut.len() == cut.len() && aad.cut.iter().zip(cut).all(|(new, old)| new.key == old.key && new.joined == old.joined);
     ensure!(named, "a cut that does not name each member once, in order, at its membership");
     for (new, old) in aad.cut.iter().zip(cut) {
@@ -993,27 +858,26 @@ fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad, 
         ensure!(new.seq > old.seq || (new.seq == old.seq && new.id == old.id && new.epoch == old.epoch), "a cut below the last");
         ensure!(new.seq - old.seq <= MAX_CUT_STEP, "a cut too far past the last");
     }
-    let old = settings_of(group.extensions())?;
-    let new = settings_of(staged.group_context().extensions())?;
-    ensure!(new.protocol == PROTOCOL, "settings name protocol {}", new.protocol);
-    ensure!(new.kind == old.kind, "the kind changed");
-    ensure!(new.public == old.public, "the public log changed");
-    let authority = service_key(&new)?;
-    if old.kind == IDENTITY {
-        ensure!(authority == service_key(&old)?, "an identity group's service authority changed");
-    }
     if let Some(leaf) = staged.update_path_leaf_node() {
         let member = group.member_at(by).context("not a member")?;
-        let before = credential_of(&member.credential).context("not a letmeknow credential")?;
-        let after = leaf_credential(leaf)?;
-        ensure!(before.key == after.key && after.key.0 == member.signature_key, "an update changed the member's key");
-        if before.certificate != after.certificate {
-            let same = before.certificate.as_ref().zip(after.certificate.as_ref())
-                .is_some_and(|(old, new)| old.identity.id == new.identity.id && old.device == new.device);
-            ensure!(same && crate::public::verify_certificate(&after), "an update changed the member's authorization or has invalid claims");
-        }
+        ensure!(leaf.signature_key().as_slice() == member.signature_key, "an update changed the member's key");
+        ensure!(names_its_key(leaf.credential(), &member.signature_key), "a credential that names another key");
     }
     Ok(())
+}
+
+/// Whether a member's credential names its leaf's signature key, as each must: a held message's sender is known by its
+/// credential, which openmls keeps of past epochs' members too.
+fn names_its_key(credential: &Credential, key: &[u8]) -> bool {
+    credential.serialized_content() == key
+}
+
+/// Checks an Ed25519 signature by `key` over `context` ‖ `bytes`.
+pub fn verify(key: &[u8], context: &[u8], bytes: &[u8], sig: &[u8]) -> bool {
+    let (Ok(key), Ok(sig)) = (<[u8; 32]>::try_from(key), ed25519_dalek::Signature::from_slice(sig)) else {
+        return false;
+    };
+    ed25519_dalek::VerifyingKey::from_bytes(&key).is_ok_and(|key| key.verify_strict(&[context, bytes].concat(), &sig).is_ok())
 }
 
 #[cfg(test)]

@@ -140,7 +140,7 @@ async fn serves_relay_and_membership_without_frontend() {
     let https_post = lmk_membership::client::https(reqwest::Client::builder().tls_backend_preconfigured(tls).no_proxy().build().unwrap());
     let post: lmk_membership::client::Post = Arc::new(move |_: String, route, body| https_post(format!("localhost:{https}"), route, body));
     let client = ServeClient::for_service(post, &service).unwrap();
-    let appended = tokio::time::timeout(Duration::from_secs(10), client.append(&[7; 32], &[b"commit".to_vec()], false))
+    let appended = tokio::time::timeout(Duration::from_secs(10), client.append(&[7; 32], &[b"commit".to_vec()]))
         .await
         .unwrap()
         .unwrap();
@@ -176,7 +176,7 @@ async fn directory_names_the_relays_given() {
 const APPEND: &str = "/membership/2/append";
 
 fn append_json(capability: u8, entry: &[u8]) -> Vec<u8> {
-    serde_json::to_vec(&Append { capability: [capability; 32], entries: vec![Bytes(entry.to_vec())], public: false }).unwrap()
+    serde_json::to_vec(&Append { capability: [capability; 32], entries: vec![Bytes(entry.to_vec())] }).unwrap()
 }
 
 fn post(path: &str, origin: Option<&str>, body: &[u8]) -> Vec<u8> {
@@ -307,7 +307,7 @@ async fn an_answer_that_does_not_drain_closes_its_connection() {
     let (config, cert) = configure(&state);
     // Stored before the service starts: a slow runner's upload of it could outlast the service's body timeout.
     let store = lmk_membership::store::Store::open(&state).unwrap();
-    store.append(&store.log(&[3; 32]), &[Bytes(vec![1; 1 << 20]), Bytes(vec![2; 1 << 20])], false).unwrap();
+    store.append(&store.log(&[3; 32]), &[Bytes(vec![1; 1 << 20]), Bytes(vec![2; 1 << 20])]).unwrap();
     drop(store);
     let https = config.https_port;
     let server = tokio::spawn(serve(config));
@@ -393,9 +393,6 @@ async fn the_journal_holds_no_addresses_keys_or_capabilities() {
     let response = https_raw("127.0.0.1", https, &cert, &post("/membership/2/heads", None, &heads)).await;
     let Answer::<Moved>::Ok(moved) = answer(&response) else { panic!("{response}") };
     assert_eq!(moved.heads.len(), 1);
-    let public = serde_json::to_vec(&Append { capability: [9; 32], entries: vec![Bytes(vec![0; 17 << 10])], public: true }).unwrap();
-    let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, None, &public)).await;
-    assert!(matches!(answer::<Appended>(&response), Answer::Refused { .. }), "{response}");
     let mut failed = TcpStream::connect((Ipv4Addr::LOCALHOST, https)).await.unwrap();
     failed.write_all(b"not a TLS handshake\r\n\r\n").await.unwrap();
     let mut ignored = Vec::new();

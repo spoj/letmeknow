@@ -2,7 +2,7 @@
 //! group logic hands on runs one item at a time (`drive`), the session catches up as it starts (`resume`) and keeps its
 //! logs and duties every hour (`upkeep`), and files are fetched.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -15,15 +15,13 @@ use lmk_proto::group::{Leaf, REVISION};
 use lmk_proto::links::FileLink;
 use lmk_proto::Bytes;
 use n0_future::{join_all, task::spawn};
-use n0_future::time::{Duration, sleep};
+use n0_future::time::sleep;
 use tokio::sync::mpsc;
 
-use crate::{COLLECT, Config, Event, G, Inner, MEMBER_WAIT, Node, Out, Rec, State, Work, admission, device_key_key, endpoint_id, get, hex, iroh_key, logs, now, peering, rec_key};
+use crate::{COLLECT, Config, Event, G, Inner, MEMBER_WAIT, Node, Out, Rec, State, Work, admission, endpoint_id, get, hex, iroh_key, logs, now, peering, rec_key};
 
 /// How long a fetch keeps looking for a member that holds the file.
 const FETCH_TRIES: u32 = 12;
-/// How often the identities whose public logs could not be read are looked at, to read those whose wait is up.
-const READ_RETRY: Duration = Duration::from_secs(30);
 
 impl Node {
     /// Opens the session in `provider`, creating it on first use, and starts its peers.
@@ -33,7 +31,7 @@ impl Node {
         let endpoint = lmk_net::builder(home).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
         let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), revision: REVISION };
         let clients = logs::Clients::new(config.post.clone());
-        let state = State::open(provider, &config, leaf)?;
+        let state = State::open(provider, leaf)?;
         let (events, events_rx) = mpsc::unbounded_channel();
         let (work, work_rx) = mpsc::unbounded_channel();
         let (outbox, outbox_rx) = mpsc::unbounded_channel();
@@ -66,11 +64,11 @@ impl Node {
 }
 
 impl State {
-    /// The session in `provider`, created on first use, with its leaf as `leaf`; its logs, groups and device keys.
-    fn open(provider: SqliteProvider, config: &Config, leaf: Leaf) -> Result<Self> {
+    /// The session in `provider`, created on first use, with its leaf as `leaf`; its logs and groups.
+    fn open(provider: SqliteProvider, leaf: Leaf) -> Result<Self> {
         let mut session = match provider.get(b"session")? {
             Some(_) => Session::load(&provider)?,
-            None => Session::create(&provider, &config.handle, leaf.clone())?,
+            None => Session::create(&provider, leaf.clone())?,
         };
         if session.leaf != leaf {
             session.set_leaf(&provider, leaf)?;
@@ -82,7 +80,6 @@ impl State {
             let rec: Rec = get(&provider, &rec_key(&gid.0))?.context("a group without its record")?;
             groups.insert(gid.0, G::new(mls, rec));
         }
-        let bindings = get(&provider, b"node/identity-bindings")?.unwrap_or_default();
         let mut hints = BTreeMap::new();
         for g in groups.values() {
             for leaf in g.mls.members().iter().filter_map(|member| member.leaf.as_ref()) {
@@ -93,20 +90,13 @@ impl State {
         }
         let peers = Peers::new(now(), u64::from_be_bytes(lmk_core::random()), *iroh_key(&provider)?.public().as_bytes());
         let mut state = State {
-            bindings,
-            notified: BTreeSet::new(),
             provider,
             out: Vec::new(),
             scrub: false,
             events: Vec::new(),
-            device: config.device.as_ref().map(|device| device.name.clone()),
             session,
             groups,
             logs,
-            public: BTreeMap::new(),
-            unlisted: HashSet::new(),
-            unreadable: HashMap::new(),
-            device_keys: BTreeMap::new(),
             peers,
             served: BTreeMap::new(),
             gate: true,
@@ -115,11 +105,6 @@ impl State {
             time: now(),
         };
         for gid in state.groups.keys().cloned().collect::<Vec<_>>() {
-            if let Some(seed) = get::<Bytes>(&state.provider, &device_key_key(&gid))? {
-                let seed: [u8; 32] = seed.0.as_slice().try_into().context("a device key is 32 bytes")?;
-                let session = state.keyed(seed)?;
-                state.device_keys.insert(gid.clone(), (seed, session));
-            }
             state.refresh(&gid);
             state.load_heard(&gid)?;
         }
@@ -128,8 +113,7 @@ impl State {
 }
 
 impl Inner {
-    /// Starts the tasks, opens the logs, and picks up where the session stopped: its public logs replayed, and its
-    /// groups it was removed from told.
+    /// Starts the tasks, opens the logs, and picks up where the session stopped: its groups it was removed from told.
     fn run(
         self: &Arc<Self>,
         mut net_events: mpsc::UnboundedReceiver<lmk_net::Event>,
@@ -148,16 +132,7 @@ impl Inner {
         self.spawn(self.clone().drive(work));
         self.spawn(self.clone().send_out(outbox));
         self.spawn(self.clone().upkeep());
-        let mut st = self.lock();
-        let public: Vec<Bytes> = st.logs.values().filter_map(|log| match &log.of {
-            logs::Of::Public(id) => Some(id.clone()),
-            _ => None,
-        }).collect();
-        for id in public {
-            if let Err(error) = self.replayed(&mut st, &id.0) {
-                self.warn(None, format!("the public log {}: {error:#}", hex(&id.0)));
-            }
-        }
+        let st = self.lock();
         // A session removed by a commit it applied before it stopped is told so now. A group its log's reading dropped
         // meanwhile is gone already.
         for (gid, g) in &st.groups {
@@ -167,7 +142,6 @@ impl Inner {
         }
         drop(st);
         self.spawn(self.clone().resume());
-        self.spawn(self.clone().reread_identities());
         self.spawn(self.clone().polling());
     }
 
@@ -189,10 +163,8 @@ impl Inner {
         }
     }
 
-    /// Catches up as this session starts: the public logs it lacks, then the entries it stored and had not applied, as
-    /// while waiting before a commit.
+    /// Catches up as this session starts: the entries it stored and had not applied, as while waiting before a commit.
     async fn resume(self: Arc<Self>) {
-        self.refresh_all().await;
         let gids: Vec<Vec<u8>> = self.lock().groups.keys().cloned().collect();
         for gid in &gids {
             if let Err(error) = self.advance(&mut self.lock(), gid) {
@@ -201,8 +173,8 @@ impl Inner {
         }
     }
 
-    /// Every `OPEN`, from now on: opens the groups' logs and touches the identities' directories, asks about the logs
-    /// members are behind in, runs every group's duties, and scrubs.
+    /// Every `OPEN`, from now on: opens the groups' logs, asks about the logs members are behind in, runs every group's
+    /// duties, and scrubs.
     async fn upkeep(self: Arc<Self>) {
         loop {
             self.open_logs().await;
@@ -232,45 +204,29 @@ impl Inner {
         });
     }
 
-    /// The relays a member may be reached at: this session's own, the relay of the service of each group the member is
-    /// in, and the relays of the identity it speaks as. The directories resolve together; one that does not adds none.
+    /// The relays a member may be reached at: this session's own, and the relay of the service of each group the member
+    /// is in. The directories resolve together; one that does not adds none.
     async fn fallback(self: Arc<Self>, peer: EndpointId) -> Vec<RelayUrl> {
-        let (groups, identities) = {
+        let services = {
             let st = self.lock();
-            let (mut groups, mut identities) = (Vec::new(), Vec::new());
+            let mut services = Vec::new();
             for g in st.groups.values() {
-                let members = g.mls.members();
-                let Some(member) = members.iter().find(|m| m.leaf.as_ref().and_then(|leaf| endpoint_id(&leaf.key.0)) == Some(peer)) else { continue };
+                let in_group = g.mls.members().iter().any(|m| m.leaf.as_ref().and_then(|leaf| endpoint_id(&leaf.key.0)) == Some(peer));
                 let service = g.mls.settings().membership;
-                if !groups.contains(&service) {
-                    groups.push(service);
-                }
-                if let Some(identity) = member.credential.as_ref().and_then(|credential| credential.identity())
-                    && let Some(log) = st.public.get(&identity.id.0)
-                    && !identities.contains(&log.membership)
-                {
-                    identities.push(log.membership.clone());
+                if in_group && !services.contains(&service) {
+                    services.push(service);
                 }
             }
-            (groups, identities)
+            services
         };
         let resolve = &self.resolve;
-        let services = groups.iter().map(|service| (service, false)).chain(identities.iter().map(|service| (service, true)));
-        let found = join_all(services.map(|(service, identity)| async move {
-            let found = lmk_membership::client::directory(resolve, service).await;
-            found.map(|found| if identity { found.relays } else { vec![found.relay] }).unwrap_or_default()
+        let found = join_all(services.iter().map(|service| async move {
+            lmk_membership::client::directory(resolve, service).await.map(|found| vec![found.relay]).unwrap_or_default()
         }))
         .await;
         let mut relays = self.relays.clone();
         relays.extend(found.iter().flatten().filter_map(|relay| relay.parse().ok()));
         relays
-    }
-
-    async fn reread_identities(self: Arc<Self>) {
-        loop {
-            sleep(READ_RETRY).await;
-            self.refresh_all().await;
-        }
     }
 
     /// Fetches, in the background, the files linked anew that are within this session's limit.
@@ -297,7 +253,7 @@ impl Inner {
     async fn drive(self: Arc<Self>, mut work: mpsc::UnboundedReceiver<Work>) {
         while let Some(item) = work.recv().await {
             match item {
-                Work::Applied { group, by, added, how, removed, settings, gone } => self.applied(&group, by, added, how, removed, settings, gone).await,
+                Work::Applied { group, by, added, removed, gone } => self.applied(&group, by, added, removed, gone).await,
                 Work::Entered(log) => {
                     let node = self.clone();
                     self.spawn(async move {

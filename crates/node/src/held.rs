@@ -317,23 +317,15 @@ impl State {
 
     /// A member by its key: the current one, or a bare one if it is gone.
     pub(crate) fn member_by_key(&self, gid: &[u8], key: &[u8]) -> Member {
-        let found = self.groups.get(gid).and_then(|g| self.member(gid, &g.mls.members().into_iter().find(|m| m.key == key)?));
-        found.unwrap_or_else(|| Member {
-            key: Bytes(key.to_vec()),
-            iroh: Bytes::default(),
-            revision: 0,
-            name: String::new(),
-            device_name: String::new(),
-            identity: None,
-            added: None,
-        })
+        let found = self.groups.get(gid).and_then(|g| g.mls.members().into_iter().find(|m| m.key == key));
+        found.map_or_else(|| Member { key: Bytes(key.to_vec()), iroh: Bytes::default(), revision: 0, added: None }, |m| self.member(gid, &m))
     }
 
     /// The deps of a message this session sends now: per membership but its own, the highest seq its client showed,
     /// less those in another's causal past, of messages it still holds.
     pub(crate) fn deps(&self, gid: &[u8]) -> Result<Vec<lmk_proto::held::Ref>> {
         let g = self.group(gid)?;
-        let me = self.me(gid);
+        let me = self.me();
         let mut candidates = Vec::new();
         for author in g.rec.authors.iter().filter(|a| !(a.key.0 == me && Some(a.joined) == g.mls.joined(me))) {
             let Some(&(_, seq)) = author.shown.ranges().last() else { continue };
@@ -492,7 +484,7 @@ impl Inner {
             self.warn(Some(gid), format!("{} sent a held message whose prev is not its seq {}: this session keeps the first", crate::fp(&h.author.0), h.seq - 1));
             return Ok(None);
         }
-        let me = st.me(gid).to_vec();
+        let me = st.me().to_vec();
         let g = st.group_mut(gid)?;
         let own = g.mls.joined(&me).context("a member of its group")?;
         if let Some((_, sent)) = &h.prev
@@ -533,7 +525,7 @@ impl Inner {
         g.changed = true;
         let from = st.member_by_key(gid, &claim.key.0);
         let messages = vec![LostOf { from, joined: claim.joined, seqs: vec![claim.seq], ids: Vec::new() }];
-        let member = st.member_by_key(gid, st.me(gid));
+        let member = st.member_by_key(gid, st.me());
         st.events.push(Event::Lost(Lost { group: Bytes(gid.to_vec()), member, messages }));
         Ok(())
     }
@@ -550,9 +542,9 @@ impl Inner {
                 rec.leaves.push((h.author.clone(), h.joined, h.seq));
                 self.work.send(Work::Duties(gid.to_vec())).ok();
             }
-            Control::Invite { hash, expires, to } => {
+            Control::Invite { hash, expires } => {
                 if !rec.invites.iter().any(|rule| rule.hash == hash) {
-                    rec.invites.push(Rule { hash, expires, to, by: h.author.clone() });
+                    rec.invites.push(Rule { hash, expires, by: h.author.clone() });
                 }
             }
         }
@@ -616,7 +608,7 @@ impl Inner {
             None => false,
         };
         let sender = st.member_by_key(gid, &h.author.0);
-        let me = st.me(gid).to_vec();
+        let me = st.me().to_vec();
         let shown = !Control::TYPES.contains(&type_of(&h.payload)) && h.author.0 != me;
         let g = st.group_mut(gid)?;
         let mut missing = Vec::new();

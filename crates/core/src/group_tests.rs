@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::provider::SqliteProvider;
-use lmk_proto::group::{CHAT, ChatMessage, REVISION, Service};
+use lmk_proto::group::{ChatMessage, REVISION, Service};
 use std::path::Path;
 use sha2::{Digest, Sha256};
 
@@ -12,22 +12,15 @@ pub(crate) fn service(domain: &str) -> Service {
     Service::Serve { key: ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key().to_bytes().into(), domain: domain.into(), rest: Default::default() }
 }
 
-pub(crate) fn settings(name: &str) -> Settings {
-    Settings {
-        protocol: PROTOCOL,
-        kind: CHAT.into(),
-        name: name.into(),
-        carry: 7,
-        update: lmk_proto::group::UPDATE,
-        membership: service("lmk.example"),
-        public: None,
-        rest: Default::default(),
-    }
+pub(crate) fn settings() -> Settings {
+    Settings { protocol: PROTOCOL, carry: 7, update: lmk_proto::group::UPDATE, membership: service("lmk.example") }
 }
 
 pub(crate) fn leaf(name: &str) -> Leaf {
     Leaf { key: Bytes(name.as_bytes().to_vec()), revision: REVISION }
 }
+
+const INVITE: [u8; 32] = [7; 32];
 
 /// An entry as a member read it: its verdict, and for a commit what applying it did.
 type Read = (Verdict, Option<Applied>);
@@ -45,7 +38,7 @@ pub(crate) struct Member {
 
 impl Member {
     pub fn new(provider: SqliteProvider, name: &str) -> Self {
-        let session = Session::create(&provider, name, leaf(name)).unwrap();
+        let session = Session::create(&provider, leaf(name)).unwrap();
         Member { provider, session, group: None, pos: 0, sent: Vec::new() }
     }
 
@@ -119,7 +112,7 @@ impl Member {
 
     pub fn index_of(&self, name: &str) -> u32 {
         let group = self.group.as_ref().unwrap();
-        group.members().iter().find(|m| m.credential.as_ref().unwrap().name == name).unwrap().index
+        group.members().iter().find(|m| m.leaf.as_ref().unwrap().key.0 == name.as_bytes()).unwrap().index
     }
 
     /// Joins by the inner entry of the commit that added this member, and the Welcome of its Add, which its committer
@@ -172,18 +165,15 @@ fn cut_aad(cut: &[Ref]) -> Vec<u8> {
     serde_json::to_vec(&Aad { cut: cut.to_vec(), ..Aad::default() }).unwrap()
 }
 
-/// A commit built past `Group::commit`'s rules: a key update naming `cut`, with `settings` and `leaf` if given. It is
-/// kept as `m`'s pending commit, as `Group::commit` keeps one.
-fn unruled(m: &mut Member, cut: Vec<Ref>, settings: Option<Settings>, leaf: Option<LeafNodeParameters>) -> Vec<u8> {
+/// A commit built past `Group::commit`'s rules: a key update naming `cut`, proposing `settings` if given. It is kept as
+/// `m`'s pending commit, as `Group::commit` keeps one.
+fn unruled(m: &mut Member, cut: Vec<Ref>, settings: Option<Settings>) -> Vec<u8> {
     let group = m.group.as_mut().unwrap();
     let aad = Aad { cut, ..Aad::default() };
     group.mls.set_aad(serde_json::to_vec(&aad).unwrap());
     let mut builder = group.mls.commit_builder().consume_proposal_store(false).force_self_update(true);
     if let Some(settings) = &settings {
         builder = builder.propose_group_context_extensions(context_extensions(settings).unwrap()).unwrap();
-    }
-    if let Some(leaf) = leaf {
-        builder = builder.leaf_node_parameters(leaf);
     }
     let bundle = builder
         .load_psks(m.provider.storage())
@@ -245,18 +235,6 @@ fn header(m: &Member, group: &[u8], joined: u64) -> Header {
     Header { group: Bytes(group.to_vec()), author: Bytes(m.session.key().to_vec()), joined, seq: 1, epoch: joined, prev: None, deps: vec![], reply_to: None, payload: message("forged") }
 }
 
-fn live(m: &Member, payload: &serde_json::Value) -> Vec<u8> {
-    let (wire, id) = m.group.as_ref().unwrap().seal_live(&m.provider, &m.session, payload).unwrap();
-    assert_eq!(m.group.as_ref().unwrap().open_live(&m.provider, &wire).unwrap().2, id);
-    wire
-}
-
-/// The sender's key and the payload of a live payload `m` opens, if it opens.
-fn open_live(m: &Member, wire: &[u8]) -> Result<(Vec<u8>, serde_json::Value)> {
-    let (sender, payload, _) = m.group.as_ref().unwrap().open_live(&m.provider, wire)?;
-    Ok((sender.key, payload))
-}
-
 struct World {
     m: Vec<Member>,
     log: Vec<Vec<u8>>,
@@ -284,10 +262,10 @@ impl World {
     /// `creator` makes the group and adds `others` in one commit.
     fn found(&mut self, creator: usize, others: &[usize]) {
         let c = &mut self.m[creator];
-        c.group = Some(Group::create(&c.provider, &c.session, &settings("Plan")).unwrap());
+        c.group = Some(Group::create(&c.provider, &c.session, &settings()).unwrap());
         let adds: Vec<_> = others.iter().map(|&i| self.m[i].session.key_package(&self.m[i].provider).unwrap()).collect();
         let cut = self.m[creator].cut();
-        let commit = self.m[creator].commit(Change { cut, add: adds.clone(), how: Some(How::Invite), ..Change::default() });
+        let commit = self.m[creator].commit(Change { cut, add: adds.clone(), invite: Some(INVITE.into()), ..Change::default() });
         let inner = self.m[creator].open_inner(&commit.entry);
         let admission = commit.admission.clone().unwrap();
         let pos = self.post(commit.entry);
@@ -327,7 +305,7 @@ fn commit_race() {
     let a = w.m[0].commit(Change { cut, ..Change::default() });
     let kp_d = w.key_package(3);
     let cut = w.m[1].cut();
-    let b = w.m[1].commit(Change { cut, add: vec![kp_d.clone()], how: Some(How::Invite), ..Change::default() });
+    let b = w.m[1].commit(Change { cut, add: vec![kp_d.clone()], invite: Some(INVITE.into()), ..Change::default() });
     assert!(w.m[0].g().posted().is_some() && w.m[1].g().posted().is_some());
     w.post(a.entry);
     w.post(b.entry);
@@ -340,17 +318,18 @@ fn commit_race() {
     w.agree(&[0, 1, 2]);
 
     let cut = w.m[1].cut();
-    let b2 = w.m[1].commit(Change { cut, add: vec![kp_d.clone()], how: Some(How::Invite), ..Change::default() });
+    let b2 = w.m[1].commit(Change { cut, add: vec![kp_d.clone()], invite: Some(INVITE.into()), ..Change::default() });
     let inner = w.m[1].open_inner(&b2.entry);
     let admission = b2.admission.clone().unwrap();
     let pos = w.post(b2.entry);
     let read = w.read(&[0, 1, 2]);
     let Applied { added, by, .. } = applied(&read[0][0]);
-    assert_eq!((added[0].credential.as_ref().unwrap().name.as_str(), *by), ("D", w.m[1].g().own_index()));
+    assert_eq!(added[0].key, w.m[3].session.key());
+    assert_eq!(*by, w.m[1].g().own_index());
     w.m[3].join(&inner, &admission, pos, &kp_d);
     w.agree(&[0, 1, 2, 3]);
     let added = w.m[0].g().added().last().unwrap().clone();
-    assert_eq!((added.member.name.as_str(), added.by.name.as_str(), added.epoch), ("D", "B", e + 2));
+    assert_eq!((added.member.0, added.by.0, added.epoch), (w.m[3].session.key().to_vec(), w.m[1].session.key().to_vec(), e + 2));
 
     // A commit the log never took is cancelled, and the group carries on.
     let cut = w.m[2].cut();
@@ -386,7 +365,7 @@ fn junk_is_skipped() {
     let app = w.m[3].send("hello");
     w.post_inner(Entry { commit: app, sig: vec![0; 64] }.encode());
     let x = &mut w.m[4];
-    x.group = Some(Group::create(&x.provider, &x.session, &settings("other")).unwrap());
+    x.group = Some(Group::create(&x.provider, &x.session, &settings()).unwrap());
     let cut = w.m[4].cut();
     let foreign = w.m[4].commit(Change { cut, ..Change::default() });
     w.post(foreign.entry);
@@ -428,7 +407,7 @@ fn a_commit_entry_needs_its_committers_signature() {
     w.found(0, &[1, 2]);
     let kp = w.key_package(3);
     let cut = w.m[1].cut();
-    let commit = w.m[1].commit(Change { cut, add: vec![kp], how: Some(How::Invite), ..Change::default() });
+    let commit = w.m[1].commit(Change { cut, add: vec![kp], invite: Some(INVITE.into()), ..Change::default() });
     let inner = w.m[0].open_inner(&commit.entry);
     let Entry { commit: bytes, .. } = Entry::parse(&inner).unwrap();
     assert_eq!(inner.len(), 1 + 4 + bytes.len() + 64, "an entry is its commit and signature");
@@ -496,10 +475,10 @@ fn two_epochs_of_keys() {
 fn a_forged_message_leaves_no_trace() {
     let mut a = Member::new(memory(), "A");
     let mut b = Member::new(memory(), "B");
-    a.group = Some(Group::create(&a.provider, &a.session, &settings("Plan")).unwrap());
+    a.group = Some(Group::create(&a.provider, &a.session, &settings()).unwrap());
     let kp = b.session.key_package(&b.provider).unwrap();
     let cut = a.cut();
-    let commit = a.commit(Change { cut, add: vec![kp.clone()], how: Some(How::Invite), ..Change::default() });
+    let commit = a.commit(Change { cut, add: vec![kp.clone()], invite: Some(INVITE.into()), ..Change::default() });
     let inner = a.open_inner(&commit.entry);
     let admission = commit.admission.clone().unwrap();
     let log = vec![commit.entry];
@@ -534,10 +513,10 @@ fn a_step_commits_or_rolls_back_with_openmls() {
     std::fs::create_dir_all(&dir).unwrap();
     let mut a = Member::new(SqliteProvider::open(&dir.join("a.db")).unwrap(), "A");
     let mut b = Member::new(memory(), "B");
-    a.group = Some(Group::create(&a.provider, &a.session, &settings("Plan")).unwrap());
+    a.group = Some(Group::create(&a.provider, &a.session, &settings()).unwrap());
     let kp = b.session.key_package(&b.provider).unwrap();
     let cut = a.cut();
-    let commit = a.commit(Change { cut, add: vec![kp.clone()], how: Some(How::Invite), ..Change::default() });
+    let commit = a.commit(Change { cut, add: vec![kp.clone()], invite: Some(INVITE.into()), ..Change::default() });
     let inner = a.open_inner(&commit.entry);
     let admission = commit.admission.clone().unwrap();
     let log = vec![commit.entry];
@@ -610,52 +589,21 @@ fn commits_from_ones_own_leaf_are_told_apart() {
     assert!(matches!(read[0][1].0, Verdict::Skipped { .. }), "the copy's commit is for an epoch past");
 }
 
-/// A member that renames the group keeps a field of the settings that a newer letmeknow wrote.
-#[test]
-fn a_rename_keeps_settings_fields_the_renamer_does_not_know() {
-    let mut w = World::new(&["A", "B"]);
-    w.found(0, &[1]);
-    let mut newer = w.m[0].g().settings();
-    newer.rest.insert("color".into(), "red".into());
-    let cut = w.m[0].cut();
-    let commit = w.m[0].commit(Change { cut, settings: Some(newer), ..Change::default() });
-    w.post(commit.entry);
-    w.read(&[0, 1]);
-    let renamed = Settings { name: "Release".into(), ..w.m[1].g().settings() };
-    let cut = w.m[1].cut();
-    let commit = w.m[1].commit(Change { cut, settings: Some(renamed), ..Change::default() });
-    w.post(commit.entry);
-    w.read(&[0, 1]);
-    let settings = w.m[0].g().settings();
-    assert_eq!((settings.name.as_str(), &settings.rest["color"]), ("Release", &serde_json::json!("red")));
-}
-
 #[test]
 fn settings_in_the_welcome() {
     let mut w = World::new(&["A", "B", "C", "D"]);
     w.found(0, &[1, 2]);
-    let mut changed = w.m[0].g().settings();
-    changed.name = "Plan v2".into();
-    changed.carry = 30;
-    changed.membership = service("elsewhere.example");
-    let cut = w.m[0].cut();
-    let commit = w.m[0].commit(Change { cut, settings: Some(changed.clone()), ..Change::default() });
-    w.post(commit.entry);
-    let read = w.read(&[0, 1, 2]);
-    assert!(applied(&read[1][0]).settings);
-    assert_eq!(w.m[1].g().settings(), changed);
-    assert_eq!(w.m[2].g().settings(), changed);
     assert!(w.m[2].g().mls.extensions().required_capabilities().is_some());
 
     let kp = w.key_package(3);
     let cut = w.m[2].cut();
-    let commit = w.m[2].commit(Change { cut, add: vec![kp.clone()], how: Some(How::Invite), ..Change::default() });
+    let commit = w.m[2].commit(Change { cut, add: vec![kp.clone()], invite: Some(INVITE.into()), ..Change::default() });
     let inner = w.m[2].open_inner(&commit.entry);
     let admission = commit.admission.clone().unwrap();
     let pos = w.post(commit.entry);
     w.read(&[0, 1, 2]);
     w.m[3].join(&inner, &admission, pos, &kp);
-    assert_eq!(w.m[3].g().settings(), changed);
+    assert_eq!(w.m[3].g().settings(), settings());
     w.agree(&[0, 1, 2, 3]);
 }
 
@@ -665,12 +613,12 @@ fn leaf_data() {
     w.found(0, &[1, 2]);
     let leaves: Vec<_> = w.m[0].g().members().into_iter().map(|m| m.leaf.unwrap()).collect();
     assert_eq!(leaves, [leaf("A"), leaf("B"), leaf("C")]);
+    let b = w.m[2].index_of("B");
     let moved = Leaf { key: Bytes(b"moved".to_vec()), ..leaf("B") };
     let cut = w.m[1].cut();
     let commit = w.m[1].commit(Change { cut, leaf: Some(moved.clone()), ..Change::default() });
     w.post(commit.entry);
     w.read(&[0, 1, 2]);
-    let b = w.m[2].index_of("B");
     for i in 0..3 {
         assert_eq!(w.m[i].g().members()[b as usize].leaf.as_ref(), Some(&moved));
     }
@@ -680,24 +628,6 @@ fn leaf_data() {
     w.read(&[0, 1, 2]);
     assert_eq!(w.m[0].g().members()[b as usize].leaf.as_ref(), Some(&moved), "a key update keeps the leaf data");
     w.agree(&[0, 1, 2]);
-}
-
-/// A member renames itself in an update; a message from before the rename still names its sender.
-#[test]
-fn a_member_renames_itself() {
-    let mut w = World::new(&["A", "B", "C"]);
-    w.found(0, &[1, 2]);
-    let before = w.m[1].send("before the rename");
-    let cut = w.m[1].cut();
-    let commit = w.m[1].commit(Change { cut, name: Some("Bee".into()), ..Change::default() });
-    w.post(commit.entry);
-    let read = w.read(&[0, 1, 2]);
-    assert!(read.iter().all(|reader| is_commit(&reader[0])));
-    w.agree(&[0, 1, 2]);
-    let b = w.m[0].index_of("Bee");
-    assert_eq!(w.m[2].g().members()[b as usize].leaf.as_ref(), Some(&leaf("B")), "the leaf data stays");
-    let opened = w.m[2].open(&before).unwrap();
-    assert_eq!(opened.sender.name.as_str(), "B");
 }
 
 #[test]
@@ -714,41 +644,15 @@ fn rules_bind_everyone() {
     let mut w = World::new(&["A", "B", "C", "E"]);
     w.found(0, &[1, 2]);
 
-    // Our own API refuses to build a commit that breaks them.
-    let mut bad = w.m[1].g().settings();
-    bad.kind = "doc".into();
+    // Settings are fixed when a group is made: a commit that proposes them is refused by every member.
+    let mut changed = settings();
+    changed.protocol = PROTOCOL + 1;
     let cut = w.m[1].cut();
-    let error = refused(&mut w.m[1], Change { cut, settings: Some(bad.clone()), ..Change::default() });
-    assert!(error.contains("kind"));
-    assert!(w.m[1].g().posted().is_none());
-
-    // A kind change, built around it, and then a protocol change.
-    for change in [|s: &mut Settings| s.kind = "doc".into(), |s: &mut Settings| s.protocol = PROTOCOL + 1] {
-        let mut bad = w.m[1].g().settings();
-        change(&mut bad);
-        let cut = w.m[1].cut();
-        let wire = unruled(&mut w.m[1], cut, Some(bad), None);
-        w.post(wire);
-        let read = w.read(&[0, 1, 2]);
-        assert!(matches!(&read[1][0].0, Verdict::Skipped { lost: true, .. }));
-        assert!(read.iter().all(|reader| !is_commit(&reader[0])));
-        w.agree(&[0, 1, 2]);
-    }
-
-    // An update that changes the committer's credential beyond its name: C claims an identity.
-    let identity = lmk_proto::group::IdentityRef { id: Bytes(vec![1; 32]), membership: service("lmk.example") };
-    w.m[2].session.credential.certificate = Some(lmk_proto::group::Certificate { identity, device: Bytes(vec![2; 32]), name: "Ann".into(), device_name: "laptop".into(), sig: Bytes(vec![3; 64]) }.into());
-    let cut = w.m[2].cut();
-    let c = &mut w.m[2];
-    let leaf = LeafNodeParameters::builder()
-        .with_credential_with_key(c.session.with_key())
-        .with_extensions(leaf_extensions(&c.session.leaf).unwrap())
-        .build();
-    let wire = unruled(c, cut, None, Some(leaf));
+    let wire = unruled(&mut w.m[1], cut, Some(changed));
     w.post(wire);
     let read = w.read(&[0, 1, 2]);
-    assert!(matches!(&read[2][0].0, Verdict::Skipped { lost: true, reason } if reason.contains("authorization")));
-    assert!(!is_commit(&read[0][0]) && !is_commit(&read[1][0]));
+    assert!(matches!(&read[1][0].0, Verdict::Skipped { lost: true, reason } if reason.contains("GroupContextExtensions")));
+    assert!(read.iter().all(|reader| !is_commit(&reader[0])));
     w.agree(&[0, 1, 2]);
 
     // A proposal by reference: B proposes adding E to C alone, and C commits it by reference.
@@ -777,127 +681,6 @@ fn rules_bind_everyone() {
     w.agree(&[0, 1, 2]);
 }
 
-#[test]
-fn private_certificates_refresh_but_cannot_rebind_a_membership() {
-    use crate::device::{public, sign};
-    use lmk_proto::group::IdentityRef;
-    use lmk_proto::public::certified;
-    let mut w = World::new(&["A", "B", "Later"]);
-    let device = crate::random();
-    let id = crate::random();
-    let key: [u8; 32] = w.m[0].session.key().try_into().unwrap();
-    let of = |id: [u8; 32], seed: &[u8; 32], key: [u8; 32], name: &str, label: &str| Certificate {
-        identity: IdentityRef { id: id.into(), membership: service("lmk.example") },
-        device: public(seed).into(), name: name.into(), device_name: label.into(),
-        sig: Bytes(sign(seed, &certified(&key, &id, &public(seed), name, label))),
-    };
-    let original = of(id, &device, key, "Ann", "phone");
-    w.m[0].session.credential.certificate = Some(Box::new(original));
-    w.found(0, &[1]);
-    let refreshed = of(id, &device, key, "Ann Lee", "pocket");
-    let mut forged = refreshed.clone();
-    forged.name = "unsigned label".into();
-    for certificate in [forged, of(crate::random(), &device, key, "Ann Lee", "pocket"), of(id, &crate::random(), key, "Ann Lee", "pocket"), of(id, &device, crate::random(), "Ann Lee", "pocket")] {
-        let a = &mut w.m[0];
-        let before = a.provider.rows();
-        let cut = a.cut();
-        assert!(refused(a, Change { cut, certificate: Some(certificate), ..Change::default() }).contains("authorization"));
-        assert!(a.g().posted().is_none());
-        assert_eq!(a.provider.rows(), before, "refused refresh leaves no stored residue");
-    }
-    let b = &mut w.m[1];
-    let before = b.provider.rows();
-    let attached = of(id, &device, b.session.key().try_into().unwrap(), "Ann", "phone");
-    let cut = b.cut();
-    assert!(refused(b, Change { cut, certificate: Some(attached), ..Change::default() }).contains("authorization"));
-    assert_eq!(b.provider.rows(), before, "an anonymous leaf cannot acquire an identity");
-    let cut = w.m[0].cut();
-    let losing = w.m[0].commit(Change { cut, certificate: Some(refreshed.clone()), ..Change::default() });
-    let cut = w.m[1].cut();
-    let competing = w.m[1].commit(Change { cut, name: Some("Bee".into()), ..Change::default() });
-    w.post(competing.entry);
-    w.post(losing.entry);
-    assert!(w.read(&[0, 1]).iter().all(|r| is_commit(&r[0]) && !is_commit(&r[1])));
-    w.agree(&[0, 1]);
-    assert!(w.m[0].g().posted().is_none());
-    let cut = w.m[0].cut();
-    let commit = w.m[0].commit(Change { cut, certificate: Some(refreshed.clone()), ..Change::default() });
-    w.post(commit.entry);
-    assert!(w.read(&[0, 1]).iter().all(|r| is_commit(&r[0])));
-    w.agree(&[0, 1]);
-    let kp = w.key_package(2);
-    let cut = w.m[1].cut();
-    let add = w.m[1].commit(Change { cut, add: vec![kp.clone()], how: Some(How::Invite), ..Change::default() });
-    let inner = w.m[1].open_inner(&add.entry);
-    let admission = add.admission.clone().unwrap();
-    let pos = w.post(add.entry);
-    w.read(&[0, 1]);
-    w.m[2].join(&inner, &admission, pos, &kp);
-    for reader in &mut w.m {
-        let a = reader.g().members().into_iter().find(|m| m.key == key).unwrap().credential.unwrap();
-        assert_eq!(a.name, "A");
-        assert_eq!(a.certificate.as_deref(), Some(&refreshed));
-    }
-    // Bypass our API, including valid signatures for forbidden authorization tuples.
-    let mut forged = refreshed;
-    forged.name = "unsigned".into();
-    let attached = of(id, &device, w.m[1].session.key().try_into().unwrap(), "Ann", "phone");
-    for (author, certificate, signed) in [
-        (0, None, false),
-        (0, Some(forged), false),
-        (0, Some(of(crate::random(), &device, key, "Ann", "phone")), true),
-        (0, Some(of(id, &crate::random(), key, "Ann", "phone")), true),
-        (1, Some(attached), true),
-    ] {
-        let before: Vec<_> = w.m.iter_mut().map(|m| (m.g().epoch(), m.g().members().into_iter().map(|m| (m.key, m.credential)).collect::<Vec<_>>())).collect();
-        let a = &mut w.m[author];
-        let mut unsigned = a.session.credential.clone();
-        unsigned.certificate = certificate.map(Box::new);
-        assert_eq!(crate::public::verify_certificate(&unsigned), signed);
-        let leaf = LeafNodeParameters::builder().with_credential_with_key(CredentialWithKey {
-            credential: BasicCredential::new(serde_json::to_vec(&unsigned).unwrap()).into(),
-            signature_key: a.session.signer.public().into(),
-        }).build();
-        let cut = a.cut();
-        let wire = unruled(a, cut, None, Some(leaf));
-        w.post(wire);
-        assert!(w.read(&[0, 1, 2]).iter().all(|r| matches!(&r[0].0, Verdict::Skipped { reason, .. } if reason.contains("authorization"))));
-        w.agree(&[0, 1, 2]);
-        for (reader, (epoch, members)) in w.m.iter_mut().zip(before) {
-            assert_eq!(reader.g().epoch(), epoch);
-            assert_eq!(reader.g().members().into_iter().map(|m| (m.key, m.credential)).collect::<Vec<_>>(), members);
-            assert!(reader.g().posted().is_none());
-        }
-    }
-}
-
-#[test]
-fn credentials_are_checked_not_enforced() {
-    use crate::device::{public, sign};
-    use crate::public::{PublicLog, Verdict, create};
-    use lmk_proto::group::{Certificate, IdentityRef};
-    use lmk_proto::public::certified;
-    let mut w = World::new(&["A", "M"]);
-    let laptop = crate::random();
-    let (id, first) = create(&laptop, service("lmk.example"));
-    let log = PublicLog::replay(&id, [first.as_slice()]).unwrap();
-    let identity = IdentityRef { id: id.into(), membership: service("lmk.example") };
-    // A speaks as Alice, certified by her laptop; M claims her identity with A's certificate.
-    let sig = Bytes(sign(&laptop, &certified(w.m[0].session.key().try_into().unwrap(), &id, &public(&laptop), "Alice", "laptop")));
-    let certificate = Certificate { identity, device: public(&laptop).into(), name: "Alice".into(), device_name: "laptop".into(), sig };
-    w.m[0].session.credential.certificate = Some(certificate.clone().into());
-    w.m[1].session.credential.certificate = Some(certificate.into());
-    let m = key_package_credential(&w.m[0].provider, &w.key_package(1)).unwrap();
-    assert_eq!(log.verify(&m), Verdict::Unverified);
-    w.found(0, &[1]);
-    w.agree(&[0, 1]);
-    let checked: Vec<Verdict> = w.m[1].g().members().iter().map(|member| log.verify(member.credential.as_ref().unwrap())).collect();
-    assert_eq!(checked, [Verdict::Authorized, Verdict::Unverified]);
-    let hi = w.m[1].send("hi from M");
-    let opened = w.m[0].open(&hi).unwrap();
-    assert_eq!((opened.sender.key.0, opened.sender.name), (w.m[1].session.key().to_vec(), "M".to_owned()));
-}
-
 /// A removed member's messages sealed before its removal still open, while the keys of their epoch are kept.
 #[test]
 fn a_removed_members_messages_open_up_to_its_final_cut() {
@@ -914,12 +697,12 @@ fn a_removed_members_messages_open_up_to_its_final_cut() {
     let commit = w.m[1].commit(Change { cut, remove: vec![c], ..Change::default() });
     w.post(commit.entry);
     let read = w.read(&[0, 1, 2]);
-    assert_eq!(applied(&read[0][0]).removed[0].credential.as_ref().unwrap().name, "C");
+    assert_eq!(applied(&read[0][0]).removed[0].key, key);
     assert!(matches!(read[2][0].0, Verdict::Commit { removes: true, .. }));
     assert!(!w.m[2].g().active());
     w.agree(&[0, 1]);
     let opened = w.m[0].open(&early).unwrap();
-    assert_eq!((opened.sender.name.as_str(), text(&opened)), ("C", "before my removal"));
+    assert_eq!((opened.header.author.0.as_slice(), text(&opened)), (key.as_slice(), "before my removal"));
     assert!(w.m[0].open(&past).unwrap_err().to_string().contains("final cut"));
 }
 
@@ -927,7 +710,7 @@ fn a_removed_members_messages_open_up_to_its_final_cut() {
 fn another_protocol_is_refused_at_join() {
     let mut w = World::new(&["A", "B"]);
     let a = &mut w.m[0];
-    a.group = Some(Group::create(&a.provider, &a.session, &settings("Plan")).unwrap());
+    a.group = Some(Group::create(&a.provider, &a.session, &settings()).unwrap());
     let mut future = w.m[0].g().settings();
     future.protocol = PROTOCOL + 1;
     let package = w.key_package(1);
@@ -965,10 +748,10 @@ fn state_survives_a_restart() {
     let mut log = Vec::new();
     let mut a = Member::new(SqliteProvider::open(&dir.join("a.db")).unwrap(), "A");
     let b = Member::new(SqliteProvider::open(&dir.join("b.db")).unwrap(), "B");
-    a.group = Some(Group::create(&a.provider, &a.session, &settings("Plan")).unwrap());
+    a.group = Some(Group::create(&a.provider, &a.session, &settings()).unwrap());
     let kp = b.session.key_package(&b.provider).unwrap();
     let cut = a.cut();
-    let commit = a.commit(Change { cut, add: vec![kp.clone()], how: Some(How::Invite), ..Change::default() });
+    let commit = a.commit(Change { cut, add: vec![kp.clone()], invite: Some(INVITE.into()), ..Change::default() });
     let inner = a.open_inner(&commit.entry);
     let admission = commit.admission.clone().unwrap();
     log.push(commit.entry);
@@ -981,7 +764,7 @@ fn state_survives_a_restart() {
     let c_package = c.session.key_package(&c.provider).unwrap();
     let c_ref = key_package_reference(&c.provider, &c_package).unwrap();
     let cut = b.cut();
-    let pending = b.commit(Change { cut, add: vec![c_package.clone()], how: Some(How::Invite), ..Change::default() });
+    let pending = b.commit(Change { cut, add: vec![c_package.clone()], invite: Some(INVITE.into()), ..Change::default() });
     let pending_admission = pending.admission.clone().unwrap();
     let inner = a.open_inner(&pending.entry);
     let rewrapped = a.seal_inner(&inner);
@@ -1124,7 +907,7 @@ fn cuts_advance_and_refuse_what_rules_refuse() {
     let c_index = w.m[0].index_of("C");
     let kp_d = w.key_package(3);
     let next = w.m[0].g().epoch() + 1;
-    let commit = w.m[0].commit(Change { cut: cut.clone(), add: vec![kp_d], how: Some(How::Invite), remove: vec![c_index], ..Change::default() });
+    let commit = w.m[0].commit(Change { cut: cut.clone(), add: vec![kp_d], remove: vec![c_index], invite: Some(INVITE.into()), ..Change::default() });
     w.post(commit.entry);
     let mut expected: Vec<Ref> = cut.iter().filter(|r| r.key.0 != c).cloned().collect();
     expected.push(Ref { key: Bytes(d), joined: next, seq: 0, id: Bytes::default(), epoch: 0 });
@@ -1156,7 +939,7 @@ fn members_skip_commits_with_refused_cuts() {
     w.agree(&[0, 1, 2]);
     for (bad, why) in refusable(&good, &a, &b) {
         let mut liar = w.m[1].copy();
-        let wire = unruled(&mut liar, bad, None, None);
+        let wire = unruled(&mut liar, bad, None);
         w.post(wire);
         for reader in w.read(&[0, 2]) {
             assert!(matches!(&reader[0].0, Verdict::Skipped { reason, .. } if reason.contains(why)), "{why}");
@@ -1186,7 +969,7 @@ fn a_joiner_starts_at_the_commits_cut() {
     advanced.seq = 2;
     advanced.id = Bytes(id2.to_vec());
     let kp_c = w.key_package(2);
-    let commit = w.m[0].commit(Change { cut: cut.clone(), add: vec![kp_c.clone()], how: Some(How::Invite), ..Change::default() });
+    let commit = w.m[0].commit(Change { cut: cut.clone(), add: vec![kp_c.clone()], invite: Some(INVITE.into()), ..Change::default() });
     let inner = w.m[0].open_inner(&commit.entry);
     let admission = commit.admission.clone().unwrap();
     let pos = w.post(commit.entry);
@@ -1209,7 +992,7 @@ fn a_joiner_starts_at_the_commits_cut() {
     let kp_d = w.key_package(3);
     let mut other = w.m[0].copy();
     let cut = other.cut();
-    let theirs = other.commit(Change { cut, add: vec![kp_d], how: Some(How::Invite), ..Change::default() });
+    let theirs = other.commit(Change { cut, add: vec![kp_d], invite: Some(INVITE.into()), ..Change::default() });
     join_error(&w.m[2], &inner, &theirs.admission.unwrap(), &kp_c);
     assert_eq!(w.m[2].provider.rows(), before);
 
@@ -1226,67 +1009,69 @@ fn a_removed_key_cannot_be_added_back_in_the_same_commit() {
     let package = w.m[1].session.key_package(&w.m[1].provider).unwrap();
     let b = w.m[0].index_of("B");
     let cut = w.m[0].cut();
-    let error = refused(&mut w.m[0], Change { cut, add: vec![package], how: Some(How::Invite), remove: vec![b], ..Change::default() });
+    let error = refused(&mut w.m[0], Change { cut, add: vec![package], invite: Some([1; 32].into()), remove: vec![b], ..Change::default() });
     assert!(error.contains("adds a key it removes"), "{error}");
     assert!(w.m[0].g().posted().is_none());
 }
 
-/// A joiner refuses a group with a member whose credential names another key than its leaf's: that member could claim
-/// the other key's messages.
+/// An Add must name the invite it came in by, and an invite must come with an Add: `rules` refuses either alone.
 #[test]
-fn a_joiner_refuses_a_member_whose_credential_names_another_key() {
-    let mut w = World::new(&["M", "B"]);
-    w.m[0].session.credential.key = Bytes(w.m[1].session.key().to_vec());
-    let package = w.key_package(1);
+fn an_add_and_its_invite_come_together() {
+    let mut w = World::new(&["A", "B", "C"]);
+    w.found(0, &[1]);
+    let package = w.m[2].session.key_package(&w.m[2].provider).unwrap();
+    let cut = w.m[0].cut();
+    let error = refused(&mut w.m[0], Change { cut: cut.clone(), add: vec![package], ..Change::default() });
+    assert!(error.contains("an Add that names no invite"), "{error}");
+    let error = refused(&mut w.m[0], Change { cut, invite: Some(INVITE.into()), ..Change::default() });
+    assert!(error.contains("an invite with no Add"), "{error}");
+    assert!(w.m[0].g().posted().is_none());
+    w.agree(&[0, 1]);
+}
+
+/// A member's credential names its leaf's key, as a held message's sender is known by it: a KeyPackage whose credential
+/// names another key is not added, and a commit whose update path does is refused by its members and by a joiner it adds.
+#[test]
+fn a_credential_that_names_another_key_is_refused() {
+    let mut w = World::new(&["M", "B", "C"]);
+    w.found(0, &[1]);
+    let forger = stranger();
+    let b = &w.m[1];
+    let naming_b = |key: &[u8]| CredentialWithKey { credential: BasicCredential::new(b.session.key().to_vec()).into(), signature_key: key.into() };
+    let package = KeyPackage::builder()
+        .leaf_node_capabilities(capabilities())
+        .leaf_node_extensions(leaf_extensions(&leaf("forger")).unwrap())
+        .key_package_lifetime(Lifetime::init(0, u64::MAX))
+        .build(CIPHERSUITE, &b.provider, &forger, naming_b(forger.public()))
+        .unwrap();
+    let package = MlsMessageOut::from(package.key_package().clone()).to_bytes().unwrap();
+    let forged = naming_b(w.m[0].session.key());
+    let cut = w.m[0].cut();
+    let error = refused(&mut w.m[0], Change { cut: cut.clone(), add: vec![package], invite: Some(INVITE.into()), ..Change::default() });
+    assert!(error.contains("a credential that names another key"), "{error}");
+
+    // Built as `Group::commit` builds it but past `rules`, as a forger's client would.
+    let package = w.key_package(2);
     let m = &mut w.m[0];
-    m.group = Some(Group::create(&m.provider, &m.session, &settings("Plan")).unwrap());
-    // Built as `Group::commit` builds it but past `rules`, which refuses M's own leaf, as a forger's client would not.
     let g = m.group.as_mut().unwrap();
-    g.mls.set_aad(cut_aad(&g.state.cut));
-    let bundle = g.mls.commit_builder().force_self_update(true).propose_adds(vec![key_package_in(&m.provider, &package).unwrap()]);
+    g.mls.set_aad(serde_json::to_vec(&Aad { invite: Some(INVITE.into()), cut, ..Aad::default() }).unwrap());
+    let bundle = g
+        .mls
+        .commit_builder()
+        .force_self_update(true)
+        .leaf_node_parameters(LeafNodeParameters::builder().with_credential_with_key(forged).build())
+        .propose_adds(vec![key_package_in(&m.provider, &package).unwrap()]);
     let bundle = bundle.load_psks(m.provider.storage()).unwrap().build(m.provider.rand(), m.provider.crypto(), &m.session.signer, |_| true).unwrap();
     let (commit, welcome, _) = bundle.stage_commit(&m.provider).unwrap().into_messages();
     let entry = entry_of(&m.session.signer, commit.to_bytes().unwrap());
     let welcome = welcome.unwrap().to_bytes().unwrap();
     let admission = Admission { sig: m.session.signer.sign(&welcome_signed(&entry, &welcome)).unwrap(), welcome };
-    assert!(join_error(&w.m[1], &entry, &admission, &package).contains("a member whose credential names another key"));
-}
-
-/// A live payload opens for the members of its epoch, from a current member, verified and unaltered; the members of
-/// another epoch, and a member removed since, do not open it.
-#[test]
-fn live_payloads_open_only_in_their_epoch() {
-    let mut w = World::new(&["A", "B", "C"]);
-    w.found(0, &[1, 2]);
-    let edit = serde_json::json!({ "type": "edit", "text": "hi" });
-    let wire = live(&w.m[0], &edit);
-    assert_eq!(open_live(&w.m[1], &wire).unwrap(), (w.m[0].session.key().to_vec(), edit.clone()));
-    let again = live(&w.m[0], &edit);
-    let b = &w.m[1];
-    let id = |wire: &[u8]| b.group.as_ref().unwrap().open_live(&b.provider, wire).unwrap().2;
-    assert_ne!(id(&again), id(&wire), "the same payload sent again is another payload");
-    let mut tampered = wire.clone();
-    let last = tampered.len() - 1;
-    tampered[last] ^= 1;
-    assert!(open_live(&w.m[1], &tampered).is_err());
-
-    let early = live(&w.m[2], &edit);
-    let cut = w.m[1].cut();
-    let commit = w.m[1].commit(Change { cut, ..Change::default() });
-    w.post(commit.entry);
-    w.read(&[0, 1, 2]);
-    assert!(open_live(&w.m[0], &early).is_err(), "sealed in an earlier epoch");
-    assert!(open_live(&w.m[0], &wire).is_err(), "sealed in an earlier epoch");
-
-    let from_c = live(&w.m[2], &edit);
-    let c = w.m[0].index_of("C");
-    let cut = w.m[0].cut();
-    let commit = w.m[0].commit(Change { cut, remove: vec![c], ..Change::default() });
-    w.post(commit.entry);
-    w.read(&[0, 1, 2]);
-    assert!(open_live(&w.m[1], &from_c).is_err(), "from a member removed since");
-    let current = live(&w.m[1], &edit);
-    assert_eq!(open_live(&w.m[0], &current).unwrap().1, edit);
+    assert!(join_error(&w.m[2], &entry, &admission, &package).contains("a member whose credential names another key"));
+    let m = &w.m[0];
+    let wire = m.group.as_ref().unwrap().seal_entry(&m.provider, &entry).unwrap();
+    w.post(wire);
+    let read = w.read(&[1]);
+    assert!(matches!(&read[0][0].0, Verdict::Skipped { reason, .. } if reason.contains("a credential that names another key")), "{:?}", read[0][0].0);
 }
 
 /// An Add's committer keeps its Welcome, with which the joiner joins; another member keeps none.
@@ -1296,7 +1081,7 @@ fn the_committer_keeps_the_welcome_of_its_add() {
     w.found(0, &[1]);
     let package = w.key_package(2);
     let cut = w.m[0].cut();
-    let commit = w.m[0].commit(Change { cut, add: vec![package.clone()], how: Some(How::Invite), ..Change::default() });
+    let commit = w.m[0].commit(Change { cut, add: vec![package.clone()], invite: Some(INVITE.into()), ..Change::default() });
     let inner = w.m[0].open_inner(&commit.entry);
     let pos = w.post(commit.entry);
     let read = w.read(&[0, 1]);
@@ -1351,10 +1136,10 @@ fn a_forgotten_group_leaves_no_epoch_keys() {
     let (path, other) = (dir.join("a.db"), dir.join("b.db"));
     let mut a = Member::new(SqliteProvider::open(&path).unwrap(), "A");
     let b = Member::new(SqliteProvider::open(&other).unwrap(), "B");
-    a.group = Some(Group::create(&a.provider, &a.session, &settings("Plan")).unwrap());
+    a.group = Some(Group::create(&a.provider, &a.session, &settings()).unwrap());
     let kp = b.session.key_package(&b.provider).unwrap();
     let cut = a.cut();
-    let commit = a.commit(Change { cut, add: vec![kp.clone()], how: Some(How::Invite), ..Change::default() });
+    let commit = a.commit(Change { cut, add: vec![kp.clone()], invite: Some(INVITE.into()), ..Change::default() });
     let inner = a.open_inner(&commit.entry);
     let admission = commit.admission.clone().unwrap();
     let mut log = vec![commit.entry];

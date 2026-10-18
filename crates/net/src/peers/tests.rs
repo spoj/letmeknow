@@ -27,7 +27,6 @@ fn own(epoch: u64, members: &[u8]) -> Own {
         epoch,
         log: [7; 32],
         head: None,
-        public: vec![],
         earlier: vec![],
         members: members.iter().map(|&n| (member(n), key(n))).collect(),
         wanted: vec![],
@@ -216,15 +215,15 @@ fn connecting_sends_the_versions_of_kept_summaries() {
     assert!(p.poll(0).contains(&Out::Frame(key(1), Frame::Versions { group: id(), versions })));
 }
 
-/// `hello` on connecting carries each served group's position and the heads of the public logs.
+/// `hello` on connecting carries each served group's position, with the newest signed head of its log.
 #[test]
-fn hello_on_connect_carries_the_served_groups_and_public_heads() {
+fn hello_on_connect_carries_the_served_groups_positions() {
     let mut p = peers();
-    let public = Head { log_ref: [9; 32], length: 3, hash: [0; 32], time: 0, sig: Bytes::default() };
-    p.group(id(), Own { public: vec![public.clone()], ..own(1, &[1]) }, 0);
+    let head = Head { log_ref: [7; 32], length: 3, hash: [0; 32], time: 0, sig: Bytes::default() };
+    p.group(id(), Own { head: Some(head.clone()), ..own(1, &[1]) }, 0);
     p.connect(key(1), gs(), false, 0);
-    let groups = vec![At { group: id(), epoch: 1, log: [7; 32], head: None }];
-    assert!(p.poll(0).contains(&Out::Frame(key(1), Frame::Hello { groups, heads: vec![public] })));
+    let groups = vec![At { group: id(), epoch: 1, log: [7; 32], head: Some(head) }];
+    assert!(p.poll(0).contains(&Out::Frame(key(1), Frame::Hello { groups })));
 }
 
 /// A peer's versions get back the summaries it lacks or holds older, and nothing it holds at the same version.
@@ -381,7 +380,7 @@ fn an_answer_cut_at_its_size_strikes_only_what_it_covered() {
 fn a_request_times_out_though_the_holder_sends_other_frames() {
     let mut p = both_hold();
     p.poll(0);
-    p.frame(&key(1), &Frame::Hello { groups: vec![], heads: vec![] }, TIMEOUT - 1);
+    p.frame(&key(1), &Frame::Hello { groups: vec![] }, TIMEOUT - 1);
     assert_eq!(wants(&p.poll(TIMEOUT)), vec![(key(2), ask())]);
 }
 
@@ -546,32 +545,6 @@ fn a_holder_past_its_backoff_is_dialed_when_the_wait_starts() {
     assert_eq!(dials(&p.poll(31_000)), vec![key(1)]);
 }
 
-/// A live payload seen lately is dropped; otherwise it goes to the neighbours but not back to its source, and not on at hops 0.
-#[test]
-fn live_payloads_are_deduped_and_forwarded_by_hops() {
-    let mut p = peers();
-    p.group(id(), own(1, &(1..=19).collect::<Vec<_>>()), 0);
-    for n in 1..=7 {
-        p.connect(key(n), gs(), false, 0);
-    }
-    let others: Vec<Key> = (2..=7).map(key).collect();
-    assert_eq!(p.live(&id(), [1; 32], Some(key(1)), 6, 0), Some(others));
-    assert_eq!(p.live(&id(), [1; 32], Some(key(2)), 6, 1), None);
-    assert_eq!(p.live(&id(), [2; 32], Some(key(2)), 0, 1), Some(vec![]));
-    assert!(p.live(&id(), [1; 32], None, 0, LIVE_AGE).is_some(), "expired after two minutes");
-}
-
-/// In a full mesh nothing is forwarded, while an own payload goes to every neighbour.
-#[test]
-fn a_full_mesh_forwards_nothing_and_own_payloads_go_to_all() {
-    let mut p = peers();
-    p.group(id(), own(1, &[1, 2]), 0);
-    p.connect(key(1), gs(), false, 0);
-    p.connect(key(2), gs(), false, 0);
-    assert_eq!(p.live(&id(), [9; 32], Some(key(1)), 6, 0), Some(vec![]));
-    assert_eq!(p.live(&id(), [8; 32], None, 6, 0), Some(vec![key(1), key(2)]));
-}
-
 /// An answer stops near a mebibyte and covers the asked seqs up to where it stopped.
 #[test]
 fn an_answer_stops_near_a_mebibyte_and_covers_what_it_reached() {
@@ -585,18 +558,15 @@ fn an_answer_stops_near_a_mebibyte_and_covers_what_it_reached() {
     assert_eq!(answers, Some(asked));
 }
 
-/// `hello` and `entries` are taken from anyone; the rest from admitted peers, and live payloads only at the head.
+/// `hello` is taken from anyone; the rest only from admitted peers.
 #[test]
 fn the_gate() {
-    let hello = Frame::Hello { groups: vec![], heads: vec![] };
-    assert!(takes(&hello, false, false) && !sends(&hello, false, false));
+    let hello = Frame::Hello { groups: vec![] };
+    assert!(takes(&hello, false));
     let want = Frame::Want { group: id(), epoch: 1, wants: vec![], ids: vec![] };
-    assert!(!takes(&want, false, true) && takes(&want, true, false));
+    assert!(!takes(&want, false) && takes(&want, true));
     let files = Frame::WantFiles { group: id(), files: vec![] };
-    assert!(!takes(&files, false, true) && takes(&files, true, false) && sends(&files, true, false));
-    let live = Frame::Live { group: id(), hops: 1, item: Bytes(vec![]) };
-    assert!(!takes(&live, true, false) && takes(&live, true, true));
-    assert!(!sends(&live, true, false) && sends(&live, true, true));
+    assert!(!takes(&files, false) && takes(&files, true));
 }
 
 const N: usize = 12;
@@ -716,7 +686,7 @@ fn twelve_members_converge_through_loss_and_reconnection() {
     let mut sim = Sim { now: 0, chaos: true, rng: Rng(0x9e37_79b9_7f4a_7c15), peers: Vec::new(), versions: vec![0; N], links: BTreeSet::new(), queue: BTreeMap::new(), sent: 0 };
     for i in 0..N {
         let members = (0..N).filter(|&j| j != i).map(|j| ((Bytes(vec![j as u8]), 0), key(j as u8))).collect();
-        let own = Own { me: (Bytes(vec![i as u8]), 0), epoch: 1, log: [1; 32], head: None, public: vec![], earlier: vec![], members, wanted: vec![], stale: vec![] };
+        let own = Own { me: (Bytes(vec![i as u8]), 0), epoch: 1, log: [1; 32], head: None, earlier: vec![], members, wanted: vec![], stale: vec![] };
         sim.peers.push(Peers::new(0, i as u64 + 1, key(i as u8)));
         sim.peers[i].group(id(), own, 0);
     }

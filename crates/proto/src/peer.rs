@@ -13,9 +13,8 @@ pub const SUMMARY: &[u8] = b"letmeknow summary v1\0";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Frame {
-    /// Where the sender is in each group it shares with the receiver, and the heads of the public logs their members
-    /// follow.
-    Hello { groups: Vec<At>, heads: Vec<Head> },
+    /// Where the sender is in each group it shares with the receiver.
+    Hello { groups: Vec<At> },
     /// Entries of a log the other lacks, by its reference, ending at `head`.
     Entries { log: Bytes, entries: Vec<Bytes>, head: Head },
     /// The versions of the summaries the sender holds, on connecting: each side then sends the other what it lacks.
@@ -38,8 +37,6 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         ids: Vec<Bytes>,
     },
-    /// A live payload, sealed under its epoch's live key, passed on while `hops` lasts.
-    Live { group: Bytes, hops: u8, item: Bytes },
     /// BLAKE3 hashes of files.
     WantFiles { group: Bytes, files: Vec<Bytes> },
     Have { group: Bytes, files: Vec<Bytes> },

@@ -46,8 +46,7 @@ const HINT_WAIT: Duration = Duration::from_secs(2);
 pub trait Groups: Send + Sync + 'static {
     /// The groups this session is in.
     fn groups(&self) -> Vec<Vec<u8>>;
-    /// Whether this session serves `peer` the group: it is in a leaf and, speaking as an identity, its device is on the
-    /// identity's list.
+    /// Whether this session serves `peer` the group: a leaf of it names `peer`.
     fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool;
     /// The files the group links now.
     fn files(&self, group: &[u8]) -> Vec<FileLink>;
@@ -74,7 +73,7 @@ pub enum Event {
 }
 
 pub struct Config {
-    /// `LETMEKNOW_HOME`, where sessions of one device publish their addresses to each other.
+    /// `LETMEKNOW_HOME`, where one machine's sessions publish their addresses to each other.
     pub home: Option<PathBuf>,
     /// Where files are kept; in memory if none.
     pub files: Option<PathBuf>,
@@ -437,7 +436,7 @@ impl ProtocolHandler for Handler {
     }
 }
 
-/// Sessions of one device find each other through `LETMEKNOW_HOME/addresses/<iroh key>.json`,
+/// One machine's sessions find each other through `LETMEKNOW_HOME/addresses/<iroh key>.json`,
 /// which holds `{"addrs": ["<ip:port>", ...]}`.
 mod addresses {
     use std::{

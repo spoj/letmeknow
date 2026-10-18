@@ -6,11 +6,12 @@ use serde_json::Value;
 /// How many characters of a message id show; commands take any unique beginning of one.
 pub const ID: usize = 12;
 
-/// Makes `value` short: a member shows as its name ([`shown`]); a message id by its first `ID` characters; and neither a
-/// group's membership service, where it is letmeknow.dev, nor a field that is false, null or empty shows at all.
+/// Makes `value` short: a member shows as "you" or its fingerprint ([`shown`]); a message id by its first `ID`
+/// characters; and neither a group's membership service, where it is letmeknow.dev, nor a field that is false, null or
+/// empty shows at all.
 pub fn compact(value: &mut Value) {
     match value {
-        Value::Object(map) if map.contains_key("fp") && map.contains_key("name") => *value = Value::String(shown(value)),
+        Value::Object(map) if map.contains_key("fp") => *value = Value::String(shown(value)),
         Value::Object(map) => {
             if map.get("membership").is_some_and(|service| *service == serde_json::json!(crate::client::letmeknow_dev())) {
                 map.remove("membership");
@@ -66,29 +67,26 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn members_show_by_name_and_ids_by_their_beginning() {
-        let ann = |shows: &str, you: bool| json!({ "fp": shows, "name": format!("Ann · {shows}"), "you": you, "identity": { "id": "i", "name": "Ann", "how": "self" } });
+    fn members_show_by_fingerprint_and_ids_by_their_beginning() {
+        let member = |fp: &str, you: bool| json!({ "fp": fp, "you": you, "added_by": "f0" });
         let mut item = json!({
             "type": "message",
-            "group": "Plans",
+            "group": "g",
             "id": "a".repeat(64),
             "seq": 7,
-            "from": ann("desk (dog)", false),
-            "to": [ann("laptop", true), ann("desk (cat)", false)],
+            "from": member("f1", false),
+            "to": [member("f2", true), member("f3", false)],
             "direct": false,
             "content": "hi \"there\"",
             "ids": ["b".repeat(64)],
-            "settings": { "name": "", "carry": false, "membership": crate::client::letmeknow_dev() },
-            "members": [
-                { "fp": "f2", "name": "Bob · phone", "identity": { "id": "j", "name": "Bob", "how": "unknown" } },
-                { "fp": "f3", "name": "f3", "identity": { "id": "i", "name": "Ann", "how": "self", "error": "not on its list" } }
-            ]
+            "carry": false,
+            "membership": crate::client::letmeknow_dev(),
         });
         compact(&mut item);
         assert_eq!(
             line(&item),
             format!(
-                r#"{{"type":"message","group":"Plans","from":"desk (dog)","id":"{}","ids":["{}"],"members":["Bob · phone","f3"],"seq":7,"to":["you","desk (cat)"],"content":"hi \"there\""}}"#,
+                r#"{{"type":"message","group":"g","from":"f1","id":"{}","ids":["{}"],"seq":7,"to":["you","f3"],"content":"hi \"there\""}}"#,
                 "a".repeat(ID),
                 "b".repeat(ID)
             )

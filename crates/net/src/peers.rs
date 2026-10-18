@@ -3,7 +3,7 @@
 //! frames, polls it, and sends what it returns. Times are milliseconds.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     mem,
 };
 
@@ -41,8 +41,6 @@ pub const WAIT: u64 = 120_000;
 /// From then, how long a wait holds though no summary shows a holder: a member back online hears the others' summaries
 /// within it.
 pub const HEAR: u64 = 15_000;
-pub const LIVE_IDS: usize = 4_096;
-pub const LIVE_AGE: u64 = 120_000;
 pub const DIALS: usize = 4;
 
 /// This member's state of a group, handed in on every change.
@@ -54,8 +52,7 @@ pub struct Own {
     /// The current epoch's log, and its newest signed head held.
     pub log: [u8; 32],
     pub head: Option<Head>,
-    /// As in 0.16: the public logs' heads, and the earlier logs' still held.
-    pub public: Vec<Head>,
+    /// The earlier logs' newest signed heads held.
     pub earlier: Vec<Head>,
     /// The other current members, with their iroh keys.
     pub members: Vec<(Membership, Key)>,
@@ -107,8 +104,6 @@ pub struct Peers {
     backoff: BTreeMap<Key, Backoff>,
     /// Peers with a `Dial` in flight.
     dialing: BTreeSet<Key>,
-    /// Live payload ids seen, oldest first.
-    live: VecDeque<([u8; 32], u64)>,
 }
 
 struct Group {
@@ -170,7 +165,6 @@ impl Peers {
             conns: BTreeMap::new(),
             backoff: BTreeMap::new(),
             dialing: BTreeSet::new(),
-            live: VecDeque::new(),
         }
     }
 
@@ -182,7 +176,7 @@ impl Peers {
                     g.struck.clear();
                 }
                 g.heard.retain(|m, _| *m == own.me || own.members.iter().any(|(n, _)| n == m));
-                let changed = (g.own.epoch, g.own.log, &g.own.head, &g.own.public) != (own.epoch, own.log, &own.head, &own.public);
+                let changed = (g.own.epoch, g.own.log, &g.own.head) != (own.epoch, own.log, &own.head);
                 g.own = own;
                 changed
             }
@@ -277,9 +271,8 @@ impl Peers {
     pub fn frame(&mut self, peer: &Key, frame: &Frame, now: u64) -> Vec<Out> {
         let Some(c) = self.conns.get_mut(peer) else { return Vec::new() };
         match frame {
-            Frame::Hello { groups, heads } => {
-                let logs = heads.iter().map(|h| (h.log_ref, h.length)).chain(groups.iter().map(|at| (at.log, at.head.as_ref().map_or(0, |h| h.length))));
-                for (log, length) in logs {
+            Frame::Hello { groups } => {
+                for (log, length) in groups.iter().map(|at| (at.log, at.head.as_ref().map_or(0, |h| h.length))) {
                     let theirs = c.theirs.entry(log).or_default();
                     *theirs = (*theirs).max(length);
                 }
@@ -369,23 +362,6 @@ impl Peers {
 
     pub fn full_mesh(&self, group: &Bytes) -> bool {
         self.groups[group].own.members.len() < MESH
-    }
-
-    /// Dedups a live payload: `None` if seen lately, else the neighbours to forward it to.
-    pub fn live(&mut self, group: &Bytes, id: [u8; 32], from: Option<Key>, hops: u8, now: u64) -> Option<Vec<Key>> {
-        while self.live.len() >= LIVE_IDS || self.live.front().is_some_and(|(_, at)| now - at >= LIVE_AGE) {
-            self.live.pop_front();
-        }
-        if self.live.iter().any(|(seen, _)| *seen == id) {
-            return None;
-        }
-        self.live.push_back((id, now));
-        let neighbours = self.neighbours(group);
-        Some(match from {
-            None => neighbours,
-            Some(from) if hops > 0 && !self.full_mesh(group) => neighbours.into_iter().filter(|k| *k != from).collect(),
-            Some(_) => Vec::new(),
-        })
     }
 
     /// Whether to apply a commit that deletes the keys of an epoch, given the seqs of that epoch the member lacks
@@ -493,7 +469,7 @@ impl Peers {
         for (key, c) in &mut self.conns {
             let served: Vec<(&Bytes, &Group)> = c.served.iter().filter_map(|id| Some((id, self.groups.get(id)?))).collect();
             for (_, g) in &served {
-                for head in g.own.head.iter().chain(&g.own.public).chain(&g.own.earlier) {
+                for head in g.own.head.iter().chain(&g.own.earlier) {
                     if let Some(theirs) = c.theirs.get_mut(&head.log_ref)
                         && *theirs < head.length
                     {
@@ -505,11 +481,8 @@ impl Peers {
             if c.hello || due {
                 c.hello = false;
                 if !served.is_empty() {
-                    let mut heads: Vec<Head> = served.iter().flat_map(|(_, g)| g.own.public.iter().cloned()).collect();
-                    heads.sort_by_key(|h| h.log_ref);
-                    heads.dedup_by(|a, b| a.log_ref == b.log_ref);
                     let groups = served.iter().map(|(id, g)| At { group: (*id).clone(), epoch: g.own.epoch, log: g.own.log, head: g.own.head.clone() }).collect();
-                    out.push(Out::Frame(*key, Frame::Hello { groups, heads }));
+                    out.push(Out::Frame(*key, Frame::Hello { groups }));
                 }
             }
         }
@@ -729,22 +702,9 @@ pub fn answer(group: Bytes, asked: &[Seqs], held: &[Seqs], mut ciphertext: impl 
     Frame::Held { group, items, answers: Some(to_seqs(&covered)) }
 }
 
-/// Whether a member acts on a frame from a peer: `hello` and `entries` from anyone, the rest only from admitted peers,
-/// and live payloads only at the head.
-pub fn takes(frame: &Frame, admitted: bool, at_head: bool) -> bool {
-    match frame {
-        Frame::Hello { .. } | Frame::Entries { .. } => true,
-        Frame::Live { .. } => admitted && at_head,
-        _ => admitted,
-    }
-}
-
-/// Whether a member sends a frame to a peer: only to admitted ones, and live payloads only at the head.
-pub fn sends(frame: &Frame, admitted: bool, at_head: bool) -> bool {
-    match frame {
-        Frame::Live { .. } => admitted && at_head,
-        _ => admitted,
-    }
+/// Whether a member acts on a frame from a peer: `hello` and `entries` from anyone, the rest only from admitted peers.
+pub fn takes(frame: &Frame, admitted: bool) -> bool {
+    matches!(frame, Frame::Hello { .. } | Frame::Entries { .. }) || admitted
 }
 
 #[cfg(test)]

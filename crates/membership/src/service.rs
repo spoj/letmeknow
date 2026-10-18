@@ -1,6 +1,6 @@
 //! Bounded membership work. Only capabilities cross the service request boundary.
 
-use std::{collections::HashMap, hash::Hash, net::{IpAddr, Ipv4Addr}, sync::{Arc, Mutex}, time::Duration};
+use std::{collections::HashMap, net::{IpAddr, Ipv4Addr}, sync::{Arc, Mutex}, time::Duration};
 
 use anyhow::{Result, ensure};
 use ed25519_dalek::Signer;
@@ -16,8 +16,6 @@ const DB_WORK: usize = 4;
 /// refusal tells the client the work was not done.
 const DB_WAIT: Duration = Duration::from_secs(2);
 const MINUTE: u64 = 60_000;
-/// The largest entry a public log takes.
-const PUBLIC_ENTRY: usize = 16 << 10;
 /// A /48's budget, in /64s.
 const WIDE: u64 = 16;
 /// Keys a quota tracks at once: a source past them is refused, so a flood of addresses cannot grow memory.
@@ -35,9 +33,6 @@ pub struct Policy {
     pub reads_per_minute: u32,
     pub read_bytes_per_minute: u64,
     pub new_logs_per_day: u64,
-    pub new_public_logs_per_day: u64,
-    /// Stored entries a day to each public log.
-    pub public_appends_per_day: u64,
     /// Per source: an IPv4 address, a /64, and a /48 at `WIDE` times as many.
     pub requests_at_once: usize,
     /// Bodies and answers in flight, a body counted twice: as bytes and as its decoded value.
@@ -51,7 +46,7 @@ impl Default for Policy {
         Self {
             appends_per_minute: 600, retention_days: 7, disk: DISK_BYTES,
             append_bytes_per_day: 256 << 20, reads_per_minute: 600, read_bytes_per_minute: 64 << 20,
-            new_logs_per_day: 2_000, new_public_logs_per_day: 10, public_appends_per_day: 10,
+            new_logs_per_day: 2_000,
             requests_at_once: 8, bytes_at_once: 16 << 20, bytes_at_once_in_all: 256 << 20,
         }
     }
@@ -93,31 +88,23 @@ struct Inner {
 }
 
 /// What each key spent in the current window of `period` milliseconds, against `limit` times its scale.
-struct Quota<K> {
+struct Quota {
     period: u64,
     limit: u64,
     window: u64,
-    spent: HashMap<K, u64>,
+    spent: HashMap<Source, u64>,
     /// The /64s each /48 tracks in `spent`.
     nets: HashMap<u64, u64>,
 }
 
-trait Key: Clone + Eq + Hash {
-    fn net48(&self) -> Option<u64> { None }
-}
-
-impl Key for ([u8; 32], Source) {
-    fn net48(&self) -> Option<u64> { self.1.net48() }
-}
-
-impl<K: Key> Quota<K> {
+impl Quota {
     fn new(period: u64, limit: u64) -> Self { Self { period, limit, window: 0, spent: HashMap::new(), nets: HashMap::new() } }
 
-    fn tracks(&self, key: &K) -> bool {
+    fn tracks(&self, key: &Source) -> bool {
         self.spent.contains_key(key) || key.net48().is_none_or(|net| self.nets.get(&net).copied().unwrap_or(0) < NETS)
     }
 
-    fn fits(&mut self, at: u64, keys: &[(K, u64)], amount: u64) -> bool {
+    fn fits(&mut self, at: u64, keys: &[(Source, u64)], amount: u64) -> bool {
         self.roll(at);
         let full = self.spent.len() >= KEYS;
         keys.iter().filter(|(key, _)| self.tracks(key)).all(|(key, scale)| {
@@ -125,16 +112,16 @@ impl<K: Key> Quota<K> {
         })
     }
 
-    fn charge(&mut self, at: u64, keys: &[(K, u64)], amount: u64) {
+    fn charge(&mut self, at: u64, keys: &[(Source, u64)], amount: u64) {
         self.roll(at);
         for (key, _) in keys {
             if !self.tracks(key) { continue; }
             if let Some(net) = key.net48().filter(|_| !self.spent.contains_key(key)) { *self.nets.entry(net).or_default() += 1; }
-            *self.spent.entry(key.clone()).or_default() += amount;
+            *self.spent.entry(*key).or_default() += amount;
         }
     }
 
-    fn take(&mut self, at: u64, keys: &[(K, u64)], amount: u64) -> bool {
+    fn take(&mut self, at: u64, keys: &[(Source, u64)], amount: u64) -> bool {
         let fits = self.fits(at, keys, amount);
         if fits { self.charge(at, keys, amount); }
         fits
@@ -153,7 +140,7 @@ impl<K: Key> Quota<K> {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Source { V4(Ipv4Addr), Net64(u64), Net48(u64) }
 
-impl Key for Source {
+impl Source {
     fn net48(&self) -> Option<u64> {
         match self { Source::Net64(net) => Some(net >> 16), _ => None }
     }
@@ -173,13 +160,11 @@ fn sources(from: IpAddr) -> Vec<(Source, u64)> {
 }
 
 struct Budgets {
-    appends: Quota<Source>,
-    append_bytes: Quota<Source>,
-    reads: Quota<Source>,
-    read_bytes: Quota<Source>,
-    new_logs: Quota<Source>,
-    new_public_logs: Quota<Source>,
-    public_appends: Quota<([u8; 32], Source)>,
+    appends: Quota,
+    append_bytes: Quota,
+    reads: Quota,
+    read_bytes: Quota,
+    new_logs: Quota,
 }
 
 impl Budgets {
@@ -190,8 +175,6 @@ impl Budgets {
             reads: Quota::new(MINUTE, policy.reads_per_minute.into()),
             read_bytes: Quota::new(MINUTE, policy.read_bytes_per_minute),
             new_logs: Quota::new(DAY_MS, policy.new_logs_per_day),
-            new_public_logs: Quota::new(DAY_MS, policy.new_public_logs_per_day),
-            public_appends: Quota::new(DAY_MS, policy.public_appends_per_day),
         }
     }
 }
@@ -313,38 +296,21 @@ impl Service {
     }
 
     async fn append(&self, sources: &[(Source, u64)], at: u64, body: &[u8]) -> Result<Appended> {
-        let Append { capability, entries, public } = decode(body)?;
-        ensure!(!public || entries.iter().all(|e| e.0.len() <= PUBLIC_ENTRY), Refused("size".into()));
+        let Append { capability, entries } = decode(body)?;
         let log = self.0.store.log(&capability);
         let bytes: u64 = entries.iter().map(|e| e.0.len() as u64).sum();
-        let count = entries.len() as u64;
-        {
-            let mut budgets = self.0.budgets.lock().unwrap();
-            ensure!(budgets.appends.take(at, sources, 1) && budgets.append_bytes.take(at, sources, bytes), Refused("rate".into()));
-        }
-        if public && count == 1 {
-            let entry = entries[0].0.clone();
-            if let Some(touched) = self.work({ let log = log.clone(); move |inner| inner.store.touch(&log, &entry) }).await? {
-                return Ok(touched);
-            }
-        }
-        let per_log: Vec<_> = sources.iter().map(|(source, scale)| ((log.reference, *source), *scale)).collect();
         let may_start = {
             let mut budgets = self.0.budgets.lock().unwrap();
-            ensure!(!public || budgets.public_appends.fits(at, &per_log, count), Refused("rate".into()));
-            budgets.new_logs.fits(at, sources, 1) && (!public || budgets.new_public_logs.fits(at, sources, 1))
+            ensure!(budgets.appends.take(at, sources, 1) && budgets.append_bytes.take(at, sources, bytes), Refused("rate".into()));
+            budgets.new_logs.fits(at, sources, 1)
         };
-        let (appended, stored, started) = self.work({ let log = log.clone(); move |inner| {
+        let (appended, started) = self.work(move |inner| {
             let started = !inner.store.records(&log)?;
             ensure!(may_start || !started, Refused("rate".into()));
-            let (appended, stored) = inner.store.append(&log, &entries, public)?;
-            Ok((appended, stored, started))
-        } }).await?;
-        let mut budgets = self.0.budgets.lock().unwrap();
-        if public { budgets.public_appends.charge(at, &per_log, stored); }
+            Ok((inner.store.append(&log, &entries)?, started))
+        }).await?;
         if started {
-            budgets.new_logs.charge(at, sources, 1);
-            if public { budgets.new_public_logs.charge(at, sources, 1); }
+            self.0.budgets.lock().unwrap().new_logs.charge(at, sources, 1);
         }
         Ok(appended)
     }

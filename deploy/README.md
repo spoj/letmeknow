@@ -29,4 +29,4 @@ Nothing carries over: it gets a new service, and the previous minor's sessions s
     ./letmeknow serve --initialize --domain relay.letmeknow.dev --state /var/lib/letmeknow.new
     chown -R letmeknow: /var/lib/letmeknow.new
 
-It prints the new domain and public key: put the key in deploy/backend.json's directory and in crates/proto/src/links.rs, and release. The directory is what the service publishes at `/.well-known/letmeknow.json` once it runs; its `relay` names the domain. A new key is a new service: groups and identities of the old one do not move to it.
+It prints the new domain and public key: put the key in deploy/backend.json's directory and in crates/proto/src/links.rs, and release. The directory is what the service publishes at `/.well-known/letmeknow.json` once it runs; its `relay` names the domain. A new key is a new service: groups of the old one do not move to it.

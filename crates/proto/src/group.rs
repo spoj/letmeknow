@@ -12,10 +12,6 @@ pub const REVISION: u32 = 0;
 pub const SETTINGS_EXTENSION: u16 = 0xff01;
 pub const LEAF_EXTENSION: u16 = 0xff02;
 
-/// The kind of every group but identities' groups.
-pub const CHAT: &str = "chat";
-/// The built-in kind of an identity's group, whose members are its devices; sessions do not join it.
-pub const IDENTITY: &str = "identity";
 /// T's default: daily.
 pub const UPDATE: u32 = 24 * 60 * 60;
 
@@ -35,24 +31,15 @@ pub enum Service {
     Newer(Value),
 }
 
-/// The group context extension `SETTINGS_EXTENSION`.
+/// The group context extension `SETTINGS_EXTENSION`, fixed when the group is made.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     pub protocol: u32,
-    pub kind: String,
-    pub name: String,
     /// H: how many days members carry the group's messages, and the files they link, for others.
     pub carry: u32,
     /// T: how many seconds a member's leaf goes between updates.
     pub update: u32,
     pub membership: Service,
-    /// The id of the group's public log, which its kind keeps: an identity's group's is the identity's id, on
-    /// `membership`. Fixed when the group is made.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub public: Option<Bytes>,
-    /// Fields a newer letmeknow added, kept when this one rewrites the settings.
-    #[serde(flatten)]
-    pub rest: Map<String, Value>,
 }
 
 /// The leaf node extension `LEAF_EXTENSION`.
@@ -65,54 +52,15 @@ pub struct Leaf {
     pub revision: u32,
 }
 
-/// The identity bytes of a member's basic credential: its name, its MLS signature key, and the certificate of the
-/// identity it speaks as.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Credential {
-    pub name: String,
-    pub key: Bytes,
-    pub certificate: Option<Box<Certificate>>,
-}
-
-impl Credential {
-    pub fn identity(&self) -> Option<&IdentityRef> {
-        self.certificate.as_ref().map(|certificate| &certificate.identity)
-    }
-}
-
-/// A device's signed private claims for this session (`public::certified`). Directory authorization is checked separately.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Certificate {
-    pub identity: IdentityRef,
-    pub device: Bytes,
-    pub name: String,
-    pub device_name: String,
-    pub sig: Bytes,
-}
-
-/// An identity commitment and an untrusted lookup hint. Genesis authenticates its directory's service.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IdentityRef {
-    pub id: Bytes,
-    pub membership: Service,
-}
-
 /// The core's own payloads. The plaintext of an MLS application message is JSON with a `type`; every type but these
-/// belongs to the group's kind.
+/// is a chat's.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Control {
     /// The sender asks to be removed.
     Leave,
-    /// An invite, which any member admits a joiner by once: SHA-256 of its secret, when it expires (milliseconds), and
-    /// whom it is for.
-    Invite {
-        hash: Bytes,
-        expires: u64,
-        /// The only identity that may join by it (`invite --to`), or device whose sessions only may (`add`).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        to: Option<Bytes>,
-    },
+    /// An invite, which any member admits a joiner by once: SHA-256 of its secret, and when it expires (milliseconds).
+    Invite { hash: Bytes, expires: u64 },
 }
 
 impl Control {
@@ -124,7 +72,7 @@ pub fn type_of(payload: &serde_json::Value) -> &str {
     payload["type"].as_str().unwrap_or_default()
 }
 
-/// A chat message, the payload of the built-in kind.
+/// A chat message.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename = "message")]
 pub struct ChatMessage {
@@ -151,15 +99,6 @@ pub struct Attachment {
     pub media_type: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum How {
-    Invite,
-    /// A way a newer letmeknow named.
-    #[serde(untagged)]
-    Other(String),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,7 +115,6 @@ mod tests {
 
     #[test]
     fn unknown_values_parse_to_the_catch_all() {
-        assert_eq!(serde_json::from_str::<How>(r#""vouched""#).unwrap(), How::Other("vouched".into()));
         let service: Service = serde_json::from_str(r#"{"s3":{"bucket":"b"}}"#).unwrap();
         assert!(matches!(service, Service::Newer(_)));
         assert_eq!(serde_json::to_string(&service).unwrap(), r#"{"s3":{"bucket":"b"}}"#);
@@ -185,11 +123,11 @@ mod tests {
     }
 
     #[test]
-    fn records_keep_fields_this_version_does_not_know() {
-        let text = r#"{"protocol":4,"kind":"chat","name":"Plan","carry":7,"update":86400,"membership":{"serve":{"key":"Ag","domain":"h.example","future":"t"}},"color":"red"}"#;
+    fn records_take_fields_this_version_does_not_know() {
+        let text = r#"{"protocol":4,"carry":7,"update":86400,"membership":{"serve":{"key":"Ag","domain":"h.example","future":"t"}},"color":"red"}"#;
         let settings: Settings = serde_json::from_str(text).unwrap();
-        let renamed = Settings { name: "Release".into(), ..settings };
-        assert_eq!(serde_json::to_string(&renamed).unwrap(), text.replace("Plan", "Release"));
+        let Service::Serve { rest, .. } = &settings.membership else { panic!("a service this version knows") };
+        assert_eq!(rest["future"], "t");
         let leaf: Leaf = serde_json::from_str(r#"{"key":"AQ"}"#).unwrap();
         assert_eq!(leaf.revision, 0);
     }

@@ -15,7 +15,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::session::Inbound;
-use lmk_proto::links::Invite;
 
 /// End-to-end encrypted chats for agents and their people.
 #[derive(Parser)]
@@ -24,7 +23,7 @@ pub struct Cli {
     /// Agent session; each session is its own group member [default: listen picks a new handle; other commands use the one running session]
     #[arg(long, env = "LETMEKNOW_SESSION", global = true)]
     pub session: Option<String>,
-    /// Where sessions and the device keep their state [default: the user's local data directory]
+    /// Where sessions keep their state [default: the user's local data directory]
     #[arg(long, env = "LETMEKNOW_HOME", global = true)]
     pub home: Option<PathBuf>,
     #[command(subcommand)]
@@ -41,7 +40,7 @@ pub enum Command {
         /// Keep the text of messages once delivered, for audit; by default only ids, senders and references are kept
         #[arg(long)]
         keep_log: bool,
-        /// The domain of the membership service for groups and identities this session creates
+        /// The domain of the membership service for groups this session creates
         #[arg(long, env = "LETMEKNOW_MEMBERSHIP", default_value = lmk_proto::links::DOMAIN)]
         membership: String,
         /// A relay this session is reached through, instead of its directory's; repeat for several
@@ -96,10 +95,10 @@ pub struct Serve {
     /// Logs, keys and certificates
     #[arg(long)]
     pub state: PathBuf,
-    /// MiB the membership database may use: its pages in use and its WAL. Appends past it are refused as quota; public logs take a tenth
+    /// MiB the membership database may use: its pages in use and its WAL. Appends past it are refused as quota
     #[arg(long, default_value_t = 4096)]
     pub disk: u64,
-    /// Days a group's log is kept after its first entry, and a directory's after its last append, at least 7
+    /// Days a group's log is kept after its first entry, or while it is empty after its last open, at least 7
     #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u64).range(7..))]
     pub retention: u64,
     /// A certificate (PEM) to use instead of Let's Encrypt, with --key
@@ -118,9 +117,7 @@ pub enum Request {
     Send {
         #[arg(long)]
         group: Option<String>,
-        /// A member to address: its fingerprint, or a name it answers to (its identity's name, which addresses all the
-        /// identity's sessions, its device's or its handle, or the first word of one); repeat for several. "@name" in the
-        /// text addresses too
+        /// A member to address, by fingerprint; repeat for several
         #[arg(long)]
         to: Vec<String>,
         /// Id of the message this answers, or any unique beginning of it
@@ -150,10 +147,6 @@ pub enum Request {
     /// The file a message links, decrypted into a file only you can read; prints its path
     #[command(display_order = 20)]
     Fetch { link: String },
-    /// `identity join <link>`: sent as the client's `join`.
-    #[command(skip)]
-    #[serde(skip)]
-    IdentityJoin { link: String },
     /// `status --group <group>`: the client's `status`, of that group only.
     #[command(skip)]
     #[serde(skip)]
@@ -161,10 +154,6 @@ pub enum Request {
     /// `sessions remove`: stops the session, answered once it stopped.
     #[command(skip)]
     Stop,
-    /// An add for this session, which the session acting for the device hands it: joins `group` as `join` does, unless
-    /// it is in it already, and prints `joined`, naming `device`, which sent the add.
-    #[command(skip)]
-    Added { link: String, group: lmk_proto::Bytes, device: String },
     #[command(flatten)]
     #[serde(untagged)]
     Client(crate::client::Request),
@@ -183,21 +172,12 @@ struct Call {
     request: Request,
 }
 
-/// Parses a command line. `identity join` and `status --group` are this command line's, beside the client core's
-/// commands.
+/// Parses a command line. `status --group` is this command line's, beside the client core's commands.
 pub fn parse<T: Into<OsString> + Clone>(args: impl IntoIterator<Item = T>) -> Result<Cli, clap::Error> {
-    let join = clap::Command::new("join")
-        .about("Add this device to an identity, through a device link (`identity invite` makes them)")
-        .arg(clap::Arg::new("link").value_name("LINK").required(true));
     let group = clap::Arg::new("group").long("group").value_name("GROUP").help("Only this group");
-    let command = Cli::command()
-        .mut_subcommand("identity", |identity| identity.subcommand(join))
-        .mut_subcommand("status", |status| status.arg(group));
+    let command = Cli::command().mut_subcommand("status", |status| status.arg(group));
     let mut matches = hyphens(command).try_get_matches_from(args)?;
     let request = match matches.subcommand() {
-        Some(("identity", identity)) => {
-            identity.subcommand_matches("join").and_then(|join| join.get_one::<String>("link")).map(|link| Request::IdentityJoin { link: link.clone() })
-        }
         Some(("status", status)) => status.get_one::<String>("group").map(|group| Request::Status { group: group.clone() }),
         _ => None,
     };
@@ -321,23 +301,10 @@ async fn answer(stream: TcpStream, token: String, inbound: mpsc::UnboundedSender
 /// Sends a request to the running session and returns its answer: made short, but for `members`. Files the request
 /// names are read here: the session process runs elsewhere.
 pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Value> {
-    if let Request::Client(crate::client::Request::Join { target, .. }) = &request {
-        ensure!(
-            !Invite::parse(target.trim()).is_ok_and(|invite| invite.device),
-            "that is a device link, which adds this device to an identity: to do that, run `letmeknow identity join <link>`"
-        );
-    }
     let mut only = None;
-    match request {
-        Request::IdentityJoin { link } => {
-            ensure!(Invite::parse(link.trim())?.device, "that is not a device link; `identity invite` makes them");
-            request = Request::Client(crate::client::Request::Join { target: link })
-        }
-        Request::Status { group } => {
-            only = Some(group);
-            request = Request::Client(crate::client::Request::Status);
-        }
-        _ => {}
+    if let Request::Status { group } = request {
+        only = Some(group);
+        request = Request::Client(crate::client::Request::Status);
     }
     if let Request::Send { text, attach, attach_name, .. } = &mut request {
         if let Some(file) = attach {
@@ -367,12 +334,8 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
     let mut answer = exchange(channel, request).await?;
     if let Some(group) = only {
         let groups = answer["groups"].as_array_mut().context("status lists groups")?;
-        groups.retain(|g| g["group"] == group.as_str() || g["name"] == group.as_str());
-        match groups.len() {
-            0 => bail!("unknown group {group}"),
-            1 => {}
-            _ => bail!("several groups are named {group}; pass its id"),
-        }
+        groups.retain(|g| g["group"] == group.as_str());
+        ensure!(groups.len() == 1, "unknown group {group}");
         // The warning counts the sends held only here in every group.
         if groups[0]["only_here"] == json!([]) {
             answer.as_object_mut().context("status is an object")?.remove("warning");
@@ -460,7 +423,7 @@ mod tests {
 
     #[test]
     fn a_link_shows_as_a_qr_code() {
-        let code = super::qr("https://letmeknow.dev/i#5.g.AAAA.BBBB").unwrap();
+        let code = super::qr("https://letmeknow.dev/i#9.AAAA.BBBB").unwrap();
         assert!(code.lines().count() > 10);
     }
 }

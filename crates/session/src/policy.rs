@@ -1,7 +1,6 @@
 //! The delivery policy. Printing wakes the agent, so only what concerns this session prints at once; the rest waits,
 //! then prints in order just before the next thing that wakes it, after its next command, or once `--hold` runs out.
 
-use crate::client::answers;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -10,17 +9,9 @@ use tokio::time::Instant;
 /// How many items that arrived while catching up are printed; older ones are counted as `omitted`.
 const CATCH_UP: usize = 20;
 
-/// Whether `text` mentions `member`: "@" and a name it answers to, as "@ann" does a member of the identity "Ann Lee".
-pub fn mentions(text: &str, member: &Value) -> bool {
-    text.match_indices('@').any(|(at, _)| {
-        let name: String = text[at + 1..].chars().take_while(|c| c.is_alphanumeric() || "-_".contains(*c)).collect();
-        !text[..at].ends_with(char::is_alphanumeric) && !name.is_empty() && answers(member, &name)
-    })
-}
-
-/// Messages addressed to this session (by `to` or by mention), answering one of its messages, or urgent; `lost`; and
-/// `removed`, which a `sessions remove` waits for. Membership and settings changes wait, as other
-/// members' messages do: each wakes every agent of the group, and seldom needs one.
+/// Messages addressed to this session, answering one of its messages, or urgent; `lost`; and `removed`, which a
+/// `sessions remove` waits for. Membership changes wait, as other members' messages do: each wakes every agent of the
+/// group, and seldom needs one.
 pub fn wakes(item: &Value, mine: impl Fn(&str) -> bool) -> bool {
     match item["type"].as_str() {
         Some("message") => {
@@ -94,17 +85,6 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn text_mentions_a_member_by_at_and_a_name_it_answers_to() {
-        let member = json!({ "handle": "claude", "device": "laptop", "identity": { "id": "e", "name": "Matthew Lee", "how": "unknown" } });
-        assert!(mentions("@Claude please check", &member));
-        assert!(mentions("ok, @matthew.", &member));
-        assert!(!mentions("@Claudette, look", &member));
-        assert!(!mentions("Claude, look", &member));
-        assert!(!mentions("mail claude@example.com", &member));
-        assert!(!mentions("@ (", &json!({ "handle": "(bot)" })));
-    }
-
-    #[test]
     fn only_what_concerns_this_session_wakes_it() {
         let mine = |id: &str| id == "m1";
         let message = |extra: Value| {
@@ -119,7 +99,6 @@ mod tests {
         assert!(!wakes(&message(json!({ "reply_to": "m2" })), mine));
         assert!(!wakes(&json!({ "type": "joined" }), mine));
         assert!(wakes(&json!({ "type": "removed" }), mine));
-        assert!(!wakes(&json!({ "type": "settings" }), mine));
         assert!(wakes(&json!({ "type": "lost" }), mine));
         assert!(!wakes(&json!({ "type": "attachment" }), mine));
     }

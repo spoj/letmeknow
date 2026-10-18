@@ -1,28 +1,27 @@
-//! Every log this session follows, alike: the log of a group's current epoch, of its commits and held messages'
-//! entries, and the public logs of the identities its groups' members speak as. A capability names each at its
-//! membership service, which keeps it under the reference `head::reference` derives from it, the log's id here. Each is
-//! read from its service, chained, held entry by entry, shown to peers by its newest signed head and caught up from
-//! them; what its entries mean is its log type's (`Of`), to which `Inner::check` hands them once held. A session asks a
-//! service about its logs only before it sends, and as it opens them hourly: online members bring it the rest.
+//! The logs this session follows: each group's log of its current epoch, of its commits and held messages' entries, and
+//! the earlier epochs' logs it still reads. A capability names each at its membership service, which keeps it under the
+//! reference `head::reference` derives from it, the log's id here. Each is read from its service, chained, held entry by
+//! entry, shown to peers by its newest signed head and caught up from them, and handed to its group once held. A
+//! session asks a service about its logs only before it sends, and as it opens them hourly: online members bring it
+//! the rest.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, ensure};
 use lmk_core::provider::SqliteProvider;
-use lmk_core::public::{PublicLog, Verdict};
 use lmk_membership::client::{Post, ServeClient};
 use lmk_membership::{Contradiction, Expired, Frontier, Unsupported, VerifiedPage, WrongDirectory};
 use lmk_net::peers::WAIT;
 use lmk_proto::Bytes;
-use lmk_proto::group::{IDENTITY, IdentityRef, Service};
+use lmk_proto::group::Service;
 use lmk_proto::head::{self, Head};
 use lmk_proto::membership::Known;
 use lmk_proto::clock::corrected;
 use n0_future::time::{Duration, timeout};
 use serde::{Deserialize, Serialize};
 
-use crate::{Epoch, Event, Inner, MEMBER_WAIT, State, Work, get, hex, put};
+use crate::{Epoch, Inner, State, Work, get, hex, put};
 
 pub(crate) const NOT_FOLLOWED: &str = "this session does not follow that log";
 
@@ -31,11 +30,8 @@ pub(crate) const NOT_FOLLOWED: &str = "this session does not follow that log";
 const FRESH: u64 = 2 * 60 * 1000;
 /// How long a send waits for the service: chat works while it is down.
 const FRESH_WAIT: Duration = Duration::from_secs(5);
-/// How often a session opens its groups' logs, touches its identities' directories, asks about the logs members are
-/// behind in, and runs its groups' duties.
+/// How often a session opens its groups' logs, asks about the logs members are behind in, and runs its groups' duties.
 pub(crate) const OPEN: Duration = Duration::from_secs(60 * 60);
-/// How long after a public log could not be read it is read again; each failure since doubles the wait, up to `OPEN`.
-const UNREAD: u64 = 30_000;
 
 /// The logs asked of one service, each with the length held.
 type Asked = (Service, Vec<(Vec<u8>, Known)>);
@@ -69,19 +65,11 @@ pub(crate) fn authority(service: &Service) -> Result<[u8; 32]> {
     key.0.as_slice().try_into().context("a service key is 32 bytes")
 }
 
-/// What a log is, which decides what its entries mean.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum Of {
-    /// A group's log of an epoch, by the group's id.
-    Group(Bytes),
-    /// A public log, by its id: an identity's, by the identity's.
-    Public(Bytes),
-}
-
-/// What this session holds of a log.
+/// What this session holds of a log of one of its groups' epochs.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Log {
-    pub of: Of,
+    /// The group's id.
+    pub group: Bytes,
     pub service: Service,
     /// The newest head held, which covers every entry held; none before the first.
     pub head: Option<Head>,
@@ -96,8 +84,8 @@ pub(crate) struct Log {
 }
 
 impl Log {
-    pub fn new(of: Of, service: Service) -> Self {
-        Log { of, service, head: None, at: 0, lapsed: None, asked: 0 }
+    pub fn new(group: Bytes, service: Service) -> Self {
+        Log { group, service, head: None, at: 0, lapsed: None, asked: 0 }
     }
 
     /// The entries held, positions 1 to this.
@@ -191,17 +179,12 @@ impl State {
         (after + 1..).map_while(|position| self.entry(id, position).ok()?.map(Bytes)).collect()
     }
 
-    /// The capability that names a log at its service: a public log's address, or a group's from the MLS state of the
-    /// epoch the log is of, while the group is in it.
+    /// The capability that names a log at its service, from the MLS state of the epoch the log is of, while the group is
+    /// in it.
     pub(crate) fn capability(&self, id: &[u8]) -> Result<[u8; 32]> {
-        match &self.log(id)?.of {
-            Of::Public(public) => Ok(lmk_proto::public::address(&public.0)),
-            Of::Group(group) => {
-                let g = self.group(&group.0)?;
-                ensure!(g.rec.log.0 == id, "the group has moved on from that log");
-                g.mls.capability(&self.provider)
-            }
-        }
+        let g = self.group(&self.log(id)?.group.0)?;
+        ensure!(g.rec.log.0 == id, "the group has moved on from that log");
+        g.mls.capability(&self.provider)
     }
 
     /// Starts the log of a group's current epoch, after position `base`, as the group's current log.
@@ -209,7 +192,7 @@ impl State {
         let g = self.group(gid)?;
         let service = g.mls.settings().membership;
         let id = head::reference(&authority(&service)?, &g.mls.capability(&self.provider)?).to_vec();
-        self.add_log(&id, Log::new(Of::Group(Bytes(gid.to_vec())), service))?;
+        self.add_log(&id, Log::new(Bytes(gid.to_vec()), service))?;
         let rec = &mut self.group_mut(gid)?.rec;
         (rec.log, rec.base) = (Bytes(id.clone()), base);
         self.save(gid)?;
@@ -231,7 +214,7 @@ impl State {
     /// The logs of a group, its current one last.
     pub(crate) fn group_logs(&self, gid: &[u8]) -> Vec<Vec<u8>> {
         let current = self.groups.get(gid).map(|g| g.rec.log.0.clone());
-        let of = |id: &Vec<u8>, log: &Log| matches!(&log.of, Of::Group(group) if group.0 == gid) && Some(id) != current.as_ref();
+        let of = |id: &Vec<u8>, log: &Log| log.group.0 == gid && Some(id) != current.as_ref();
         let mut logs: Vec<Vec<u8>> = self.logs.iter().filter(|(id, log)| of(id, log)).map(|(id, _)| id.clone()).collect();
         logs.extend(current);
         logs
@@ -249,55 +232,28 @@ impl State {
         Ok(())
     }
 
-    /// The public log of an identity this session follows.
-    pub(crate) fn public_log(&self, identity: &[u8]) -> Option<Vec<u8>> {
-        self.logs.iter().find_map(|(id, log)| matches!(&log.of, Of::Public(of) if of.0 == identity).then(|| id.clone()))
-    }
-
-    /// The logs this session follows at their services: its public logs, and each group's current log.
-    pub(crate) fn followed(&self) -> Vec<(Vec<u8>, Service, Known)> {
-        let mut followed = Vec::new();
-        for (id, log) in &self.logs {
-            let current = match &log.of {
-                Of::Public(_) => log.lapsed.is_none(),
-                Of::Group(group) => self.groups.get(&group.0).is_some_and(|g| g.rec.log.0 == *id),
-            };
-            if let (true, Ok(capability)) = (current, self.capability(id)) {
-                followed.push((id.clone(), log.service.clone(), Known(capability, log.length())));
-            }
-        }
-        followed
-    }
-
-    /// The groups a log concerns.
-    pub(crate) fn groups_of(&self, id: &[u8]) -> Vec<Vec<u8>> {
-        match self.logs.get(id).map(|log| &log.of) {
-            Some(Of::Group(group)) => vec![group.0.clone()],
-            Some(Of::Public(public)) => {
-                let of = |gid: &Vec<u8>| {
-                    self.identities(gid).iter().any(|i| i.id == *public) || self.groups[gid].mls.settings().public.as_ref() == Some(public)
-                };
-                self.groups.keys().filter(|gid| of(gid)).cloned().collect()
-            }
-            None => Vec::new(),
-        }
+    /// A group's current log at its service, with its capability and the length held.
+    fn followed(&self, gid: &[u8]) -> Option<(Vec<u8>, Service, Known)> {
+        let id = self.groups.get(gid)?.rec.log.0.clone();
+        let log = self.logs.get(&id)?;
+        let capability = self.capability(&id).ok()?;
+        Some((id, log.service.clone(), Known(capability, log.length())))
     }
 }
 
 impl Inner {
-    /// Asks about the logs of a group, its current log and the public logs of the identities in it, that this session
-    /// has not read or asked about within `FRESH`, and reads the group's logs on through each epoch a commit read moves
-    /// it to, waiting at most `FRESH_WAIT`: before it sends to the group.
+    /// Asks about a group's current log, unless this session read or asked about it within `FRESH`, and reads the
+    /// group's logs on through each epoch a commit read moves it to, waiting at most `FRESH_WAIT`: before it sends to the
+    /// group.
     pub(crate) async fn refresh(self: &Arc<Self>, gid: &[u8]) {
         let (stale, log) = {
             let mut st = self.lock();
             let now = corrected();
-            let mut followed = st.followed();
-            followed.retain(|(id, ..)| st.groups_of(id).iter().any(|g| g == gid) && st.logs[id].at.max(st.logs[id].asked) + FRESH <= now);
-            for (id, ..) in &followed {
+            let stale: Vec<_> = st.followed(gid).into_iter().filter(|(id, ..)| st.logs[id].at.max(st.logs[id].asked) + FRESH <= now).collect();
+            for (id, ..) in &stale {
                 st.logs.get_mut(id).unwrap().asked = now;
             }
-            (followed, st.group(gid).map(|g| g.rec.log.clone()).ok())
+            (stale, st.group(gid).map(|g| g.rec.log.clone()).ok())
         };
         let asked = async {
             self.ask(stale).await;
@@ -414,7 +370,7 @@ impl Inner {
             let st = self.lock();
             (st.log(id)?.service.clone(), st.capability(id)?, st.log(id)?.length())
         };
-        match self.clients.client(&service)?.append(&capability, &[], false).await {
+        match self.clients.client(&service)?.append(&capability, &[]).await {
             Ok(appended) if appended.head.length > length => self.read(id).await,
             Ok(_) => self.lock().read_as_of(id, corrected()),
             Err(error) => {
@@ -426,21 +382,12 @@ impl Inner {
         }
     }
 
-    /// Opens the current log of each group this session is in, and touches the directory of each identity whose group it
-    /// is in, as every `OPEN` does: a log's retention thus starts at most an hour before its last member went offline.
+    /// Opens the current log of each group this session is in, as every `OPEN` does: a log's retention thus starts at
+    /// most an hour before its last member went offline.
     pub(crate) async fn open_logs(self: &Arc<Self>) {
-        let (logs, identities): (Vec<Vec<u8>>, Vec<Vec<u8>>) = {
-            let st = self.lock();
-            let active = || st.groups.iter().filter(|(_, g)| g.mls.active());
-            (active().map(|(_, g)| g.rec.log.0.clone()).collect(), active().filter(|(_, g)| g.mls.settings().kind == IDENTITY).map(|(gid, _)| gid.clone()).collect())
-        };
+        let logs: Vec<Vec<u8>> = self.lock().groups.values().filter(|g| g.mls.active()).map(|g| g.rec.log.0.clone()).collect();
         for log in logs {
             if let Err(error) = self.open(&log).await {
-                self.report(&error);
-            }
-        }
-        for gid in identities {
-            if let Err(error) = self.touch_directory(&gid).await {
                 self.report(&error);
             }
         }
@@ -455,7 +402,7 @@ impl Inner {
         tracing::debug!("asking the membership service: {error:#}");
     }
 
-    /// Reads a log from its service, through its end; a group's only while the group is in its epoch.
+    /// Reads a log from its service, through its end, while its group is in its epoch.
     pub(crate) async fn read(&self, id: &[u8]) -> Result<()> {
         loop {
             let (capability, service, frontier) = {
@@ -494,7 +441,7 @@ impl Inner {
 
     /// Holds entries of a log that follow position `after` and end at `head`, a head its service signed, from the
     /// service or a peer: the new ones, if they chain on to this session's copy; a head that contradicts it is
-    /// reported. Hands the new ones to the log's type.
+    /// reported. Hands the new ones to the group, while it is the group's current log.
     pub(crate) fn take_entries(&self, st: &mut State, id: &[u8], after: u64, entries: Vec<Bytes>, head: Head) -> Result<()> {
         let length = st.log(id)?.length();
         if after > length {
@@ -525,14 +472,14 @@ impl Inner {
             log.head = Some(head);
         }
         st.save_log(id)?;
-        if fresh {
-            self.check(st, id)?;
+        let group = st.log(id)?.group.0.clone();
+        if fresh && st.groups.get(&group).is_some_and(|g| g.rec.log.0 == id) {
+            self.advance(st, &group)?;
         }
         Ok(())
     }
 
-    /// The service let a log go, as it answered. A public log's directory is closed from then on, and so is every identity
-    /// group of it, which this session leaves. A group's current log that stays gone for `WAIT`, with no entry of it
+    /// The service let a log go, as it answered. A group's current log that stays gone for `WAIT`, with no entry of it
     /// brought meanwhile, is left once it is found gone again: the commit that moves the group on is in it, and no member
     /// can read it.
     fn lapse(&self, st: &mut State, id: &[u8]) -> Result<()> {
@@ -546,140 +493,16 @@ impl Inner {
                 now
             }
         };
-        let of = log.of.clone();
+        let group = log.group.0.clone();
         st.save_log(id)?;
-        match of {
-            Of::Public(identity) => self.replayed(st, &identity.0),
-            Of::Group(group) => {
-                if now >= since + WAIT && st.groups.get(&group.0).is_some_and(|g| g.rec.log.0 == id) {
-                    self.work.send(Work::Gone(group.0)).ok();
-                }
-                Ok(())
-            }
+        if now >= since + WAIT && st.groups.get(&group).is_some_and(|g| g.rec.log.0 == id) {
+            self.work.send(Work::Gone(group)).ok();
         }
-    }
-
-    /// Hands a log's new entries to its log type: a group's, while it is the group's current log.
-    fn check(&self, st: &mut State, id: &[u8]) -> Result<()> {
-        match st.log(id)?.of.clone() {
-            Of::Group(group) => match st.groups.get(&group.0) {
-                Some(g) if g.rec.log.0 == id => self.advance(st, &group.0),
-                _ => Ok(()),
-            },
-            Of::Public(public) => self.replayed(st, &public.0),
-        }
+        Ok(())
     }
 }
 
 impl Inner {
-    /// Reads the public logs of the identities in this session's groups that it holds none of, once their wait after a
-    /// failed read is up, and once more for each device a member's certificate names that its identity does not list. A
-    /// log read is followed from then on.
-    pub(crate) async fn refresh_all(self: &Arc<Self>) {
-        let unread: Vec<IdentityRef> = {
-            let mut st = self.lock();
-            let st = &mut *st;
-            let now = crate::now();
-            let mut unread = Vec::new();
-            for credential in st.groups.values().flat_map(|g| g.mls.members()).filter_map(|m| m.credential) {
-                let Some(certificate) = &credential.certificate else { continue };
-                let identity = &certificate.identity;
-                let read = match st.public.get(&identity.id.0) {
-                    None => st.unreadable.get(&identity.id.0).is_none_or(|(at, _)| *at <= now),
-                    Some(log) => log.verify(&credential) == Verdict::Unverified && st.unlisted.insert((identity.id.0.clone(), certificate.device.0.clone())),
-                };
-                if read && !unread.contains(identity) {
-                    unread.push(identity.clone());
-                }
-            }
-            unread
-        };
-        for identity in unread {
-            let read = timeout(MEMBER_WAIT, self.read_public(&identity)).await.map_err(anyhow::Error::from).and_then(|r| r);
-            let mut st = self.lock();
-            match read {
-                Ok(_) => drop(st.unreadable.remove(&identity.id.0)),
-                Err(error) => {
-                    tracing::debug!("the public log of {}: {error:#}", hex(&identity.id.0));
-                    let wait = st.unreadable.get(&identity.id.0).map_or(UNREAD, |(_, wait)| (wait * 2).min(OPEN.as_millis() as u64));
-                    st.unreadable.insert(identity.id.0.clone(), (crate::now() + wait, wait));
-                }
-            }
-        }
-    }
-
-    /// Uses a claimant's route only to find the genesis-authenticated service; only that service's history is held
-    /// and followed.
-    pub(crate) async fn read_public(&self, identity: &IdentityRef) -> Result<PublicLog> {
-        let address = lmk_proto::public::address(&identity.id.0);
-        let followed = self.lock().public_log(&identity.id.0);
-        let id = match followed {
-            Some(id) => id,
-            None => {
-                let public_id = identity.id.0.as_slice().try_into()?;
-                // Unauthenticated lookups must not seed the shared clients or the persisted route.
-                let hint = ServeClient::for_service(self.clients.post.clone(), &identity.membership)?;
-                let key = authority(&identity.membership)?;
-                let first = hint.read(&address, &Frontier::empty(key, head::reference(&key, &address))).await?;
-                let service = PublicLog::replay(public_id, first.page().entries.iter().map(|entry| entry.0.as_slice()))?.membership;
-                let (client, key) = (self.clients.client(&service)?, authority(&service)?);
-                let mut frontier = Frontier::empty(key, head::reference(&key, &address));
-                let mut entries = Vec::new();
-                loop {
-                    let page = client.read(&address, &frontier).await?;
-                    if page.page().entries.is_empty() {
-                        break;
-                    }
-                    frontier = page.frontier().clone();
-                    entries.extend(page.into_page().entries);
-                }
-                let public = PublicLog::replay(public_id, entries.iter().map(|entry| entry.0.as_slice()))?;
-                ensure!(public.membership == service, "the public log belongs to another membership service");
-                let id = frontier.log_ref().to_vec();
-                let mut st = self.lock();
-                if !st.logs.contains_key(&id) {
-                    st.add_log(&id, Log::new(Of::Public(identity.id.clone()), service))?;
-                    self.take_entries(&mut st, &id, 0, entries, frontier.head().cloned().context("the public log has no head")?)?;
-                }
-                id
-            }
-        };
-        self.read(&id).await?;
-        self.lock().public.get(&identity.id.0).cloned().context("the public log has no valid first entry")
-    }
-
-    /// Replays a public log: an identity's, against which its sessions' certificates are checked.
-    pub(crate) fn replayed(&self, st: &mut State, id: &[u8]) -> Result<()> {
-        let Some(log) = st.public_log(id) else { return Ok(()) };
-        let entries = st.entries(&log, 0);
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let mut public = PublicLog::replay(id.try_into()?, entries.iter().map(|entry| entry.0.as_slice()))?;
-        ensure!(public.membership == st.log(&log)?.service, "the public log belongs to another membership service");
-        if st.log(&log)?.lapsed.is_some() {
-            public.expire();
-            let own: Vec<Vec<u8>> = st
-                .groups
-                .iter()
-                .filter(|(_, g)| g.mls.settings().kind == IDENTITY && g.mls.settings().public.as_ref().is_some_and(|public| public.0 == id))
-                .map(|(gid, _)| gid.clone())
-                .collect();
-            for gid in own {
-                self.work.send(Work::Gone(gid)).ok();
-            }
-        }
-        st.public.insert(id.to_vec(), public);
-        st.observe_identities()?;
-        st.gate = true;
-        for gid in st.groups_of(&log) {
-            st.events.push(Event::Heard { group: Bytes(gid.clone()) });
-            self.work.send(Work::Duties(gid)).ok();
-        }
-        st.events.push(Event::Public { identity: Bytes(id.to_vec()) });
-        Ok(())
-    }
-
     /// Reports a log that its service showed differently, here and at `there`, unless it reported those two heads of it
     /// already.
     pub(crate) fn contradicted(&self, st: &State, log: &[u8], contradiction: &Contradiction, there: &str) {
@@ -689,23 +512,13 @@ impl Inner {
         if !self.contradictions.lock().unwrap().insert((log.to_vec(), heads)) {
             return;
         }
-        let what = match st.logs.get(log).map(|l| &l.of) {
-            Some(Of::Public(_)) => "a public log",
-            _ => "the group's log",
-        };
         let text = format!(
-            "the membership service showed {there} another version of {what}: length {} with hash {} here, length {} with hash {} there",
+            "the membership service showed {there} another version of the group's log: length {} with hash {} here, length {} with hash {} there",
             ours.length,
             hex(&ours.hash),
             theirs.length,
             hex(&theirs.hash)
         );
-        let groups = st.groups_of(log);
-        if groups.is_empty() {
-            self.warn(None, text.clone());
-        }
-        for gid in groups {
-            self.warn(Some(&gid), text.clone());
-        }
+        self.warn(st.logs.get(log).map(|l| l.group.0.as_slice()), text);
     }
 }

@@ -1,31 +1,24 @@
 //! A group's duties, each derived from committed records and idempotent: a pass runs at the log's head after each
-//! advance, at start, and every hour (`OPEN`). It drops what the group kept past H; commits at most once, with every Remove
-//! due (members whose `leave` the cut it builds keeps, and members whose devices their identities dropped) and this
-//! session's update if due (each T, at an offset of its own), which first fetches for at most `HEAR` what the last commit
-//! kept and connected members hold past the cut; and in an identity group, has the identity kind run its own
-//! (`Event::Duties`).
+//! advance, at start, and every hour (`OPEN`). It drops what the group kept past H, and commits at most once, with every
+//! Remove due (members whose `leave` the cut it builds keeps, and members left behind in an epoch whose log was let go)
+//! and this session's update if due (each T, at an offset of its own), which first fetches for at most `HEAR` what the
+//! last commit kept and connected members hold past the cut.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use anyhow::{Result, ensure};
-use lmk_core::group::{self as core, Change, MAX_CUT_STEP};
+use anyhow::Result;
+use lmk_core::group::{Change, MAX_CUT_STEP};
 use lmk_proto::Bytes;
-use lmk_proto::group::IDENTITY;
 use lmk_proto::held::Ref;
 use n0_future::time::{Duration, sleep};
 use sha2::{Digest, Sha256};
 
-use std::collections::BTreeMap;
-
-use lmk_core::public::{PublicLog, Verdict};
 use lmk_net::peers::HEAR;
-use lmk_proto::group::Credential;
 use lmk_proto::peer::Seqs;
 
-use crate::groups::renaming;
 use crate::held::delivered_key;
 use crate::reading::commit_key;
-use crate::{Event, G, Inner, State, Work, days, get, now};
+use crate::{G, Inner, State, Work, days, get, now};
 
 /// How soon a pass runs again while an update waits for its fetch.
 const BLOCKED: u64 = 10_000;
@@ -45,7 +38,7 @@ impl State {
     /// may have them holds them.
     pub(crate) fn cut_for(&self, gid: &[u8]) -> Result<Vec<Ref>> {
         let g = self.group(gid)?;
-        let (epoch, me) = (g.mls.epoch(), self.me(gid));
+        let (epoch, me) = (g.mls.epoch(), self.me());
         let mut cut = Vec::new();
         for r in g.mls.cut() {
             let mut kept = r.clone();
@@ -87,7 +80,7 @@ impl State {
         let members: Vec<Vec<u8>> = g.mls.members().into_iter().map(|m| m.key).collect();
         let usable: Vec<Bytes> = g.rec.invites.iter().filter(|rule| rule.expires > now()).map(|rule| rule.hash.clone()).collect();
         let keep = |added: &lmk_core::group::Added| {
-            added.at >= before || members.contains(&added.member.key.0) || added.invite.as_ref().is_some_and(|hash| usable.contains(hash))
+            added.at >= before || members.contains(&added.member.0) || usable.contains(&added.invite)
         };
         self.groups.get_mut(gid).unwrap().mls.forget_added(&self.provider, keep)?;
         let g = self.group_mut(gid)?;
@@ -122,23 +115,18 @@ impl State {
     }
 }
 
-/// What a pass commits on the group as it stands, if anything: the Removes due and this session's update; with the
-/// members removed whose devices were dropped.
-fn due(st: &State, g: &G) -> Result<Option<(Change, Vec<core::Member>)>> {
+/// What a pass commits on the group as it stands, if anything: the Removes due and this session's update.
+fn due(st: &State, g: &G) -> Result<Option<Change>> {
     let gid = g.mls.id();
-    let me = st.me(gid);
+    let me = st.me();
     let cut = st.cut_for(gid)?;
     let members = g.mls.members();
-    let others = members.iter().filter(|m| m.key != me);
-    let dropped = |m: &&core::Member| m.credential.as_ref().is_some_and(|c| dropped(&st.public, c));
-    let dropped: Vec<core::Member> = others.clone().filter(dropped).cloned().collect();
-    let kept = |m: &core::Member| g.left(&m.key).is_some_and(|seq| cut.iter().any(|r| r.key.0 == m.key && r.seq >= seq));
-    let remove: Vec<u32> = others.filter(|m| kept(m) || g.left_behind(&m.key) || dropped.iter().any(|d| d.index == m.index)).map(|m| m.index).collect();
+    let kept = |m: &&lmk_core::group::Member| g.left(&m.key).is_some_and(|seq| cut.iter().any(|r| r.key.0 == m.key && r.seq >= seq));
+    let remove: Vec<u32> = members.iter().filter(|m| m.key != me).filter(|m| kept(m) || g.left_behind(&m.key)).map(|m| m.index).collect();
     let Some(own) = members.iter().find(|m| m.index == g.mls.own_index()) else { return Ok(None) };
-    let name = renaming(&g.mls, st.device.as_deref());
     let leaf = &st.session.leaf;
-    let update = own.leaf.as_ref() != Some(leaf) || name.is_some() || now() >= next_update(g.rec.updated, g.mls.settings().update, me);
-    Ok((update || !remove.is_empty()).then(|| (Change { remove, leaf: Some(leaf.clone()), name, cut, ..Change::default() }, dropped)))
+    let update = own.leaf.as_ref() != Some(leaf) || now() >= next_update(g.rec.updated, g.mls.settings().update, me);
+    Ok((update || !remove.is_empty()).then(|| Change { remove, leaf: Some(leaf.clone()), cut, ..Change::default() }))
 }
 
 impl Inner {
@@ -169,21 +157,6 @@ impl Inner {
         });
     }
 
-    /// Runs a pass of a group's duties now if it would remove members whose devices their identities' directories dropped,
-    /// before a payload is sealed to them; fails while they are still in the group, as when this session is not at its
-    /// log's head.
-    pub(crate) async fn cut_off(self: &Arc<Self>, gid: &[u8]) -> Result<()> {
-        let dropped = || -> Result<bool> {
-            let st = self.lock();
-            Ok(due(&st, st.group(gid)?)?.is_some_and(|(_, dropped)| !dropped.is_empty()))
-        };
-        if dropped()? {
-            self.pass(gid).await?;
-            ensure!(!dropped()?, "a member whose device its identity took off is still in the group, and this session cannot remove it yet: nothing was sent; try again shortly");
-        }
-        Ok(())
-    }
-
     async fn pass(self: &Arc<Self>, gid: &[u8]) -> Result<()> {
         let (commit, next) = {
             let mut st = self.lock();
@@ -197,15 +170,12 @@ impl Inner {
                 return Ok(());
             }
             st.expire(gid)?;
-            if st.group(gid)?.mls.settings().kind == IDENTITY {
-                st.events.push(Event::Duties { group: Bytes(gid.to_vec()) });
-            }
             let tick = st.tick();
             let g = st.group(gid)?;
-            let next = next_update(g.rec.updated, g.mls.settings().update, st.me(gid));
+            let next = next_update(g.rec.updated, g.mls.settings().update, st.me());
             let pending = due(&st, g)?;
             // A pass that removes commits at once.
-            let removing = pending.as_ref().is_some_and(|(change, _)| !change.remove.is_empty());
+            let removing = pending.as_ref().is_some_and(|change| !change.remove.is_empty());
             let fetch = if pending.is_some() && !removing { st.fetch_wait(gid, tick)? } else { None };
             let next = match fetch {
                 Some(until) => (now() + BLOCKED).min(until),
@@ -217,18 +187,7 @@ impl Inner {
         if !commit {
             return Ok(());
         }
-        let removing = Mutex::new(Vec::new());
-        let committed = self
-            .commit(gid, |st, g| {
-                let Some((change, dropped)) = due(st, g)? else { return Ok(None) };
-                *removing.lock().unwrap() = dropped;
-                Ok(Some(change))
-            })
-            .await?;
-        let removed = removing.into_inner().unwrap();
-        if committed.is_some() && !removed.is_empty() {
-            self.revoked(gid, &removed)?;
-        }
+        self.commit(gid, due).await?;
         Ok(())
     }
 
@@ -258,35 +217,12 @@ impl Inner {
             inner.work.send(Work::Duties(gid)).ok();
         });
     }
-
-    /// Tells that this session's commit removed members whose devices were dropped, and which members they added or
-    /// let in by their invites.
-    fn revoked(&self, gid: &[u8], removed: &[core::Member]) -> Result<()> {
-        let mut st = self.lock();
-        let g = st.group(gid)?;
-        let by_them = |key: &[u8]| removed.iter().any(|m| m.key == key);
-        let invites: Vec<&Bytes> = g.rec.invites.iter().filter(|rule| by_them(&rule.by.0)).map(|rule| &rule.hash).collect();
-        let let_in = |m: &core::Member| {
-            let added = g.mls.added().iter().rev().find(|added| added.member.key.0 == m.key);
-            added.is_some_and(|added| by_them(&added.by.key.0) || added.invite.as_ref().is_some_and(|invite| invites.contains(&invite)))
-        };
-        let added = g.mls.members().into_iter().filter(let_in).filter_map(|m| st.member(gid, &m)).collect();
-        let removed = removed.iter().filter_map(|m| st.member(gid, m)).collect();
-        st.events.push(Event::Revoked { group: Bytes(gid.to_vec()), removed, added });
-        Ok(())
-    }
 }
 
 /// Whether an update waits on its fetch: while `live`, the seqs connected members list that it lacks, still holds any of
 /// `fixed`, those it listed when it first waited in this epoch `since`, for at most `HEAR`.
 fn waits(fixed: &[Seqs], since: u64, live: &[Seqs], now: u64) -> bool {
     now < since + HEAR && live.iter().any(|want| fixed.iter().any(|f| f.key == want.key && f.joined == want.joined && !f.seqs.intersection(&want.seqs).is_empty()))
-}
-
-/// Whether a member's device was dropped from its identity's list, as the public logs held show it.
-fn dropped(public: &BTreeMap<Vec<u8>, PublicLog>, credential: &Credential) -> bool {
-    let log = credential.identity().and_then(|identity| public.get(&identity.id.0));
-    log.is_some_and(|log| log.verify(credential) == Verdict::Dropped)
 }
 
 #[cfg(test)]

@@ -49,7 +49,7 @@ impl Inner {
         match g.mls.judge(&st.provider, entry)? {
             Verdict::Skipped { .. } => {}
             Verdict::Copied => {
-                let text = "a copy of this session's state committed in the group, so this session stops using it: join it again, or revoke this device if it may be stolen";
+                let text = "a copy of this session's state committed in the group, so this session stops using it: join it again from a new session";
                 self.warn(Some(gid), text.into());
                 self.work.send(Work::Gone(gid.to_vec())).ok();
                 return Ok(false);
@@ -117,14 +117,13 @@ impl Inner {
         }
         self.cuts(st, gid, &applied, ending)?;
         st.moved(gid, &applied, ended)?;
-        st.observe_identities()?;
         st.scrub = true;
         st.gate = true;
         let gone = applied.gone;
         if !gone {
             st.events.push(Event::Heard { group: Bytes(gid.to_vec()) });
         }
-        let core::Applied { added, how, removed, settings, .. } = applied;
+        let core::Applied { added, removed, .. } = applied;
         for member in &removed {
             st.unhear(gid, &member.key)?;
         }
@@ -135,7 +134,7 @@ impl Inner {
         for peer in removed.iter().filter_map(|member| crate::endpoint_id(&member.leaf.as_ref()?.key.0)).filter(|peer| st.served.contains_key(peer)) {
             st.out.push(Out::Frame { peer, frame: Frame::Entries { log: Bytes(ended.clone()), entries: entries.clone(), head: head.clone() } });
         }
-        self.work.send(Work::Applied { group: gid.to_vec(), by, added, how, removed, settings, gone }).ok();
+        self.work.send(Work::Applied { group: gid.to_vec(), by, added, removed, gone }).ok();
         st.group_mut(gid)?.rec.position = position;
         if gone {
             return Ok(false);
@@ -165,7 +164,7 @@ impl Inner {
         }
         g.changed = true;
         let messages = lacking.iter().map(|lost| LostOf { from: st.member_by_key(gid, &lost.key.0), joined: lost.joined, seqs: lost.seqs.iter().collect(), ids: Vec::new() });
-        let member = st.member_by_key(gid, st.me(gid));
+        let member = st.member_by_key(gid, st.me());
         st.events.push(Event::Lost(Lost { group: Bytes(gid.to_vec()), member, messages: messages.collect() }));
         Ok(())
     }
@@ -174,7 +173,7 @@ impl Inner {
     /// before the next commit, the kept sealings frozen, the memberships that ended (their messages past their final
     /// cuts dropped, their leaves forgotten) and began.
     fn cuts(&self, st: &mut State, gid: &[u8], applied: &core::Applied, ending: u64) -> Result<()> {
-        let me = st.me(gid).to_vec();
+        let me = st.me().to_vec();
         let g = st.group_mut(gid)?;
         let own = g.mls.joined(&me).or_else(|| applied.cut.iter().find(|r| r.key.0 == me).map(|r| r.joined));
         let mut keep = Vec::new();
@@ -251,7 +250,7 @@ impl State {
     /// Moves what this session knows of its members' epochs as a commit applied: the epoch it ended keeps its log while a
     /// member is still in it; the committer and the members it added are in the epoch it began; the removed are forgotten.
     fn moved(&mut self, gid: &[u8], applied: &core::Applied, ended: Epoch) -> Result<()> {
-        let me = self.me(gid).to_vec();
+        let me = self.me().to_vec();
         let current = self.group(gid)?.mls.epoch();
         let members = self.group(gid)?.mls.members();
         let committer = members.iter().find(|m| m.index == applied.by).map(|m| m.key.clone());

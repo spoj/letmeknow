@@ -27,7 +27,7 @@ pub struct Header {
     pub deps: Vec<Ref>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<Bytes>,
-    /// A JSON object with a `type`: the core's, or the group's kind's.
+    /// A JSON object with a `type`: the core's (`Control`), or a chat message.
     pub payload: Value,
 }
 

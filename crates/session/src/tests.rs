@@ -1,4 +1,4 @@
-//! Session processes in one test process, each its own device, talking over a local relay with a self-signed
+//! Session processes in one test process, each in a home of its own (sessions may share one), talking over a local relay with a self-signed
 //! certificate, their logs on a membership service served through it. The CLI talks to them over their command
 //! channels.
 
@@ -18,9 +18,6 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::cli::{Command, Request, session_dir};
 use crate::session::Config;
-
-#[path = "identity_tests.rs"]
-mod private_identity;
 
 const HOUR: Duration = Duration::from_secs(3600);
 /// How long a test waits for what a session prints: sessions start slowly on CI's Windows runners.
@@ -88,8 +85,6 @@ struct Agent {
     handle: String,
     home: PathBuf,
     fp: String,
-    /// Its device's name.
-    device: String,
     events: mpsc::UnboundedReceiver<String>,
     stop: Option<oneshot::Sender<()>>,
     done: Option<tokio::task::JoinHandle<()>>,
@@ -97,21 +92,21 @@ struct Agent {
 }
 
 impl World {
-    /// A session process in its own home: its own device.
+    /// A session process in a home of its own.
     async fn start(&self, handle: &str, hold: Duration) -> Agent {
         self.start_in(handle, handle, hold).await
     }
 
-    /// A session process in the home `device`.
-    async fn start_in(&self, device: &str, handle: &str, hold: Duration) -> Agent {
-        self.launch(Config { hold, ..self.config(device, handle) }, usize::MAX).await
+    /// A session process in the home `home`.
+    async fn start_in(&self, home: &str, handle: &str, hold: Duration) -> Agent {
+        self.launch(Config { hold, ..self.config(home, handle) }, usize::MAX).await
     }
 
-    /// A session's configuration, in the home `device`.
-    fn config(&self, device: &str, handle: &str) -> Config {
+    /// A session's configuration, in the home `home`.
+    fn config(&self, home: &str, handle: &str) -> Config {
         Config {
             handle: handle.into(),
-            dir: session_dir(&self.root.path().join(device), handle).unwrap(),
+            dir: session_dir(&self.root.path().join(home), handle).unwrap(),
             hold: HOUR,
             keep_log: false,
             membership: self.domain.clone(),
@@ -140,11 +135,10 @@ impl World {
             };
             crate::listen(config, &at, network, print, async { drop(stopped.await) }).await.unwrap();
         });
-        let mut agent = Agent { handle, home, fp: String::new(), device: String::new(), events, stop: Some(stop), done: Some(done), ready: Value::Null };
+        let mut agent = Agent { handle, home, fp: String::new(), events, stop: Some(stop), done: Some(done), ready: Value::Null };
         let ready = agent.expect("ready").await;
-        assert!(keys(&ready).is_superset(&keys(&json!({ "type": 0, "session": 0, "name": 0, "fp": 0, "bin": 0, "membership": 0 }))), "{ready}");
+        assert!(keys(&ready).is_superset(&keys(&json!({ "type": 0, "session": 0, "fp": 0, "bin": 0, "membership": 0 }))), "{ready}");
         agent.fp = ready["fp"].as_str().unwrap().into();
-        agent.device = ready["name"].as_str().unwrap().into();
         agent.ready = ready;
         agent
     }
@@ -193,11 +187,6 @@ impl Agent {
                 return event;
             }
             eprintln!("{}: {event}", self.handle);
-            if event["type"] == "warning" {
-                let text = event["text"].as_str().unwrap();
-                assert!(text.starts_with("First locally observed identity claim:") || text.starts_with("Previously observed identity-name change or shared name:"), "{event}");
-                assert!(text.contains("not been independently verified"), "{event}");
-            }
         }
     }
 
@@ -227,27 +216,20 @@ fn local<F: std::future::Future>(test: F) -> F::Output {
     tokio::task::LocalSet::new().block_on(&runtime, test)
 }
 
-/// Alice makes a group and invites Bob, who speaks as his identity "Robert".
+/// Alice makes a group and invites Bob.
 async fn pair(world: &World, hold: Duration) -> (Agent, Agent, String) {
     let mut alice = world.start("alice", hold).await;
     let bob = world.start("bob", hold).await;
-    alice.cmd(&["identity", "create", "Alice"]).await.unwrap();
-    bob.cmd(&["identity", "create", "Robert"]).await.unwrap();
     let invite = alice.cmd(&["invite"]).await.unwrap();
     assert_eq!(keys(&invite), keys(&json!({ "link": 0, "group": 0, "expires_in": 0 })));
     let link = invite["link"].as_str().unwrap();
-    assert!(link.starts_with("https://letmeknow.dev/i#9.g."));
+    assert!(link.starts_with("https://letmeknow.dev/i#9."));
     let joined = bob.cmd(&["join", link]).await.unwrap();
     assert_eq!(joined["group"], invite["group"]);
     assert_eq!(joined["members"].as_array().unwrap().len(), 2);
     let event = alice.told(&["joined"]).await;
-    assert_eq!((&event["member"], &event["by"], &event["how"]), (&json!(format!("Robert · {}", bob.device)), &json!("you"), &json!("invite")));
+    assert_eq!((&event["member"], &event["by"]), (&json!(bob.fp), &json!("you")));
     (alice, bob, invite["group"].as_str().unwrap().to_owned())
-}
-
-/// The id of an agent's identity.
-async fn identity_of(agent: &Agent) -> String {
-    agent.cmd(&["identity", "list"]).await.unwrap()["identity"].as_str().unwrap().to_owned()
 }
 
 #[test]
@@ -258,19 +240,18 @@ fn messages_that_do_not_concern_a_session_wait_for_one_that_does() {
         let sent = bob.cmd(&["send", "the build is green"]).await.unwrap();
         assert!(sent["id"].is_string() && sent.get("pos").is_none(), "{sent}");
         assert!(alice.printed().await.iter().all(|e| e["type"] != "message"));
-        bob.cmd(&["send", "@alice can you deploy?"]).await.unwrap();
+        bob.cmd(&["send", "--to", &alice.fp, "can you deploy?"]).await.unwrap();
         let first = alice.expect("message").await;
         let second = alice.expect("message").await;
         assert_eq!((first["content"].as_str(), first.get("direct")), (Some("the build is green"), None));
-        assert_eq!((second["content"].as_str(), second["direct"].as_bool()), (Some("@alice can you deploy?"), Some(true)));
-        assert_eq!(keys(&second), keys(&json!({ "type": 0, "group": 0, "id": 0, "seq": 0, "from": 0, "direct": 0, "content": 0, "sent_at": 0 })));
+        assert_eq!((second["content"].as_str(), second["direct"].as_bool()), (Some("can you deploy?"), Some(true)));
+        assert_eq!(keys(&second), keys(&json!({ "type": 0, "group": 0, "id": 0, "seq": 0, "from": 0, "to": 0, "direct": 0, "content": 0, "sent_at": 0 })));
         assert_eq!(second["seq"].as_u64(), first["seq"].as_u64().map(|s| s + 1), "in order");
         assert_eq!((second["group"].as_str(), second["id"].as_str().unwrap().len()), (Some(group.as_str()), crate::short::ID));
-        // Bob's identity is known only by its own claim; `members` tells more of him.
-        assert_eq!(second["from"], format!("Robert · {}", bob.device));
+        assert_eq!(second["from"], bob.fp);
         let members = alice.cmd(&["members"]).await.unwrap();
-        let robert = members["members"].as_array().unwrap().iter().find(|m| m["handle"] == "bob").unwrap();
-        assert_eq!((&robert["identity"]["how"], &robert["added_by"]), (&json!("observed"), &json!({ "fp": alice.fp, "how": "invite" })));
+        let robert = members["members"].as_array().unwrap().iter().find(|m| m["fp"] == bob.fp).unwrap();
+        assert_eq!(robert["added_by"], alice.fp);
         // The read frontier: Alice's answer comes after what she was shown, and a reply to Bob wakes him.
         let id = second["id"].as_str().unwrap();
         let answer = alice.cmd(&["send", "--reply-to", id, "on it"]).await.unwrap();
@@ -307,7 +288,7 @@ fn send_answers_its_id_and_refuses_a_message_too_large() {
         let world = world("pending").await;
         let (alice, mut bob, _) = pair(&world, HOUR).await;
         let big = "x".repeat(1 << 20);
-        let refused = alice.cmd(&["send", "--to", "Bob", &big]).await.unwrap_err().to_string();
+        let refused = alice.cmd(&["send", "--to", &bob.fp, &big]).await.unwrap_err().to_string();
         assert!(refused.contains("members take"), "{refused}");
         bob.stop().await;
         let before = lmk_node::now();
@@ -332,8 +313,8 @@ fn an_attachment_arrives_as_a_private_file() {
         let (mut alice, bob, _) = pair(&world, HOUR).await;
         let file = world.root.path().join("token.txt");
         std::fs::write(&file, "s3cret").unwrap();
-        let sent = bob.cmd(&["send", "--to", "Alice", "--attach", file.to_str().unwrap(), "the token"]).await.unwrap();
-        assert_eq!(sent["attachment"]["held_by"], json!([format!("Alice · {}", alice.device)]));
+        let sent = bob.cmd(&["send", "--to", &alice.fp, "--attach", file.to_str().unwrap(), "the token"]).await.unwrap();
+        assert_eq!(sent["attachment"]["held_by"], json!([alice.fp]));
         let message = alice.expect("message").await;
         assert_eq!(message["attachment"]["name"], "token.txt");
         assert!(message["attachment"]["link"].as_str().unwrap().starts_with("lmk:"));
@@ -359,32 +340,24 @@ fn an_attachment_arrives_as_a_private_file() {
 }
 
 #[test]
-fn membership_and_settings_changes_are_told_and_a_removed_session_learns_it() {
+fn membership_changes_are_told_and_a_removed_session_learns_it() {
     local(async {
         let world = world("remove").await;
         let (mut alice, mut bob, group) = pair(&world, HOUR).await;
-        let named = alice.cmd(&["name", "Release"]).await.unwrap();
-        assert_eq!(named["settings"]["name"], "Release");
-        let settings = bob.told(&["settings"]).await;
-        let alice_shown = json!(format!("Alice · {}", alice.device));
-        assert_eq!((&settings["group"], &settings["settings"]["name"], &settings["by"]), (&json!("Release"), &json!("Release"), &alice_shown));
-        let members = bob.cmd(&["members", "--group", "Release"]).await.unwrap();
-        let handles: Vec<&str> = members["members"].as_array().unwrap().iter().map(|m| m["handle"].as_str().unwrap()).collect();
-        assert_eq!(handles, ["alice", "bob"], "`members` tells all of each");
-        assert_eq!(members["members"][1]["you"], true);
+        let members = bob.cmd(&["members", "--group", &group]).await.unwrap();
+        assert_eq!(members["members"][0]["fp"], alice.fp);
+        assert_eq!(members["members"][1], json!({ "fp": bob.fp, "you": true }));
         let other = alice.cmd(&["invite"]).await.unwrap()["group"].as_str().unwrap().to_owned();
         assert_eq!(alice.cmd(&["status"]).await.unwrap()["groups"].as_array().unwrap().len(), 2);
-        for named in ["Release", group.as_str()] {
-            let status = alice.cmd(&["status", &format!("--group={named}")]).await.unwrap();
-            assert_eq!(status["groups"].as_array().unwrap().iter().map(|g| &g["group"]).collect::<Vec<_>>(), [group.as_str()]);
-        }
+        let status = alice.cmd(&["status", &format!("--group={group}")]).await.unwrap();
+        assert_eq!(status["groups"].as_array().unwrap().iter().map(|g| &g["group"]).collect::<Vec<_>>(), [group.as_str()]);
         assert!(alice.cmd(&["status", "--group", "nope"]).await.unwrap_err().to_string().contains("unknown group nope"));
         alice.cmd(&["leave", &format!("--group={other}")]).await.unwrap();
         assert!(alice.cmd(&["remove", "Carol"]).await.is_err());
-        alice.cmd(&["remove", "Bob"]).await.unwrap();
-        assert_eq!(alice.told(&["left"]).await["member"], format!("Robert · {}", bob.device));
+        alice.cmd(&["remove", &bob.fp]).await.unwrap();
+        assert_eq!(alice.told(&["left"]).await["member"], bob.fp);
         let removed = bob.told(&["removed"]).await;
-        assert_eq!((&removed["group"], &removed["by"]), (&json!("Release"), &alice_shown), "by the name it had");
+        assert_eq!((&removed["group"], &removed["by"]), (&json!(group), &json!(alice.fp)));
         assert_eq!(bob.cmd(&["groups"]).await.unwrap(), json!([]));
     });
 }
@@ -402,11 +375,11 @@ fn text_shown_or_left_behind_stays_in_no_file() {
         let world = world("scrub").await;
         let (mut alice, mut bob, _) = pair(&world, HOUR).await;
         let secret = "the vault code is 7-tangerine-42";
-        bob.cmd(&["send", &format!("@alice {secret}")]).await.unwrap();
-        assert_eq!(alice.expect("message").await["content"].as_str().unwrap(), format!("@alice {secret}"));
+        bob.cmd(&["send", "--to", &alice.fp, secret]).await.unwrap();
+        assert_eq!(alice.expect("message").await["content"].as_str().unwrap(), secret);
         alice.cmd(&["status"]).await.unwrap();
         assert_eq!(holding(&session_dir(&alice.home, "alice").unwrap(), secret), Vec::<PathBuf>::new());
-        alice.cmd(&["remove", "Bob"]).await.unwrap();
+        alice.cmd(&["remove", &bob.fp]).await.unwrap();
         bob.told(&["removed"]).await;
         assert_eq!(holding(&session_dir(&bob.home, "bob").unwrap(), secret), Vec::<PathBuf>::new());
     });
@@ -419,7 +392,7 @@ fn a_leaving_member_is_removed_by_another() {
         let (mut alice, mut bob, _) = pair(&world, HOUR).await;
         let left = bob.cmd(&["leave"]).await.unwrap();
         assert_eq!(left["left"], true);
-        assert_eq!(alice.told(&["left"]).await["member"], format!("Robert · {}", bob.device));
+        assert_eq!(alice.told(&["left"]).await["member"], bob.fp);
         bob.told(&["removed"]).await;
     });
 }
@@ -444,10 +417,10 @@ fn a_message_printed_is_read_and_one_waiting_only_held() {
         let (mut alice, bob, _) = pair(&world, HOUR).await;
         let quiet = bob.cmd(&["send", "fyi"]).await.unwrap();
         let id = quiet["id"].as_str().unwrap();
-        let alice_shown = json!([format!("Alice · {}", alice.device)]);
+        let alice_shown = json!([alice.fp]);
         let read = until(|| async { bob.cmd(&["read", id]).await.unwrap() }, |read| read[0]["held_by"] == alice_shown).await;
         assert_eq!((&read[0]["held_by"], &read[0]["read_by"]), (&alice_shown, &Value::Null), "Alice holds it, unprinted");
-        let look = bob.cmd(&["send", "@alice look"]).await.unwrap();
+        let look = bob.cmd(&["send", "--to", &alice.fp, "look"]).await.unwrap();
         assert_eq!(alice.expect("message").await["id"], id);
         alice.expect("message").await;
         let read = until(|| async { bob.cmd(&["read", id]).await.unwrap() }, |read| read[0]["read_by"] == alice_shown).await;
@@ -489,7 +462,7 @@ fn a_message_taken_in_is_forgotten_after_h_with_its_attachments_copy() {
         let (mut alice, bob, _) = pair(&world, HOUR).await;
         let file = world.root.path().join("token.txt");
         std::fs::write(&file, "s3cret").unwrap();
-        bob.cmd(&["send", "--to", "Alice", "--attach", file.to_str().unwrap(), "the token"]).await.unwrap();
+        bob.cmd(&["send", "--to", &alice.fp, "--attach", file.to_str().unwrap(), "the token"]).await.unwrap();
         let message = alice.expect("message").await;
         let path = match message["attachment"]["path"].as_str() {
             Some(path) => path.to_owned(),
@@ -516,15 +489,14 @@ fn status_lists_sends_held_only_here_and_members_away() {
     local(async {
         lmk_proto::clock::set(shifted);
         let world = world("only-here").await;
-        let (alice, mut bob, _) = pair(&world, HOUR).await;
-        let robert = format!("Robert · {}", bob.device);
+        let (mut alice, mut bob, group) = pair(&world, HOUR).await;
         let hello = alice.cmd(&["send", "hello"]).await.unwrap();
         // Bob was shown it, so his summary that says so shows that he holds it and the invite before it: Alice's next
         // commit keeps both.
         bob.told(&["message"]).await;
-        let read = until(|| async { alice.cmd(&["read", hello["id"].as_str().unwrap()]).await.unwrap() }, |read| read[0]["read_by"] == json!([robert])).await;
-        assert_eq!(read[0]["read_by"], json!([robert]), "{read}");
-        alice.cmd(&["name", "Kept"]).await.unwrap();
+        let read = until(|| async { alice.cmd(&["read", hello["id"].as_str().unwrap()]).await.unwrap() }, |read| read[0]["read_by"] == json!([bob.fp])).await;
+        assert_eq!(read[0]["read_by"], json!([bob.fp]), "{read}");
+        add_and_remove(&world, &mut alice, &group).await;
         let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["only_here"].is_null()).await;
         assert!(status["groups"][0]["only_here"].is_null(), "{status}");
         bob.stop().await;
@@ -534,16 +506,16 @@ fn status_lists_sends_held_only_here_and_members_away() {
         assert!(status["warning"].is_string());
         assert!(status["groups"][0]["away"].is_null(), "Bob was heard from just now");
         let mut bob = world.start("bob", HOUR).await;
-        held(&alice, &sent, &robert).await;
-        alice.cmd(&["name", "Again"]).await.unwrap();
+        held(&alice, &sent, &bob.fp).await;
+        add_and_remove(&world, &mut alice, &group).await;
         let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["only_here"].is_null()).await;
         assert!(status["groups"][0]["only_here"].is_null(), "Bob holds it");
         assert!(status.get("warning").is_none());
         bob.stop().await;
         SHIFT.store(8 * 24 * 3600 * 1000, std::sync::atomic::Ordering::Relaxed);
         // Once Bob's close reaches Alice.
-        let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["away"][0] == robert.as_str()).await;
-        assert_eq!(status["groups"][0]["away"][0], robert.as_str(), "not heard from for longer than members carry messages");
+        let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["away"][0] == bob.fp.as_str()).await;
+        assert_eq!(status["groups"][0]["away"][0], bob.fp.as_str(), "not heard from for longer than members carry messages");
         assert_eq!(alice.cmd(&["members"]).await.unwrap()["members"].as_array().unwrap().len(), 2, "away, not removed");
     });
 }
@@ -561,17 +533,27 @@ fn a_leave_is_pending_until_another_member_removes_the_session() {
     });
 }
 
+/// Alice adds a session to the group and removes it again: two commits, after which the members are as they were.
+async fn add_and_remove(world: &World, alice: &mut Agent, group: &str) {
+    let mut carol = world.start("carol", HOUR).await;
+    let link = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap();
+    carol.cmd(&["join", link["link"].as_str().unwrap()]).await.unwrap();
+    alice.told(&["joined"]).await;
+    alice.cmd(&["remove", &carol.fp]).await.unwrap();
+    carol.told(&["removed"]).await;
+    carol.stop().await;
+}
+
 /// A message no other member holds is not told lost: Bob is away while Alice sends and commits twice, and gets the
 /// message once Alice is back, as she still holds it.
 #[test]
 fn a_message_no_other_member_holds_is_not_lost() {
     local(async {
         let world = world("unkept").await;
-        let (mut alice, mut bob, _) = pair(&world, HOUR).await;
+        let (mut alice, mut bob, group) = pair(&world, HOUR).await;
         bob.stop().await;
         alice.cmd(&["send", "while you were out"]).await.unwrap();
-        alice.cmd(&["name", "Once"]).await.unwrap();
-        alice.cmd(&["name", "Twice"]).await.unwrap();
+        add_and_remove(&world, &mut alice, &group).await;
         alice.stop().await;
         let mut bob = world.start("bob", HOUR).await;
         let _alice = world.start("alice", HOUR).await;
@@ -605,7 +587,7 @@ fn the_command_channel_needs_its_token_and_a_running_session() {
         let finding = std::time::Instant::now();
         assert_eq!(crate::cli::running_session(&alice.home).await.unwrap(), "alice");
         assert!(finding.elapsed() < Duration::from_secs(1), "{:?}", finding.elapsed());
-        let missing = Agent { handle: "nobody".into(), home: alice.home.clone(), fp: String::new(), device: String::new(), events: mpsc::unbounded_channel().1, stop: None, done: None, ready: Value::Null };
+        let missing = Agent { handle: "nobody".into(), home: alice.home.clone(), fp: String::new(), events: mpsc::unbounded_channel().1, stop: None, done: None, ready: Value::Null };
         let error = missing.cmd(&["groups"]).await.unwrap_err().to_string();
         assert!(error.contains("not running"), "{error}");
     });
@@ -620,8 +602,6 @@ fn a_restarted_session_takes_in_what_it_missed_in_delivery_order() {
         let first = bob.cmd(&["send", "--urgent", "first"]).await.unwrap();
         assert!(first["id"].is_string(), "{first}");
         let second = bob.cmd(&["send", "--urgent", "second"]).await.unwrap();
-        let bob_renamed = bob.cmd(&["name", "Later"]).await.unwrap();
-        assert_eq!(bob_renamed["settings"]["name"], "Later");
         let mut alice = world.start("alice", HOUR).await;
         let mut got = Vec::new();
         while got.len() < 2 {
@@ -631,7 +611,7 @@ fn a_restarted_session_takes_in_what_it_missed_in_delivery_order() {
         }
         assert_eq!(got, [first["id"].clone(), second["id"].clone()]);
         let groups = alice.cmd(&["groups"]).await.unwrap();
-        assert_eq!((groups[0]["group"].as_str(), groups[0]["name"].as_str()), (Some(group.as_str()), Some("Later")));
+        assert_eq!(groups[0]["group"], group);
     });
 }
 
@@ -643,251 +623,9 @@ fn a_group_ended_for_everyone_keeps_no_member() {
         let (alice, mut bob, _) = pair(&world, HOUR).await;
         let ended = alice.cmd(&["leave", "--end"]).await.unwrap();
         assert_eq!((ended["ended"].as_bool(), ended.get("pending")), (Some(true), None), "{ended}");
-        assert_eq!(bob.told(&["removed"]).await["by"], format!("Alice · {}", alice.device));
+        assert_eq!(bob.told(&["removed"]).await["by"], alice.fp);
         assert_eq!(alice.cmd(&["groups"]).await.unwrap(), json!([]));
         assert_eq!(bob.cmd(&["groups"]).await.unwrap(), json!([]));
-    });
-}
-
-#[test]
-fn a_link_for_one_identity_admits_no_other() {
-    local(async {
-        let world = world("to").await;
-        let (alice, bob, _) = pair(&world, HOUR).await;
-        let invite = alice.cmd(&["invite", "--to", &identity_of(&bob).await]).await.unwrap();
-        let carol = world.start("carol", HOUR).await;
-        carol.cmd(&["identity", "create", "Carol"]).await.unwrap();
-        let link = invite["link"].as_str().unwrap();
-        let refused = carol.cmd(&["join", link]).await.unwrap_err().to_string();
-        assert!(refused.contains("another identity"), "{refused}");
-        // A refused try does not use the link up: Bob still can.
-        assert_eq!(bob.cmd(&["join", link]).await.unwrap()["group"], invite["group"]);
-    });
-}
-
-#[test]
-fn a_device_is_on_one_identity_which_lists_and_loses_devices() {
-    local(async {
-        let world = world("identity").await;
-        let alice = world.start("alice", HOUR).await;
-        let created = alice.cmd(&["identity", "create", "Alice Smith"]).await.unwrap();
-        assert_eq!(created["name"], "Alice Smith");
-        let listed = alice.cmd(&["identity", "list"]).await.unwrap();
-        assert_eq!(listed["devices"][0]["you"], true);
-        assert_eq!(listed["name"], "Alice Smith");
-        let invite = alice.cmd(&["identity", "invite"]).await.unwrap();
-        assert!(invite["link"].as_str().unwrap().contains("#9.d."));
-        let phone = world.start("phone", HOUR).await;
-        let refused = phone.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap_err().to_string();
-        assert!(refused.contains("letmeknow identity join <link>"), "{refused}");
-        let group = alice.cmd(&["invite"]).await.unwrap();
-        let refused = phone.cmd(&["identity", "join", group["link"].as_str().unwrap()]).await.unwrap_err().to_string();
-        assert!(refused.contains("not a device link"), "{refused}");
-        let joined = phone.cmd(&["identity", "join", invite["link"].as_str().unwrap()]).await.unwrap();
-        assert!(joined["device"].is_string());
-        assert_eq!(phone.cmd(&["identity", "list"]).await.unwrap()["name"], "Alice Smith");
-        let refused = phone.cmd(&["identity", "create", "Phone"]).await.unwrap_err().to_string();
-        assert!(refused.contains("on an identity already"), "{refused}");
-        let again = alice.cmd(&["identity", "invite"]).await.unwrap();
-        let refused = phone.cmd(&["identity", "join", again["link"].as_str().unwrap()]).await.unwrap_err().to_string();
-        assert!(refused.contains("on an identity already"), "{refused}");
-        let listed = alice.cmd(&["identity", "list"]).await.unwrap();
-        let devices = listed["devices"].as_array().unwrap();
-        assert_eq!(devices.len(), 2);
-        let phone_key = devices.iter().find(|d| d["you"] != true).unwrap()["key"].as_str().unwrap().to_owned();
-        alice.cmd(&["identity", "remove", "--", &phone_key]).await.unwrap();
-        let listed = alice.cmd(&["identity", "list"]).await.unwrap();
-        assert_eq!(listed["devices"].as_array().unwrap().len(), 1);
-    });
-}
-
-/// A device that makes its identity after joining a group stays anonymous there, and speaks as the identity in the groups
-/// it joins after.
-#[test]
-fn an_identity_made_late_speaks_only_in_later_groups() {
-    local(async {
-        let world = world("late-identity").await;
-        let alice = world.start("alice", HOUR).await;
-        let old = alice.cmd(&["invite", "--name", "anonymous"]).await.unwrap();
-        alice.cmd(&["identity", "create", "Ann"]).await.unwrap();
-        let new = alice.cmd(&["invite", "--name", "certified"]).await.unwrap();
-        let [old, new] = [old, new].map(|made| format!("--group={}", made["group"].as_str().unwrap()));
-        let certified = until(|| async { alice.cmd(&["members", &new]).await.unwrap() }, |m| m["members"][0]["identity"]["name"] == "Ann").await;
-        assert_eq!(certified["members"][0]["identity"]["how"], "self");
-        assert!(alice.cmd(&["members", &old]).await.unwrap()["members"][0]["identity"].is_null());
-    });
-}
-
-/// Two identities whose names collide, seen in one group, show each with its id and the other's, and a name either
-/// answers to addresses neither.
-#[test]
-fn colliding_identities_show_their_ids_and_answer_to_neither_name_alone() {
-    local(async {
-        let world = world("colliding").await;
-        let host = world.start("host", HOUR).await;
-        let mut reader = world.start("reader", HOUR).await;
-        let invite = host.cmd(&["invite"]).await.unwrap();
-        let group = format!("--group={}", invite["group"].as_str().unwrap());
-        let mut anns = Vec::new();
-        for (handle, name) in [("phone", "Ann"), ("desk", "ann")] {
-            let member = world.start(handle, HOUR).await;
-            member.cmd(&["identity", "create", name]).await.unwrap();
-            let link = host.cmd(&["invite", &group]).await.unwrap();
-            member.cmd(&["join", link["link"].as_str().unwrap()]).await.unwrap();
-            anns.push(member);
-        }
-        let link = host.cmd(&["invite", &group]).await.unwrap();
-        reader.cmd(&["join", link["link"].as_str().unwrap()]).await.unwrap();
-        let claims = |members: &Value| members["members"].as_array().unwrap().iter().filter(|m| m["identity"]["observed"].is_object()).cloned().collect::<Vec<_>>();
-        let members = until(|| async { reader.cmd(&["members", &group]).await.unwrap() }, |m| claims(m).len() == 2).await;
-        let claims = claims(&members);
-        for claim in &claims {
-            let other = claims.iter().find(|other| other["identity"]["id"] != claim["identity"]["id"]).unwrap();
-            assert_eq!(claim["identity"]["observed"]["other_ids"], json!([other["identity"]["id"]]), "{claim}");
-            assert!(claim["name"].as_str().unwrap().contains('['), "{claim}");
-        }
-        let refused = reader.cmd(&["send", "--to", "Ann", "which one?"]).await.unwrap_err().to_string();
-        assert!(refused.contains("could be any"), "{refused}");
-        let status = reader.cmd(&["status"]).await.unwrap().to_string();
-        assert!(claims.iter().all(|claim| status.contains(claim["identity"]["id"].as_str().unwrap())), "{status}");
-        reader.printed().await;
-    });
-}
-
-/// A device that leaves its identity while another device stays on it leaves the groups it speaks as the identity in, and
-/// the identity goes on, listing the other device alone.
-#[test]
-fn a_device_leaves_its_identity_while_another_stays_on_it() {
-    local(async {
-        let world = world("leaves-identity").await;
-        let alice = world.start("alice", HOUR).await;
-        let laptop = world.start("laptop", HOUR).await;
-        let tablet = world.start("tablet", HOUR).await;
-        laptop.cmd(&["identity", "create", "Bob"]).await.unwrap();
-        let link = laptop.cmd(&["identity", "invite"]).await.unwrap();
-        tablet.cmd(&["identity", "join", link["link"].as_str().unwrap()]).await.unwrap();
-        let chat = alice.cmd(&["invite"]).await.unwrap();
-        tablet.cmd(&["join", chat["link"].as_str().unwrap()]).await.unwrap();
-        let left = tablet.cmd(&["identity", "leave"]).await.unwrap();
-        assert_eq!(left["left"], json!([chat["group"]]), "{left}");
-        assert!(left["ended"].is_null(), "the identity goes on: {left}");
-        until(|| async { alice.cmd(&["members"]).await.unwrap() }, |m| m["members"].as_array().unwrap().len() == 1).await;
-        let listed = until(|| async { laptop.cmd(&["identity", "list"]).await.unwrap() }, |l| l["devices"].as_array().unwrap().len() == 1).await;
-        assert_eq!(listed["devices"][0]["you"], true);
-        assert!(tablet.cmd(&["identity", "list"]).await.unwrap()["identity"].is_null(), "the tablet is on no identity");
-    });
-}
-
-/// A group whose service is gone holds up refreshing none of the device's claims in the others: a rename reaches the
-/// rest, and the group that cannot take it is warned of.
-#[test]
-fn a_group_whose_service_is_gone_holds_up_no_other_claims_refresh() {
-    local(async {
-        let world = world("refresh").await;
-        // Shut down with its runtime, the service drops its connections too.
-        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
-        let (spare, _) = service(world.root.path(), "spare", runtime.handle()).await;
-        let observer = world.start("observer", HOUR).await;
-        let elsewhere = world.launch(Config { membership: spare, ..world.config("elsewhere", "elsewhere") }, usize::MAX).await;
-        let mut phone = world.start("phone", HOUR).await;
-        phone.cmd(&["identity", "create", "Ann"]).await.unwrap();
-        for host in [&observer, &elsewhere] {
-            let invite = host.cmd(&["invite"]).await.unwrap();
-            phone.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
-        }
-        runtime.shutdown_background();
-        phone.cmd(&["identity", "rename", "Ann Lee"]).await.unwrap();
-        let renamed = |members: &Value| members["members"].as_array().unwrap().iter().any(|m| m["identity"]["name"] == "Ann Lee");
-        assert!(renamed(&until(|| async { observer.cmd(&["members"]).await.unwrap() }, renamed).await));
-        while !phone.expect("warning").await["text"].as_str().unwrap().contains("refreshing identity claims") {}
-    });
-}
-
-/// A member shows as its identity and its device, with its handle where another session of its device is in the group,
-/// and answers to any of them: another person's identity's name too.
-#[test]
-fn a_member_shows_as_its_identity_and_device_and_answers_to_them() {
-    local(async {
-        let world = world("shown").await;
-        let (alice, mut bob, group) = pair(&world, HOUR).await;
-        let mut desk = world.start_in("bob", "desk", HOUR).await;
-        let invite = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap();
-        desk.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
-        let device = lmk_core::device::Device::load(&bob.home.join("device.json")).unwrap().name;
-        let shown = |members: &Value| {
-            let mut names: Vec<String> = members["members"].as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap().to_owned()).collect();
-            names.sort();
-            names
-        };
-        let expected = [format!("Alice · {device}"), format!("Robert · {device} (bob)"), format!("Robert · {device} (desk)")];
-        let members = until(|| async { alice.cmd(&["members"]).await.unwrap() }, |members| shown(members) == expected).await;
-        assert_eq!(shown(&members), expected);
-        alice.cmd(&["send", "@robert, a word"]).await.unwrap();
-        for robert in [&mut bob, &mut desk] {
-            let message = robert.expect("message").await;
-            assert_eq!((&message["direct"], &message["from"]), (&json!(true), &json!(format!("Alice · {device}"))));
-        }
-        // To Bob, another session of his own identity shows as its device, with its handle, as the device has two here.
-        desk.cmd(&["send", "--to", "bob", "from the desk"]).await.unwrap();
-        let message = bob.expect("message").await;
-        assert_eq!((&message["from"], &message["to"]), (&json!(format!("{device} (desk)")), &json!(["you"])));
-    });
-}
-
-/// A session that does not act for its device renames the device and takes it off its identity, through the session
-/// that does: both sessions refresh their private signed credentials, and the identity, whose only device it was, ends.
-#[test]
-fn a_device_is_renamed_and_leaves_its_identity_from_another_of_its_sessions() {
-    local(async {
-        let world = world("rename").await;
-        let alice = world.start("alice", HOUR).await;
-        let desk = world.start_in("alice", "desk", HOUR).await;
-        let mut carol = world.start("carol", HOUR).await;
-        alice.cmd(&["identity", "create", "Alice"]).await.unwrap();
-        let invite = carol.cmd(&["invite"]).await.unwrap();
-        desk.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
-        carol.told(&["joined"]).await;
-
-        assert_eq!(desk.cmd(&["identity", "rename", "--device", "studio"]).await.unwrap()["device"]["name"], "studio");
-        let listed = alice.cmd(&["identity", "list"]).await.unwrap();
-        assert_eq!(listed["devices"][0]["name"], "studio");
-        assert_eq!(lmk_core::device::Device::load(&alice.home.join("device.json")).unwrap().name, "studio");
-        let studio = |members: &Value| members["members"].as_array().unwrap().iter().any(|m| m["device"] == "studio");
-        let members = until(|| async { carol.cmd(&["members"]).await.unwrap() }, studio).await;
-        assert!(studio(&members), "carol sees the device's new name in its refreshed signed leaf");
-
-        let left = desk.cmd(&["identity", "leave"]).await.unwrap();
-        assert_eq!((&left["left"][0], &left["ended"]), (&invite["group"], &json!(true)));
-        assert_eq!(alice.cmd(&["identity", "list"]).await.unwrap()["identity"], json!(null));
-        // Carol may hear that the device left its identity before she commits its leave, and then it shows by fingerprint.
-        let left = carol.told(&["left"]).await;
-        assert!(left["member"] == desk.fp.as_str() || left["member"] == "Alice · studio", "{left}");
-    });
-}
-
-#[test]
-fn every_session_of_a_device_sees_its_state_and_changes_it() {
-    local(async {
-        let world = world("device").await;
-        let mut first = world.start("alice", HOUR).await;
-        let mut second = world.start_in("alice", "second", HOUR).await;
-        // The second session process acts through the first, which holds the device's lock.
-        second.cmd(&["identity", "create", "Alice"]).await.unwrap();
-        assert_eq!(first.cmd(&["identity", "list"]).await.unwrap()["name"], "Alice");
-        let bob = world.start("bob", HOUR).await;
-        bob.cmd(&["identity", "create", "Robert"]).await.unwrap();
-        let invite = second.cmd(&["invite"]).await.unwrap();
-        bob.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
-        second.told(&["joined"]).await;
-        let members = second.cmd(&["members"]).await.unwrap();
-        let alice_seen = members["members"].as_array().unwrap().iter().find(|m| m["you"] == true).unwrap().clone();
-        assert_eq!((alice_seen["identity"]["name"].as_str(), alice_seen["identity"]["how"].as_str()), (Some("Alice"), Some("self")));
-        // Once the first stops, the second acts for the device, from its next command on.
-        first.stop().await;
-        assert_eq!(second.cmd(&["identity", "list"]).await.unwrap()["name"], "Alice");
-        // Work the second sent the first in the background may fail as the first stops; taking over may not.
-        let warnings: Vec<Value> = second.printed().await.into_iter().filter(|e| e["type"] == "warning").collect();
-        assert!(warnings.iter().all(|w| !w["text"].as_str().unwrap_or_default().contains("acting for this device")), "{warnings:?}");
     });
 }
 
@@ -907,9 +645,9 @@ fn a_message_no_member_online_holds_does_not_hold_up_others() {
         bob.stop().await;
         let alice = world.start("alice", HOUR).await;
         let mut carol = world.start("carol", HOUR).await;
-        alice.cmd(&["send", "@carol after the gap"]).await.unwrap();
+        alice.cmd(&["send", "--to", &carol.fp, "after the gap"]).await.unwrap();
         let got = carol.expect("message").await;
-        assert_eq!(got["content"], "@carol after the gap");
+        assert_eq!(got["content"], "after the gap");
         assert!(got.get("missing").is_none(), "{got}");
     });
 }
@@ -940,8 +678,7 @@ fn a_session_stops_once_it_cannot_print_and_prints_the_rest_when_started_again()
     });
 }
 
-/// `sessions` lists this machine's sessions, each with its groups, and their other members as they show to it, and
-/// whether it runs. `sessions remove` stops one that runs, or runs one that does not, until another member holds its
+/// `sessions` lists this machine's sessions, each with its group ids and whether it runs. `sessions remove` stops one that runs, or runs one that does not, until another member holds its
 /// leave of each group, and deletes it.
 #[test]
 fn a_session_is_listed_and_removed_running_or_stopped() {
@@ -951,21 +688,20 @@ fn a_session_is_listed_and_removed_running_or_stopped() {
         let desk = world.start_in("bob", "desk", HOUR).await;
         let invite = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap();
         desk.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
-        let groups = |other: &str| json!([{ "group": group, "name": "", "members": [format!("Alice · {}", alice.device), format!("{} ({other})", bob.device)] }]);
         let both = json!({ "sessions": [
-            { "handle": "bob", "running": true, "groups": groups("desk") },
-            { "handle": "desk", "running": true, "groups": groups("bob") },
+            { "handle": "bob", "running": true, "groups": [group] },
+            { "handle": "desk", "running": true, "groups": [group] },
         ] });
         let listed = until(|| async { crate::sessions(&bob.home).await.unwrap() }, |listed| *listed == both).await;
         assert_eq!(listed, both);
 
         let removed = crate::remove(world.config("bob", "desk"), &bob.home, world.network.clone()).await.unwrap();
         assert_eq!(removed, json!({ "removed": "desk", "left": [group] }));
-        assert_eq!(alice.told(&["left"]).await["member"], format!("Robert · {} (desk)", bob.device), "Bob's device has two sessions here");
+        assert_eq!(alice.told(&["left"]).await["member"], desk.fp);
         drop(desk);
         bob.stop().await;
         crate::remove(world.config("bob", "bob"), &bob.home, world.network.clone()).await.unwrap();
-        assert_eq!(alice.told(&["left"]).await["member"], format!("Robert · {}", bob.device));
+        assert_eq!(alice.told(&["left"]).await["member"], bob.fp);
         assert_eq!(crate::sessions(&bob.home).await.unwrap(), json!({ "sessions": [] }));
     });
 }
@@ -984,91 +720,6 @@ fn a_session_runs_in_one_process() {
     });
 }
 
-/// `add` brings a session of another of your devices into a group: `identity list` shows the sessions each device runs,
-/// and their groups, and the session the add names joins once it runs, by an invite that admits only a session of its
-/// device, once.
-#[test]
-fn an_add_brings_a_session_of_another_device_into_a_group_once() {
-    local(async {
-        let world = world("add").await;
-        let (alice, bob, group) = pair(&world, HOUR).await;
-        let mut desk = world.start("desk", HOUR).await;
-        let invite = bob.cmd(&["identity", "invite"]).await.unwrap();
-        desk.cmd(&["identity", "join", invite["link"].as_str().unwrap()]).await.unwrap();
-        let runs = |listed: &Value, you: bool| listed["devices"].as_array().unwrap().iter().find(|d| (d["you"] == true) == you).unwrap().clone();
-        let listed = until(|| async { bob.cmd(&["identity", "list"]).await.unwrap() }, |listed| runs(listed, false)["sessions"] == json!(["desk"])).await;
-        assert_eq!(runs(&listed, false)["sessions"], json!(["desk"]), "the laptop hears which sessions the desk runs");
-        assert_eq!(runs(&listed, true)["sessions"], json!(["bob"]));
-
-        // Added while it is stopped, the desk's session joins once it runs again.
-        desk.stop().await;
-        let added = bob.cmd(&["add", "desk", &format!("--group={group}")]).await.unwrap();
-        assert_eq!((added["group"].as_str(), added["session"].as_str()), (Some(group.as_str()), Some("desk")));
-        let link = added["link"].as_str().unwrap();
-        let laptop = world.start_in("bob", "laptop", HOUR).await;
-        let refused = laptop.cmd(&["join", link]).await.unwrap_err().to_string();
-        assert!(refused.contains("another device"), "{refused}");
-        let mut desk = world.start("desk", HOUR).await;
-        let joined = desk.told(&["joined"]).await;
-        assert_eq!((joined["how"].as_str(), joined["group"].as_str()), (Some("add"), Some(group.as_str())));
-        assert_eq!(joined["device"], runs(&listed, true)["name"]);
-        // Both devices are named after this machine, so the laptop's session shows with its handle.
-        let members = [format!("Alice · {}", alice.device), format!("{} (bob)", bob.device)];
-        let shown = json!([{ "session": "desk", "group": group, "members": members }]);
-        let heard = until(|| async { bob.cmd(&["identity", "list"]).await.unwrap() }, |listed| runs(listed, false)["groups"] == shown).await;
-        assert_eq!(runs(&heard, false)["groups"], shown, "the laptop hears which groups the desk's sessions are in, with whom");
-        let other = world.start_in("desk", "other", HOUR).await;
-        let refused = other.cmd(&["join", link]).await.unwrap_err().to_string();
-        assert!(refused.contains("used"), "{refused}");
-
-        // In the group, it is refused another add, and an add it is handed anyway, made before it joined, is done.
-        let again = bob.cmd(&["add", "desk", &format!("--group={group}")]).await.unwrap_err().to_string();
-        assert!(again.contains("desk is in this group already"), "{again}");
-        let stale = Request::Added { link: link.to_owned(), group: serde_json::from_value(json!(group)).unwrap(), device: "laptop".into() };
-        assert_eq!(crate::cli::call(&desk.home, &desk.handle, stale).await.unwrap(), Value::Null);
-
-        // Two devices run a session "other": an add names one as members show it.
-        desk.cmd(&["identity", "rename", "--device", "desk"]).await.unwrap();
-        let _mine = world.start_in("bob", "other", HOUR).await;
-        let heard = |listed: &Value| {
-            let devices = listed["devices"].as_array().unwrap();
-            let other = |d: &Value| d["sessions"].as_array().is_some_and(|sessions| sessions.contains(&json!("other")));
-            devices.iter().all(other) && devices.iter().any(|d| d["name"] == "desk")
-        };
-        until(|| async { bob.cmd(&["identity", "list"]).await.unwrap() }, heard).await;
-        let several = bob.cmd(&["add", "other", &format!("--group={group}")]).await.unwrap_err().to_string();
-        assert!(several.contains("several of your devices run a session other"), "{several}");
-        let added = bob.cmd(&["add", "desk (other)", &format!("--group={group}")]).await.unwrap();
-        assert_eq!((added["device"].as_str(), added["session"].as_str()), (Some("desk"), Some("other")));
-    });
-}
-
-/// An added session tells of its own join before any other event of the group, though the group changes as it joins.
-#[test]
-fn an_added_session_tells_of_its_join_first() {
-    local(async {
-        let world = world("add-first").await;
-        let (alice, bob, group) = pair(&world, HOUR).await;
-        let mut desk = world.start("desk", HOUR).await;
-        let invite = bob.cmd(&["identity", "invite"]).await.unwrap();
-        desk.cmd(&["identity", "join", invite["link"].as_str().unwrap()]).await.unwrap();
-        let runs_desk = |listed: &Value| listed["devices"].as_array().unwrap().iter().any(|d| d["sessions"] == json!(["desk"]));
-        until(|| async { bob.cmd(&["identity", "list"]).await.unwrap() }, runs_desk).await;
-        let at = format!("--group={group}");
-        let renames = tokio::task::spawn_local(async move {
-            // Within the service's 600 appends a minute from one address.
-            for round in 0..1000 {
-                alice.cmd(&["name", &format!("round {round}"), &at]).await.ok();
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        });
-        bob.cmd(&["add", "desk", &format!("--group={group}")]).await.unwrap();
-        let first = desk.told(&["joined", "settings"]).await;
-        renames.abort();
-        assert_eq!((first["type"].as_str(), first["how"].as_str()), (Some("joined"), Some("add")), "{first}");
-    });
-}
-
 /// A join that waits on a member who never answers holds up none of the session's other work.
 #[test]
 fn a_session_goes_on_while_a_join_waits() {
@@ -1084,8 +735,8 @@ fn a_session_goes_on_while_a_join_waits() {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let started = std::time::Instant::now();
         bob.cmd(&["status"]).await.unwrap();
-        alice.cmd(&["send", "@bob still there?"]).await.unwrap();
-        assert_eq!(bob.expect("message").await["content"], "@bob still there?");
+        alice.cmd(&["send", "--to", &bob.fp, "still there?"]).await.unwrap();
+        assert_eq!(bob.expect("message").await["content"], "still there?");
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
         assert!(!joining.is_finished(), "the join still waits");
     });
@@ -1098,15 +749,14 @@ fn a_restarted_session_prints_what_came_after_the_last_it_showed() {
         let world = world("reprint").await;
         let (mut alice, bob, _) = pair(&world, HOUR).await;
         bob.cmd(&["send", "before"]).await.unwrap();
-        bob.cmd(&["send", "@alice shown"]).await.unwrap();
+        bob.cmd(&["send", "--to", &alice.fp, "to alice"]).await.unwrap();
         assert_eq!(alice.expect("message").await["content"], "before");
-        assert_eq!(alice.expect("message").await["content"], "@alice shown");
+        assert_eq!(alice.expect("message").await["content"], "to alice");
         bob.cmd(&["send", "after one"]).await.unwrap();
         let last = bob.cmd(&["send", "after two"]).await.unwrap();
         // Alice holds both and, unaddressed, prints neither.
-        let alice_shown = json!([format!("Alice \u{b7} {}", alice.device)]);
-        let read = until(|| async { bob.cmd(&["read", last["id"].as_str().unwrap()]).await.unwrap() }, |read| read[0]["held_by"] == alice_shown).await;
-        assert_eq!(read[0]["held_by"], alice_shown);
+        let read = until(|| async { bob.cmd(&["read", last["id"].as_str().unwrap()]).await.unwrap() }, |read| read[0]["held_by"] == json!([alice.fp])).await;
+        assert_eq!(read[0]["held_by"], json!([alice.fp]));
         alice.stop().await;
         let mut alice = world.start("alice", HOUR).await;
         assert_eq!(alice.expect("message").await["content"], "after one");
