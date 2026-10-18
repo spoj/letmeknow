@@ -140,18 +140,17 @@ async fn serves_relay_and_membership_without_frontend() {
     let https_post = lmk_membership::client::https(reqwest::Client::builder().tls_backend_preconfigured(tls).no_proxy().build().unwrap());
     let post: lmk_membership::client::Post = Arc::new(move |_: String, route, body| https_post(format!("localhost:{https}"), route, body));
     let client = ServeClient::for_service(post, &service).unwrap();
-    let appended = tokio::time::timeout(Duration::from_secs(10), client.append(&[7; 32], &[b"commit".to_vec()]))
+    tokio::time::timeout(Duration::from_secs(10), client.append(&[7; 32], &[b"commit".to_vec()]))
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(appended.position, 1);
     let lmk_proto::group::Service::Serve { key, .. } = &service else { unreachable!() };
     let key: [u8; 32] = key.0.as_slice().try_into().unwrap();
     let page = client.read(&[7; 32], &lmk_membership::Frontier::empty(key, lmk_proto::head::reference(&key, &[7; 32]))).await.unwrap();
-    assert_eq!(page.page().entries[0].0, b"commit");
+    assert_eq!(page.entries[0].0, b"commit");
     let heads = client.heads(&[lmk_proto::membership::Known([7; 32], 0)]).await.unwrap();
     let head = heads[0].as_ref().unwrap();
-    assert_eq!((head.length, head.hash), (page.page().head.length, page.page().head.hash));
+    assert_eq!((head.length, head.hash), (page.head.length, page.head.hash));
 
     server.abort();
 }

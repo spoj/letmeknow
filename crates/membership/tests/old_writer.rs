@@ -40,7 +40,7 @@ fn published_writer_refuses_without_mutation_and_guard_removal_is_a_negative_con
             assert!(stderr.contains("views may not be indexed"), "expected structural refusal: {stderr}");
             assert_eq!(fs::read(&db_path).unwrap(), before, "old executable must not change any database bytes");
             let store = Store::open(&state).unwrap();
-            assert_eq!(store.head(&d).unwrap().hash, tip.hash);
+            assert_eq!(store.read(&d, 0).unwrap().head.hash, tip.hash);
             assert_eq!(store.read(&d, 0).unwrap().entries, [Bytes(vec![42])]);
         } else {
             assert!(stderr.contains("view"), "negative control should fail only after creating legacy storage: {stderr}");

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, ensure};
 use lmk_core::provider::SqliteProvider;
 use lmk_membership::client::{Post, ServeClient};
-use lmk_membership::{Contradiction, Expired, Frontier, Unsupported, VerifiedPage, WrongDirectory};
+use lmk_membership::{Contradiction, Expired, Frontier, Unsupported, WrongDirectory};
 use lmk_net::peers::WAIT;
 use lmk_proto::Bytes;
 use lmk_proto::group::Service;
@@ -423,20 +423,14 @@ impl Inner {
                     return Err(error);
                 }
             };
-            let more = !page.page().entries.is_empty();
-            self.stored(id, page)?;
+            let more = !page.entries.is_empty();
+            self.take_entries(&mut self.lock(), id, page.after, page.entries, page.head)?;
             if !more {
                 let mut st = self.lock();
                 st.logs.get_mut(id).context("dropped the log")?.at = corrected();
                 return st.save_log(id);
             }
         }
-    }
-
-    /// Holds a page the service sent.
-    pub(crate) fn stored(&self, id: &[u8], page: VerifiedPage) -> Result<()> {
-        let page = page.into_page();
-        self.take_entries(&mut self.lock(), id, page.after, page.entries, page.head)
     }
 
     /// Holds entries of a log that follow position `after` and end at `head`, a head its service signed, from the

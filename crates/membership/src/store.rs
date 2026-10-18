@@ -14,20 +14,12 @@ const MARK_LOGS: usize = 1024;
 const EXPIRE_ROWS: usize = 1024;
 const EXPIRE_BYTES: u64 = 4 << 20;
 pub const DAY_MS: u64 = 86_400_000;
-const STATS_DAYS: u64 = 7;
-const FORMAT: u32 = 6;
+const FORMAT: u32 = 7;
 pub const DISK_BYTES: u64 = 4 << 30;
 const EXPIRY: &str = "SELECT reference FROM anchors WHERE opened<? LIMIT ?";
 const DOOMED: &str = "SELECT reference FROM doomed LIMIT 1";
 const DOOMED_RECORDS: &str = "SELECT position,length(sealed) FROM records WHERE reference=? ORDER BY position LIMIT ?";
 const READ_RECORDS: &str = "SELECT sealed FROM records WHERE reference=? AND position>? ORDER BY position LIMIT ?";
-const TOTALS: &str = "SELECT day,entries,bytes FROM totals WHERE day>=? AND day<? ORDER BY day";
-
-#[derive(Debug, serde::Serialize, PartialEq, Eq)]
-pub struct DayTotals { pub day: u64, pub entries: u64, pub bytes: u64 }
-
-#[derive(Debug, serde::Serialize, PartialEq, Eq)]
-pub struct Stats { pub days: Vec<DayTotals> }
 
 pub struct Store {
     db: Mutex<Connection>,
@@ -123,7 +115,6 @@ impl Store {
             "BEGIN IMMEDIATE;
              CREATE TABLE metadata (id INTEGER PRIMARY KEY CHECK(id=1), format INTEGER NOT NULL,
                  authority BLOB NOT NULL CHECK(length(authority)=32), passed INTEGER NOT NULL);
-             CREATE TABLE totals (day INTEGER PRIMARY KEY, entries INTEGER NOT NULL, bytes INTEGER NOT NULL);
              CREATE TABLE anchors (reference BLOB PRIMARY KEY CHECK(length(reference)=32), opened INTEGER NOT NULL,
                  sealed BLOB NOT NULL) WITHOUT ROWID;
              CREATE INDEX expiry ON anchors(opened);
@@ -191,7 +182,7 @@ impl Store {
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let (length, mut hash) = self.state(&tx, log)?;
         if entries.is_empty() && length > 0 {
-            return Ok(Appended { position: length + 1, head: self.sign(&log.reference, length, hash) });
+            return Ok(Appended { head: self.sign(&log.reference, length, hash) });
         }
         ensure!(used(&tx, &self.wal)? + bytes <= self.disk, Refused("quota".into()));
         let end = length + entries.len() as u64;
@@ -206,12 +197,8 @@ impl Store {
             "INSERT INTO anchors VALUES(?1,?2,?3) ON CONFLICT(reference) DO UPDATE SET sealed=?3, opened=CASE WHEN ?4 THEN ?2 ELSE opened END",
             params![log.reference, day, state, length == 0],
         )?;
-        if !entries.is_empty() {
-            tx.execute("INSERT INTO totals VALUES(?1,?2,?3) ON CONFLICT(day) DO UPDATE SET entries=entries+?2,bytes=bytes+?3",
-                params![day, entries.len() as u64, bytes])?;
-        }
         tx.commit()?;
-        Ok(Appended { position: length + 1, head: self.sign(&log.reference, end, hash) })
+        Ok(Appended { head: self.sign(&log.reference, end, hash) })
     }
 
     pub fn read(&self, log: &Log, after: u64) -> Result<Page> {
@@ -232,15 +219,6 @@ impl Store {
             hash = next_hash;
         }
         Ok(Page { after, head: self.sign(&log.reference, after + entries.len() as u64, hash), entries })
-    }
-
-    pub fn head(&self, log: &Log) -> Result<Head> {
-        let (length, hash) = self.state(&self.db.lock().unwrap(), log)?;
-        Ok(self.sign(&log.reference, length, hash))
-    }
-
-    pub fn length(&self, log: &Log) -> Result<u64> {
-        Ok(tip(&self.db.lock().unwrap(), log)?.map_or(0, |(length, _)| length))
     }
 
     /// Whether the store records a log, empty or not; an error if it let it go.
@@ -268,21 +246,6 @@ impl Store {
         Ok(tip(db, log)?.unwrap_or((0, head::start(self.key.verifying_key().as_bytes(), &log.reference))))
     }
 
-    pub fn stats(&self) -> Result<Stats> {
-        let db = self.db.lock().unwrap();
-        let today = now() / DAY_MS;
-        let start = today.saturating_sub(STATS_DAYS);
-        let mut days: Vec<_> = (start..today).map(|day| DayTotals { day, entries: 0, bytes: 0 }).collect();
-        let mut query = db.prepare_cached(TOTALS)?;
-        let mut rows = query.query(params![start, today])?;
-        while let Some(row) = rows.next()? {
-            let total = DayTotals { day: row.get(0)?, entries: row.get(1)?, bytes: row.get(2)? };
-            let index = (total.day - start) as usize;
-            days[index] = total;
-        }
-        Ok(Stats { days })
-    }
-
     /// One bounded pass of expiry, then a truncating checkpoint of the WAL, recording its day. A log goes once its `opened`
     /// day is before `before_day`, and keeps only its reference. Returns whether more is left for another pass.
     pub fn expire(&self, before_day: u64) -> Result<bool> {
@@ -296,7 +259,6 @@ impl Store {
             tx.execute("INSERT INTO doomed VALUES(?)", [reference])?;
         }
         let more = reap(&tx)?;
-        tx.execute("DELETE FROM totals WHERE day<?", [(now() / DAY_MS).saturating_sub(STATS_DAYS)])?;
         tx.execute("UPDATE metadata SET passed=?", [now() / DAY_MS])?;
         tx.commit()?;
         db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
@@ -372,16 +334,15 @@ mod tests {
                 CREATE TRIGGER abort_append AFTER INSERT ON records BEGIN INSERT INTO child VALUES(1); END;").unwrap();
         }
         assert!(store.append(&d, &[Bytes(b"uncommitted".to_vec())]).is_err());
-        assert_eq!(store.head(&d).unwrap().length, 0);
+        assert_eq!(store.read(&d, 0).unwrap().head.length, 0);
         assert!(store.read(&d, 0).unwrap().entries.is_empty());
-        assert_eq!(store.db.lock().unwrap().query_row("SELECT count(*) FROM totals", [], |r| r.get::<_, u64>(0)).unwrap(), 0);
         store.db.lock().unwrap().execute_batch("DROP TRIGGER abort_append").unwrap();
         let appended = store.append(&d, &[Bytes(b"committed".to_vec())]).unwrap();
         let s = store.key().verifying_key();
         drop(store);
         let store = Store::open(&path).unwrap();
         assert_eq!(store.key().verifying_key(), s);
-        assert_eq!(store.head(&d).unwrap().hash, appended.head.hash);
+        assert_eq!(store.read(&d, 0).unwrap().head.hash, appended.head.hash);
         assert_eq!(store.read(&d, 0).unwrap().entries, [Bytes(b"committed".to_vec())]);
         drop(store);
     }
@@ -414,8 +375,6 @@ mod tests {
         drop(db);
         assert_eq!(store.read(&log, 0).unwrap_err().downcast_ref::<Expired>().unwrap().0, log.reference);
         assert_eq!(store.append(&log, &[Bytes(vec![2])]).unwrap_err().downcast_ref::<Expired>().unwrap().0, log.reference);
-        assert_eq!(store.head(&log).unwrap_err().downcast_ref::<Expired>().unwrap().0, log.reference);
-        assert_eq!(store.length(&log).unwrap_err().downcast_ref::<Expired>().unwrap().0, log.reference);
         assert_eq!(store.moved(&[(log.clone(), 0), (store.log(&[8; 32]), 0)]).unwrap(), (vec![], vec![log.reference]));
         assert_eq!(store.moved(&[(store.log(&[8; 32]), 0)]).unwrap(), (vec![], vec![]));
         assert_eq!(store.moved(&[(store.log(&[8; 32]), 1)]).unwrap().0.len(), 1);
@@ -432,7 +391,7 @@ mod tests {
         let (group, gone) = (store.log(&[1; 32]), store.log(&[3; 32]));
         on(10);
         let open = store.append(&group, &[]).unwrap();
-        assert_eq!((open.position, open.head.length, opened(&store, &group)), (1, 0, 10), "an open records an empty log");
+        assert_eq!((open.head.length, opened(&store, &group)), (0, 10), "an open records an empty log");
         store.append(&gone, &[]).unwrap();
         on(12);
         store.append(&group, &[]).unwrap();
@@ -442,8 +401,7 @@ mod tests {
         assert_eq!(opened(&store, &group), 13, "a first entry sets the day");
         on(15);
         let open = store.append(&group, &[]).unwrap();
-        assert_eq!((open.position, open.head.length, opened(&store, &group)), (2, 1, 13), "an open changes nothing past it");
-        assert_eq!(store.db.lock().unwrap().query_row("SELECT sum(entries) FROM totals", [], |r| r.get::<_, u64>(0)).unwrap(), 1);
+        assert_eq!((open.head.length, opened(&store, &group)), (1, 13), "an open changes nothing past it");
 
         store.expire(11).unwrap();
         assert!(store.append(&gone, &[]).unwrap_err().is::<Expired>(), "a log that went is not opened again");
@@ -505,7 +463,7 @@ mod tests {
             on(if i < LOGS / 2 { 10 } else { 11 });
             let log = store.log(&capabilities[i]);
             store.append(&log, &[Bytes(entry)]).unwrap();
-            if i == 0 { head_hash = Some(store.head(&log).unwrap().hash); }
+            if i == 0 { head_hash = Some(store.read(&log, 0).unwrap().head.hash); }
         }
         let gone: std::collections::HashSet<&[u8]> = markers[..LOGS / 2].iter().flatten().map(Vec::as_slice).collect();
         let kept = store.log(&capabilities[LOGS - 1]).reference;
@@ -553,24 +511,6 @@ mod tests {
     }
 
     #[test]
-    fn daily_totals_go_after_seven_days() {
-        let (_dir, path) = state();
-        let store = Store::initialize(&path).unwrap();
-        let totals = || store.db.lock().unwrap().query_row("SELECT count(*) FROM totals", [], |r| r.get::<_, u64>(0)).unwrap();
-        on(10);
-        store.append(&store.log(&[1; 32]), &[Bytes(vec![1])]).unwrap();
-        on(16);
-        store.expire(0).unwrap();
-        assert_eq!(totals(), 1);
-        on(17);
-        store.expire(0).unwrap();
-        assert_eq!(totals(), 1);
-        on(18);
-        store.expire(0).unwrap();
-        assert_eq!(totals(), 0);
-    }
-
-    #[test]
     fn lost_or_mismatched_state_never_initializes() {
         let (_dir, missing) = state();
         assert!(Store::open(&missing).is_err());
@@ -611,7 +551,7 @@ mod tests {
         assert!(store.append(&d, &[Bytes(vec![1; membership::MAX_ENTRY+1])]).is_err());
         assert!(store.append(&d, &vec![Bytes(vec![1; membership::MAX_ENTRY]); 3]).is_err());
         store.append(&d, &[Bytes(vec![1])]).unwrap();
-        assert_eq!(store.head(&d).unwrap().length, 1);
+        assert_eq!(store.read(&d, 0).unwrap().head.length, 1);
         drop(store);
     }
 
@@ -624,10 +564,10 @@ mod tests {
         let before = used(&store.db.lock().unwrap(), &store.wal).unwrap();
         store.disk = before + 99;
         assert_eq!(store.append(&d, &[Bytes(vec![2; 100])]).unwrap_err().downcast::<Refused>().unwrap().0, "quota");
-        assert_eq!(store.head(&d).unwrap().length, 1);
+        assert_eq!(store.read(&d, 0).unwrap().head.length, 1);
         store.disk = before + 100;
         store.append(&d, &[Bytes(vec![2; 100])]).unwrap();
-        assert_eq!(store.head(&d).unwrap().length, 2);
+        assert_eq!(store.read(&d, 0).unwrap().head.length, 2);
         drop(store);
     }
 
@@ -637,44 +577,11 @@ mod tests {
         let store = Store::initialize(&path).unwrap();
         let (a, b) = (store.log(&[1; 32]), store.log(&[2; 32]));
         store.append(&a, &[Bytes(vec![1])]).unwrap();
-        assert_eq!((store.length(&a).unwrap(), store.length(&b).unwrap()), (1, 0));
+        assert_eq!((store.read(&a, 0).unwrap().head.length, store.read(&b, 0).unwrap().head.length), (1, 0));
         let (moved, expired) = store.moved(&[(a.clone(), 0), (a.clone(), 1), (b, 0)]).unwrap();
         assert!(expired.is_empty());
         assert_eq!(moved.len(), 1);
         assert_eq!((moved[0].log_ref, moved[0].length), (a.reference, 1));
-        drop(store);
-    }
-
-    #[test]
-    fn completed_site_totals_survive_failures_restart_and_expiry() {
-        lmk_proto::clock::set(|| 10 * DAY_MS);
-        let (_dir, path) = state();
-        let store = Store::initialize(&path).unwrap();
-        store.append(&store.log(&[1; 32]), &[Bytes(vec![1; 3]), Bytes(vec![2; 5])]).unwrap();
-        store.append(&store.log(&[2; 32]), &[Bytes(vec![3; 7])]).unwrap();
-        assert!(store.stats().unwrap().days.iter().all(|d| d.entries == 0 && d.bytes == 0));
-        lmk_proto::clock::set(|| 11 * DAY_MS);
-        let expected = store.stats().unwrap();
-        assert_eq!(expected.days.len(), 7);
-        assert_eq!(expected.days[6], DayTotals { day: 10, entries: 3, bytes: 15 });
-        store.append(&store.log(&[1; 32]), &[Bytes(vec![1; 9])]).unwrap();
-        store.db.lock().unwrap().execute_batch("CREATE TRIGGER fail_totals BEFORE UPDATE ON totals BEGIN SELECT RAISE(ABORT,'failure'); END;").unwrap();
-        assert!(store.append(&store.log(&[3; 32]), &[Bytes(vec![1; 10])]).is_err());
-        assert_eq!(store.head(&store.log(&[3; 32])).unwrap().length, 0);
-        assert_eq!(store.stats().unwrap(), expected);
-        store.expire(12).unwrap();
-        drop(store);
-        let store = Store::open(&path).unwrap();
-        assert_eq!(store.stats().unwrap(), expected);
-        lmk_proto::clock::set(|| 12 * DAY_MS);
-        let stats = store.stats().unwrap();
-        assert_eq!(stats.days[5], DayTotals { day: 10, entries: 3, bytes: 15 });
-        assert_eq!(stats.days[6], DayTotals { day: 11, entries: 1, bytes: 9 });
-        assert!(stats.days[..5].iter().all(|d| d.entries == 0 && d.bytes == 0));
-        lmk_proto::clock::set(|| 18 * DAY_MS);
-        assert_eq!(store.stats().unwrap().days[0], DayTotals { day: 11, entries: 1, bytes: 9 });
-        lmk_proto::clock::set(|| 19 * DAY_MS);
-        assert!(store.stats().unwrap().days.iter().all(|d| d.entries == 0 && d.bytes == 0));
         drop(store);
     }
 
@@ -705,7 +612,7 @@ mod tests {
         assert!(db.execute_batch("CREATE TABLE IF NOT EXISTS logs(id BLOB PRIMARY KEY, length INTEGER NOT NULL, hash BLOB NOT NULL, public INTEGER NOT NULL DEFAULT 0, appended INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS entries(log BLOB NOT NULL, position INTEGER NOT NULL, entry BLOB NOT NULL, hash BLOB NOT NULL,time INTEGER NOT NULL, PRIMARY KEY(log,position)) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS entries_time ON entries(time);").is_err());
-        assert_eq!(db.query_row("SELECT count(*) FROM sqlite_schema WHERE type='table'", [], |r| r.get::<_, u64>(0)).unwrap(), 6);
+        assert_eq!(db.query_row("SELECT count(*) FROM sqlite_schema WHERE type='table'", [], |r| r.get::<_, u64>(0)).unwrap(), 5);
         db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
         assert!(!fs::read(path.join("membership.db")).unwrap().windows(32).any(|w| w == capability));
         drop(db);

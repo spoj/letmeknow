@@ -76,7 +76,6 @@ async fn routes_answer_appends_reads_and_heads_with_signed_heads() {
     let Answer::Ok(appended) = http.post::<Appended>(Route::Append, "192.0.2.1", &append_body(7, &one(b"one"))).await else {
         panic!("append refused")
     };
-    assert_eq!(appended.position, 1);
     assert!(appended.head.verify(&http.key));
     let read = serde_json::to_vec(&Read { capability: [7; 32], after: 0 }).unwrap();
     let Answer::Ok(page) = http.post::<Page>(Route::Read, "192.0.2.1", &read).await else { panic!("read refused") };

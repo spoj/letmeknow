@@ -20,11 +20,7 @@ pub fn start(service: &[u8; 32], log_ref: &[u8; 32]) -> [u8; 32] {
 }
 
 pub fn next(prev: &[u8; 32], entry: &[u8]) -> [u8; 32] {
-    next_digest(prev, &Sha256::digest(entry).into())
-}
-
-pub fn next_digest(prev: &[u8; 32], digest: &[u8; 32]) -> [u8; 32] {
-    Sha256::new().chain_update(prev).chain_update(digest).finalize().into()
+    Sha256::new().chain_update(prev).chain_update(Sha256::digest(entry)).finalize().into()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -111,7 +111,6 @@ pub fn valid_page(entries: &[Bytes]) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Appended {
-    pub position: u64,
     pub head: Head,
 }
 

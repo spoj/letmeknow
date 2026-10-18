@@ -68,9 +68,8 @@ async fn appends_reads_and_heads_check_against_the_service_key() {
     let client = membership.client();
     let capability = log(1);
     let appended = client.append(&capability, &[b"one".to_vec(), b"two".to_vec()]).await.unwrap();
-    assert_eq!(appended.position, 1);
     let page = client.read(&capability, &anchor(&membership.key, &capability)).await.unwrap();
-    assert_eq!(page.page().entries, [Bytes(b"one".to_vec()), Bytes(b"two".to_vec())]);
+    assert_eq!(page.entries, [Bytes(b"one".to_vec()), Bytes(b"two".to_vec())]);
     let moved = client.heads(&[Known(capability, 0)]).await.unwrap();
     let head = moved[0].as_ref().unwrap();
     assert_eq!((moved.len(), head.length, head.hash), (1, 2, appended.head.hash));

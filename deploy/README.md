@@ -1,7 +1,7 @@
 # Deploying letmeknow
 
 - `https://letmeknow.dev`: a static page, `site/`, served by GitHub Pages, which invite links open: it shows the commands that join with them.
-- `https://relay.letmeknow.dev`: `letmeknow serve`, the membership service and iroh relay, on the VPS (129.212.227.207, 2400:6180:0:d2:0:3:37cd:7000; Ubuntu with a `letmeknow` user, a swap file and unattended security updates). It needs TCP 22, 80 and 443 and UDP 7842 open, gets its own TLS certificate, and serves no pages: it answers `/health` (version and public key), `/stats` (totals of the last 7 completed UTC days), `/ping` and `/.well-known/letmeknow.json` (its directory).
+- `https://relay.letmeknow.dev`: `letmeknow serve`, the membership service and iroh relay, on the VPS (129.212.227.207, 2400:6180:0:d2:0:3:37cd:7000; Ubuntu with a `letmeknow` user, a swap file and unattended security updates). It needs TCP 22, 80 and 443 and UDP 7842 open, gets its own TLS certificate, and serves no pages: it answers `/health` (version and public key), `/ping` and `/.well-known/letmeknow.json` (its directory).
 
 Its domain, directory and public key are in deploy/backend.json; crates/proto/src/links.rs holds its domain, relay and key. Its private key exists only in the VPS's state directory, /var/lib/letmeknow, which has no backup.
 

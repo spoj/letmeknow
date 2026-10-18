@@ -2,7 +2,7 @@
 
 use anyhow::{Result, ensure};
 use ed25519_dalek::VerifyingKey;
-use lmk_proto::{head::{self, Head}, membership::{Page, PAGE_ROWS, valid_page}};
+use lmk_proto::{head::{self, Head}, membership::{Page, valid_page}};
 
 #[derive(Debug, thiserror::Error)]
 #[error("invalid membership signature")]
@@ -71,66 +71,22 @@ impl Frontier {
         Ok(())
     }
 
-    pub fn proof(&self, target: Head) -> Result<Proof> {
-        self.check(&target, None)?;
-        ensure!(target.length >= self.length, InvalidProof);
-        Ok(Proof { service: self.service, log_ref: self.log_ref, position: self.length, hash: self.hash, target })
-    }
-
-    pub fn verify_page(&self, page: Page) -> Result<VerifiedPage> {
-        let mut proof = self.proof(page.head.clone())?;
+    /// Checks a page extends this frontier to its head, and returns it.
+    pub fn verify_page(&self, page: Page) -> Result<Page> {
+        self.check(&page.head, None)?;
         ensure!(page.after == self.length && valid_page(&page.entries), InvalidProof);
         ensure!(page.after.checked_add(page.entries.len() as u64) == Some(page.head.length), InvalidProof);
-        for entry in &page.entries {
-            proof.hash = head::next(&proof.hash, &entry.0);
-            proof.position += 1;
-        }
-        let frontier = proof.finish()?;
-        Ok(VerifiedPage { page, frontier })
+        let hash = page.entries.iter().fold(self.hash, |hash, entry| head::next(&hash, &entry.0));
+        ensure!(hash == page.head.hash, InvalidProof);
+        Ok(page)
     }
-}
-
-pub struct Proof {
-    service: [u8; 32],
-    log_ref: [u8; 32],
-    position: u64,
-    hash: [u8; 32],
-    target: Head,
-}
-
-impl Proof {
-    pub fn push(&mut self, digests: &[[u8; 32]]) -> Result<()> {
-        ensure!(digests.len() <= PAGE_ROWS, InvalidProof);
-        let end = self.position.checked_add(digests.len() as u64).ok_or(InvalidProof)?;
-        ensure!(end <= self.target.length, InvalidProof);
-        for digest in digests { self.hash = head::next_digest(&self.hash, digest); }
-        self.position = end;
-        Ok(())
-    }
-
-    pub fn finish(self) -> Result<Frontier> {
-        ensure!(self.position == self.target.length && self.hash == self.target.hash, InvalidProof);
-        Ok(Frontier { service: self.service, log_ref: self.log_ref, length: self.position, hash: self.hash, head: Some(self.target) })
-    }
-}
-
-#[derive(Debug)]
-pub struct VerifiedPage {
-    page: Page,
-    frontier: Frontier,
-}
-
-impl VerifiedPage {
-    pub fn page(&self) -> &Page { &self.page }
-    pub fn into_page(self) -> Page { self.page }
-    pub fn frontier(&self) -> &Frontier { &self.frontier }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use lmk_proto::Bytes;
+    use lmk_proto::{Bytes, membership::PAGE_ROWS};
 
     fn page(key: &SigningKey, d: &[u8; 32], entries: &[&[u8]]) -> Page {
         let hash = entries.iter().fold(head::start(key.verifying_key().as_bytes(), d), |h, e| head::next(&h, e));
@@ -145,8 +101,8 @@ mod tests {
         let empty = Frontier::empty(s, d);
         assert!(empty.head().is_none());
         let signed = empty.verify_page(page(&key, &d, &[])).unwrap();
-        assert_eq!(signed.frontier().hash(), empty.hash());
-        assert!(signed.frontier().head().unwrap().verify(&key.verifying_key()));
+        assert_eq!(&signed.head.hash, empty.hash());
+        assert!(signed.head.verify(&key.verifying_key()));
         assert!(empty.verify_page(page(&key, &[2; 32], &[])).unwrap_err().is::<WrongLog>());
         assert!(empty.verify_page(page(&SigningKey::from_bytes(&[9; 32]), &d, &[])).unwrap_err().is::<Forged>());
         let unsigned = Head { sig: Bytes::default(), ..page(&key, &d, &[]).head };
@@ -167,38 +123,34 @@ mod tests {
         tampered.entries[0] = Bytes(b"tampered".to_vec());
         assert!(empty.verify_page(tampered).unwrap_err().is::<InvalidProof>());
         assert!(empty.head().is_none());
-        let verified = empty.verify_page(long.clone()).unwrap();
-        verified.frontier().check(&short, Some(short.hash)).unwrap();
+        let frontier = Frontier::from_head(s, d, empty.verify_page(long.clone()).unwrap().head).unwrap();
+        frontier.check(&short, Some(short.hash)).unwrap();
         let resigned = Head::sign(&key, &d, 2, long.head.hash, 100);
-        verified.frontier().check(&resigned, None).unwrap();
+        frontier.check(&resigned, None).unwrap();
         let fork = page(&key, &d, &[b"x"]).head;
-        verified.frontier().check(&fork, None).unwrap();
-        let err = verified.frontier().check(&fork, Some(short.hash)).unwrap_err().downcast::<Contradiction>().unwrap();
+        frontier.check(&fork, None).unwrap();
+        let err = frontier.check(&fork, Some(short.hash)).unwrap_err().downcast::<Contradiction>().unwrap();
         assert_eq!((err.ours, err.theirs), (long.head.clone(), fork));
         let equal_fork = page(&key, &d, &[b"x", b"y"]).head;
-        assert!(verified.frontier().check(&equal_fork, None).unwrap_err().is::<Contradiction>());
+        assert!(frontier.check(&equal_fork, None).unwrap_err().is::<Contradiction>());
         let shorter = Frontier::from_head(s, d, short).unwrap();
         let bad_extension = Page { after: 1, entries: vec![Bytes(b"garbage".to_vec())], head: long.head };
         assert!(shorter.verify_page(bad_extension).unwrap_err().is::<InvalidProof>());
     }
 
     #[test]
-    fn rolling_proof_has_no_eight_mib_total_ceiling() {
+    fn pages_chain_without_a_total_ceiling() {
         let key = SigningKey::from_bytes(&[7; 32]);
         let s = key.verifying_key().to_bytes();
         let d = head::reference(&s, &[8; 32]);
-        let empty = Frontier::empty(s, d);
-        let digest = [4; 32];
-        let n = (8 << 20) / 32 + 1;
-        let hash = (0..n).fold(*empty.hash(), |h, _| head::next_digest(&h, &digest));
-        let target = Head::sign(&key, &d, n, hash, 0);
-        let mut proof = empty.proof(target.clone()).unwrap();
-        let chunk = [digest; PAGE_ROWS];
-        for _ in 0..n / PAGE_ROWS as u64 { proof.push(&chunk).unwrap(); }
-        proof.push(&[digest]).unwrap();
-        assert_eq!(proof.finish().unwrap().head(), Some(&target));
-        let mut bad = empty.proof(Head::sign(&key, &d, 1, hash, 0)).unwrap();
-        bad.push(&[digest]).unwrap();
-        assert!(bad.finish().unwrap_err().is::<InvalidProof>());
+        let mut frontier = Frontier::empty(s, d);
+        for _ in 0..3 {
+            let entries = vec![Bytes(vec![4; 32]); PAGE_ROWS];
+            let hash = entries.iter().fold(*frontier.hash(), |h, e| head::next(&h, &e.0));
+            let length = frontier.length() + PAGE_ROWS as u64;
+            let page = Page { after: frontier.length(), entries, head: Head::sign(&key, &d, length, hash, 0) };
+            frontier = Frontier::from_head(s, d, frontier.verify_page(page).unwrap().head).unwrap();
+        }
+        assert_eq!(frontier.length(), 3 * PAGE_ROWS as u64);
     }
 }

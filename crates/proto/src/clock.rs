@@ -10,6 +10,10 @@ use n0_future::time::SystemTime;
 /// meanwhile shows: 10 minutes.
 const KEEP: u64 = 10 * 60 * 1000;
 
+/// How far the service's clock may stand from this one before its reading is ignored: 7 days, so a service cannot move
+/// corrected times by years.
+const MAX_OFFSET: u64 = 7 * 86_400_000;
+
 thread_local! {
     static CLOCK: Cell<Option<fn() -> u64>> = const { Cell::new(None) };
 }
@@ -36,6 +40,7 @@ pub fn set(clock: fn() -> u64) {
 pub fn heard(sent: u64, received: u64, service: u64) {
     let trip = received.saturating_sub(sent);
     let offset = service as i64 - (sent + trip / 2) as i64;
+    if offset.unsigned_abs() > MAX_OFFSET { return; }
     let mut kept = READING.lock().unwrap();
     if kept.is_none_or(|(best, _, at)| trip <= best || received.saturating_sub(at) > KEEP) {
         *kept = Some((trip, offset, received));
@@ -60,6 +65,8 @@ mod tests {
         heard(3_000, 3_900, 3_450);
         assert_eq!(READING.lock().unwrap().map(|(_, offset, _)| offset), Some(10_000));
         heard(2_100 + KEEP + 1, 2_100 + KEEP + 901, 2_100 + KEEP + 451 + 5_000);
+        heard(0, 0, MAX_OFFSET + 1);
+        assert_eq!(READING.lock().unwrap().map(|(_, offset, _)| offset), Some(5_000));
         set(|| 1_000);
         assert_eq!(corrected(), 6_000);
     }

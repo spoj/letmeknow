@@ -14,7 +14,7 @@ use n0_future::boxed::BoxFuture;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::Semaphore;
 
-use crate::{Expired, Forged, Frontier, Refused, Unsupported, VerifiedPage, WrongDirectory, WrongLog};
+use crate::{Expired, Forged, Frontier, Refused, Unsupported, WrongDirectory, WrongLog};
 
 /// Resolves a domain to the directory its service publishes.
 pub type Resolve = Arc<dyn Fn(String) -> BoxFuture<Result<Directory>> + Send + Sync>;
@@ -127,18 +127,17 @@ impl ServeClient {
         let body = json(&Append { capability: *capability, entries: entries.iter().cloned().map(Bytes).collect() })?;
         let appended: Appended = self.request("/membership/2/append", body, Some(head::reference(self.0.key.as_bytes(), capability))).await?;
         Frontier::empty(*self.0.key.as_bytes(), head::reference(self.0.key.as_bytes(), capability)).check(&appended.head, None)?;
-        ensure!(appended.position > 0 && appended.position.checked_add(entries.len() as u64) == Some(appended.head.length + 1), crate::InvalidProof);
         record_time(sent, &appended.head)?;
         Ok(appended)
     }
 
-    pub async fn read(&self, capability: &[u8; 32], anchor: &Frontier) -> Result<VerifiedPage> {
+    pub async fn read(&self, capability: &[u8; 32], anchor: &Frontier) -> Result<Page> {
         ensure!(anchor.service() == self.0.key.as_bytes() && anchor.log_ref() == &head::reference(self.0.key.as_bytes(), capability), WrongLog);
         let sent = clock::now();
         let body = json(&Read { capability: *capability, after: anchor.length() })?;
         let page: Page = self.request("/membership/2/read", body, Some(*anchor.log_ref())).await?;
         let page = anchor.verify_page(page)?;
-        record_time(sent, &page.page().head)?;
+        record_time(sent, &page.head)?;
         Ok(page)
     }
 

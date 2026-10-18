@@ -384,17 +384,6 @@ impl HyperService<Request<Incoming>> for Site {
             "/ping" => return Box::pin(std::future::ready(respond(StatusCode::OK).body(body("")).map_err(Into::into))),
             "/.well-known/letmeknow.json" => return Box::pin(std::future::ready(json(self.directory.clone()).map_err(Into::into))),
             "/health" => return Box::pin(std::future::ready(json(self.health.clone()).map_err(Into::into))),
-            // What the service took in each of the last completed days, which it keeps nothing private of.
-            "/stats" => {
-                let membership = self.membership.clone();
-                return Box::pin(async move {
-                    let res = match membership.stats().await {
-                        Ok(stats) => json(serde_json::to_vec(&stats).unwrap()),
-                        Err(_) => respond(StatusCode::SERVICE_UNAVAILABLE).body(body("busy")),
-                    };
-                    res.map_err(Into::into)
-                });
-            }
             _ => {}
         }
         Box::pin(std::future::ready(

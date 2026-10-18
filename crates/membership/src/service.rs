@@ -9,7 +9,7 @@ use n0_future::task::AbortOnDropHandle;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::{sync::Semaphore, time::timeout};
 
-use crate::{Expired, Refused, store::{DAY_MS, DISK_BYTES, Log, Stats, Store}};
+use crate::{Expired, Refused, store::{DAY_MS, DISK_BYTES, Log, Store}};
 
 const DB_WORK: usize = 4;
 /// How long a request waits for a slot of `DB_WORK` before it is refused as busy. Work that started runs to its end: a
@@ -244,8 +244,6 @@ impl Service {
         tokio::task::spawn_blocking(move || { let _permit = permit; f(&inner) }).await?
     }
 
-    pub async fn stats(&self) -> Result<Stats> { self.work(|inner| inner.store.stats()).await }
-
     /// One pass of expiry, as `Store::expire` runs it; whether more is left.
     pub async fn expire(&self) -> bool {
         let before = (now() / DAY_MS).saturating_sub(self.0.policy.retention_days);
@@ -463,7 +461,6 @@ mod tests {
             releases.push(release);
         }
         assert_eq!(service.work(|_| Ok(())).await.unwrap_err().downcast::<Refused>().unwrap().0, "busy");
-        assert_eq!(service.stats().await.unwrap_err().downcast::<Refused>().unwrap().0, "busy");
         for job in &jobs { job.abort(); }
         for job in jobs { assert!(job.await.unwrap_err().is_cancelled()); }
         assert_eq!(service.0.work.available_permits(), 0);

@@ -5,7 +5,7 @@ pub mod client;
 pub mod service;
 pub mod store;
 
-pub use chain::{Contradiction, Forged, Frontier, InvalidProof, Proof, VerifiedPage, WrongLog};
+pub use chain::{Contradiction, Forged, Frontier, InvalidProof, WrongLog};
 
 #[derive(Debug, thiserror::Error)]
 #[error("the membership service refused: {0}")]
