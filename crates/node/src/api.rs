@@ -9,7 +9,7 @@ use lmk_proto::group::Settings;
 use lmk_proto::Bytes;
 use serde_json::{Value, json};
 
-use crate::{G, Member, Message, Node, Rec, State, Work};
+use crate::{G, Member, Message, Node, Rec, State};
 
 impl Node {
     /// Stops the peers and every task, and closes the provider.
@@ -68,7 +68,6 @@ impl Node {
             let mls = Group::create(&st.provider, &st.session, &settings)?;
             st.add_group(mls, Rec::default())?
         };
-        self.inner.work.send(Work::Entered(self.log(&gid)?.0)).ok();
         Ok(Bytes(gid))
     }
 
@@ -113,13 +112,13 @@ impl Node {
         }
     }
 
-    /// Sends a held payload, a reply to the delivered message `reply_to` if given. The node first reads the group's log
-    /// from the membership service, waiting for it at most 5 seconds; then it seals the payload to the members as of then,
-    /// keeps it, delivers it to this session and pushes it to the members online, and seals it again in each epoch until
-    /// a cut keeps it. Answers its id. Fails with `SendError` when this session sends faster than members take, or
-    /// the message is too large.
+    /// Sends a held payload, a reply to the delivered message `reply_to` if given. The node first asks the membership
+    /// service about the group's log, and catches up if it moved, waiting at most 5 seconds; then it seals the payload to
+    /// the members as of then, keeps it, delivers it to this session and pushes it to the members online, and seals it
+    /// again in each epoch until a cut keeps it. Answers its id. Fails with `SendError` when this session sends faster
+    /// than members take, the message is too large, the service let the log go, or the session did not catch up.
     pub async fn send(&self, gid: &[u8], payload: &Value, reply_to: Option<&[u8]>) -> Result<Bytes> {
-        self.inner.refresh(gid).await;
+        self.inner.refresh(gid).await?;
         self.inner.send(&mut self.inner.lock(), gid, payload, reply_to)
     }
 
@@ -149,14 +148,9 @@ impl Node {
         Ok(())
     }
 
-    /// Asks the services whether the logs members are behind in were let go, as every hour does.
-    pub async fn sync_members(&self) -> Result<()> {
-        self.inner.ask_members().await
-    }
-
-    /// Opens the groups' current logs, as every hour does.
-    pub async fn open_logs(&self) {
-        self.inner.open_logs().await
+    /// Asks the services whether the logs the group's members are behind in were let go, as a commit does first.
+    pub async fn ask_behind(&self, gid: &[u8]) -> Result<()> {
+        self.inner.ask_behind(gid).await
     }
 
     /// The reference of a group's current log, its epoch's, at its membership service.

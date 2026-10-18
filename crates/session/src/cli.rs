@@ -98,7 +98,7 @@ pub struct Serve {
     /// MiB the membership database may use: its pages in use and its WAL. Appends past it are refused as quota
     #[arg(long, default_value_t = 4096)]
     pub disk: u64,
-    /// Days a group's log is kept after its first entry, or while it is empty after its last open, 7 to 25
+    /// Days a group's log is kept after its first entry, 7 to 25
     #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u64).range(7..=lmk_proto::membership::MAX_RETENTION_DAYS))]
     pub retention: u64,
     /// A certificate (PEM) to use instead of Let's Encrypt, with --key

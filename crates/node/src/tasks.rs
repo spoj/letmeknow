@@ -1,6 +1,6 @@
 //! Starting a session and its background tasks: what steps produced goes out in order (`send_out`), the work the
-//! group logic hands on runs one item at a time (`drive`), the session catches up as it starts (`resume`) and keeps its
-//! logs and duties every hour (`upkeep`).
+//! group logic hands on runs one item at a time (`drive`), and the session catches up as it starts (`resume`) and runs
+//! each group's duties.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -9,12 +9,12 @@ use anyhow::{Context, Result};
 use iroh::{EndpointId, RelayUrl};
 use lmk_core::group::{Group, Session};
 use lmk_core::provider::SqliteProvider;
-use lmk_net::peers::Peers;
+use lmk_net::peers::{Peers, WAIT};
 use lmk_net::Net;
 use lmk_proto::group::{Leaf, REVISION};
 use lmk_proto::Bytes;
+use n0_future::time::{Duration, sleep};
 use n0_future::{join_all, task::spawn};
-use n0_future::time::sleep;
 use tokio::sync::mpsc;
 
 use crate::{Config, Event, G, Inner, Node, Out, Rec, State, Work, admission, endpoint_id, get, hex, iroh_key, logs, now, peering, rec_key};
@@ -122,14 +122,12 @@ impl Inner {
         });
         self.spawn(self.clone().drive(work));
         self.spawn(self.clone().send_out(outbox));
-        self.spawn(self.clone().upkeep());
         let st = self.lock();
         // A session removed by a commit it applied before it stopped is told so now. A group its log's reading dropped
         // meanwhile is gone already.
         for (gid, g) in &st.groups {
-            if !g.mls.active() {
-                self.work.send(Work::Gone(gid.clone())).ok();
-            }
+            let work = if g.mls.active() { Work::Duties(gid.clone()) } else { Work::Gone(gid.clone()) };
+            self.work.send(work).ok();
         }
         drop(st);
         self.spawn(self.clone().resume());
@@ -163,21 +161,6 @@ impl Inner {
         }
     }
 
-    /// Every `OPEN`, from now on: opens the groups' logs, asks about the logs members are behind in, runs every group's
-    /// duties, and scrubs.
-    async fn upkeep(self: Arc<Self>) {
-        loop {
-            self.open_logs().await;
-            if let Err(error) = self.ask_members().await {
-                self.report(&error);
-            }
-            for gid in self.lock().groups.keys() {
-                self.work.send(Work::Duties(gid.clone())).ok();
-            }
-            sleep(logs::OPEN).await;
-            self.lock().scrub = true;
-        }
-    }
 
     /// Dials a member, at the relay it last said it was on, then its fallback, and tells `Peers` how it went.
     fn dial(self: &Arc<Self>, peer: EndpointId) {
@@ -224,15 +207,16 @@ impl Inner {
         while let Some(item) = work.recv().await {
             match item {
                 Work::Applied { group, by, added, removed, gone } => self.applied(&group, by, added, removed, gone).await,
-                Work::Entered(log) => {
+                Work::Duties(gid) => self.duties(&gid),
+                Work::Lapsed(log) => {
                     let node = self.clone();
                     self.spawn(async move {
-                        if let Err(error) = node.open(&log).await {
-                            tracing::debug!("opening log {}: {error:#}", hex(&log));
+                        sleep(Duration::from_millis(WAIT)).await;
+                        if let Err(error) = node.read(&log).await {
+                            tracing::debug!("reading the lapsed log {}: {error:#}", hex(&log));
                         }
                     });
                 }
-                Work::Duties(gid) => self.duties(&gid),
                 Work::Gone(group) => self.gone(&group, None),
             }
         }

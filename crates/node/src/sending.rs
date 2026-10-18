@@ -150,13 +150,11 @@ impl Inner {
     }
 
     /// Seals this session's messages past its cut again in the current epoch, in seq order, and pushes them in frames,
-    /// to each member that joined before they were sent: once per epoch, at the head of its log, once the log has been
-    /// read.
+    /// to each member that joined before they were sent: once per epoch, at the head of its log as far as it knows.
     pub(crate) fn reseal(&self, st: &mut State, gid: &[u8]) -> Result<()> {
         let g = st.group(gid)?;
         let epoch = g.mls.epoch();
-        let read = st.logs.get(&g.rec.log.0).is_some_and(|log| log.at > 0);
-        if g.rec.resealed >= epoch || !read || !st.at_head(gid) {
+        if g.rec.resealed >= epoch || !st.at_head(gid) {
             return Ok(());
         }
         let me = st.me().to_vec();

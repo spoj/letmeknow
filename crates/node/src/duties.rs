@@ -1,8 +1,9 @@
 //! A group's duties, each derived from committed records and idempotent: a pass runs at the log's head after each
-//! advance, at start, and every hour (`OPEN`). It drops what the group kept past H, and commits at most once, with every
-//! Remove due (members whose `leave` the cut it builds keeps, and members left behind in an epoch whose log was let go)
-//! and this session's update if due (each T, at an offset of its own), which first fetches for at most `HEAR` what the
-//! last commit kept and connected members hold past the cut.
+//! advance, at start, and at this session's next update, and one whose commit failed again after `RETRY`. It drops what
+//! the group kept past H, and commits at most once, with every Remove due (members whose `leave` the cut it builds
+//! keeps, and members left behind in an epoch whose log was let go, as the service answers just before) and this
+//! session's update if due (each T, at an offset of its own), which first fetches for at most `HEAR` what the last
+//! commit kept and connected members hold past the cut.
 
 use std::sync::Arc;
 
@@ -22,6 +23,8 @@ use crate::{G, Inner, State, Work, days, get, now};
 
 /// How soon a pass runs again while an update waits for its fetch.
 const BLOCKED: u64 = 10_000;
+/// How soon a pass runs again after its commit failed, as while the service is down.
+const RETRY: u64 = 10 * 60 * 1000;
 
 /// When the leaf of the member with key `key`, last updated at `updated`, is next due an update, in milliseconds: at its
 /// first slot after `updated`, its slots every `update` seconds at an offset by a hash of its key, so that members
@@ -186,15 +189,21 @@ impl Inner {
         if !commit {
             return Ok(());
         }
-        self.commit(gid, due).await?;
+        let committed = async {
+            self.ask_behind(gid).await?;
+            self.commit(gid, due).await
+        };
+        if let Err(error) = committed.await {
+            self.time(gid, now() + RETRY);
+            return Err(error);
+        }
         Ok(())
     }
 
-    /// Runs the group's duties again at `at`, if that is sooner than the next hourly run (`OPEN`) and than the run already
-    /// timed.
+    /// Runs the group's duties again at `at`, unless a run is timed sooner.
     fn time(self: &Arc<Self>, gid: &[u8], at: u64) {
         let wait = at.saturating_sub(now());
-        if wait == 0 || wait >= crate::logs::OPEN.as_millis() as u64 {
+        if wait == 0 {
             return;
         }
         {

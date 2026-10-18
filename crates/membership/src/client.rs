@@ -118,9 +118,9 @@ impl ServeClient {
         }
     }
 
-    /// Appends entries to a log; none opens a group log, as `Store::append` says.
+    /// Appends entries to a log, at least one.
     pub async fn append(&self, capability: &[u8; 32], entries: &[Vec<u8>]) -> Result<Appended> {
-        ensure!(entries.len() <= membership::APPEND_ROWS
+        ensure!((1..=membership::APPEND_ROWS).contains(&entries.len())
             && entries.iter().all(|e| !e.is_empty() && e.len() <= membership::MAX_ENTRY)
             && entries.iter().map(Vec::len).sum::<usize>() <= membership::APPEND_BYTES, Refused("size".into()));
         let sent = clock::now();

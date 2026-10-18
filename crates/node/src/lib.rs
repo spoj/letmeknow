@@ -126,6 +126,10 @@ pub enum SendError {
     Rate,
     #[error("size: {0}")]
     Size(String),
+    #[error("let go: the membership service let the group's log go; this session leaves the group unless a member online brings what it missed")]
+    LetGo,
+    #[error("behind: the group moved on, and this session has not caught up yet; send again")]
+    Behind,
 }
 
 #[derive(Debug)]
@@ -260,7 +264,7 @@ pub(crate) struct G {
     unverified: Vec<(EndpointId, Signed)>,
     /// This session's summary changed since it was signed.
     changed: bool,
-    /// Epochs behind this session's whose logs their services let go, as the hourly check found.
+    /// Epochs behind this session's whose logs their services let go, as the check before its last commit found.
     lapsed: Vec<u64>,
 }
 
@@ -378,10 +382,10 @@ pub(crate) enum Work {
         removed: Vec<core::Member>,
         gone: bool,
     },
-    /// A group's new log: opened, so that the service keeps it a retention from now, and read if its head moved.
-    Entered(Vec<u8>),
     /// A group's duties to run.
     Duties(Vec<u8>),
+    /// A group's current log, just found let go: read again once `WAIT` passed.
+    Lapsed(Vec<u8>),
     /// A group this session is out of, by no one's commit.
     Gone(Vec<u8>),
 }

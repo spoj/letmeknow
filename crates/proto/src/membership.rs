@@ -103,9 +103,9 @@ fn gone_logs<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Expiry>, D::Error> {
 
 pub fn encoded_entry_bytes(entry: &Bytes) -> usize { (entry.0.len() * 4).div_ceil(3) + 3 }
 
-/// Whether an append's entries are within its limits: none opens a group log.
+/// Whether an append's entries are within its limits: at least one.
 pub fn valid_append(entries: &[Bytes]) -> bool {
-    entries.len() <= APPEND_ROWS
+    (1..=APPEND_ROWS).contains(&entries.len())
         && entries.iter().all(|e| !e.0.is_empty() && e.0.len() <= MAX_ENTRY)
         && entries.iter().map(|e| e.0.len()).sum::<usize>() <= APPEND_BYTES
 }

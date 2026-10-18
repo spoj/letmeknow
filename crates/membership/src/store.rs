@@ -16,7 +16,7 @@ const EXPIRE_BYTES: u64 = 4 << 20;
 pub const DAY_MS: u64 = 86_400_000;
 const FORMAT: u32 = 7;
 pub const DISK_BYTES: u64 = 4 << 30;
-const EXPIRY: &str = "SELECT reference FROM anchors WHERE opened<? LIMIT ?";
+const EXPIRY: &str = "SELECT reference FROM anchors WHERE day<? LIMIT ?";
 const DOOMED: &str = "SELECT reference FROM doomed LIMIT 1";
 const DOOMED_RECORDS: &str = "SELECT position,length(sealed) FROM records WHERE reference=? ORDER BY position LIMIT ?";
 const READ_RECORDS: &str = "SELECT sealed FROM records WHERE reference=? AND position>? ORDER BY position LIMIT ?";
@@ -116,15 +116,15 @@ impl Store {
             "BEGIN IMMEDIATE;
              CREATE TABLE metadata (id INTEGER PRIMARY KEY CHECK(id=1), format INTEGER NOT NULL,
                  authority BLOB NOT NULL CHECK(length(authority)=32), passed INTEGER NOT NULL);
-             CREATE TABLE anchors (reference BLOB PRIMARY KEY CHECK(length(reference)=32), opened INTEGER NOT NULL,
+             CREATE TABLE anchors (reference BLOB PRIMARY KEY CHECK(length(reference)=32), day INTEGER NOT NULL,
                  sealed BLOB NOT NULL) WITHOUT ROWID;
-             CREATE INDEX expiry ON anchors(opened);
+             CREATE INDEX expiry ON anchors(day);
              CREATE TABLE expired (reference BLOB PRIMARY KEY CHECK(length(reference)=32), day INTEGER NOT NULL) WITHOUT ROWID;
              CREATE INDEX forgetting ON expired(day);
              CREATE TABLE doomed (reference BLOB PRIMARY KEY CHECK(length(reference)=32)) WITHOUT ROWID;
              CREATE TABLE records (reference BLOB NOT NULL, position INTEGER NOT NULL, sealed BLOB NOT NULL,
                  PRIMARY KEY(reference,position)) WITHOUT ROWID;
-             CREATE VIEW logs AS SELECT reference,opened FROM anchors;
+             CREATE VIEW logs AS SELECT reference,day FROM anchors;
              CREATE VIEW entries AS SELECT reference,position FROM records;",
         )?;
         db.execute("INSERT INTO metadata VALUES(1,?,?,?)", params![FORMAT, key.verifying_key().as_bytes(), now() / DAY_MS])?;
@@ -158,7 +158,7 @@ impl Store {
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let (passed, today): (u64, u64) = (tx.query_row("SELECT passed FROM metadata", [], |r| r.get(0))?, now() / DAY_MS);
         if today > passed {
-            tx.execute("UPDATE anchors SET opened=opened+?", [today - passed])?;
+            tx.execute("UPDATE anchors SET day=day+?", [today - passed])?;
             tx.execute("UPDATE metadata SET passed=?", [today])?;
         }
         tx.commit()?;
@@ -175,17 +175,14 @@ impl Store {
         Head::sign(&self.key, log_ref, length, hash, now())
     }
 
-    /// Appends entries to a log. None opens a group log: it records an empty log, or moves an empty log's `opened` day
-    /// to today, and changes nothing once the log has an entry. A log's first entry sets `opened` to its day.
+    /// Appends entries to a log. A log's first entry records it, with that day as its `day`; until then the store holds
+    /// nothing of it.
     pub fn append(&self, log: &Log, entries: &[Bytes]) -> Result<Appended> {
         ensure!(membership::valid_append(entries), Refused("size".into()));
         let bytes = entries.iter().map(|e| e.0.len() as u64).sum::<u64>();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let (length, mut hash) = self.state(&tx, log)?;
-        if entries.is_empty() && length > 0 {
-            return Ok(Appended { head: self.sign(&log.reference, length, hash) });
-        }
         ensure!(used(&tx, &self.wal)? + bytes <= self.disk, Refused("quota".into()));
         let end = length + entries.len() as u64;
         let day = now() / DAY_MS;
@@ -196,8 +193,8 @@ impl Store {
         }
         let state = seal(&log.key, &[&end.to_be_bytes()[..], &hash].concat());
         tx.execute(
-            "INSERT INTO anchors VALUES(?1,?2,?3) ON CONFLICT(reference) DO UPDATE SET sealed=?3, opened=CASE WHEN ?4 THEN ?2 ELSE opened END",
-            params![log.reference, day, state, length == 0],
+            "INSERT INTO anchors VALUES(?1,?2,?3) ON CONFLICT(reference) DO UPDATE SET sealed=?3",
+            params![log.reference, day, state],
         )?;
         tx.commit()?;
         Ok(Appended { head: self.sign(&log.reference, end, hash) })
@@ -248,7 +245,7 @@ impl Store {
         Ok(tip(db, log)?.unwrap_or((0, head::start(self.key.verifying_key().as_bytes(), &log.reference))))
     }
 
-    /// One bounded pass of expiry, then a truncating checkpoint of the WAL, recording its day. A log goes once its `opened`
+    /// One bounded pass of expiry, then a truncating checkpoint of the WAL, recording its day. A log goes once its
     /// day is before `before_day`, and keeps only its reference and the day it went; `EXPIRED_DAYS` after, once its
     /// entries are deleted, the reference goes too. Returns whether more is left for another pass.
     pub fn expire(&self, before_day: u64) -> Result<bool> {
@@ -409,32 +406,23 @@ mod tests {
         assert_eq!(store.read(&log, 0).unwrap().head.length, 0, "forgotten");
     }
 
-    fn opened(store: &Store, log: &Log) -> u64 {
-        store.db.lock().unwrap().query_row("SELECT opened FROM anchors WHERE reference=?", [log.reference], |r| r.get(0)).unwrap()
+    fn first_day(store: &Store, log: &Log) -> u64 {
+        store.db.lock().unwrap().query_row("SELECT day FROM anchors WHERE reference=?", [log.reference], |r| r.get(0)).unwrap()
     }
 
     #[test]
-    fn an_open_records_or_moves_only_an_empty_group_log() {
+    fn a_first_entry_records_a_log_and_its_day() {
         let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
-        let (group, gone) = (store.log(&[1; 32]), store.log(&[3; 32]));
+        let group = store.log(&[1; 32]);
         on(10);
-        let open = store.append(&group, &[]).unwrap();
-        assert_eq!((open.head.length, opened(&store, &group)), (0, 10), "an open records an empty log");
-        store.append(&gone, &[]).unwrap();
-        on(12);
-        store.append(&group, &[]).unwrap();
-        assert_eq!(opened(&store, &group), 12, "and moves an empty log's day");
+        assert!(store.append(&group, &[]).unwrap_err().is::<Refused>(), "an append of nothing");
+        assert!(!store.records(&group).unwrap(), "a log never appended to is not recorded");
         on(13);
         store.append(&group, &[Bytes(b"commit".to_vec())]).unwrap();
-        assert_eq!(opened(&store, &group), 13, "a first entry sets the day");
         on(15);
-        let open = store.append(&group, &[]).unwrap();
-        assert_eq!((open.head.length, opened(&store, &group)), (1, 13), "an open changes nothing past it");
-
-        store.expire(11).unwrap();
-        assert!(store.append(&gone, &[]).unwrap_err().is::<Expired>(), "a log that went is not opened again");
-        assert!(store.records(&group).unwrap());
+        store.append(&group, &[Bytes(b"another".to_vec())]).unwrap();
+        assert_eq!(first_day(&store, &group), 13, "its first entry sets the day");
     }
 
     #[test]
@@ -443,7 +431,7 @@ mod tests {
         let store = Store::initialize(&path).unwrap();
         let group = store.log(&[1; 32]);
         on(10);
-        store.append(&group, &[]).unwrap();
+        store.append(&group, &[Bytes(vec![1])]).unwrap();
         store.expire(3).unwrap();
         drop(store);
         on(30);
@@ -462,7 +450,7 @@ mod tests {
         let store = Store::initialize(&path).unwrap();
         let group = store.log(&[1; 32]);
         on(10);
-        store.append(&group, &[]).unwrap();
+        store.append(&group, &[Bytes(vec![1])]).unwrap();
         store.expire(3).unwrap();
         drop(store);
         on(11);

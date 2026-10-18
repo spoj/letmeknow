@@ -2,13 +2,12 @@
 //! the earlier epochs' logs it still reads. A capability names each at its membership service, which keeps it under the
 //! reference `head::reference` derives from it, the log's id here. Each is read from its service, chained, held entry by
 //! entry, shown to peers by its newest signed head and caught up from them, and handed to its group once held. A
-//! session asks a service about its logs only before it sends, and as it opens them hourly: online members bring it
-//! the rest.
+//! session asks a service about its logs only before it sends and as it commits: online members bring it the rest.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use lmk_core::provider::SqliteProvider;
 use lmk_membership::client::{Post, ServeClient};
 use lmk_membership::{Contradiction, Expired, Frontier, Unsupported, WrongDirectory};
@@ -18,20 +17,16 @@ use lmk_proto::group::Service;
 use lmk_proto::head::{self, Head};
 use lmk_proto::membership::{Known, STALE};
 use lmk_proto::clock::corrected;
-use n0_future::time::{Duration, timeout};
+use n0_future::time::{Duration, Instant, timeout};
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 
-use crate::{Epoch, Inner, State, Work, get, hex, put};
+use crate::{Epoch, Inner, SendError, State, Work, get, hex, put};
 
 pub(crate) const NOT_FOLLOWED: &str = "this session does not follow that log";
 
 /// How long a send waits for the service: chat works while it is down.
 const SEND_WAIT: Duration = Duration::from_secs(5);
-/// How often a session opens its groups' logs, asks about the logs members are behind in, and runs its groups' duties.
-pub(crate) const OPEN: Duration = Duration::from_secs(60 * 60);
-
-/// The logs asked of one service, each with the length held.
-type Asked = (Service, Vec<(Vec<u8>, Known)>);
 
 /// One membership client per service, sharing the session's post.
 pub(crate) struct Clients {
@@ -232,103 +227,71 @@ impl State {
         Ok(())
     }
 
-    /// A group's current log at its service, with its capability and the length held.
-    fn followed(&self, gid: &[u8]) -> Option<(Vec<u8>, Service, Known)> {
-        let id = self.groups.get(gid)?.rec.log.0.clone();
-        let log = self.logs.get(&id)?;
-        let capability = self.capability(&id).ok()?;
-        Some((id, log.service.clone(), Known(capability, log.length())))
-    }
 }
 
 impl Inner {
-    /// Asks about a group's current log, and reads the group's logs on through each epoch a commit read moves it to,
-    /// waiting at most `SEND_WAIT`: before it sends to the group.
-    pub(crate) async fn refresh(self: &Arc<Self>, gid: &[u8]) {
-        let (followed, log) = {
-            let st = self.lock();
-            (st.followed(gid).into_iter().collect(), st.group(gid).map(|g| g.rec.log.clone()).ok())
-        };
-        let asked = async {
-            self.ask(followed).await;
-            let moved = self.lock().group(gid).is_ok_and(|g| Some(&g.rec.log) != log.as_ref());
-            if moved && let Err(error) = self.read_group(gid).await {
-                self.report(&error);
-            }
-        };
-        timeout(SEND_WAIT, asked).await.ok();
-    }
-
-    /// Asks each service for the heads of these logs, and reads those that moved. A log the answer leaves out is unchanged
-    /// as of the request, which counts as a read of it; one it lets go is lapsed.
-    async fn ask(self: &Arc<Self>, followed: Vec<(Vec<u8>, Service, Known)>) {
-        let mut services: Vec<Asked> = Vec::new();
-        for (id, service, known) in followed {
-            match services.iter_mut().find(|(s, _)| *s == service) {
-                Some((_, logs)) => logs.push((id, known)),
-                None => services.push((service, vec![(id, known)])),
-            }
-        }
-        for (service, logs) in services {
-            let sent = corrected();
-            let known: Vec<Known> = logs.iter().map(|(_, known)| *known).collect();
-            let moved = match self.clients.client(&service) {
-                Ok(client) => client.heads(&known).await,
-                Err(error) => Err(error),
-            };
-            let answers = match moved {
-                Ok(answers) => answers,
-                Err(error) => {
-                    self.report(&error);
-                    continue;
-                }
-            };
-            let (moved, lapsed): (Vec<_>, Vec<_>) = answers.into_iter().partition(Result::is_ok);
-            let moved: Vec<Head> = moved.into_iter().flatten().collect();
-            let lapsed: Vec<[u8; 32]> = lapsed.into_iter().filter_map(|answer| answer.err().map(|Expired(reference)| reference)).collect();
-            for (id, _) in logs {
-                if lapsed.iter().any(|reference| reference[..] == id[..]) {
-                    if let Err(error) = self.lapse(&mut self.lock(), &id) {
-                        self.report(&error);
-                    }
-                } else if moved.iter().any(|head| head.log_ref[..] == id[..]) {
-                    if let Err(error) = self.read(&id).await {
-                        self.report(&error);
-                    }
-                } else if let Err(error) = self.lock().read_as_of(&id, sent) {
-                    self.report(&error);
-                }
-            }
-        }
-    }
-
-    /// Asks the services whether the logs that members are behind in were let go, and tells each group whose member's log
-    /// one let go to remove it (`due`).
-    pub(crate) async fn ask_members(self: &Arc<Self>) -> Result<()> {
-        let asked: Vec<(Vec<u8>, Epoch)> = {
-            let st = self.lock();
-            st.groups.iter().flat_map(|(gid, g)| g.rec.epochs.iter().filter(|e| e.epoch < g.mls.epoch()).map(|e| (gid.clone(), e.clone()))).collect()
-        };
-        let gone = self.let_go(asked.iter().map(|(_, epoch)| (epoch.service.clone(), epoch.capability)).collect()).await;
-        let mut found = Vec::new();
-        for (gid, epoch) in asked {
-            if gone.contains(&epoch.reference()?) {
-                found.push((gid, epoch.epoch));
-            }
-        }
-        let mut behind = Vec::new();
-        {
+    /// Before a send: asks the service about the group's current log, and reads the group's logs on through each epoch a
+    /// commit moves it to. Fails when the log counts as let go, or the service answered that it moved and this session
+    /// did not catch up within `SEND_WAIT`, as it goes on doing. A service that does not answer within it holds nothing
+    /// back: chat goes on while it is down.
+    pub(crate) async fn refresh(self: &Arc<Self>, gid: &[u8]) -> Result<()> {
+        let started = Instant::now();
+        let (id, service, known) = {
             let mut st = self.lock();
-            for (gid, g) in st.groups.iter_mut() {
-                g.lapsed = found.iter().filter(|(id, _)| id == gid).map(|(_, epoch)| *epoch).collect();
-                if !g.lapsed.is_empty() {
-                    behind.push(gid.clone());
+            let id = st.group(gid)?.rec.log.0.clone();
+            let capability = match st.capability(&id) {
+                Err(error) if error.is::<Expired>() => return self.lapse(&mut st, &id).and(Err(SendError::LetGo.into())),
+                capability => capability?,
+            };
+            (id.clone(), st.log(&id)?.service.clone(), Known(capability, st.log(&id)?.length()))
+        };
+        let sent = corrected();
+        let answer = match timeout(SEND_WAIT, async { self.clients.client(&service)?.heads(&[known]).await }).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(error)) => {
+                self.report(&error);
+                return Ok(());
+            }
+            Err(_) => return Ok(()),
+        };
+        match answer.into_iter().next() {
+            Some(Err(_)) => self.lapse(&mut self.lock(), &id).and(Err(SendError::LetGo.into())),
+            Some(Ok(_)) => {
+                let (read, reading) = oneshot::channel();
+                let (inner, group) = (self.clone(), gid.to_vec());
+                self.spawn(async move {
+                    read.send(inner.read_group(&group).await).ok();
+                });
+                match timeout(SEND_WAIT.saturating_sub(started.elapsed()), reading).await {
+                    Ok(Ok(read)) => read?,
+                    _ => bail!(SendError::Behind),
                 }
+                ensure!(self.lock().at_head(gid), SendError::Behind);
+                Ok(())
+            }
+            None => self.lock().read_as_of(&id, sent),
+        }
+    }
+
+    /// Asks the services whether the logs the group's members are behind in were let go, so that the commit this
+    /// session builds next removes those members (`due`).
+    pub(crate) async fn ask_behind(self: &Arc<Self>, gid: &[u8]) -> Result<()> {
+        let asked: Vec<Epoch> = {
+            let st = self.lock();
+            let g = st.group(gid)?;
+            g.rec.epochs.iter().filter(|e| e.epoch < g.mls.epoch()).cloned().collect()
+        };
+        if asked.is_empty() {
+            return Ok(());
+        }
+        let gone = self.let_go(asked.iter().map(|epoch| (epoch.service.clone(), epoch.capability)).collect()).await;
+        let mut lapsed = Vec::new();
+        for epoch in asked {
+            if gone.contains(&epoch.reference()?) {
+                lapsed.push(epoch.epoch);
             }
         }
-        for gid in behind {
-            self.duties(&gid);
-        }
+        self.lock().group_mut(gid)?.lapsed = lapsed;
         Ok(())
     }
 
@@ -356,41 +319,6 @@ impl Inner {
         gone
     }
 
-    /// Opens a group's log: the service keeps it a retention from its last open while it is empty, so a group whose
-    /// members were all away that long ends. The head it answers shows whether the log moved, when it is read; one it
-    /// let go is lapsed.
-    pub(crate) async fn open(&self, id: &[u8]) -> Result<()> {
-        let (service, capability, length) = {
-            let mut st = self.lock();
-            let capability = match st.capability(id) {
-                Err(error) if error.is::<Expired>() => return self.lapse(&mut st, id),
-                capability => capability?,
-            };
-            (st.log(id)?.service.clone(), capability, st.log(id)?.length())
-        };
-        match self.clients.client(&service)?.append(&capability, &[]).await {
-            Ok(appended) if appended.head.length > length => self.read(id).await,
-            Ok(_) => self.lock().read_as_of(id, corrected()),
-            Err(error) => {
-                if error.is::<Expired>() {
-                    self.lapse(&mut self.lock(), id)?;
-                }
-                Err(error)
-            }
-        }
-    }
-
-    /// Opens the current log of each group this session is in, as every `OPEN` does: a log's retention thus starts at
-    /// most an hour before its last member went offline.
-    pub(crate) async fn open_logs(self: &Arc<Self>) {
-        let logs: Vec<Vec<u8>> = self.lock().groups.values().filter(|g| g.mls.active()).map(|g| g.rec.log.0.clone()).collect();
-        for log in logs {
-            if let Err(error) = self.open(&log).await {
-                self.report(&error);
-            }
-        }
-    }
-
     /// Warns once of what the service answered that it is not the group's, or runs another minor. Other failures are
     /// retried at the next send or open.
     pub(crate) fn report(&self, error: &anyhow::Error) {
@@ -404,8 +332,12 @@ impl Inner {
     pub(crate) async fn read(&self, id: &[u8]) -> Result<()> {
         loop {
             let (capability, service, frontier) = {
-                let st = self.lock();
-                let Ok(capability) = st.capability(id) else { return Ok(()) };
+                let mut st = self.lock();
+                let capability = match st.capability(id) {
+                    Ok(capability) => capability,
+                    Err(error) if error.is::<Expired>() => return self.lapse(&mut st, id).and(Err(error)),
+                    Err(_) => return Ok(()),
+                };
                 let log = st.log(id)?;
                 (capability, log.service.clone(), log.frontier(id)?)
             };
@@ -472,8 +404,8 @@ impl Inner {
     }
 
     /// The service let a log go, as it answered. A group's current log that stays gone for `WAIT`, with no entry of it
-    /// brought meanwhile, is left once it is found gone again: the commit that moves the group on is in it, and no member
-    /// can read it.
+    /// brought meanwhile, is left once it is found gone again, as it is read again then: the commit that moves the group
+    /// on is in it, and no member can read it.
     fn lapse(&self, st: &mut State, id: &[u8]) -> Result<()> {
         let now = crate::now();
         let log = st.logs.get_mut(id).context(NOT_FOLLOWED)?;
@@ -487,8 +419,13 @@ impl Inner {
         };
         let group = log.group.0.clone();
         st.save_log(id)?;
-        if now >= since + WAIT && st.groups.get(&group).is_some_and(|g| g.rec.log.0 == id) {
+        if !st.groups.get(&group).is_some_and(|g| g.rec.log.0 == id) {
+            return Ok(());
+        }
+        if now >= since + WAIT {
             self.work.send(Work::Gone(group)).ok();
+        } else if since == now {
+            self.work.send(Work::Lapsed(id.to_vec())).ok();
         }
         Ok(())
     }
