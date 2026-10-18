@@ -92,10 +92,14 @@ impl Relay {
     }
 }
 
+/// A relay with a self-signed certificate of its own, named apart from the others' (which `post` trusts too): a client
+/// checks a certificate against the roots of its issuer's name, and gives up past 100 checks.
 pub async fn relay() -> Relay {
-    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let cert = CertificateDer::from(certified.cert.der().to_vec());
-    let key = PrivateKeyDer::try_from(certified.signing_key.serialize_der()).unwrap();
+    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+    params.distinguished_name.push(rcgen::DnType::CommonName, format!("relay {}", CERTS.lock().unwrap().len()));
+    let signing_key = rcgen::KeyPair::generate().unwrap();
+    let cert = CertificateDer::from(params.self_signed(&signing_key).unwrap().der().to_vec());
+    let key = PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
     serve(cert, key).await
 }
 
