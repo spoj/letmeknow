@@ -1,5 +1,5 @@
 //! A group's duties, each derived from committed records and idempotent: a pass runs at the log's head after each
-//! advance, at start, and every `TIMER`. It drops what the group kept past H; commits at most once, with every Remove
+//! advance, at start, and every hour (`OPEN`). It drops what the group kept past H; commits at most once, with every Remove
 //! due (members whose `leave` the cut it builds keeps, and members whose devices their identities dropped) and this
 //! session's update if due (each T, at an offset of its own), which first fetches for at most `HEAR` what the last commit
 //! kept and connected members hold past the cut; and in an identity group, has the identity kind run its own
@@ -28,8 +28,6 @@ use crate::held::delivered_key;
 use crate::reading::commit_key;
 use crate::{Event, G, Inner, State, Work, days, get, now};
 
-/// How often every group's duties run, besides as its log moves.
-pub(crate) const TIMER: Duration = Duration::from_secs(10 * 60);
 /// How soon a pass runs again while an update waits for its fetch.
 const BLOCKED: u64 = 10_000;
 
@@ -235,10 +233,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
         Ok(())
     }
 
-    /// Runs the group's duties again at `at`, if that is sooner than `TIMER` and than the run already timed.
+    /// Runs the group's duties again at `at`, if that is sooner than the next hourly run (`OPEN`) and than the run already
+    /// timed.
     fn time(self: &Arc<Self>, gid: &[u8], at: u64) {
         let wait = at.saturating_sub(now());
-        if wait == 0 || wait >= TIMER.as_millis() as u64 {
+        if wait == 0 || wait >= crate::logs::OPEN.as_millis() as u64 {
             return;
         }
         {

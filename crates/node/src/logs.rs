@@ -19,7 +19,7 @@ use lmk_proto::group::{IDENTITY, IdentityRef, Service};
 use lmk_proto::head::{self, Head};
 use lmk_proto::membership::Known;
 use lmk_proto::clock::corrected;
-use n0_future::time::{Duration, sleep, timeout};
+use n0_future::time::{Duration, timeout};
 use serde::{Deserialize, Serialize};
 
 use crate::{Epoch, Event, Inner, MEMBER_WAIT, State, Work, get, hex, put};
@@ -31,9 +31,9 @@ pub(crate) const NOT_FOLLOWED: &str = "this session does not follow that log";
 const FRESH: u64 = 2 * 60 * 1000;
 /// How long a send waits for the service: chat works while it is down.
 const FRESH_WAIT: Duration = Duration::from_secs(5);
-/// How often a session opens its groups' logs, touches its identities' directories, and asks about the logs members are
-/// behind in.
-const OPEN: Duration = Duration::from_secs(60 * 60);
+/// How often a session opens its groups' logs, touches its identities' directories, asks about the logs members are
+/// behind in, and runs its groups' duties.
+pub(crate) const OPEN: Duration = Duration::from_secs(60 * 60);
 /// How long after a public log could not be read it is read again; each failure since doubles the wait, up to `OPEN`.
 const UNREAD: u64 = 30_000;
 
@@ -446,20 +446,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Opens the logs and asks about the members' every `OPEN`, from now on.
-    pub(crate) async fn open_forever(self: Arc<Self>) {
-        loop {
-            self.open_logs().await;
-            if let Err(error) = self.ask_members().await {
-                self.report(&error);
-            }
-            sleep(OPEN).await;
-        }
-    }
-
     /// Warns once of what the service answered that it is not the group's, or runs another minor. Other failures are
     /// retried at the next send or open.
-    fn report(&self, error: &anyhow::Error) {
+    pub(crate) fn report(&self, error: &anyhow::Error) {
         if (error.is::<WrongDirectory>() || error.is::<Unsupported>()) && self.warned.lock().unwrap().insert(error.to_string()) {
             self.warn(None, error.to_string());
         }

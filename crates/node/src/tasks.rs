@@ -1,6 +1,6 @@
 //! Starting a session and its background tasks: what steps produced goes out in order (`send_out`), the work the
-//! group logic hands on runs one item at a time (`drive`), the duties run at start and every while (`resume`), and
-//! files are fetched.
+//! group logic hands on runs one item at a time (`drive`), the session catches up as it starts (`resume`) and keeps its
+//! logs and duties every hour (`upkeep`), and files are fetched.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -18,7 +18,7 @@ use n0_future::{join_all, task::spawn};
 use n0_future::time::{Duration, sleep};
 use tokio::sync::mpsc;
 
-use crate::{COLLECT, Config, Event, G, Inner, MEMBER_WAIT, Node, Out, Rec, State, Work, admission, device_key_key, duties, endpoint_id, get, hex, iroh_key, logs, now, peering, rec_key};
+use crate::{COLLECT, Config, Event, G, Inner, MEMBER_WAIT, Node, Out, Rec, State, Work, admission, device_key_key, endpoint_id, get, hex, iroh_key, logs, now, peering, rec_key};
 
 /// How long a fetch keeps looking for a member that holds the file.
 const FETCH_TRIES: u32 = 12;
@@ -147,7 +147,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         });
         self.spawn(self.clone().drive(work));
         self.spawn(self.clone().send_out(outbox));
-        self.spawn(self.clone().open_forever());
+        self.spawn(self.clone().upkeep());
         let mut st = self.lock();
         let public: Vec<Bytes> = st.logs.values().filter_map(|log| match &log.of {
             logs::Of::Public(id) => Some(id.clone()),
@@ -190,7 +190,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Catches up as this session starts: the public logs it lacks, then the entries it stored and had not applied, as
-    /// while waiting before a commit. Then runs every group's duties, now and every `duties::TIMER`, and scrubs.
+    /// while waiting before a commit.
     async fn resume(self: Arc<Self>) {
         self.refresh_all().await;
         let gids: Vec<Vec<u8>> = self.lock().groups.keys().cloned().collect();
@@ -199,11 +199,20 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 tracing::debug!("applying the stored log of {}: {error:#}", hex(gid));
             }
         }
+    }
+
+    /// Every `OPEN`, from now on: opens the groups' logs and touches the identities' directories, asks about the logs
+    /// members are behind in, runs every group's duties, and scrubs.
+    async fn upkeep(self: Arc<Self>) {
         loop {
+            self.open_logs().await;
+            if let Err(error) = self.ask_members().await {
+                self.report(&error);
+            }
             for gid in self.lock().groups.keys() {
                 self.work.send(Work::Duties(gid.clone())).ok();
             }
-            sleep(duties::TIMER).await;
+            sleep(logs::OPEN).await;
             self.lock().scrub = true;
         }
     }

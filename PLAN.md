@@ -51,7 +51,7 @@ For: simplicity.
 - The ignored `heads_keep_the_target_rate_from_a_cold_cache`, whose bar was the polls' rate.
 - What still speaks of polls: serve's `HEADERS`, `an_idle_connection_is_kept_for_its_next_request`, `a_commit_reaches_a_member_with_no_peer_online_at_its_poll`.
 
-## 7. One hourly loop
+## 7. One hourly loop (done)
 
 For: simplicity.
 
