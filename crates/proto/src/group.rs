@@ -35,7 +35,7 @@ pub enum Service {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     pub protocol: u32,
-    /// H: how many days members carry the group's messages, and the files they link, for others.
+    /// H: how many days members carry the group's messages for others.
     pub carry: u32,
     /// T: how many seconds a member's leaf goes between updates.
     pub update: u32,
@@ -91,12 +91,8 @@ pub struct ChatMessage {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
-    /// A file link (see `links::FileLink`).
-    pub link: String,
     pub name: String,
-    pub size: u64,
-    #[serde(rename = "type")]
-    pub media_type: String,
+    pub data: Bytes,
 }
 
 #[cfg(test)]

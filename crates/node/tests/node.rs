@@ -56,9 +56,6 @@ fn config(relay: &Relay) -> Config {
         resolve: lmk_testing::resolve(),
         post: relay.post(),
         ca: relay.ca(),
-        home: None,
-        files: None,
-        file_limit: 100 << 20,
     }
 }
 
@@ -257,7 +254,8 @@ async fn a_committer_stopped_once_its_add_is_logged_answers_the_retry_with_it() 
     bob.node.shutdown().await.unwrap();
 }
 
-/// A chat of two: a message arrives with its sender, and a removal ends its group for the removed member.
+/// A chat of two: a message arrives with its sender, one of 8 MiB too, and a removal ends its group for the removed
+/// member.
 #[tokio::test(flavor = "multi_thread")]
 async fn chat_and_removal() {
     let relay = relay().await;
@@ -280,7 +278,14 @@ async fn chat_and_removal() {
         _ => None,
     }).await;
     assert_eq!((got.id, got.seq, got.sender.key), (sent, 1, bob.node.key()));
-    let big = message(&"x".repeat(1 << 20));
+    let large = message(&"y".repeat(8 << 20));
+    let sent = bob.node.send(&gid.0, &large, None).await.unwrap();
+    let got = alice.until(|e| match e {
+        Event::Message(message) => Some(message),
+        _ => None,
+    }).await;
+    assert_eq!((got.id, got.payload), (sent, large));
+    let big = message(&"x".repeat(16 << 20));
     let refused = bob.node.send(&gid.0, &big, None).await.unwrap_err();
     assert!(matches!(refused.downcast_ref(), Some(lmk_node::SendError::Size(_))), "{refused:#}");
 
@@ -744,7 +749,6 @@ async fn a_log_let_go_is_no_removal_while_a_peer_brings_the_commits() {
         async move {
             let mut config = config(relay);
             config.post = gate.post(name, relay.post());
-            config.files = Some(dir.join(format!("{name}-files")));
             let (node, events) = Node::start(SqliteProvider::open(&dir.join(format!("{name}.db"))).unwrap(), config).await.unwrap();
             Session { node, events }
         }
@@ -756,7 +760,6 @@ async fn a_log_let_go_is_no_removal_while_a_peer_brings_the_commits() {
     bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID).await.unwrap()).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     let held = bob.node.send(&gid.0, &message("held before refusal"), None).await.unwrap();
-    let file = bob.node.add_file(&gid.0, b"held file".to_vec()).await.unwrap();
     let members = bob.node.members(&gid.0).unwrap();
     let epoch = bob.node.epoch(&gid.0).unwrap();
     let log_ref: [u8; 32] = bob.node.log(&gid.0).unwrap().0.try_into().unwrap();
@@ -791,7 +794,6 @@ async fn a_log_let_go_is_no_removal_while_a_peer_brings_the_commits() {
     assert_eq!(bob.node.members(&gid.0).unwrap(), members);
     assert_eq!(bob.node.epoch(&gid.0).unwrap(), epoch);
     assert_eq!(bob.node.message(&gid.0, &held.0).unwrap().unwrap().payload, message("held before refusal"));
-    assert_eq!(bob.node.file(&file).await.unwrap().unwrap(), b"held file");
     bob.node.shutdown().await.unwrap();
 
     gate.set(false);
@@ -1300,7 +1302,7 @@ impl Hand {
     /// Asks the node for nothing, and waits for its answer, which carries what it gave: it has handled every frame sent
     /// before.
     async fn settle(&mut self, gid: &Bytes) -> Vec<Bytes> {
-        self.send(&Frame::Want { group: gid.clone(), epoch: 0, wants: Vec::new(), ids: Vec::new() }).await;
+        self.send(&Frame::Want { group: gid.clone(), epoch: 0, wants: Vec::new() }).await;
         self.until(|f| match f {
             Frame::Held { items, answers: Some(_), .. } => Some(items),
             _ => None,
@@ -1573,12 +1575,11 @@ async fn two_asks_with_one_key_package_add_it_once() {
     assert_eq!(alice.node.epoch(&gid.0).unwrap(), epoch + 1, "one Add");
 }
 
-/// A member online is not away, though not heard from yet; a file spreads once one member takes it, though another never
-/// answers; a member's adder keeps its key once gone.
+/// A member online is not away, though not heard from yet; a member's adder keeps its key once gone.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_member_online_is_not_away_and_a_file_spreads_on_its_first_holder() {
+async fn a_member_online_is_not_away() {
     let relay = relay().await;
-    let dir = folder("spread");
+    let dir = folder("online");
     std::fs::create_dir_all(&dir).unwrap();
     let (alice_db, carol_db) = (dir.join("alice.db"), dir.join("carol.db"));
     let alice = stored(&relay, &alice_db).await;
@@ -1602,16 +1603,6 @@ async fn a_member_online_is_not_away_and_a_file_spreads_on_its_first_holder() {
     let _carol = hand(&relay, key, &alice.node).await;
     eventually("Carol is online", || alice.node.online(&gid.0).unwrap().iter().any(|m| m.key == carol_key)).await;
     assert!(!alice.node.away(&gid.0).unwrap().iter().any(|m| m.key == carol_key), "online, though not heard from");
-
-    // Bob takes the file a second into the wait.
-    let file = alice.node.add_file(&gid.0, b"attached".to_vec()).await.unwrap();
-    let started = std::time::Instant::now();
-    let (holders, _) = tokio::join!(alice.node.spread(&gid.0, &file), async {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        bob.node.hold(&gid.0, &[file.link()]).unwrap();
-    });
-    assert_eq!(holders.iter().map(|m| m.key.clone()).collect::<Vec<_>>(), [bob.node.key()]);
-    assert!(started.elapsed() < Duration::from_secs(4), "no wait for Carol's answer: {:?}", started.elapsed());
 
     alice.node.remove(&gid.0, &bob.node.key().0).await.unwrap();
     let carol = alice.node.members(&gid.0).unwrap().into_iter().find(|m| m.key == carol_key).unwrap();

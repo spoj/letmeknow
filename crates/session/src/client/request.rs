@@ -11,7 +11,7 @@ pub enum Request {
     Invite {
         #[arg(long)]
         group: Option<String>,
-        /// Days members carry a new group's messages and files for one another
+        /// Days members carry a new group's messages for one another
         #[arg(long, default_value_t = 7, conflicts_with = "group")]
         #[serde(default = "carry")]
         carry: u32,

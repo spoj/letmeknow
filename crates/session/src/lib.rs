@@ -263,9 +263,6 @@ pub async fn listen(
         resolve: network.resolve.clone(),
         post: network.post.clone(),
         ca: network.ca.clone(),
-        home: Some(home.to_path_buf()),
-        files: Some(config.dir.join("files")),
-        file_limit: 100 << 20,
     };
     let (node, events) = Node::start(provider, node_config).await?;
     let lookup = newer_minor(network, config.registry.clone());

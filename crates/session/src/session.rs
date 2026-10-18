@@ -2,11 +2,10 @@
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use crate::client::{Chat, Client, ClientEvent, File, Missing, message_id};
+use crate::client::{Chat, Client, ClientEvent, Missing, message_id};
 use lmk_node::{Event, Message, Node};
 use lmk_proto::Bytes;
-use lmk_proto::group::Service;
-use lmk_proto::links::FileLink;
+use lmk_proto::group::{Attachment, Service};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -64,31 +63,6 @@ fn b64(bytes: &[u8]) -> String {
     serde_json::to_value(Bytes(bytes.to_vec())).expect("JSON").as_str().expect("a string").to_owned()
 }
 
-/// The file extension of an image, by its first bytes: PNG, JPEG, GIF or WebP.
-fn image_type(bytes: &[u8]) -> Option<&'static str> {
-    match bytes {
-        [0x89, b'P', b'N', b'G', ..] => Some("png"),
-        [0xff, 0xd8, 0xff, ..] => Some("jpeg"),
-        [b'G', b'I', b'F', b'8', ..] => Some("gif"),
-        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("webp"),
-        _ => None,
-    }
-}
-
-/// Writes a file into `dir`, in a file only this user can read; returns its path.
-fn save(dir: &Path, link: &FileLink, name: Option<&str>, bytes: &[u8]) -> Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
-    let hash = &hex::encode(link.hash)[..16];
-    let file = match (name, image_type(bytes)) {
-        (Some(name), _) => format!("{hash}-{}", name.replace(|c: char| !c.is_ascii_alphanumeric() && !"._-".contains(c), "-")),
-        (None, Some(extension)) => format!("{hash}.{extension}"),
-        (None, None) => hash.to_owned(),
-    };
-    let path = dir.join(file);
-    private_file(&path, bytes)?;
-    Ok(path)
-}
-
 impl Session {
     pub async fn open(config: Config, db: Connection, node: Node, home: &Path, held: std::fs::File, membership: Service) -> Result<Self> {
         let (client, told) = Client::new(node, membership);
@@ -124,7 +98,7 @@ impl Session {
             }
             for message in unshown.iter().rev() {
                 let event = session.message_event(message)?;
-                session.received(event).await?;
+                session.received(event)?;
             }
         }
         Ok(session)
@@ -210,19 +184,6 @@ impl Session {
                     Err(error) => self.answer(Err(error), reply),
                 }
             }
-            Request::Fetch { link } => match self.fetching(&link) {
-                Ok((link, gid, name)) => {
-                    let dir = self.attachments_dir(&gid);
-                    self.running.spawn_local(async move {
-                        let fetched = async {
-                            let bytes = client.fetched(&gid, &link).await?;
-                            anyhow::Ok(json!({ "path": save(&dir, &link, name.as_deref(), &bytes)?, "bytes": bytes.len() }))
-                        };
-                        Answered(fetched.await, reply)
-                    });
-                }
-                Err(error) => self.answer(Err(error), reply),
-            },
             Request::Client(request) => _ = self.running.spawn_local(async move { Answered(client.request(request).await, reply) }),
             Request::Status { .. } => unreachable!("the CLI sends it as the client's request"),
             Request::Stop => unreachable!("`run` stops on it"),
@@ -237,13 +198,13 @@ impl Session {
     }
 
     /// What the client tells.
-    pub async fn client_event(&mut self, event: ClientEvent) {
-        if let Err(error) = self.on(event).await {
+    pub fn client_event(&mut self, event: ClientEvent) {
+        if let Err(error) = self.on(event) {
             self.warn(format!("{error:#}"));
         }
     }
 
-    async fn on(&mut self, event: ClientEvent) -> Result<()> {
+    fn on(&mut self, event: ClientEvent) -> Result<()> {
         if let ClientEvent::Joined { .. } | ClientEvent::Left { .. } | ClientEvent::Removed { .. } | ClientEvent::Lost { .. } = &event
         {
             let mut item = serde_json::to_value(&event)?;
@@ -263,14 +224,13 @@ impl Session {
         if let ClientEvent::Message { id, .. } = &event {
             let id = message_id(id)?;
             if !self.taken(&id)? {
-                self.received(event).await?;
+                self.received(event)?;
             }
             return Ok(());
         }
         match event {
             ClientEvent::Warning { .. } => self.outbox.print(serde_json::to_value(&event)?),
             ClientEvent::Gone { group } => self.forget(&group)?,
-            ClientEvent::File { hash } => self.arrived(hex::decode(hash)?.try_into().ok().context("a hash is 32 bytes")?).await?,
             _ => {}
         }
         Ok(())
@@ -278,9 +238,7 @@ impl Session {
 
     /// Clears what the session kept of a group the client let go of.
     fn forget(&mut self, gid: &Bytes) -> Result<()> {
-        for table in ["taken", "attachments"] {
-            self.db.execute(&format!("DELETE FROM {table} WHERE gid = ?"), [&gid.0])?;
-        }
+        self.db.execute("DELETE FROM taken WHERE gid = ?", [&gid.0])?;
         let attachments = self.attachments_dir(gid);
         if attachments.exists() {
             std::fs::remove_dir_all(attachments)?;
@@ -310,50 +268,37 @@ impl Session {
             None => None,
         };
         let attachment = match attach {
-            Some((data, name)) => {
-                let data = B64.decode(data)?;
-                let media_type = image_type(&data).map(|t| format!("image/{t}")).unwrap_or_default();
-                Some(File { name, media_type, data })
-            }
+            Some((data, name)) => Some(Attachment { name, data: Bytes(B64.decode(data)?) }),
             None => None,
         };
         Ok((gid, Chat { text, to, reply_to, urgent, attachment }))
     }
 
-    /// Takes in a chat message, in delivery order: printed, with its attachment's file once it is held.
-    async fn received(&mut self, event: ClientEvent) -> Result<()> {
-        let mut item = self.message_item(event)?;
+    /// Takes in a chat message, in delivery order: printed, with its attachment saved into a file only this user can read.
+    fn received(&mut self, event: ClientEvent) -> Result<()> {
+        let ClientEvent::Message { payload, .. } = &event else { bail!("not a chat message") };
+        let attachment: Option<Attachment> = payload.get("attachment").map(|a| serde_json::from_value(a.clone())).transpose()?;
+        let item = self.message_item(event)?;
         let gid: Bytes = serde_json::from_value(item["group"].clone())?;
         let id = message_id(item["id"].as_str().context("a message has an id")?)?;
-        self.db.execute("INSERT OR IGNORE INTO taken (id, gid, at) VALUES (?, ?, ?)", params![id, gid.0, lmk_proto::clock::now()])?;
-        let wakes = wakes(&item, |id| self.mine(id));
-        if item["attachment"].is_object() {
-            let link = FileLink::parse(item["attachment"]["link"].as_str().context("an attachment has a link")?)?;
-            let name = item["attachment"]["name"].as_str().unwrap_or_default().to_owned();
-            self.db.execute(
-                "INSERT OR IGNORE INTO attachments (hash, gid, message, link, name, wakes) VALUES (?, ?, ?, ?, ?, ?)",
-                params![link.hash, gid.0, id, link.link(), name, wakes],
-            )?;
-            match self.client.node().file(&link).await? {
-                Some(bytes) => {
-                    let path = save(&self.attachments_dir(&gid), &link, Some(&name), &bytes)?;
-                    self.db.execute("UPDATE attachments SET path = ? WHERE hash = ? AND message = ?", params![path.to_str(), link.hash, id])?;
-                    item["attachment"]["path"] = json!(path);
-                }
-                None => item["attachment"]["pending"] = json!(true),
-            }
+        let path = item["attachment"]["path"].as_str();
+        self.db.execute("INSERT OR IGNORE INTO taken (id, gid, at, attachment) VALUES (?, ?, ?, ?)", params![id, gid.0, lmk_proto::clock::now(), path])?;
+        if let (Some(attachment), Some(path)) = (attachment, path) {
+            std::fs::create_dir_all(self.attachments_dir(&gid))?;
+            private_file(Path::new(path), &attachment.data.0)?;
         }
+        let wakes = wakes(&item, |id| self.mine(id));
         self.outbox.deliver(item, wakes);
         Ok(())
     }
 
-    /// Forgets the messages taken in more than the group's H ago, and their attachments, with the copies of their files: no
-    /// member can send them again by then.
+    /// Forgets the messages taken in more than the group's H ago, with the copies of their attachments: no member can
+    /// send them again by then.
     fn forget_old(&self) -> Result<()> {
         let node = self.client.node();
         for gid in node.groups() {
             let before = lmk_proto::clock::now().saturating_sub(node.settings(&gid.0)?.carry as u64 * 24 * 3600 * 1000);
-            let old = "SELECT path FROM attachments WHERE path IS NOT NULL AND message IN (SELECT id FROM taken WHERE gid = ?1 AND at < ?2)";
+            let old = "SELECT attachment FROM taken WHERE gid = ?1 AND at < ?2 AND attachment IS NOT NULL";
             let paths: Vec<String> = self.db.prepare(old)?.query_map(params![gid.0, before], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
             for path in paths {
                 match std::fs::remove_file(&path) {
@@ -361,7 +306,6 @@ impl Session {
                     _ => {}
                 }
             }
-            self.db.execute("DELETE FROM attachments WHERE message IN (SELECT id FROM taken WHERE gid = ?1 AND at < ?2)", params![gid.0, before])?;
             self.db.execute("DELETE FROM taken WHERE gid = ?1 AND at < ?2", params![gid.0, before])?;
         }
         Ok(())
@@ -414,9 +358,15 @@ impl Session {
         if payload["urgent"] == true {
             item["urgent"] = json!(true);
         }
-        for field in ["attachment", "sent_at"] {
-            if let Some(value) = payload.get(field) {
-                item[field] = value.clone();
+        if let Some(sent_at) = payload.get("sent_at") {
+            item["sent_at"] = sent_at.clone();
+        }
+        // An attachment shows as the file another member's attached is saved in.
+        if let Some(name) = payload["attachment"]["name"].as_str() {
+            item["attachment"] = json!({ "name": name });
+            if item["from"]["you"] != true {
+                let file = format!("{}-{}", &hex::encode(id)[..16], name.replace(|c: char| !c.is_ascii_alphanumeric() && !"._-".contains(c), "-"));
+                item["attachment"]["path"] = json!(self.attachments_dir(&gid).join(file));
             }
         }
         Ok(item)
@@ -480,48 +430,6 @@ impl Session {
         self.config.dir.join("attachments").join(hex::encode(&gid.0))
     }
 
-    /// A file arrived: for the attachments waiting for it.
-    #[allow(clippy::type_complexity)]
-    async fn arrived(&mut self, hash: [u8; 32]) -> Result<()> {
-        let waiting: Vec<(Vec<u8>, Vec<u8>, String, String, bool)> = self
-            .db
-            .prepare("SELECT gid, message, link, name, wakes FROM attachments WHERE hash = ? AND path IS NULL")?
-            .query_map([hash], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
-            .collect::<Result<_, _>>()?;
-        for (gid, message, link, name, wakes) in waiting {
-            let (gid, link) = (Bytes(gid), FileLink::parse(&link)?);
-            let bytes = self.client.node().file(&link).await?.context("an arrived file is held")?;
-            let path = save(&self.attachments_dir(&gid), &link, Some(&name), &bytes)?;
-            self.db.execute("UPDATE attachments SET path = ? WHERE hash = ? AND message = ?", params![path.to_str(), hash, message])?;
-            let item = json!({ "type": "attachment", "group": b64(&gid.0), "message": hex::encode(&message), "name": name, "path": path });
-            self.outbox.deliver(item, wakes);
-        }
-        Ok(())
-    }
-
-    /// The file a message's attachment links, the group that links it, and the file's name if a message attached it.
-    fn fetching(&self, link: &str) -> Result<(FileLink, Bytes, Option<String>)> {
-        let parsed = FileLink::parse(link.trim())?;
-        let (gid, name) = self.linking(&parsed.link())?.context("no message here links that")?;
-        Ok((parsed, gid, name))
-    }
-
-    /// The group that links `link`, by a message, which names the file, or by a file it holds.
-    fn linking(&self, link: &str) -> Result<Option<(Bytes, Option<String>)>> {
-        let node = self.client.node();
-        for gid in node.groups() {
-            for message in node.messages(&gid.0)? {
-                if message.payload["attachment"]["link"] == link {
-                    return Ok(Some((gid, message.payload["attachment"]["name"].as_str().map(str::to_owned))));
-                }
-            }
-            if node.linked(&gid.0).iter().any(|linked| linked.link() == link) {
-                return Ok(Some((gid, None)));
-            }
-        }
-        Ok(None)
-    }
-
     fn warn(&mut self, text: String) {
         self.outbox.print(json!({ "type": "warning", "text": text }));
     }
@@ -575,8 +483,8 @@ pub async fn run(
                     let Answered(answer, reply) = done.expect("work in flight runs until shutdown");
                     session.answer(answer, reply);
                 }
-                Some(event) = events.recv() => client.event(event).await,
-                Some(event) = session.told.recv() => session.client_event(event).await,
+                Some(event) = events.recv() => client.event(event),
+                Some(event) = session.told.recv() => session.client_event(event),
                 _ = tokio::time::sleep_until(due) => session.tick().await,
                 _ = &mut shutdown => break,
             }

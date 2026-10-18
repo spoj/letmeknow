@@ -28,25 +28,18 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         answers: Option<Vec<Seqs>>,
     },
-    /// Held messages asked of one holder, sealed so that a member in `epoch` can open them: by membership and seq, and
-    /// by id.
+    /// Held messages asked of one holder, sealed so that a member in `epoch` can open them: by membership and seq.
     Want {
         group: Bytes,
         epoch: u64,
         wants: Vec<Seqs>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        ids: Vec<Bytes>,
     },
-    /// BLAKE3 hashes of files.
-    WantFiles { group: Bytes, files: Vec<Bytes> },
-    Have { group: Bytes, files: Vec<Bytes> },
 }
 
-/// Where a member is in a group: its epoch, and that epoch's log, by its reference, with its newest signed head held.
+/// Where a member is in a group: its current epoch's log, by its reference, with its newest signed head held.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct At {
     pub group: Bytes,
-    pub epoch: u64,
     #[serde(with = "fixed32")]
     pub log: [u8; 32],
     pub head: Option<Head>,
@@ -158,14 +151,12 @@ mod tests {
     #[test]
     fn shapes() {
         let wants = vec![Seqs { key: Bytes(vec![2]), joined: 3, seqs: Ranges::from(vec![(1, 10), (13, 50)]) }];
-        let want = Frame::Want { group: Bytes(vec![1]), epoch: 4, wants, ids: Vec::new() };
+        let want = Frame::Want { group: Bytes(vec![1]), epoch: 4, wants };
         let text = serde_json::to_string(&want).unwrap();
         assert_eq!(text, r#"{"want":{"group":"AQ","epoch":4,"wants":[["Ag",3,[[1,10],[13,50]]]]}}"#);
         assert_eq!(serde_json::from_str::<Frame>(&text).unwrap(), want);
         let push = Frame::Held { group: Bytes(vec![1]), items: vec![Bytes(vec![2])], answers: None };
         assert_eq!(serde_json::to_string(&push).unwrap(), r#"{"held":{"group":"AQ","items":["Ag"]}}"#);
-        let files: Frame = serde_json::from_str(r#"{"want_files":{"group":"AQ","files":[]}}"#).unwrap();
-        assert!(matches!(files, Frame::WantFiles { .. }));
         assert!(serde_json::from_str::<Frame>(r#"{"doc":{"group":"AQ"}}"#).is_err(), "a frame this version does not know");
         let summary = r#"{"group":"AQ","member":"Ag","joined":0,"version":1,"time":2,"epoch":3}"#;
         let parsed: Summary = serde_json::from_str(summary).unwrap();

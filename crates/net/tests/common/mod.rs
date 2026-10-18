@@ -1,22 +1,18 @@
-//! A local relay with a self-signed certificate, and a fake of the group logic: who is in which group, and the files
-//! each links.
+//! A local relay with a self-signed certificate, and a fake of the group logic, which lets every frame go.
 
 #![allow(dead_code)]
 
 use std::{
-    collections::HashMap,
     net::{Ipv4Addr, Ipv6Addr},
-    path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
 
 use iroh::{EndpointId, RelayUrl, SecretKey, tls::CaTlsConfig};
 use iroh_relay::server::{CertConfig, QuicConfig, RelayConfig, Server, ServerConfig, TlsConfig};
-use lmk_net::{Admit, Config, Event, Groups, Net};
+use lmk_net::{Admit, Event, Groups, Net};
 use lmk_proto::{
     Answer, Bytes,
-    links::FileLink,
     peer::{Admitted, Frame, Join},
 };
 use n0_future::boxed::BoxFuture;
@@ -65,32 +61,18 @@ pub async fn relays(n: usize) -> Vec<Relay> {
 pub struct Node {
     pub net: Net,
     pub events: mpsc::UnboundedReceiver<Event>,
-    pub fake: Arc<Fake>,
 }
 
-pub struct Options {
-    pub relay_only: bool,
-    pub home: Option<PathBuf>,
-    pub file_limit: u64,
-    pub collect: Duration,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Options { relay_only: false, home: None, file_limit: 100 << 20, collect: Duration::from_secs(3600) }
-    }
-}
-
-pub async fn node(relay: &Relay, key: SecretKey, fake: Arc<Fake>, options: Options) -> Node {
+/// A node on `relay`; with `relay_only`, reached only through it.
+pub async fn node(relay: &Relay, key: SecretKey, relay_only: bool) -> Node {
     let mut builder = lmk_net::builder([relay.url.clone()]).secret_key(key).ca_tls_config(CaTlsConfig::custom_roots([relay.cert.clone()]));
-    if options.relay_only {
+    if relay_only {
         builder = builder.clear_ip_transports();
     }
     let endpoint = builder.bind().await.unwrap();
     tokio::time::timeout(WAIT, endpoint.online()).await.expect("online");
-    let config = Config { home: options.home, files: None, file_limit: options.file_limit, collect: options.collect };
-    let (net, events) = Net::spawn(endpoint, config, fake.clone(), Arc::new(Inviter)).await.unwrap();
-    Node { net, events, fake }
+    let (net, events) = Net::spawn(endpoint, Arc::new(Fake), Arc::new(Inviter)).await.unwrap();
+    Node { net, events }
 }
 
 impl Node {
@@ -139,52 +121,10 @@ impl Admit for Inviter {
     }
 }
 
-#[derive(Default)]
-pub struct Group {
-    pub members: Vec<EndpointId>,
-    pub files: Vec<FileLink>,
-}
-
-pub struct Fake {
-    pub groups: Mutex<HashMap<Vec<u8>, Group>>,
-    /// After this many more membership checks, the peer is no longer a member.
-    pub cut: Mutex<Option<(EndpointId, usize)>>,
-}
-
-impl Fake {
-    pub fn new() -> Arc<Fake> {
-        Arc::new(Fake { groups: Mutex::default(), cut: Mutex::default() })
-    }
-
-    pub fn with(self: &Arc<Self>, group: &[u8], g: Group) -> Arc<Self> {
-        self.groups.lock().unwrap().insert(group.to_vec(), g);
-        self.clone()
-    }
-}
+pub struct Fake;
 
 impl Groups for Fake {
     fn admit(&self, _: &EndpointId, frame: Frame) -> Option<Frame> {
         Some(frame)
-    }
-
-    fn groups(&self) -> Vec<Vec<u8>> {
-        self.groups.lock().unwrap().keys().cloned().collect()
-    }
-
-    fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool {
-        let mut cut = self.cut.lock().unwrap();
-        if let Some((who, left)) = cut.as_mut()
-            && who == peer
-        {
-            if *left == 0 {
-                return false;
-            }
-            *left -= 1;
-        }
-        self.groups.lock().unwrap().get(group).is_some_and(|g| g.members.contains(peer))
-    }
-
-    fn files(&self, group: &[u8]) -> Vec<FileLink> {
-        self.groups.lock().unwrap()[group].files.clone()
     }
 }

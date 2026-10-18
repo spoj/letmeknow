@@ -1,4 +1,4 @@
-//! Invite links and file links.
+//! Invite links.
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -52,31 +52,6 @@ impl Invite {
     }
 }
 
-/// `lmk:<BLAKE3 of the ciphertext, hex>.<plaintext size>#<key, hex>`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FileLink {
-    pub hash: [u8; 32],
-    pub size: u64,
-    pub key: [u8; 32],
-}
-
-impl FileLink {
-    pub fn link(&self) -> String {
-        format!("lmk:{}.{}#{}", hex::encode(self.hash), self.size, hex::encode(self.key))
-    }
-
-    pub fn parse(link: &str) -> Result<Self> {
-        let rest = link.strip_prefix("lmk:").context("a file link starts with lmk:")?;
-        let (located, key) = rest.split_once('#').context("a file link has a key after #")?;
-        let (hash, size) = located.split_once('.').context("a file link has a size")?;
-        Ok(FileLink {
-            hash: hex::decode(hash)?.try_into().ok().context("a hash is 32 bytes")?,
-            size: size.parse()?,
-            key: hex::decode(key)?.try_into().ok().context("a key is 32 bytes")?,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,9 +86,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn file_round_trip() {
-        let file = FileLink { hash: [3; 32], size: 12345, key: [4; 32] };
-        assert_eq!(FileLink::parse(&file.link()).unwrap(), file);
-    }
 }

@@ -1,45 +1,25 @@
-//! A `peer` stream: frames both ways. Files' `want_files` is answered here with `have`, by the serving rules; every other
-//! frame goes to the node as it comes.
+//! A `peer` stream: frames both ways.
 
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-};
+use std::sync::Arc;
 
-use anyhow::Result;
-use iroh::{
-    EndpointId,
-    endpoint::{Connection, RecvStream, SendStream},
-};
-use lmk_proto::{Bytes, frame, peer::Frame};
+use iroh::endpoint::{Connection, RecvStream, SendStream};
+use lmk_proto::{frame, peer::Frame};
 use n0_future::task::spawn;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use crate::{Event, Inner};
-
-/// Takes the answer to a `want_files`; `None` for those sent unasked, whose answers start downloads.
-type HaveReply = Option<oneshot::Sender<Vec<[u8; 32]>>>;
 
 pub(crate) enum Input {
     Frame(Frame),
     Closed,
     Send(Frame),
-    Want { group: Bytes, files: Vec<[u8; 32]>, reply: HaveReply },
-}
-
-struct Session {
-    inner: Arc<Inner>,
-    peer: EndpointId,
-    send: SendStream,
-    /// Our `want_files` awaiting their `have`, in order.
-    wants: HashMap<Bytes, VecDeque<HaveReply>>,
 }
 
 /// Runs the connection's one peer stream; the connection closes with it.
 pub(crate) async fn run(
     inner: Arc<Inner>,
     conn: Connection,
-    send: SendStream,
+    mut send: SendStream,
     mut recv: RecvStream,
     input: mpsc::UnboundedSender<Input>,
     mut rx: mpsc::UnboundedReceiver<Input>,
@@ -55,21 +35,17 @@ pub(crate) async fn run(
         }
         input.send(Input::Closed).ok();
     });
-    let mut session = Session { inner, peer, send, wants: HashMap::new() };
     let result = async {
         while let Some(input) = rx.recv().await {
             match input {
-                Input::Frame(frame) => session.frame(frame).await?,
+                Input::Frame(frame) => {
+                    inner.events.send(Event::Frame(peer, frame)).ok();
+                }
                 Input::Closed => break,
                 Input::Send(frame) => {
-                    if let Some(frame) = session.inner.groups.admit(&session.peer, frame) {
-                        frame::write(&mut session.send, &frame).await?;
+                    if let Some(frame) = inner.groups.admit(&peer, frame) {
+                        frame::write(&mut send, &frame).await?;
                     }
-                }
-                Input::Want { group, files, reply } => {
-                    session.wants.entry(group.clone()).or_default().push_back(reply);
-                    let files = files.into_iter().map(Bytes::from).collect();
-                    frame::write(&mut session.send, &Frame::WantFiles { group, files }).await?;
                 }
             }
         }
@@ -80,45 +56,4 @@ pub(crate) async fn run(
         tracing::debug!("peer stream with {} ended: {e:#}", peer.fmt_short());
     }
     conn.close(0u32.into(), b"peer stream ended");
-}
-
-impl Session {
-    async fn frame(&mut self, frame: Frame) -> Result<()> {
-        match frame {
-            Frame::WantFiles { group, files } => {
-                let mut have = Vec::new();
-                if self.inner.groups.is_member(&group.0, &self.peer) {
-                    let linked = self.inner.groups.files(&group.0);
-                    for file in files {
-                        let Ok(hash) = <[u8; 32]>::try_from(&file.0[..]) else { continue };
-                        if linked.iter().any(|link| link.hash == hash) && self.inner.files.has(&hash).await? {
-                            have.push(file);
-                        }
-                    }
-                }
-                frame::write(&mut self.send, &Frame::Have { group, files: have }).await?;
-            }
-            Frame::Have { group, files } => self.on_have(group, files),
-            frame => {
-                self.inner.events.send(Event::Frame(self.peer, frame)).ok();
-            }
-        }
-        Ok(())
-    }
-
-    fn on_have(&mut self, group: Bytes, files: Vec<Bytes>) {
-        let Some(reply) = self.wants.get_mut(&group).and_then(VecDeque::pop_front) else { return };
-        let hashes: Vec<[u8; 32]> = files.iter().filter_map(|f| f.0[..].try_into().ok()).collect();
-        match reply {
-            Some(reply) => {
-                reply.send(hashes).ok();
-            }
-            None => {
-                let links = self.inner.groups.files(&group.0);
-                for link in links.iter().filter(|link| hashes.contains(&link.hash)) {
-                    self.inner.offer(link, self.peer);
-                }
-            }
-        }
-    }
 }

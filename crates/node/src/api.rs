@@ -6,14 +6,11 @@ use iroh::RelayUrl;
 use lmk_core::group::{Change, Group};
 use lmk_net::Net;
 use lmk_proto::group::Settings;
-use lmk_proto::links::FileLink;
 use lmk_proto::Bytes;
-use n0_future::{FutureExt, MergeUnbounded, StreamExt};
-use n0_future::time::{Duration, sleep, timeout};
 use serde_json::{Value, json};
 
 use crate::held::delivered_key;
-use crate::{G, MEMBER_WAIT, Member, Message, Node, Rec, State, Work, get};
+use crate::{G, Member, Message, Node, Rec, State, Work, get};
 
 impl Node {
     /// Stops the peers and every task, and closes the provider.
@@ -62,11 +59,6 @@ impl Node {
         let connected = self.inner.net().connected();
         let members = self.members(gid)?;
         Ok(members.into_iter().filter(|m| connected.iter().any(|peer| peer.as_bytes()[..] == m.iroh.0[..])).collect())
-    }
-
-    /// The files this session added to a group that no other member held yet.
-    pub fn pending_files(&self, gid: &[u8]) -> Result<Vec<[u8; 32]>> {
-        Ok(self.inner.lock().group(gid)?.rec.pending.clone())
     }
 
     /// A new group with this session its only member.
@@ -132,27 +124,6 @@ impl Node {
         self.inner.send(&mut self.inner.lock(), gid, payload, reply_to)
     }
 
-    /// Holds files for the group's H from now, as those a held message links, unless it holds them already; fetches
-    /// those within this session's limit.
-    pub fn hold(&self, gid: &[u8], links: &[String]) -> Result<()> {
-        let parsed = links.iter().map(|link| FileLink::parse(link)).collect::<Result<Vec<_>>>()?;
-        let mut st = self.inner.lock();
-        let rec = &mut st.group_mut(gid)?.rec;
-        for link in links {
-            if !rec.files.iter().any(|(held, _)| held == link) {
-                rec.link(link.clone());
-            }
-        }
-        st.save(gid)?;
-        self.inner.fetch_within_limit(gid, parsed);
-        Ok(())
-    }
-
-    /// The files a group holds.
-    pub fn linked(&self, gid: &[u8]) -> Vec<FileLink> {
-        lmk_net::Groups::files(&*self.inner, gid)
-    }
-
     /// A held message of the group this session delivered.
     pub fn message(&self, gid: &[u8], id: &[u8]) -> Result<Option<Message>> {
         self.inner.lock().message(gid, id)
@@ -197,79 +168,6 @@ impl Node {
     pub fn scrub(&self) -> Result<()> {
         self.inner.lock().scrub = true;
         Ok(())
-    }
-
-    /// Seals a file and holds it for a group.
-    pub async fn add_file(&self, gid: &[u8], bytes: Vec<u8>) -> Result<FileLink> {
-        let link = self.inner.net().add_file(std::io::Cursor::new(bytes)).await?;
-        let mut st = self.inner.lock();
-        st.group_mut(gid)?.rec.link(link.link());
-        st.save(gid)?;
-        Ok(link)
-    }
-
-    /// A file's plaintext, if it is held whole.
-    pub async fn file(&self, link: &FileLink) -> Result<Option<Vec<u8>>> {
-        if !self.inner.net().has(link.hash).await? {
-            return Ok(None);
-        }
-        let mut plain = Vec::new();
-        self.inner.net().read_file(link, &mut plain).await?;
-        Ok(Some(plain))
-    }
-
-    /// The files this session's groups link now, which it holds.
-    pub fn files(&self) -> Vec<FileLink> {
-        self.groups().iter().flat_map(|gid| lmk_net::Groups::files(&*self.inner, &gid.0)).collect()
-    }
-
-    /// Fetches a file the group links, whatever its size; `Event::File` follows.
-    pub fn fetch(&self, gid: &[u8], link: FileLink) {
-        self.inner.work.send(Work::Fetch { group: gid.to_vec(), link }).ok();
-    }
-
-    /// The first member online found to hold a file whole, waiting up to `wait`; none at once if no member is online.
-    pub async fn holders(&self, gid: &[u8], link: &FileLink, wait: Duration) -> Vec<Member> {
-        // Asks again every half second, as a member may take the file meanwhile, keeping the earlier asks' answers.
-        let first = async {
-            let mut asks = MergeUnbounded::default();
-            loop {
-                if self.online(gid).is_ok_and(|online| online.is_empty()) {
-                    return None;
-                }
-                asks.push(self.inner.net().holders(gid, link.hash));
-                let answered = async {
-                    match asks.next().await {
-                        Some(holder) => Some(holder),
-                        None => std::future::pending().await,
-                    }
-                };
-                let tick = async {
-                    sleep(Duration::from_millis(500)).await;
-                    None
-                };
-                if let Some(holder) = answered.or(tick).await {
-                    return Some(holder);
-                }
-            }
-        };
-        let holder = timeout(wait, first).await.ok().flatten();
-        let st = self.inner.lock();
-        holder.iter().map(|peer| st.by_iroh(gid, peer)).collect()
-    }
-
-    /// Waits until another member online holds a file this session added, or a few seconds; returns them. If none does,
-    /// the file is pending until one fetches it.
-    pub async fn spread(&self, gid: &[u8], link: &FileLink) -> Vec<Member> {
-        let holders = self.holders(gid, link, MEMBER_WAIT).await;
-        let mut st = self.inner.lock();
-        if holders.is_empty()
-            && let Ok(g) = st.group_mut(gid)
-        {
-            g.rec.pending.push(link.hash);
-            st.save(gid).ok();
-        }
-        holders
     }
 
     /// Asks the services whether the logs members are behind in were let go, as every hour does.

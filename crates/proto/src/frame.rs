@@ -6,7 +6,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const ALPN: &[u8] = b"letmeknow/5";
 
 /// The largest frame a reader takes.
-pub const MAX_FRAME: u32 = 16 << 20;
+pub const MAX_FRAME: u32 = 32 << 20;
 
 /// The first frame on every stream: which exchange it carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

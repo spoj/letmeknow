@@ -805,7 +805,7 @@ fn a_payload_that_could_seal_over_the_limit_is_refused() {
     let a = &mut w.m[0];
     let group = a.group.as_mut().unwrap();
     let error = group.seal(&a.provider, &a.session, &over).unwrap_err();
-    assert_eq!(error.to_string(), format!("the message is {} bytes, over the 1 MiB members take", MAX_MESSAGE + 1));
+    assert_eq!(error.to_string(), format!("the message is {} bytes, over the 16 MiB members take", MAX_MESSAGE + 1));
     let sealed = group.seal(&a.provider, &a.session, &most).unwrap();
     assert!(sealed.len() <= MAX_MESSAGE);
 }

@@ -126,7 +126,7 @@ pub enum Request {
         /// Deliver at once to every member, not only those addressed
         #[arg(long)]
         urgent: bool,
-        /// File to attach ("-" reads stdin); each recipient's session saves it into a private file
+        /// File to attach ("-" reads stdin), up to about 12 MiB; each recipient's session saves it into a private file
         #[arg(long, value_name = "FILE")]
         attach: Option<String>,
         /// The attached file's name, set from its path
@@ -144,9 +144,6 @@ pub enum Request {
         #[arg(long, default_value_t = 0)]
         ancestors: usize,
     },
-    /// The file a message links, decrypted into a file only you can read; prints its path
-    #[command(display_order = 20)]
-    Fetch { link: String },
     /// `status --group <group>`: the client's `status`, of that group only.
     #[command(skip)]
     #[serde(skip)]

@@ -1,9 +1,9 @@
 //! One member's session over lmk-core, lmk-net and lmk-membership: its groups and their logs of commits, its held
-//! messages and files, and the invites it shares and the joiners it admits. Held messages travel between members and
-//! are delivered in causal order; commits keep them, by their cuts. A chat sees a group's content through the channels
-//! here (held messages as delivered, and files), and nothing of the rest; the core reads only its own payloads
-//! (`Control`). It stores everything in one SQLite database (the core's `SqliteProvider`), one transaction per step
-//! (`Step`): nothing a step produces leaves the node before its transaction commits.
+//! messages, and the invites it shares and the joiners it admits. Held messages travel between members and are
+//! delivered in causal order; commits keep them, by their cuts. A chat sees a group's content as its held messages are
+//! delivered, and nothing of the rest; the core reads only its own payloads (`Control`). It stores everything in one
+//! SQLite database (the core's `SqliteProvider`), one transaction per step (`Step`): nothing a step produces leaves the
+//! node before its transaction commits.
 
 mod admission;
 mod api;
@@ -19,7 +19,6 @@ mod tasks;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use anyhow::{Context, Result};
@@ -31,7 +30,6 @@ use lmk_membership::client::{Post, Resolve};
 use lmk_net::peers::Peers;
 use lmk_net::Net;
 use lmk_proto::group::Service;
-use lmk_proto::links::FileLink;
 use lmk_proto::peer::{Frame, Seqs, Signed};
 use lmk_proto::Bytes;
 use n0_future::task::{JoinHandle, spawn};
@@ -50,9 +48,7 @@ pub use lmk_proto::clock::now;
 
 /// How long an invite is valid, in milliseconds.
 pub const INVITE_VALID: u64 = 10 * 60 * 1000;
-/// How often files no group holds any longer are deleted.
-pub const COLLECT: Duration = Duration::from_secs(60 * 60);
-/// How long some waits for other members last: for those online to hold a file or an invite.
+/// How long an invite waits for the members online to hold it.
 const MEMBER_WAIT: Duration = Duration::from_secs(5);
 
 pub struct Config {
@@ -66,12 +62,6 @@ pub struct Config {
     /// Posts to a membership service's routes, as the shell does over https.
     pub post: Post,
     pub ca: CaTlsConfig,
-    /// `LETMEKNOW_HOME`, where this machine's sessions publish their addresses.
-    pub home: Option<PathBuf>,
-    /// Where files are kept; in memory if none.
-    pub files: Option<PathBuf>,
-    /// The largest file fetched without being asked.
-    pub file_limit: u64,
 }
 
 /// A group member, from its leaf.
@@ -169,8 +159,6 @@ pub enum Event {
     Heard {
         group: Bytes,
     },
-    /// A file is held whole.
-    File([u8; 32]),
     Warning {
         group: Option<Bytes>,
         text: String,
@@ -185,7 +173,6 @@ impl Event {
             Event::Message(message) => Some(&message.group),
             Event::Lost(lost) => Some(&lost.group),
             Event::Warning { group, .. } => group.as_ref(),
-            Event::File(_) => None,
         }
     }
 }
@@ -201,11 +188,6 @@ struct Rec {
     base: u64,
     /// The epoch this session's own last commit moved the group to.
     committed: u64,
-    /// The files this session added that no other member held yet.
-    pending: Vec<[u8; 32]>,
-    /// File links, with when they were linked: the files this session added, and those held messages link. Each is
-    /// held for the group's H.
-    files: Vec<(String, u64)>,
     /// The invites shared with the group, kept for H after they expire.
     invites: Vec<Rule>,
     /// The `leave`s opened: each one's membership, and its seq.
@@ -254,18 +236,6 @@ struct Rule {
     expires: u64,
     /// The inviter's session key.
     by: Bytes,
-}
-
-impl Rec {
-    fn link(&mut self, link: String) {
-        self.files.push((link, now()));
-    }
-
-    /// The files this session holds for the group: those linked within H.
-    fn held(&self, carry: u32) -> Vec<FileLink> {
-        let since = now().saturating_sub(days(carry));
-        self.files.iter().filter(|(_, at)| *at >= since).filter_map(|(link, _)| FileLink::parse(link).ok()).collect()
-    }
 }
 
 /// H, in milliseconds.
@@ -361,8 +331,6 @@ pub(crate) struct State {
 /// What a step produced for the peers.
 pub(crate) enum Out {
     Frame { peer: EndpointId, frame: Frame },
-    /// Ask the peer for the files the group links that this session lacks.
-    WantFiles { peer: EndpointId, group: Vec<u8> },
     Dial(EndpointId),
     Close(EndpointId),
 }
@@ -423,10 +391,6 @@ pub(crate) enum Work {
     Duties(Vec<u8>),
     /// A group this session is out of, by no one's commit.
     Gone(Vec<u8>),
-    Fetch {
-        group: Vec<u8>,
-        link: FileLink,
-    },
 }
 
 /// A log, and the lengths and hashes of two heads of it that contradict each other.
@@ -439,7 +403,6 @@ pub(crate) struct Inner {
     resolve: Resolve,
     relays: Vec<RelayUrl>,
     chosen: Vec<RelayUrl>,
-    file_limit: u64,
     events: mpsc::UnboundedSender<Event>,
     work: mpsc::UnboundedSender<Work>,
     /// Peer output and client events from steps, in order.
@@ -525,16 +488,6 @@ impl State {
     fn members(&self, gid: &[u8]) -> Result<Vec<Member>> {
         let g = self.group(gid)?;
         Ok(g.mls.members().iter().map(|member| self.member(gid, member)).collect())
-    }
-
-    /// The member whose leaf names an iroh key, or a bare one.
-    fn by_iroh(&self, gid: &[u8], iroh: &EndpointId) -> Member {
-        self.in_leaf(gid, iroh).map(|member| self.member(gid, &member)).unwrap_or_else(|| Member {
-            key: Bytes::default(),
-            iroh: Bytes(iroh.as_bytes().to_vec()),
-            revision: 0,
-            added: None,
-        })
     }
 
     /// The member of a group whose leaf names an iroh key.
@@ -632,7 +585,7 @@ mod tests {
     async fn node(relay: &Relay, post: Post) -> Node {
         let config = Config {
             relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), post,
-            ca: relay.ca(), home: None, files: None, file_limit: 0,
+            ca: relay.ca(),
         };
         Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0
     }
@@ -665,15 +618,5 @@ mod tests {
         for node in [bob, carol] {
             node.shutdown().await.unwrap();
         }
-    }
-
-    #[test]
-    fn a_group_holds_files_linked_within_h() {
-        let link = |n: u8| FileLink { hash: [n; 32], size: 1, key: [0; 32] }.link();
-        let old = now() - 3 * 24 * 3600 * 1000;
-        let files = vec![(link(1), old), (link(2), now())];
-        let rec = Rec { files, ..Rec::default() };
-        let held: Vec<u8> = rec.held(2).iter().map(|file| file.hash[0]).collect();
-        assert_eq!(held, [2]);
     }
 }

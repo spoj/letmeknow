@@ -67,12 +67,11 @@ impl State {
     }
 
     /// Drops what the group kept past H: delivered messages (but this session's own that no cut kept), commit entries,
-    /// invites, file links, earlier logs, and memberships that ended with nothing left here.
+    /// invites, earlier logs, and memberships that ended with nothing left here.
     fn expire(&mut self, gid: &[u8]) -> Result<()> {
         let before = now().saturating_sub(days(self.group(gid)?.mls.settings().carry));
         self.drop_earlier(gid, before)?;
         let g = self.group_mut(gid)?;
-        g.rec.files.retain(|(_, at)| *at >= before);
         g.rec.invites.retain(|rule| rule.expires >= before);
         let g = self.group(gid)?;
         // A record of who added whom stays while its member is in the group, while its invite admits, and for H, so that

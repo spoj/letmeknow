@@ -100,7 +100,6 @@ mod tests {
         assert!(!wakes(&json!({ "type": "joined" }), mine));
         assert!(wakes(&json!({ "type": "removed" }), mine));
         assert!(wakes(&json!({ "type": "lost" }), mine));
-        assert!(!wakes(&json!({ "type": "attachment" }), mine));
     }
 
     #[test]

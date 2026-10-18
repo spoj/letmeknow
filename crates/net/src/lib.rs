@@ -1,20 +1,17 @@
 //! Everything a session says to its peers over iroh: one `letmeknow/5` connection per pair of sessions, its `peer`
-//! stream of frames, an `admission` stream per joiner's request, and files over iroh-blobs. What the frames mean is the
-//! node's (see [`peers`]): this crate moves them, answers the files' `want_files`, and holds no keys.
+//! stream of frames, and an `admission` stream per joiner's request. What the frames mean is the node's (see [`peers`]):
+//! this crate moves them, and holds no keys.
 
-mod files;
 mod peer;
 pub mod peers;
-mod seal;
 
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, Watcher,
     endpoint::{Builder, Connection, RecvStream, SendStream, presets},
@@ -23,33 +20,18 @@ use iroh::{
 use lmk_proto::{
     Answer,
     frame::{self, ALPN, Open, Stream},
-    links::FileLink,
     peer::{Admitted, Frame, Join},
 };
-use n0_future::{FuturesUnordered, StreamExt, boxed::BoxFuture, task::spawn, time::timeout};
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    sync::{mpsc, oneshot},
-};
+use n0_future::{StreamExt, boxed::BoxFuture, task::spawn, time::timeout};
+use tokio::sync::mpsc;
 
-use crate::{
-    files::Files,
-    peer::Input,
-};
+use crate::peer::Input;
 
-/// How long to wait for a peer's `have`.
-const ANSWER_WAIT: Duration = Duration::from_secs(5);
 /// How long a dial at the hint's relays may take before it is dropped for a dial at all relays.
 const HINT_WAIT: Duration = Duration::from_secs(2);
 
-/// What this crate needs from the group logic to serve files and gate frames. Calls are quick and local.
+/// What this crate needs from the group logic to gate frames. Calls are quick and local.
 pub trait Groups: Send + Sync + 'static {
-    /// The groups this session is in.
-    fn groups(&self) -> Vec<Vec<u8>>;
-    /// Whether this session serves `peer` the group: a leaf of it names `peer`.
-    fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool;
-    /// The files the group links now.
-    fn files(&self, group: &[u8]) -> Vec<FileLink>;
     /// What of a frame goes to `peer` as it is written, by the gate as it is then: none if nothing.
     fn admit(&self, peer: &EndpointId, frame: Frame) -> Option<Frame>;
 }
@@ -64,23 +46,10 @@ pub enum Event {
     /// A `peer` stream with the peer started, replacing any other; true when this side dialed it.
     Connected(EndpointId, bool),
     Disconnected(EndpointId),
-    /// A frame on the peer's stream, but files' `want_files` and `have`, which this crate answers.
+    /// A frame on the peer's stream.
     Frame(EndpointId, Frame),
-    /// A file is now held whole.
-    Fetched([u8; 32]),
     /// The endpoint's home relay is now this one.
     Home(RelayUrl),
-}
-
-pub struct Config {
-    /// `LETMEKNOW_HOME`, where one machine's sessions publish their addresses to each other.
-    pub home: Option<PathBuf>,
-    /// Where files are kept; in memory if none.
-    pub files: Option<PathBuf>,
-    /// The largest file fetched without being asked.
-    pub file_limit: u64,
-    /// How often the files no group links any longer are deleted.
-    pub collect: Duration,
 }
 
 /// An endpoint with these relays and no address lookup; relay connections honour the proxy
@@ -97,14 +66,10 @@ pub struct Net {
 
 pub(crate) struct Inner {
     endpoint: Endpoint,
-    config: Config,
     groups: Arc<dyn Groups>,
     admit: Arc<dyn Admit>,
-    files: Arc<Files>,
     links: Mutex<BTreeMap<EndpointId, Link>>,
     events: mpsc::UnboundedSender<Event>,
-    /// The task that publishes this session's addresses in its home, as they change.
-    publishing: Mutex<Option<n0_future::task::JoinHandle<()>>>,
 }
 
 struct Link {
@@ -116,12 +81,9 @@ struct Link {
 impl Net {
     pub async fn spawn(
         endpoint: Endpoint,
-        config: Config,
         groups: Arc<dyn Groups>,
         admit: Arc<dyn Admit>,
     ) -> Result<(Net, mpsc::UnboundedReceiver<Event>)> {
-        let files = Arc::new(Files::new(endpoint.clone(), config.files.clone(), groups.clone(), config.collect).await?);
-        let publishing = config.home.as_ref().map(|home| addresses::publish(&endpoint, home)).transpose()?;
         let (events, rx) = mpsc::unbounded_channel();
         let mut homes = endpoint.watch_addr().stream();
         let reporting = events.clone();
@@ -138,16 +100,12 @@ impl Net {
         }));
         let inner = Arc::new(Inner {
             endpoint: endpoint.clone(),
-            config,
             groups,
             admit,
-            files,
             links: Mutex::default(),
             events,
-            publishing: Mutex::new(publishing),
         });
-        let blobs = inner.files.protocol(inner.groups.clone());
-        let router = Router::builder(endpoint).accept(ALPN, Handler(inner.clone())).accept(iroh_blobs::ALPN, blobs).spawn();
+        let router = Router::builder(endpoint).accept(ALPN, Handler(inner.clone())).spawn();
         Ok((Net { inner, router }, rx))
     }
 
@@ -157,7 +115,6 @@ impl Net {
 
     /// Connects to a member, unless already connected: at the `hint` relays, or if that takes over 2 s, at those and the
     /// `fallback` relays, giving up 5 s later. The fallback is resolved from the start, and awaited once the 2 s are up.
-    /// Each attempt also dials the same-machine addresses.
     pub async fn dial(&self, key: EndpointId, hint: Vec<RelayUrl>, fallback: BoxFuture<Vec<RelayUrl>>) -> Result<()> {
         self.inner.connection(key, hint, fallback).await?;
         Ok(())
@@ -179,22 +136,6 @@ impl Net {
         self.inner.input(&peer).is_some_and(|input| input.send(Input::Send(frame)).is_ok())
     }
 
-    /// Asks a peer for the files the group links that this session lacks, within its limit, and fetches those it has.
-    pub fn want_files(&self, peer: EndpointId, group: &[u8]) {
-        let (inner, group) = (self.inner.clone(), group.to_vec());
-        spawn(async move {
-            let mut files = Vec::new();
-            for link in inner.groups.files(&group) {
-                if link.size <= inner.config.file_limit && !inner.files.has(&link.hash).await.unwrap_or(true) {
-                    files.push(link.hash);
-                }
-            }
-            if let (false, Some(input)) = (files.is_empty(), inner.input(&peer)) {
-                input.send(Input::Want { group: lmk_proto::Bytes(group), files, reply: None }).ok();
-            }
-        });
-    }
-
     /// Asks a member to admit this session, on an `admission` stream of its own.
     pub async fn join(&self, peer: EndpointId, hint: Vec<RelayUrl>, fallback: BoxFuture<Vec<RelayUrl>>, join: Join) -> Result<Answer<Admitted>> {
         let conn = self.inner.connection(peer, hint, fallback).await?;
@@ -204,74 +145,8 @@ impl Net {
         frame::read(&mut recv).await
     }
 
-    /// Seals a file under a new key and holds it.
-    pub async fn add_file(&self, plain: impl AsyncRead + Unpin + Send + Sync + 'static) -> Result<FileLink> {
-        self.inner.files.add(plain).await
-    }
-
-    /// The members online that hold a file whole, as they answer.
-    pub fn holders(&self, group: &[u8], hash: [u8; 32]) -> impl n0_future::Stream<Item = EndpointId> + 'static {
-        let asked: FuturesUnordered<_> = self
-            .inner
-            .members(group)
-            .into_iter()
-            .filter_map(|(peer, input)| {
-                let (reply, answer) = oneshot::channel();
-                input.send(Input::Want { group: group.into(), files: vec![hash], reply: Some(reply) }).ok()?;
-                Some(async move { timeout(ANSWER_WAIT, answer).await.ok()?.ok()?.contains(&hash).then_some(peer) })
-            })
-            .collect();
-        asked.filter_map(|holder| holder)
-    }
-
-    /// Fetches a file from every member online that holds it, whatever its size.
-    pub async fn fetch(&self, group: &[u8], link: &FileLink) -> Result<()> {
-        if self.inner.files.has(&link.hash).await? {
-            return Ok(());
-        }
-        let holders: Vec<_> = self.holders(group, link.hash).collect().await;
-        if holders.is_empty() {
-            bail!("no member online holds {}", link.link());
-        }
-        for holder in holders {
-            self.inner.offer(link, holder);
-        }
-        if !self.inner.files.wait(&link.hash).await? {
-            bail!("could not fetch {}", link.link());
-        }
-        Ok(())
-    }
-
-    /// Whether a file is held whole.
-    pub async fn has(&self, hash: [u8; 32]) -> Result<bool> {
-        self.inner.files.has(&hash).await
-    }
-
-    /// Verified ciphertext bytes held of a file.
-    pub async fn held(&self, hash: [u8; 32]) -> Result<u64> {
-        self.inner.files.held(&hash).await
-    }
-
-    /// Decrypts a held file into `out`.
-    pub async fn read_file(&self, link: &FileLink, out: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
-        self.inner.files.read(link, out).await
-    }
-
-    /// Closes the files store, then the connections and the endpoint, each in full: a session started again in this
-    /// process can open the store only once it is closed (on Windows), and is reached only once no endpoint of its key
-    /// is left closing, refusing connections.
+    /// Closes the connections and the endpoint, in full.
     pub async fn shutdown(&self) -> Result<()> {
-        let publishing = self.inner.publishing.lock().unwrap().take();
-        if let Some(publishing) = publishing {
-            publishing.abort();
-            publishing.await.ok();
-            let home = self.inner.config.home.as_ref().expect("published in a home");
-            match std::fs::remove_file(addresses::path(home, &self.id())) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                removed => removed?,
-            }
-        }
-        self.inner.files.shutdown().await?;
         self.router.shutdown().await?;
         Ok(())
     }
@@ -286,7 +161,7 @@ impl Inner {
         let hinted = if hint.is_empty() {
             None
         } else {
-            timeout(HINT_WAIT, self.endpoint.connect(self.addr(key, hint.clone()), ALPN)).await.ok().and_then(Result::ok)
+            timeout(HINT_WAIT, self.endpoint.connect(addr(key, hint.clone()), ALPN)).await.ok().and_then(Result::ok)
         };
         let conn = match hinted {
             Some(conn) => {
@@ -295,7 +170,7 @@ impl Inner {
             }
             None => {
                 let relays = fallback.await?;
-                self.endpoint.connect(self.addr(key, hint.into_iter().chain(relays)), ALPN).await?
+                self.endpoint.connect(addr(key, hint.into_iter().chain(relays)), ALPN).await?
             }
         };
         match self.register(&conn, true) {
@@ -305,14 +180,6 @@ impl Inner {
             }
             None => self.live(&key).context("the connection closed"),
         }
-    }
-
-    fn addr(&self, key: EndpointId, relays: impl IntoIterator<Item = RelayUrl>) -> EndpointAddr {
-        let mut addr = relays.into_iter().fold(EndpointAddr::new(key), EndpointAddr::with_relay_url);
-        if let Some(home) = &self.config.home {
-            addr = addresses::read(home, &key).into_iter().fold(addr, EndpointAddr::with_ip_addr);
-        }
-        addr
     }
 
     fn live(&self, key: &EndpointId) -> Option<Connection> {
@@ -397,21 +264,10 @@ impl Inner {
             tracing::debug!("admitting {}: {e:#}", peer.fmt_short());
         }
     }
+}
 
-    /// The peers online that are members of a group, by this session's view.
-    fn members(&self, group: &[u8]) -> Vec<(EndpointId, mpsc::UnboundedSender<Input>)> {
-        let links: Vec<_> = self.links.lock().unwrap().iter().map(|(peer, link)| (*peer, link.input.clone())).collect();
-        links.into_iter().filter(|(peer, _)| self.groups.is_member(group, peer)).collect()
-    }
-
-    fn offer(&self, link: &FileLink, holder: EndpointId) {
-        let (events, hash) = (self.events.clone(), link.hash);
-        self.files.offer(link, holder, move |ok| {
-            if ok {
-                events.send(Event::Fetched(hash)).ok();
-            }
-        });
-    }
+fn addr(key: EndpointId, relays: impl IntoIterator<Item = RelayUrl>) -> EndpointAddr {
+    relays.into_iter().fold(EndpointAddr::new(key), EndpointAddr::with_relay_url)
 }
 
 async fn open_peer(conn: &Connection) -> Result<(SendStream, RecvStream)> {
@@ -433,50 +289,5 @@ impl ProtocolHandler for Handler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         self.0.clone().accept(conn).await;
         Ok(())
-    }
-}
-
-/// One machine's sessions find each other through `LETMEKNOW_HOME/addresses/<iroh key>.json`,
-/// which holds `{"addrs": ["<ip:port>", ...]}`.
-mod addresses {
-    use std::{
-        net::SocketAddr,
-        path::{Path, PathBuf},
-    };
-
-    use iroh::{Endpoint, EndpointId, Watcher};
-    use n0_future::StreamExt;
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Serialize, Deserialize)]
-    struct Addresses {
-        addrs: Vec<SocketAddr>,
-    }
-
-    pub fn path(home: &Path, key: &EndpointId) -> PathBuf {
-        home.join("addresses").join(format!("{key}.json"))
-    }
-
-    pub fn publish(endpoint: &Endpoint, home: &Path) -> anyhow::Result<n0_future::task::JoinHandle<()>> {
-        std::fs::create_dir_all(home.join("addresses"))?;
-        let path = path(home, &endpoint.id());
-        let mut updates = endpoint.watch_addr().stream();
-        Ok(n0_future::task::spawn(async move {
-            while let Some(addr) = updates.next().await {
-                let addrs = Addresses { addrs: addr.ip_addrs().copied().collect() };
-                let temp = path.with_extension("tmp");
-                let written = std::fs::write(&temp, serde_json::to_vec(&addrs).unwrap()).and_then(|()| std::fs::rename(&temp, &path));
-                if let Err(e) = written {
-                    tracing::warn!("cannot publish addresses at {}: {e}", path.display());
-                }
-            }
-        }))
-    }
-
-    pub fn read(home: &Path, key: &EndpointId) -> Vec<SocketAddr> {
-        std::fs::read(path(home, key))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Addresses>(&bytes).ok())
-            .map_or_else(Vec::new, |addresses| addresses.addrs)
     }
 }

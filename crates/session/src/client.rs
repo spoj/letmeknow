@@ -16,16 +16,12 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use lmk_node::{Event, Heard, INVITE_VALID, Member, Message, Node};
 use lmk_proto::Bytes;
 use lmk_proto::group::{Attachment, ChatMessage, PROTOCOL, Service, Settings, UPDATE};
-use lmk_proto::links::{FileLink, Invite};
+use lmk_proto::links::Invite;
 use lmk_proto::peer::Seqs;
-use n0_future::time::{Duration, timeout};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{mpsc, oneshot};
-
-/// How long a file asked for may take to arrive.
-const FETCH_WAIT: Duration = Duration::from_secs(60);
+use tokio::sync::mpsc;
 
 pub use lmk_node::fp;
 
@@ -90,8 +86,6 @@ pub enum ClientEvent {
     Lost { group: Bytes, member: Described, messages: Vec<LostMessages> },
     /// A member's summary of the group came: who holds and read what may have changed (`Client::receipts`).
     Heard { group: Bytes },
-    /// A file is held whole.
-    File { hash: String },
     Warning { group: Option<Bytes>, text: String },
 }
 
@@ -102,19 +96,11 @@ pub struct Chat {
     pub to: Vec<String>,
     pub reply_to: Option<[u8; 32]>,
     pub urgent: bool,
-    pub attachment: Option<File>,
-}
-
-pub struct File {
-    pub name: String,
-    pub media_type: String,
-    pub data: Vec<u8>,
+    pub attachment: Option<Attachment>,
 }
 
 #[derive(Default)]
 struct State {
-    /// Files waited for, by hash.
-    files: Vec<([u8; 32], oneshot::Sender<()>)>,
     /// The invite secrets this session is joining by.
     joining: HashSet<Vec<u8>>,
 }
@@ -295,9 +281,8 @@ impl Client {
             let describer = self.describer(&gid)?;
             let online: Vec<Described> = node.online(&gid.0)?.iter().map(|m| describer.describe(m)).collect();
             let away: Vec<Described> = node.away(&gid.0)?.iter().map(|m| describer.describe(m)).collect();
-            let mut only_here: Vec<Value> =
+            let only_here: Vec<Value> =
                 node.only_here(&gid.0)?.iter().map(|(id, payload)| json!({ "what": payload["type"], "id": hex::encode(&id.0) })).collect();
-            only_here.extend(node.pending_files(&gid.0)?.iter().map(|hash| json!({ "what": "file", "id": hex::encode(hash) })));
             only_here_count += only_here.len();
             groups.push(json!({ "group": b64(&gid.0), "online": online, "away": away, "only_here": only_here }));
         }
@@ -336,34 +321,17 @@ impl Client {
         if let Some(id) = &chat.reply_to {
             ensure!(node.message(&gid.0, id)?.is_some(), "unknown message {}", hex::encode(id));
         }
-        let attachment = match chat.attachment {
-            Some(File { name, media_type, data }) => {
-                let size = data.len() as u64;
-                let link = node.add_file(&gid.0, data).await?;
-                Some((link.clone(), Attachment { link: link.link(), name, size, media_type }))
-            }
-            None => None,
-        };
         let payload = ChatMessage {
             content: chat.text,
             to: addressed.iter().map(|m| Bytes(Sha256::digest(&m.key.0)[..8].to_vec())).collect(),
             urgent: chat.urgent,
-            attachment: attachment.as_ref().map(|(_, a)| a.clone()),
+            attachment: chat.attachment,
             sent_at: Some(lmk_proto::clock::corrected()),
         };
         let id = node.send(&gid.0, &serde_json::to_value(payload)?, chat.reply_to.as_ref().map(|id| &id[..])).await?;
-        let describer = self.describer(gid)?;
         let mut answer = json!({ "id": hex::encode(&id.0) });
         if !addressed.is_empty() {
             answer["to"] = json!(addressed.iter().map(|m| fp(&m.key.0)).collect::<Vec<_>>());
-        }
-        if let Some((link, _)) = attachment {
-            let holders = node.spread(&gid.0, &link).await;
-            if holders.is_empty() {
-                answer["attachment"] = json!({ "pending": true, "warning": "no other member holds the file yet; members may still be fetching it" });
-            } else {
-                answer["attachment"] = json!({ "held_by": holders.iter().map(|m| describer.describe(m)).collect::<Vec<_>>() });
-            }
         }
         Ok((id, answer))
     }
@@ -386,30 +354,17 @@ impl Client {
         members.into_iter().find(|m| self::fp(&m.key.0) == fp).with_context(|| format!("no member of {} has the fingerprint {fp}", b64(&gid.0)))
     }
 
-    /// A file a group links: held, or else fetched from the members online, waiting for it up to a minute.
-    pub async fn fetched(&self, gid: &Bytes, link: &FileLink) -> Result<Vec<u8>> {
-        let (arrived, arrival) = oneshot::channel();
-        self.state().files.push((link.hash, arrived));
-        if let Some(bytes) = self.inner.node.file(link).await? {
-            return Ok(bytes);
-        }
-        self.inner.node.fetch(&gid.0, link.clone());
-        timeout(FETCH_WAIT, arrival).await.ok().and_then(Result::ok).context("no member online holds that file; try again when one is")?;
-        self.inner.node.file(link).await?.context("an arrived file is held")
-    }
-
     // Events.
 
     /// Takes an event of this client's node.
-    pub async fn event(&self, event: Event) {
+    pub fn event(&self, event: Event) {
         let group = event.group().cloned();
-        if let Err(error) = self.on(event).await {
+        if let Err(error) = self.on(event) {
             self.warn(group.as_ref(), format!("{error:#}"));
         }
     }
 
-    async fn on(&self, event: Event) -> Result<()> {
-        let node = &self.inner.node;
+    fn on(&self, event: Event) -> Result<()> {
         match event {
             Event::Joined { group, member, by } => {
                 let describer = self.describer(&group)?;
@@ -426,10 +381,6 @@ impl Client {
                 self.emit(ClientEvent::Removed { group, by, not_kept });
             }
             Event::Message(message) if message.payload["type"] == "message" => {
-                // A session holds the file a message attaches.
-                if let Some(link) = message.payload["attachment"]["link"].as_str() {
-                    node.hold(&message.group.0, &[link.to_owned()])?;
-                }
                 let describer = self.describer(&message.group)?;
                 let from = describer.describe(&message.sender);
                 let missing: Vec<Missing> = message.missing.iter().map(|seqs| Missing { from: describer.describe_key(&seqs.key), seqs: seqs.seqs.iter().collect() }).collect();
@@ -447,18 +398,6 @@ impl Client {
                 self.emit(ClientEvent::Lost { group: lost.group, member, messages: messages.collect() });
             }
             Event::Heard { group } => self.emit(ClientEvent::Heard { group }),
-            Event::File(hash) => {
-                let arrived: Vec<oneshot::Sender<()>> = {
-                    let mut st = self.state();
-                    let (arrived, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut st.files).into_iter().partition(|(waited, _)| *waited == hash);
-                    st.files = waiting.into_iter().filter(|(_, arrival)| !arrival.is_closed()).collect();
-                    arrived.into_iter().map(|(_, arrival)| arrival).collect()
-                };
-                for arrival in arrived {
-                    arrival.send(()).ok();
-                }
-                self.emit(ClientEvent::File { hash: hex::encode(hash) });
-            }
             Event::Warning { group, text } => self.warn(group.as_ref(), text),
         }
         Ok(())

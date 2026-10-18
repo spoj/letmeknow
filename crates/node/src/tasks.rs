@@ -1,6 +1,6 @@
 //! Starting a session and its background tasks: what steps produced goes out in order (`send_out`), the work the
 //! group logic hands on runs one item at a time (`drive`), the session catches up as it starts (`resume`) and keeps its
-//! logs and duties every hour (`upkeep`), and files are fetched.
+//! logs and duties every hour (`upkeep`).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -12,16 +12,12 @@ use lmk_core::provider::SqliteProvider;
 use lmk_net::peers::Peers;
 use lmk_net::Net;
 use lmk_proto::group::{Leaf, REVISION};
-use lmk_proto::links::FileLink;
 use lmk_proto::Bytes;
 use n0_future::{join_all, task::spawn};
 use n0_future::time::sleep;
 use tokio::sync::mpsc;
 
-use crate::{COLLECT, Config, Event, G, Inner, MEMBER_WAIT, Node, Out, Rec, State, Work, admission, endpoint_id, get, hex, iroh_key, logs, now, peering, rec_key};
-
-/// How long a fetch keeps looking for a member that holds the file.
-const FETCH_TRIES: u32 = 12;
+use crate::{Config, Event, G, Inner, Node, Out, Rec, State, Work, admission, endpoint_id, get, hex, iroh_key, logs, now, peering, rec_key};
 
 impl Node {
     /// Opens the session in `provider`, creating it on first use, and starts its peers.
@@ -42,7 +38,6 @@ impl Node {
             relays: config.relays.clone(),
             chosen: config.chosen.clone(),
             resolve: config.resolve.clone(),
-            file_limit: config.file_limit,
             events,
             work,
             outbox,
@@ -55,8 +50,7 @@ impl Node {
             contradictions: Mutex::default(),
             warned: Mutex::default(),
         });
-        let net_config = lmk_net::Config { home: config.home, files: config.files, file_limit: config.file_limit, collect: COLLECT };
-        let (net, net_events) = Net::spawn(endpoint, net_config, inner.clone(), Arc::new(admission::Admitter(inner.clone()))).await?;
+        let (net, net_events) = Net::spawn(endpoint, inner.clone(), Arc::new(admission::Admitter(inner.clone()))).await?;
         inner.net.set(net).ok();
         inner.run(net_events, work_rx, outbox_rx);
         Ok((Node { inner }, events_rx))
@@ -123,10 +117,7 @@ impl Inner {
         let peering = self.clone();
         self.spawn(async move {
             while let Some(event) = net_events.recv().await {
-                match event {
-                    lmk_net::Event::Fetched(hash) => peering.fetched_file(hash),
-                    event => peering.peer_event(event),
-                }
+                peering.peer_event(event);
             }
         });
         self.spawn(self.clone().drive(work));
@@ -155,7 +146,6 @@ impl Inner {
                 let Some(net) = self.net.get() else { continue };
                 match out {
                     Out::Frame { peer, frame } => drop(net.frame(peer, frame)),
-                    Out::WantFiles { peer, group } => net.want_files(peer, &group),
                     Out::Dial(peer) => self.dial(peer),
                     Out::Close(peer) => net.close(peer),
                 }
@@ -229,26 +219,6 @@ impl Inner {
         relays
     }
 
-    /// Fetches, in the background, the files linked anew that are within this session's limit.
-    pub(crate) fn fetch_within_limit(&self, gid: &[u8], links: Vec<FileLink>) {
-        for link in links.into_iter().filter(|link| link.size <= self.file_limit) {
-            self.work.send(Work::Fetch { group: gid.to_vec(), link }).ok();
-        }
-    }
-
-    /// Fetches a file from the members online, trying for a while.
-    pub(crate) async fn fetched(&self, gid: &[u8], link: &FileLink) -> Result<()> {
-        let mut last = anyhow::anyhow!("no member online holds the file");
-        for _ in 0..FETCH_TRIES {
-            match self.net().fetch(gid, link).await {
-                Ok(()) => return Ok(()),
-                Err(error) => last = error,
-            }
-            sleep(MEMBER_WAIT).await;
-        }
-        Err(last)
-    }
-
     /// Handles what the group logic and the peers hand on, one at a time.
     async fn drive(self: Arc<Self>, mut work: mpsc::UnboundedReceiver<Work>) {
         while let Some(item) = work.recv().await {
@@ -264,35 +234,8 @@ impl Inner {
                 }
                 Work::Duties(gid) => self.duties(&gid),
                 Work::Gone(group) => self.gone(&group, None),
-                Work::Fetch { group, link } => {
-                    if self.net().has(link.hash).await.unwrap_or(false) {
-                        self.lock().events.push(Event::File(link.hash));
-                        continue;
-                    }
-                    let inner = self.clone();
-                    self.spawn(async move {
-                        if let Err(error) = inner.fetched(&group, &link).await {
-                            tracing::debug!("fetching {}: {error:#}", link.link());
-                        }
-                    });
-                }
             }
         }
-    }
-
-    /// A file is held whole: it is no longer held only here.
-    fn fetched_file(&self, hash: [u8; 32]) {
-        let mut st = self.lock();
-        let gids: Vec<Vec<u8>> = st.groups.keys().cloned().collect();
-        for gid in gids {
-            let g = st.groups.get_mut(&gid).unwrap();
-            let before = g.rec.pending.len();
-            g.rec.pending.retain(|pending| *pending != hash);
-            if g.rec.pending.len() != before {
-                st.save(&gid).ok();
-            }
-        }
-        st.events.push(Event::File(hash));
     }
 }
 

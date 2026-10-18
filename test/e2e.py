@@ -154,12 +154,9 @@ def main():
 
         # An attachment.
         token = write("token.txt", "s3cret")
-        sent = run("alice", "send", "--attach", token, "the token")
-        check(sent["attachment"]["held_by"] == [bob.ready["fp"]], "an attachment is held by another member before send returns")
+        run("alice", "send", "--attach", token, "the token")
         message = bob.expect("message", lambda e: e["content"] == "the token")
-        arrived = bob.expect("attachment") if "path" not in message["attachment"] else message["attachment"]
-        check(content(arrived["path"]) == "s3cret", "the attachment arrives as a private file")
-        check(content(run("bob", "fetch", message["attachment"]["link"])["path"]) == "s3cret", "fetch gives the same file")
+        check(content(message["attachment"]["path"]) == "s3cret", "the attachment arrives as a private file")
 
         # Carol joins through bob.
         joined = run("carol", "join", run("bob", "invite", f"--group={group}")["link"])

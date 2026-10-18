@@ -29,8 +29,6 @@ Messages live only on members, and move only between members online at the same 
 
 If the membership service has let the log of your group's current epoch go, you stay in the group only while an online member brings you the commits you missed; otherwise you leave it within about an hour, its keys are deleted, and the other members remove you, as they remove anyone who fell behind.
 
-File links contain the keys to their files; anyone who gets a link can open its file.
-
 ## Storage
 
 A session commits its records, in SQLite with WAL and full synchronization, before anything that depends on them leaves it; when its storage fails, it stops, and keeps what it had committed. This holds as far as the storage honors synchronization: tests restart processes, they do not cut power.

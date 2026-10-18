@@ -12,10 +12,7 @@ use lmk_net::Groups;
 use lmk_net::peers::{self, Own};
 use lmk_proto::Bytes;
 use lmk_proto::head::Head;
-use lmk_proto::links::FileLink;
 use lmk_proto::peer::{At, Frame, SUMMARY, Seqs, Signed, Summary};
-use n0_future::StreamExt;
-use n0_future::task::spawn;
 use n0_future::time::{Duration, sleep};
 use serde::{Deserialize, Serialize};
 
@@ -66,12 +63,7 @@ fn heard_key(gid: &[u8], key: &[u8], joined: u64) -> Vec<u8> {
 fn group_of(frame: &Frame) -> Option<&Bytes> {
     match frame {
         Frame::Hello { .. } | Frame::Entries { .. } => None,
-        Frame::Versions { group, .. }
-        | Frame::Summaries { group, .. }
-        | Frame::Held { group, .. }
-        | Frame::Want { group, .. }
-        | Frame::WantFiles { group, .. }
-        | Frame::Have { group, .. } => Some(group),
+        Frame::Versions { group, .. } | Frame::Summaries { group, .. } | Frame::Held { group, .. } | Frame::Want { group, .. } => Some(group),
     }
 }
 
@@ -501,16 +493,8 @@ impl Inner {
             // An `at` of a log this session does not hold, of an epoch it has not reached or has dropped, is taken unchecked.
             let shown = |at: &At| at.head.as_ref().is_none_or(|head| head.log_ref == at.log && (!st.logs.contains_key(at.log.as_slice()) || self.vouched(st, head, &peer)));
             let groups: Vec<At> = groups.into_iter().filter(|at| st.groups.contains_key(&at.group.0) && shown(at)).collect();
-            for out in st.peers.frame(&key, &Frame::Hello { groups: groups.clone() }, now) {
+            for out in st.peers.frame(&key, &Frame::Hello { groups }, now) {
                 self.out(st, out)?;
-            }
-            let shows = |head: &Option<Head>| head.as_ref().map(|head| (head.length, head.hash));
-            for at in groups {
-                let gid = at.group.0;
-                let log = &st.group(&gid)?.rec.log.0;
-                if at.log.as_slice() == log && shows(&at.head) == shows(&st.log(log)?.head) && st.admitted(&gid, &peer) {
-                    self.synced(st, &gid, peer)?;
-                }
             }
             return Ok(());
         }
@@ -561,26 +545,6 @@ impl Inner {
                 false
             }
         }
-    }
-
-    /// A neighbour's `hello` shows this session's head of the group's log.
-    fn synced(self: &Arc<Self>, st: &mut State, gid: &[u8], peer: EndpointId) -> Result<()> {
-        st.out.push(Out::WantFiles { peer, group: gid.to_vec() });
-        // A file only this session held may have reached the peer since.
-        let pending = st.group(gid)?.rec.pending.clone();
-        for hash in pending {
-            let (inner, gid) = (self.clone(), gid.to_vec());
-            spawn(async move {
-                if inner.net().holders(&gid, hash).any(|holder| holder == peer).await {
-                    let mut st = inner.lock();
-                    if let Ok(g) = st.group_mut(&gid) {
-                        g.rec.pending.retain(|pending| *pending != hash);
-                        st.save(&gid).ok();
-                    }
-                }
-            });
-        }
-        Ok(())
     }
 }
 
@@ -664,22 +628,6 @@ impl Node {
 }
 
 impl Groups for Inner {
-    fn groups(&self) -> Vec<Vec<u8>> {
-        self.lock().groups.keys().cloned().collect()
-    }
-
-    fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool {
-        self.lock().serves(group, peer)
-    }
-
-    fn files(&self, group: &[u8]) -> Vec<FileLink> {
-        let st = self.lock();
-        let Some(g) = st.groups.get(group) else {
-            return Vec::new();
-        };
-        g.rec.held(g.mls.settings().carry)
-    }
-
     fn admit(&self, peer: &EndpointId, frame: Frame) -> Option<Frame> {
         self.lock().admissible(peer, frame)
     }

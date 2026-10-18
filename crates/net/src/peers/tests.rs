@@ -222,7 +222,7 @@ fn hello_on_connect_carries_the_served_groups_positions() {
     let head = Head { log_ref: [7; 32], length: 3, hash: [0; 32], time: 0, sig: Bytes::default() };
     p.group(id(), Own { head: Some(head.clone()), ..own(1, &[1]) }, 0);
     p.connect(key(1), gs(), false, 0);
-    let groups = vec![At { group: id(), epoch: 1, log: [7; 32], head: Some(head) }];
+    let groups = vec![At { group: id(), log: [7; 32], head: Some(head) }];
     assert!(p.poll(0).contains(&Out::Frame(key(1), Frame::Hello { groups })));
 }
 
@@ -563,10 +563,8 @@ fn an_answer_stops_near_a_mebibyte_and_covers_what_it_reached() {
 fn the_gate() {
     let hello = Frame::Hello { groups: vec![] };
     assert!(takes(&hello, false));
-    let want = Frame::Want { group: id(), epoch: 1, wants: vec![], ids: vec![] };
+    let want = Frame::Want { group: id(), epoch: 1, wants: vec![] };
     assert!(!takes(&want, false) && takes(&want, true));
-    let files = Frame::WantFiles { group: id(), files: vec![] };
-    assert!(!takes(&files, false) && takes(&files, true));
 }
 
 const N: usize = 12;

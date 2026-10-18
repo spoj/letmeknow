@@ -287,7 +287,7 @@ fn send_answers_its_id_and_refuses_a_message_too_large() {
     local(async {
         let world = world("pending").await;
         let (alice, mut bob, _) = pair(&world, HOUR).await;
-        let big = "x".repeat(1 << 20);
+        let big = "x".repeat(16 << 20);
         let refused = alice.cmd(&["send", "--to", &bob.fp, &big]).await.unwrap_err().to_string();
         assert!(refused.contains("members take"), "{refused}");
         bob.stop().await;
@@ -314,28 +314,19 @@ fn an_attachment_arrives_as_a_private_file() {
         let file = world.root.path().join("token.txt");
         std::fs::write(&file, "s3cret").unwrap();
         let sent = bob.cmd(&["send", "--to", &alice.fp, "--attach", file.to_str().unwrap(), "the token"]).await.unwrap();
-        assert_eq!(sent["attachment"]["held_by"], json!([alice.fp]));
         let message = alice.expect("message").await;
+        assert_eq!(keys(&message["attachment"]), keys(&json!({ "name": 0, "path": 0 })));
         assert_eq!(message["attachment"]["name"], "token.txt");
-        assert!(message["attachment"]["link"].as_str().unwrap().starts_with("lmk:"));
-        let path = match message["attachment"]["path"].as_str() {
-            Some(path) => path.to_owned(),
-            None => {
-                assert_eq!(message["attachment"]["pending"], true);
-                let arrived = alice.expect("attachment").await;
-                assert_eq!(keys(&arrived), keys(&json!({ "type": 0, "group": 0, "message": 0, "name": 0, "path": 0 })));
-                assert_eq!(arrived["message"], message["id"]);
-                arrived["path"].as_str().unwrap().to_owned()
-            }
-        };
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "s3cret");
+        let path = message["attachment"]["path"].as_str().unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "s3cret");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
         }
-        let fetched = alice.cmd(&["fetch", message["attachment"]["link"].as_str().unwrap()]).await.unwrap();
-        assert_eq!(fetched["bytes"], 6);
+        let id = sent["id"].as_str().unwrap();
+        assert_eq!(alice.cmd(&["read", id]).await.unwrap()[0]["attachment"], message["attachment"]);
+        assert_eq!(bob.cmd(&["read", id]).await.unwrap()[0]["attachment"], json!({ "name": "token.txt" }), "the sender's own is not saved");
     });
 }
 
@@ -464,23 +455,17 @@ fn a_message_taken_in_is_forgotten_after_h_with_its_attachments_copy() {
         std::fs::write(&file, "s3cret").unwrap();
         bob.cmd(&["send", "--to", &alice.fp, "--attach", file.to_str().unwrap(), "the token"]).await.unwrap();
         let message = alice.expect("message").await;
-        let path = match message["attachment"]["path"].as_str() {
-            Some(path) => path.to_owned(),
-            None => alice.expect("attachment").await["path"].as_str().unwrap().to_owned(),
-        };
+        let path = message["attachment"]["path"].as_str().unwrap();
+        assert!(Path::new(path).exists());
         let db = session_dir(&alice.home, "alice").unwrap().join("session.db");
-        let rows = || {
-            let db = rusqlite::Connection::open(&db).unwrap();
-            let count = |table: &str| db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get::<_, i64>(0)).unwrap();
-            (count("taken"), count("attachments"))
-        };
-        assert_eq!(rows(), (1, 1));
+        let taken = || rusqlite::Connection::open(&db).unwrap().query_row("SELECT count(*) FROM taken", [], |row| row.get::<_, i64>(0)).unwrap();
+        assert_eq!(taken(), 1);
         alice.stop().await;
         LATER.store(8 * 24 * 3600 * 1000, Ordering::Relaxed);
         let alice = world.start("alice", HOUR).await;
         alice.cmd(&["status"]).await.unwrap();
-        assert_eq!(rows(), (0, 0));
-        assert!(!Path::new(&path).exists());
+        assert_eq!(taken(), 0);
+        assert!(!Path::new(path).exists());
     });
 }
 

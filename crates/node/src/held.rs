@@ -21,9 +21,8 @@ use crate::{Event, G, Inner, Lost, LostOf, Member, Message, Rule, State, Work, g
 /// How far past a membership's lowest wanted seq ciphertexts are opened as they come: openmls opens none more than
 /// 1,000 behind the newest it opened of a sender.
 const WINDOW: u64 = 500;
-/// The bytes of ciphertexts a group keeps unopened per membership, and of the next epoch's per peer.
-const UNOPENED: usize = 4 << 20;
-const EARLY: usize = 4 << 20;
+/// The bytes of ciphertexts a group keeps unopened, of its epoch and the next.
+const UNOPENED: usize = 2 * MAX_MESSAGE;
 /// How many hashes of ciphertexts taken are remembered.
 const SEEN: usize = 8192;
 /// How long after a message opened a requirement this session does not hold holds it: while no connected member's
@@ -196,7 +195,7 @@ impl Bucket {
     pub(crate) fn take(&mut self, bytes: usize, scale: f64, now: u64) -> bool {
         let elapsed = now.saturating_sub(self.at) as f64 / 1000.0;
         self.messages = (self.messages + elapsed * scale).min(100.0 * scale);
-        self.bytes = (self.bytes + elapsed * 65536.0 * scale).min(4194304.0 * scale);
+        self.bytes = (self.bytes + elapsed * 65536.0 * scale).min(MAX_MESSAGE as f64 * scale);
         self.at = now;
         let take = self.messages >= 1.0 && self.bytes >= bytes as f64;
         if take {
@@ -376,12 +375,12 @@ impl Inner {
         }
         let Ok((claim, epoch)) = core::claim(&ciphertext) else { return Ok(None) };
         let current = g.mls.epoch();
+        let room = |g: &G| g.early.iter().map(|(_, c)| c.len()).chain(g.unopened.values().map(|(_, c)| c.len())).sum::<usize>() + ciphertext.len() <= UNOPENED;
         if epoch == current + 1 {
-            if let Some(peer) = from {
-                let size: usize = g.early.iter().filter(|(by, _)| *by == peer).map(|(_, early)| early.len()).sum();
-                if size + ciphertext.len() <= EARLY {
-                    g.early.push((peer, ciphertext));
-                }
+            if let Some(peer) = from
+                && room(g)
+            {
+                g.early.push((peer, ciphertext));
             }
             return Ok(None);
         }
@@ -396,8 +395,7 @@ impl Inner {
         let waiting = g.waiting;
         let taken = claim.seq < lowest + WINDOW && (waiting || newer || g.buckets.entry(membership).or_default().take(ciphertext.len(), 2.0, now));
         if !taken {
-            let size: usize = g.unopened.iter().filter(|((k, j, _), _)| *k == claim.key && *j == claim.joined).map(|(_, (_, c))| c.len()).sum();
-            if size + ciphertext.len() <= UNOPENED {
+            if room(g) {
                 remember(&mut g.seen, hash);
                 g.unopened.insert((claim.key, claim.joined, claim.seq), (epoch, ciphertext));
             }

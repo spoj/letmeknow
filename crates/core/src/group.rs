@@ -20,7 +20,7 @@ use crate::provider::SqliteProvider;
 
 pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519;
 /// The largest message ciphertext taken, and sent.
-pub const MAX_MESSAGE: usize = 1 << 20;
+pub const MAX_MESSAGE: usize = 16 << 20;
 /// More than an application message's ciphertext adds to its plaintext.
 pub const FRAMING: usize = 1024;
 /// How far one cut may move a membership's.
@@ -29,7 +29,6 @@ const ADDRESS_LABEL: &str = "letmeknow epoch log address v1";
 const SEALING_LABEL: &str = "letmeknow epoch log sealing v1";
 const ENVELOPE_DOMAIN: &[u8] = b"letmeknow epoch envelope v1\0";
 const MAX_INNER: usize = (1 << 20) - 45;
-const NEIGHBOURS_LABEL: &str = "letmeknow neighbours";
 
 fn service_key(settings: &Settings) -> Result<[u8; 32]> {
     let Service::Serve { key, .. } = &settings.membership else { bail!("unsupported membership service authority") };
@@ -509,11 +508,6 @@ impl Group {
         self.state.cut.iter().find(|r| r.key.0 == key).map(|r| r.joined)
     }
 
-    /// The current epoch's secret that ranks members as one another's neighbours.
-    pub fn neighbour_secret(&self, provider: &SqliteProvider) -> Result<[u8; 32]> {
-        Ok(self.mls.export_secret(provider.crypto(), NEIGHBOURS_LABEL, &[], 32)?.try_into().unwrap())
-    }
-
     fn epoch_context(&self) -> Result<([u8; 32], Vec<u8>)> {
         let service = service_key(&self.settings())?;
         Ok((service, [self.id(), &self.epoch().to_be_bytes(), &service].concat()))
@@ -733,7 +727,7 @@ impl Group {
     /// keys.
     pub fn seal(&mut self, provider: &SqliteProvider, session: &Session, plaintext: &[u8]) -> Result<Vec<u8>> {
         let size = plaintext.len() + FRAMING;
-        ensure!(size <= MAX_MESSAGE, "the message is {size} bytes, over the 1 MiB members take");
+        ensure!(size <= MAX_MESSAGE, "the message is {size} bytes, over the 16 MiB members take");
         self.mls.set_aad(serde_json::to_vec(&Header::open(plaintext)?.claim())?);
         Ok(self.mls.create_message(provider, &session.signer, plaintext)?.to_bytes()?)
     }

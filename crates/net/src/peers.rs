@@ -481,7 +481,7 @@ impl Peers {
             if c.hello || due {
                 c.hello = false;
                 if !served.is_empty() {
-                    let groups = served.iter().map(|(id, g)| At { group: (*id).clone(), epoch: g.own.epoch, log: g.own.log, head: g.own.head.clone() }).collect();
+                    let groups = served.iter().map(|(id, g)| At { group: (*id).clone(), log: g.own.log, head: g.own.head.clone() }).collect();
                     out.push(Out::Frame(*key, Frame::Hello { groups }));
                 }
             }
@@ -559,7 +559,7 @@ impl Peers {
                 let wants = to_seqs(&asked);
                 self.conns.get_mut(&holder).expect("a connected holder").active = now;
                 self.groups.get_mut(&id).expect("a group of ours").request = Some(Request { holder, asked, epoch, at: now });
-                out.push(Out::Frame(holder, Frame::Want { group: id, epoch, wants, ids: Vec::new() }));
+                out.push(Out::Frame(holder, Frame::Want { group: id, epoch, wants }));
             }
         }
         out

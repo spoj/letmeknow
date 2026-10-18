@@ -116,7 +116,7 @@ impl Inner {
         let plaintext = header.encode();
         let size = plaintext.len() + FRAMING;
         if size > MAX_MESSAGE {
-            return Err(SendError::Size(format!("the message is {size} bytes, over the 1 MiB members take")).into());
+            return Err(SendError::Size(format!("the message is {size} bytes, over the 16 MiB members take")).into());
         }
         let g = st.groups.get_mut(gid).unwrap();
         if !g.sending.take(plaintext.len(), 1.0, now) {
