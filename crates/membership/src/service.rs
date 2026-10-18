@@ -11,15 +11,12 @@ use tokio::{sync::Semaphore, time::timeout};
 
 use crate::{Expired, Refused, store::{DAY_MS, DISK_BYTES, Log, Store}};
 
-const DB_WORK: usize = 4;
-/// How long a request waits for a slot of `DB_WORK` before it is refused as busy. Work that started runs to its end: a
+/// How long a request waits for a slot of `Policy::db_work` before it is refused as busy. Work that started runs to its end: a
 /// refusal tells the client the work was not done.
 const DB_WAIT: Duration = Duration::from_secs(2);
 const MINUTE: u64 = 60_000;
 /// A /48's budget, in /64s.
 const WIDE: u64 = 16;
-/// Keys a quota tracks at once: a source past them is refused, so a flood of addresses cannot grow memory.
-const KEYS: usize = 1 << 20;
 /// /64s a /48 tracks in one window of a quota: past them, its /64s are charged to the /48 alone.
 const NETS: u64 = 16;
 
@@ -39,6 +36,10 @@ pub struct Policy {
     pub bytes_at_once: u64,
     /// Over all addresses.
     pub bytes_at_once_in_all: u64,
+    /// Requests that work on the database at once.
+    pub db_work: usize,
+    /// Sources each quota tracks at once: a source past them is refused, so a flood of addresses cannot grow memory.
+    pub sources: usize,
 }
 
 impl Default for Policy {
@@ -48,6 +49,7 @@ impl Default for Policy {
             append_bytes_per_day: 256 << 20, reads_per_minute: 600, read_bytes_per_minute: 64 << 20,
             new_logs_per_day: 2_000,
             requests_at_once: 8, bytes_at_once: 16 << 20, bytes_at_once_in_all: 256 << 20,
+            db_work: 4, sources: 1 << 20,
         }
     }
 }
@@ -91,6 +93,7 @@ struct Inner {
 struct Quota {
     period: u64,
     limit: u64,
+    sources: usize,
     window: u64,
     spent: HashMap<Source, u64>,
     /// The /64s each /48 tracks in `spent`.
@@ -98,7 +101,7 @@ struct Quota {
 }
 
 impl Quota {
-    fn new(period: u64, limit: u64) -> Self { Self { period, limit, window: 0, spent: HashMap::new(), nets: HashMap::new() } }
+    fn new(period: u64, limit: u64, sources: usize) -> Self { Self { period, limit, sources, window: 0, spent: HashMap::new(), nets: HashMap::new() } }
 
     fn tracks(&self, key: &Source) -> bool {
         self.spent.contains_key(key) || key.net48().is_none_or(|net| self.nets.get(&net).copied().unwrap_or(0) < NETS)
@@ -106,7 +109,7 @@ impl Quota {
 
     fn fits(&mut self, at: u64, keys: &[(Source, u64)], amount: u64) -> bool {
         self.roll(at);
-        let full = self.spent.len() >= KEYS;
+        let full = self.spent.len() >= self.sources;
         keys.iter().filter(|(key, _)| self.tracks(key)).all(|(key, scale)| {
             (!full || self.spent.contains_key(key)) && self.spent.get(key).copied().unwrap_or(0) + amount <= self.limit * scale
         })
@@ -170,11 +173,11 @@ struct Budgets {
 impl Budgets {
     fn new(policy: &Policy) -> Self {
         Self {
-            appends: Quota::new(MINUTE, policy.appends_per_minute.into()),
-            append_bytes: Quota::new(DAY_MS, policy.append_bytes_per_day),
-            reads: Quota::new(MINUTE, policy.reads_per_minute.into()),
-            read_bytes: Quota::new(MINUTE, policy.read_bytes_per_minute),
-            new_logs: Quota::new(DAY_MS, policy.new_logs_per_day),
+            appends: Quota::new(MINUTE, policy.appends_per_minute.into(), policy.sources),
+            append_bytes: Quota::new(DAY_MS, policy.append_bytes_per_day, policy.sources),
+            reads: Quota::new(MINUTE, policy.reads_per_minute.into(), policy.sources),
+            read_bytes: Quota::new(MINUTE, policy.read_bytes_per_minute, policy.sources),
+            new_logs: Quota::new(DAY_MS, policy.new_logs_per_day, policy.sources),
         }
     }
 }
@@ -220,8 +223,8 @@ impl Service {
     pub fn new(mut store: Store, policy: Policy) -> Self {
         store.disk = policy.disk;
         let service = Self(Arc::new(Inner {
-            store, budgets: Mutex::new(Budgets::new(&policy)), in_flight: Mutex::default(), policy,
-            work: Arc::new(Semaphore::new(DB_WORK)), expiry: Mutex::default(),
+            store, budgets: Mutex::new(Budgets::new(&policy)), in_flight: Mutex::default(),
+            work: Arc::new(Semaphore::new(policy.db_work)), expiry: Mutex::default(), policy,
         }));
         let weak = Arc::downgrade(&service.0);
         let expiry = n0_future::task::spawn(async move {
@@ -367,17 +370,17 @@ mod tests {
 
     #[test]
     fn a_quota_refuses_new_keys_past_its_capacity() {
-        let mut quota = Quota::new(MINUTE, 2);
+        let mut quota = Quota::new(MINUTE, 2, 100);
         let v4 = |key: usize| Source::V4(Ipv4Addr::from(key as u32));
-        for key in 0..KEYS { quota.charge(0, &[(v4(key), 1)], 1); }
+        for key in 0..100 { quota.charge(0, &[(v4(key), 1)], 1); }
         assert!(quota.fits(0, &[(v4(0), 1)], 1));
-        assert!(!quota.fits(0, &[(v4(KEYS), 1)], 1));
-        assert!(quota.fits(MINUTE, &[(v4(KEYS), 1)], 1));
+        assert!(!quota.fits(0, &[(v4(100), 1)], 1));
+        assert!(quota.fits(MINUTE, &[(v4(100), 1)], 1));
     }
 
     #[test]
     fn a_net48_tracks_only_some_of_its_nets() {
-        let mut quota = Quota::new(MINUTE, 2);
+        let mut quota = Quota::new(MINUTE, 2, 1 << 20);
         let net64 = |i: u32| sources(format!("2001:db8:0:{i:x}::1").parse().unwrap());
         for i in 0..1_000 { quota.charge(0, &net64(i), 1); }
         assert_eq!(quota.spent.len(), 1 + NETS as usize);
@@ -452,7 +455,7 @@ mod tests {
         let (_dir, service) = service(Policy::default());
         let mut jobs = Vec::new();
         let mut releases = Vec::new();
-        for _ in 0..DB_WORK {
+        for _ in 0..Policy::default().db_work {
             let (entered, inside) = tokio::sync::oneshot::channel();
             let (release, wait) = std::sync::mpsc::channel();
             let service = service.clone();
@@ -465,7 +468,7 @@ mod tests {
         for job in jobs { assert!(job.await.unwrap_err().is_cancelled()); }
         assert_eq!(service.0.work.available_permits(), 0);
         for release in releases { release.send(()).unwrap(); }
-        let all = service.0.work.acquire_many(DB_WORK as u32).await.unwrap();
+        let all = service.0.work.acquire_many(Policy::default().db_work as u32).await.unwrap();
         drop(all);
         drop(service);
     }

@@ -30,3 +30,25 @@ Nothing carries over: it gets a new service, and the previous minor's sessions s
     chown -R letmeknow: /var/lib/letmeknow.new
 
 It prints the new domain and public key: put the key in deploy/backend.json's directory and in crates/proto/src/links.rs, and release. The directory is what the service publishes at `/.well-known/letmeknow.json` once it runs; its `relay` names the domain. A new key is a new service: groups of the old one do not move to it.
+
+## Limits
+
+The protocol's limits (entry and page sizes, the 30 days a log let go is remembered, the 28 days a session waits before taking a log as let go) are fixed. The service's are its own, set by `serve` flags sized to its machine; each defaults as below:
+
+| Flag | Default | Limits |
+| --- | --- | --- |
+| `--disk <MiB>` | 4096 | the database's pages and WAL; appends past it are refused as quota |
+| `--retention <days>` | 7 | days a log is kept after its first entry, 7 to 25 |
+| `--appends-per-minute` | 600 | appends of each address |
+| `--append-mib-per-day` | 256 | bytes appended by each address |
+| `--reads-per-minute` | 600 | reads of each address |
+| `--read-mib-per-minute` | 64 | bytes read by each address |
+| `--new-logs-per-day` | 2000 | logs each address starts, by their first entries: about one per commit |
+| `--requests-at-once` | 8 | requests in flight from each source |
+| `--mib-at-once` | 16 | bytes in flight from each source |
+| `--mib-at-once-in-all` | 256 | bytes in flight over all sources |
+| `--db-work` | 4 | requests working on the database at once |
+| `--sources` | 1048576 | sources each rate limit tracks; new ones past it are refused |
+| `--relay-kib-per-second` | 1024 | what the relay reads from each connection |
+
+Per address means an IPv4 address or an IPv6 /64, and a /48 gets 16 times as much.

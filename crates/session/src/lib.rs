@@ -34,13 +34,14 @@ const RETRY: Duration = Duration::from_secs(60);
 pub const SKILL: &str = include_str!("../../../SKILL.md");
 
 pub async fn serve(serve: cli::Serve) -> Result<()> {
+    let policy = serve.policy();
     let mut config = lmk_serve::ServeConfig::new(serve.domain, serve.state);
     config.https_port = serve.https_port;
     config.http_port = Some(serve.http_port);
     config.relays = serve.relays;
     config.qad_port = serve.qad_port;
-    config.policy.disk = serve.disk << 20;
-    config.policy.retention_days = serve.retention;
+    config.policy = policy;
+    config.relay_rate_limit = std::num::NonZeroU32::new(serve.relay_kib_per_second << 10).expect("a parsed rate is at least 1 KiB");
     if let (Some(chain), Some(key)) = (serve.cert, serve.key) {
         config.certificate = lmk_serve::Certificate::Files { chain, key };
     }

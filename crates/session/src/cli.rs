@@ -4,6 +4,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use lmk_membership::service::Policy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::ffi::OsString;
@@ -79,16 +80,69 @@ pub struct Serve {
     #[arg(long)]
     pub state: PathBuf,
     /// MiB the membership database may use: its pages in use and its WAL. Appends past it are refused as quota
-    #[arg(long, default_value_t = 4096)]
+    #[arg(long, default_value_t = Policy::default().disk >> 20)]
     pub disk: u64,
     /// Days a group's log is kept after its first entry, 7 to 25
-    #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u64).range(7..=lmk_proto::membership::MAX_RETENTION_DAYS))]
+    #[arg(long, default_value_t = Policy::default().retention_days, value_parser = clap::value_parser!(u64).range(7..=lmk_proto::membership::MAX_RETENTION_DAYS))]
     pub retention: u64,
+    /// Appends each address may make a minute
+    #[arg(long, default_value_t = Policy::default().appends_per_minute)]
+    pub appends_per_minute: u32,
+    /// MiB each address may append a day
+    #[arg(long, default_value_t = Policy::default().append_bytes_per_day >> 20)]
+    pub append_mib_per_day: u64,
+    /// Reads each address may make a minute
+    #[arg(long, default_value_t = Policy::default().reads_per_minute)]
+    pub reads_per_minute: u32,
+    /// MiB each address may read a minute
+    #[arg(long, default_value_t = Policy::default().read_bytes_per_minute >> 20)]
+    pub read_mib_per_minute: u64,
+    /// Logs each address may start a day, by their first entries
+    #[arg(long, default_value_t = Policy::default().new_logs_per_day)]
+    pub new_logs_per_day: u64,
+    /// Requests each source may have in flight
+    #[arg(long, default_value_t = Policy::default().requests_at_once)]
+    pub requests_at_once: usize,
+    /// MiB of requests and answers each source may have in flight
+    #[arg(long, default_value_t = Policy::default().bytes_at_once >> 20)]
+    pub mib_at_once: u64,
+    /// MiB of requests and answers in flight over all sources
+    #[arg(long, default_value_t = Policy::default().bytes_at_once_in_all >> 20)]
+    pub mib_at_once_in_all: u64,
+    /// Requests that work on the database at once
+    #[arg(long, default_value_t = Policy::default().db_work)]
+    pub db_work: usize,
+    /// Sources each rate limit tracks at once; past them, new sources are refused
+    #[arg(long, default_value_t = Policy::default().sources)]
+    pub sources: usize,
+    /// KiB a second the relay reads from each connection
+    #[arg(long, default_value_t = lmk_serve::RELAY_RATE >> 10, value_parser = clap::value_parser!(u32).range(1..=(u32::MAX >> 10) as i64))]
+    pub relay_kib_per_second: u32,
     /// A certificate (PEM) to use instead of Let's Encrypt, with --key
     #[arg(long, requires = "key")]
     pub cert: Option<PathBuf>,
     #[arg(long, requires = "cert")]
     pub key: Option<PathBuf>,
+}
+
+impl Serve {
+    /// The membership service's limits, as the flags set them.
+    pub fn policy(&self) -> Policy {
+        Policy {
+            retention_days: self.retention,
+            disk: self.disk << 20,
+            appends_per_minute: self.appends_per_minute,
+            append_bytes_per_day: self.append_mib_per_day << 20,
+            reads_per_minute: self.reads_per_minute,
+            read_bytes_per_minute: self.read_mib_per_minute << 20,
+            new_logs_per_day: self.new_logs_per_day,
+            requests_at_once: self.requests_at_once,
+            bytes_at_once: self.mib_at_once << 20,
+            bytes_at_once_in_all: self.mib_at_once_in_all << 20,
+            db_work: self.db_work,
+            sources: self.sources,
+        }
+    }
 }
 
 /// Requests an agent sends to its session process: the client core's, and those of its own.
@@ -348,7 +402,7 @@ pub fn private_file(path: &Path, contents: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, Request, parse};
+    use super::{Command, Policy, Request, parse};
 
     #[test]
     fn a_value_may_start_with_a_hyphen() {
@@ -375,5 +429,16 @@ mod tests {
         assert_eq!(retention(&[]).unwrap(), 7);
         assert_eq!(retention(&["--retention", "25"]).unwrap(), 25);
         assert!(retention(&["--retention", "6"]).is_err() && retention(&["--retention", "26"]).is_err());
+    }
+
+    #[test]
+    fn a_service_has_the_default_limits_unless_flags_set_them() {
+        let policy = |flags: &[&str]| match parse([&["letmeknow", "serve", "--domain", "relay.example", "--state", "s"], flags].concat()).unwrap().command {
+            Command::Serve(serve) => serve.policy(),
+            _ => panic!("not serve"),
+        };
+        assert_eq!(format!("{:?}", policy(&[])), format!("{:?}", Policy::default()));
+        let set = policy(&["--append-mib-per-day", "1", "--new-logs-per-day", "50000", "--sources", "10"]);
+        assert_eq!((set.append_bytes_per_day, set.new_logs_per_day, set.sources), (1 << 20, 50_000, 10));
     }
 }

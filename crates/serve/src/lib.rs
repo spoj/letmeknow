@@ -52,6 +52,8 @@ const BODY: Duration = Duration::from_secs(15);
 const DRAIN: Duration = Duration::from_secs(30);
 /// Hyper takes an answer's next chunk once it has room to write it.
 const CHUNK: usize = 64 << 10;
+/// Bytes a second that the relay reads from each connection, unless configured otherwise.
+pub const RELAY_RATE: u32 = 1 << 20;
 
 pub enum Certificate {
     /// From Let's Encrypt, by TLS-ALPN-01 on the HTTPS port; cached in the state directory.
@@ -87,7 +89,7 @@ impl ServeConfig {
             relays: vec![],
             state: state.into(),
             certificate: Certificate::Acme { contact: None },
-            relay_rate_limit: NonZeroU32::new(1 << 20).unwrap(),
+            relay_rate_limit: NonZeroU32::new(RELAY_RATE).unwrap(),
             policy: Policy::default(),
         }
     }
