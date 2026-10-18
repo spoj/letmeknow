@@ -490,7 +490,7 @@ impl<P: Provider + Send + 'static> DerefMut for Step<'_, P> {
 
 impl<P: Provider + Send + 'static> Drop for Step<'_, P> {
     fn drop(&mut self) {
-        self.guard.tell_peers();
+        self.guard.gate();
         // Nothing a step produced may leave unless it committed, and its state in memory no longer matches storage.
         if let Err(error) = self.guard.provider.commit() {
             tracing::error!("committing a step: {error:#}; stopping");
@@ -811,6 +811,7 @@ impl<P: Provider> State<P> {
         self.save_groups()?;
         self.observe_identities()?;
         self.gate = true;
+        self.refresh(&gid);
         Ok(gid)
     }
 }
@@ -975,6 +976,36 @@ mod tests {
         }
         assert_eq!(counted.load(Ordering::SeqCst), read + 8);
         bob.shutdown().await.unwrap();
+    }
+
+    /// A group is handed to `Peers` as it is added, and its new members as their Add applies, before the next poll: a
+    /// joiner's summary that arrives at once is kept.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_joiners_summary_right_after_its_add_is_kept() {
+        let relay = lmk_testing::relay().await;
+        let (alice, bob, carol) = (node(&relay, "Alice", relay.post()).await, node(&relay, "Bob", relay.post()).await, node(&relay, "Carol", relay.post()).await);
+        let settings = Settings { protocol: PROTOCOL, kind: CHAT.into(), name: String::new(), carry: 7, update: UPDATE, membership: relay.service.clone(), public: None, rest: Default::default() };
+        let gid = bob.create(settings.clone(), None).unwrap();
+        alice.join(&bob.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+        // Alice no longer polls.
+        let tasks: Vec<_> = alice.inner.tasks.lock().unwrap().drain(..).collect();
+        for task in &tasks {
+            task.abort();
+        }
+        let other = alice.create(settings, None).unwrap();
+        alice.inner.lock().peers.full_mesh(&other);
+        carol.join(&bob.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+        alice.read_group(&gid.0).await.unwrap();
+        let mut st = alice.inner.lock();
+        let (member, epoch) = (carol.key_in(&gid.0), st.group(&gid.0).unwrap().mls.epoch());
+        let joined = st.group(&gid.0).unwrap().mls.joined(&member.0).expect("Alice applied Carol's Add");
+        let summary = serde_json::from_value(serde_json::json!({ "group": gid, "member": member, "joined": joined, "version": 1, "time": now(), "epoch": epoch })).unwrap();
+        let heard = lmk_net::peers::Heard { signed: Signed { body: Bytes(Vec::new()), sig: Bytes(Vec::new()) }, summary, at: now() };
+        assert!(st.peers.summary(&gid, heard, None));
+        drop(st);
+        for node in [bob, carol] {
+            node.shutdown().await.unwrap();
+        }
     }
 
     #[test]

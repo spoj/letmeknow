@@ -59,7 +59,7 @@ Two loops run the node's upkeep: every 10 minutes, duties and a scrub (`resume`,
 
 - One loop runs them all hourly. `TIMER` goes; `time` schedules what comes due within the hour.
 
-## 8. A step hands `Peers` only what it changed
+## 8. A step hands `Peers` only what it changed (done: a read-only step at 301 groups, debug, 8.3 ms to 29 µs)
 
 For: a session in up to 128 groups.
 

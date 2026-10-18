@@ -133,7 +133,8 @@ impl<P: Provider> State<P> {
         self.peers.group(Bytes(gid.to_vec()), own, now);
     }
 
-    /// Hands `Peers` what a step changed: the gate, and this session's state of each group.
+    /// Hands `Peers` the gate, and this session's state of each group: at each poll, before `Peers` sends anything. A
+    /// step hands it only a group added (`add_group`) or moved to a new epoch (`apply`), whose frames may follow at once.
     pub(crate) fn tell_peers(&mut self) {
         self.gate();
         let gids: Vec<Vec<u8>> = self.groups.keys().cloned().collect();
