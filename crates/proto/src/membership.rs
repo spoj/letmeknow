@@ -16,6 +16,14 @@ pub const APPEND_BYTES: usize = 2 << 20;
 pub const PAGE_ROWS: usize = 1024;
 pub const HEAD_LOGS: usize = 256;
 pub const PAGE_OVERHEAD: usize = 512;
+/// How many days a service answers that it let a log go, from the day it did; then it forgets the log.
+pub const EXPIRED_DAYS: u64 = 30;
+/// How long after a member last saw a log alive it takes the log as let go without asking, in milliseconds: two days
+/// within `EXPIRED_DAYS`, so that a service that let the log go still answers so until then.
+pub const STALE: u64 = (EXPIRED_DAYS - 2) * 86_400_000;
+/// The longest retention a service keeps logs for, in days: a log lives at most two days past it after a member last
+/// saw it alive, as members commit at least daily, so `STALE` never takes a live log as let go.
+pub const MAX_RETENTION_DAYS: u64 = 25;
 
 pub(crate) fn decode_bytes<'de, D: Deserializer<'de>, const MAX: usize>(d: D) -> Result<Vec<u8>, D::Error> {
     struct Encoded<const MAX: usize>;

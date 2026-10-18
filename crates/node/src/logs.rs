@@ -16,7 +16,7 @@ use lmk_net::peers::WAIT;
 use lmk_proto::Bytes;
 use lmk_proto::group::Service;
 use lmk_proto::head::{self, Head};
-use lmk_proto::membership::Known;
+use lmk_proto::membership::{Known, STALE};
 use lmk_proto::clock::corrected;
 use n0_future::time::{Duration, timeout};
 use serde::{Deserialize, Serialize};
@@ -73,13 +73,16 @@ pub(crate) struct Log {
     /// When it was last read from its service, or the time of the newest head a peer's entries ended at, in
     /// milliseconds.
     pub at: u64,
-    /// When the service first answered that it let the log go, and the length held then.
+    /// When this session began to follow it, in milliseconds.
+    pub since: u64,
+    /// When the service first answered that it let the log go, or this session took it as let go, and the length held
+    /// then.
     pub lapsed: Option<(u64, u64)>,
 }
 
 impl Log {
     pub fn new(group: Bytes, service: Service) -> Self {
-        Log { group, service, head: None, at: 0, lapsed: None }
+        Log { group, service, head: None, at: 0, since: corrected(), lapsed: None }
     }
 
     /// The entries held, positions 1 to this.
@@ -174,10 +177,13 @@ impl State {
     }
 
     /// The capability that names a log at its service, from the MLS state of the epoch the log is of, while the group is
-    /// in it.
+    /// in it, and while this session saw the log alive within `STALE`: past that, the service may have forgotten that it
+    /// let the log go, so the log counts as let go.
     pub(crate) fn capability(&self, id: &[u8]) -> Result<[u8; 32]> {
-        let g = self.group(&self.log(id)?.group.0)?;
+        let log = self.log(id)?;
+        let g = self.group(&log.group.0)?;
         ensure!(g.rec.log.0 == id, "the group has moved on from that log");
+        ensure!(corrected() <= log.at.max(log.since) + STALE, Expired(id.try_into()?));
         g.mls.capability(&self.provider)
     }
 
@@ -355,8 +361,12 @@ impl Inner {
     /// let go is lapsed.
     pub(crate) async fn open(&self, id: &[u8]) -> Result<()> {
         let (service, capability, length) = {
-            let st = self.lock();
-            (st.log(id)?.service.clone(), st.capability(id)?, st.log(id)?.length())
+            let mut st = self.lock();
+            let capability = match st.capability(id) {
+                Err(error) if error.is::<Expired>() => return self.lapse(&mut st, id),
+                capability => capability?,
+            };
+            (st.log(id)?.service.clone(), capability, st.log(id)?.length())
         };
         match self.clients.client(&service)?.append(&capability, &[]).await {
             Ok(appended) if appended.head.length > length => self.read(id).await,

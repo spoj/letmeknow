@@ -1089,6 +1089,33 @@ fn a_joiner_whose_key_is_in_the_tree_of_a_lapsed_member_is_removed_before_its_ad
     });
 }
 
+/// A session that has not seen its group's log alive for `STALE` takes the log as let go, as its service may have
+/// forgotten that it let it go, and asks the service nothing of it: it leaves the group once no peer brought the commits
+/// within `WAIT`.
+#[test]
+fn a_log_not_seen_alive_for_stale_is_let_go_without_asking() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let (requests, post) = recording(relay.post());
+        let mut alice = session_with(&relay, post).await;
+        let gid = alice.node.create(settings(&relay)).unwrap();
+        alice.node.open_logs().await;
+        quiet(&requests).await;
+        let asked = requests.lock().unwrap().len();
+        SHIFT.store(lmk_proto::membership::STALE + 60_000, std::sync::atomic::Ordering::Relaxed);
+        alice.node.open_logs().await;
+        SHIFT.fetch_add(lmk_net::peers::WAIT + 60_000, std::sync::atomic::Ordering::Relaxed);
+        alice.node.open_logs().await;
+        alice.until(|e| matches!(&e, Event::Removed { group, .. } if *group == gid).then_some(())).await;
+        assert_eq!(requests.lock().unwrap().len(), asked, "nothing asked of the service");
+        alice.node.shutdown().await.unwrap();
+    });
+}
+
 /// A session on SQLite at `db`, which survives a restart.
 async fn stored(relay: &Relay, db: &Path) -> Session {
     stored_with(relay, db, relay.post()).await

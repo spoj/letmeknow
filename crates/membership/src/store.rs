@@ -20,6 +20,7 @@ const EXPIRY: &str = "SELECT reference FROM anchors WHERE opened<? LIMIT ?";
 const DOOMED: &str = "SELECT reference FROM doomed LIMIT 1";
 const DOOMED_RECORDS: &str = "SELECT position,length(sealed) FROM records WHERE reference=? ORDER BY position LIMIT ?";
 const READ_RECORDS: &str = "SELECT sealed FROM records WHERE reference=? AND position>? ORDER BY position LIMIT ?";
+const FORGOTTEN: &str = "SELECT reference FROM expired WHERE day<? AND NOT EXISTS(SELECT 1 FROM doomed WHERE doomed.reference=expired.reference) LIMIT ?";
 
 pub struct Store {
     db: Mutex<Connection>,
@@ -118,7 +119,8 @@ impl Store {
              CREATE TABLE anchors (reference BLOB PRIMARY KEY CHECK(length(reference)=32), opened INTEGER NOT NULL,
                  sealed BLOB NOT NULL) WITHOUT ROWID;
              CREATE INDEX expiry ON anchors(opened);
-             CREATE TABLE expired (reference BLOB PRIMARY KEY CHECK(length(reference)=32)) WITHOUT ROWID;
+             CREATE TABLE expired (reference BLOB PRIMARY KEY CHECK(length(reference)=32), day INTEGER NOT NULL) WITHOUT ROWID;
+             CREATE INDEX forgetting ON expired(day);
              CREATE TABLE doomed (reference BLOB PRIMARY KEY CHECK(length(reference)=32)) WITHOUT ROWID;
              CREATE TABLE records (reference BLOB NOT NULL, position INTEGER NOT NULL, sealed BLOB NOT NULL,
                  PRIMARY KEY(reference,position)) WITHOUT ROWID;
@@ -247,22 +249,28 @@ impl Store {
     }
 
     /// One bounded pass of expiry, then a truncating checkpoint of the WAL, recording its day. A log goes once its `opened`
-    /// day is before `before_day`, and keeps only its reference. Returns whether more is left for another pass.
+    /// day is before `before_day`, and keeps only its reference and the day it went; `EXPIRED_DAYS` after, once its
+    /// entries are deleted, the reference goes too. Returns whether more is left for another pass.
     pub fn expire(&self, before_day: u64) -> Result<bool> {
+        let today = now() / DAY_MS;
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let forgotten = tx.execute(
+            &format!("DELETE FROM expired WHERE reference IN ({FORGOTTEN})"),
+            params![today.saturating_sub(membership::EXPIRED_DAYS), MARK_LOGS as u64],
+        )?;
         let logs: Vec<[u8; 32]> = tx.prepare_cached(EXPIRY)?
             .query_map(params![before_day, MARK_LOGS as u64], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         for reference in &logs {
             tx.execute("DELETE FROM anchors WHERE reference=?", [reference])?;
-            tx.execute("INSERT INTO expired VALUES(?)", [reference])?;
+            tx.execute("INSERT INTO expired VALUES(?,?)", params![reference, today])?;
             tx.execute("INSERT INTO doomed VALUES(?)", [reference])?;
         }
         let more = reap(&tx)?;
-        tx.execute("UPDATE metadata SET passed=?", [now() / DAY_MS])?;
+        tx.execute("UPDATE metadata SET passed=?", [today])?;
         tx.commit()?;
         db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
-        Ok(more || logs.len() == MARK_LOGS)
+        Ok(more || logs.len() == MARK_LOGS || forgotten == MARK_LOGS)
     }
 }
 
@@ -361,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn an_expired_log_answers_expired_and_never_starts_again() {
+    fn an_expired_log_answers_expired() {
         let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
         let log = store.log(&[7; 32]);
@@ -378,6 +386,27 @@ mod tests {
         assert_eq!(store.moved(&[(log.clone(), 0), (store.log(&[8; 32]), 0)]).unwrap(), (vec![], vec![log.reference]));
         assert_eq!(store.moved(&[(store.log(&[8; 32]), 0)]).unwrap(), (vec![], vec![]));
         assert_eq!(store.moved(&[(store.log(&[8; 32]), 1)]).unwrap().0.len(), 1);
+    }
+
+    /// A log that went answers so for `EXPIRED_DAYS`, and is forgotten after, once its entries are deleted.
+    #[test]
+    fn an_expired_log_is_forgotten_after_expired_days() {
+        let (_dir, path) = state();
+        let store = Store::initialize(&path).unwrap();
+        let log = store.log(&[7; 32]);
+        on(10);
+        store.append(&log, &[Bytes(vec![1])]).unwrap();
+        on(11);
+        store.expire(11).unwrap();
+        on(11 + membership::EXPIRED_DAYS);
+        store.expire(0).unwrap();
+        assert!(store.read(&log, 0).unwrap_err().is::<Expired>(), "through its last day");
+        on(12 + membership::EXPIRED_DAYS);
+        store.db.lock().unwrap().execute("INSERT INTO doomed VALUES(?)", [log.reference]).unwrap();
+        store.expire(0).unwrap();
+        assert!(store.read(&log, 0).unwrap_err().is::<Expired>(), "while its entries are deleted");
+        store.expire(0).unwrap();
+        assert_eq!(store.read(&log, 0).unwrap().head.length, 0, "forgotten");
     }
 
     fn opened(store: &Store, log: &Log) -> u64 {

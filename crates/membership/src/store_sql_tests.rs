@@ -14,6 +14,8 @@ fn locked_sqlite_uses_bounded_index_ranges_not_limit_scans() {
             INSERT INTO anchors SELECT CAST(printf('%032d',i) AS BLOB),100,zeroblob(64) FROM n;
             WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<{population})
             INSERT INTO records SELECT CAST(printf('%032d',i) AS BLOB),1,zeroblob(64) FROM n;
+            WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<{population})
+            INSERT INTO expired SELECT CAST(printf('%032d',i) AS BLOB),100 FROM n;
             COMMIT;")).unwrap();
         let d = vec![7; 32];
         for matches in [false, true] {
@@ -27,6 +29,7 @@ fn locked_sqlite_uses_bounded_index_ranges_not_limit_scans() {
                 (EXPIRY, vec![Value::Integer(10), Value::Integer(EXPIRE_ROWS as i64)], "expiry"),
                 (DOOMED_RECORDS, vec![Value::Blob(d.clone()), Value::Integer(EXPIRE_ROWS as i64)], "PRIMARY KEY"),
                 (READ_RECORDS, vec![Value::Blob(d.clone()), Value::Integer(0), Value::Integer(membership::PAGE_ROWS as i64)], "PRIMARY KEY"),
+                (FORGOTTEN, vec![Value::Integer(10), Value::Integer(MARK_LOGS as i64)], "forgetting"),
             ] {
                 let plan: Vec<String> = db.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap()
                     .query_map(params_from_iter(&values), |r| r.get(3)).unwrap().collect::<rusqlite::Result<_>>().unwrap();

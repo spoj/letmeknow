@@ -98,8 +98,8 @@ pub struct Serve {
     /// MiB the membership database may use: its pages in use and its WAL. Appends past it are refused as quota
     #[arg(long, default_value_t = 4096)]
     pub disk: u64,
-    /// Days a group's log is kept after its first entry, or while it is empty after its last open, at least 7
-    #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u64).range(7..))]
+    /// Days a group's log is kept after its first entry, or while it is empty after its last open, 7 to 25
+    #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u64).range(7..=lmk_proto::membership::MAX_RETENTION_DAYS))]
     pub retention: u64,
     /// A certificate (PEM) to use instead of Let's Encrypt, with --key
     #[arg(long, requires = "key")]
@@ -405,14 +405,14 @@ mod tests {
     }
 
     #[test]
-    fn a_service_keeps_logs_for_a_week_at_least() {
+    fn a_service_keeps_logs_for_a_week_to_25_days() {
         let retention = |days: &[&str]| parse([&["letmeknow", "serve", "--domain", "relay.example", "--state", "s"], days].concat()).map(|cli| match cli.command {
             Command::Serve(serve) => serve.retention,
             _ => panic!("not serve"),
         });
         assert_eq!(retention(&[]).unwrap(), 7);
-        assert_eq!(retention(&["--retention", "30"]).unwrap(), 30);
-        assert!(retention(&["--retention", "6"]).is_err());
+        assert_eq!(retention(&["--retention", "25"]).unwrap(), 25);
+        assert!(retention(&["--retention", "6"]).is_err() && retention(&["--retention", "26"]).is_err());
     }
 
     #[test]

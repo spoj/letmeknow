@@ -29,7 +29,7 @@ impl Inner {
                 let mut st = self.lock();
                 let st = &mut *st;
                 let g = st.group(gid)?;
-                let (service, capability, epoch) = (g.mls.settings().membership, g.mls.capability(&st.provider)?, g.mls.epoch());
+                let (service, capability, epoch) = (g.mls.settings().membership, st.capability(&g.rec.log.0)?, g.mls.epoch());
                 match g.mls.posted() {
                     Some(posted) => (posted.to_vec(), service, capability, epoch),
                     None => {
