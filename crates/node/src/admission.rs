@@ -12,6 +12,7 @@ use lmk_net::Admit;
 use lmk_proto::group::{Control, Service};
 use lmk_proto::links::Invite;
 use lmk_proto::peer::{Admitted, Join};
+use lmk_proto::clock::corrected;
 use lmk_proto::{Answer, Bytes};
 use n0_future::boxed::BoxFuture;
 use n0_future::task::spawn;
@@ -20,7 +21,7 @@ use n0_future::time::{Duration, Instant, sleep, sleep_until, timeout};
 use sha2::{Digest, Sha256};
 
 use crate::reading::commit_key;
-use crate::{G, Inner, MEMBER_WAIT, Member, Node, Rec, Rule, State, endpoint_id, get, now, put};
+use crate::{G, Inner, MEMBER_WAIT, Member, Node, Rec, Rule, State, endpoint_id, get, put};
 
 /// How many members besides the inviter a link names, of those online that hold the invite's message.
 const LINK_MEMBERS: usize = 3;
@@ -41,7 +42,7 @@ impl Node {
     pub async fn invite(&self, gid: &[u8], valid: u64) -> Result<Invite> {
         let secret: [u8; 16] = lmk_core::random();
         let hash = Bytes(Sha256::digest(secret).to_vec());
-        let expires = now() + valid;
+        let expires = corrected() + valid;
         {
             let mut st = self.inner.lock();
             let by = Bytes(st.me().to_vec());
@@ -208,7 +209,7 @@ const MEMBER_ALREADY: &str = "this session is a member already";
 /// that adds it is built. An invite dies when its inviter leaves the group.
 fn admits(g: &G, joiner: &[u8], rule: &Rule) -> Result<()> {
     let members = g.mls.members();
-    ensure!(now() < rule.expires && !g.mls.used(&rule.hash.0), UNKNOWN);
+    ensure!(corrected() < rule.expires && !g.mls.used(&rule.hash.0), UNKNOWN);
     ensure!(members.iter().any(|m| m.key == rule.by.0) && g.left(&rule.by.0).is_none(), INVITER_LEFT);
     ensure!(members.iter().all(|member| member.key != joiner), MEMBER_ALREADY);
     Ok(())

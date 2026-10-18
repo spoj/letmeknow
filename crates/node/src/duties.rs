@@ -10,6 +10,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use lmk_core::group::{Change, MAX_CUT_STEP};
 use lmk_proto::Bytes;
+use lmk_proto::clock::corrected;
 use lmk_proto::held::Ref;
 use n0_future::time::{Duration, sleep};
 use sha2::{Digest, Sha256};
@@ -80,7 +81,7 @@ impl State {
         // A record of an Add stays while its member is in the group, while its invite admits, and for H, so that
         // an invite told late finds itself used.
         let members: Vec<Vec<u8>> = g.mls.members().into_iter().map(|m| m.key).collect();
-        let usable: Vec<Bytes> = g.rec.invites.iter().filter(|rule| rule.expires > now()).map(|rule| rule.hash.clone()).collect();
+        let usable: Vec<Bytes> = g.rec.invites.iter().filter(|rule| rule.expires > corrected()).map(|rule| rule.hash.clone()).collect();
         let keep = |added: &lmk_core::group::Added| {
             added.at >= before || members.contains(&added.member.0) || usable.contains(&added.invite)
         };
