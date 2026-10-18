@@ -257,7 +257,7 @@ async fn response(tls: &mut tokio_rustls::client::TlsStream<TcpStream>) -> Strin
     }
 }
 
-/// A connection waits for its next request longer than a stalled handshake: sessions poll on one kept connection.
+/// A connection waits for its next request longer than a stalled handshake: a session's requests keep one connection.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_idle_connection_is_kept_for_its_next_request() {
     let dir = tempfile::tempdir().unwrap();

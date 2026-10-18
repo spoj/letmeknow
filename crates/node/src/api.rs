@@ -321,11 +321,6 @@ impl<P: Provider + Send + 'static> Node<P> {
         holders
     }
 
-    /// Asks the services for the heads of the logs this session follows, and reads those that moved.
-    pub async fn sync(&self) {
-        self.inner.ask_heads().await;
-    }
-
     /// Asks the services whether the logs members are behind in were let go, as every hour does.
     pub async fn sync_members(&self) -> Result<()> {
         self.inner.ask_members().await

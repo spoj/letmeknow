@@ -43,11 +43,11 @@ When a test flakes there, its timing is fixed:
 - `Store::open` moves live logs' days by the days since the last expiry pass, plus one: a restart across midnight credits two days for minutes down, past "seven to eight". The extra day goes. Test: a start on the day after the last pass moves days by one.
 - CI: the actions off Node 20 (`checkout`, `setup-python`, `setup-node`, the artifact actions); Linux jobs name `ubuntu-24.04` until a release is checked on 26, to which `ubuntu-latest` moves from October 19.
 
-## 6. Polling's leftovers go
+## 6. Polling's leftovers go (done)
 
 For: simplicity.
 
-- `Node::sync` and `ask_heads`, which only tests call: tests catch up as sessions do, by `open_logs`, a send, `read_group` or `read_public`. `a_directory_change_reaches_its_follower_at_the_poll` becomes a send that reads the directory first; `a_poll_asks_each_service_once_for_every_256_logs` goes, as the membership client's test covers the chunks, and a send to a group whose identities live on two services asks each once.
+- `Node::sync` and `ask_heads`, which only tests call: tests catch up as sessions do, by pushes, `open_logs` or a send. `a_directory_change_reaches_its_follower_at_the_poll` goes, as `a_send_removes_a_revoked_devices_session_before_sealing` reads a directory at a send; `a_poll_asks_each_service_once_for_every_256_logs` goes, as the membership client's test covers the chunks, and a send to a group whose identities live on two services asks each once. A key the service signs with that its directory does not name is reported at a send.
 - The ignored `heads_keep_the_target_rate_from_a_cold_cache`, whose bar was the polls' rate.
 - What still speaks of polls: serve's `HEADERS`, `an_idle_connection_is_kept_for_its_next_request`, `a_commit_reaches_a_member_with_no_peer_online_at_its_poll`.
 

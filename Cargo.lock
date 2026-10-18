@@ -2805,7 +2805,6 @@ dependencies = [
  "ed25519-dalek 3.0.0",
  "hex",
  "iroh",
- "libc",
  "lmk-proto",
  "n0-future",
  "rcgen",

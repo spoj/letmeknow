@@ -289,8 +289,8 @@ async fn a_member_is_reached_through_its_groups_service_when_its_own_relay_is_do
     let mut bob = Session { node, events };
     bob.node.join(&carol.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     carol.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    eventually("Alice holds Bob", || alice.node.members(&gid.0).unwrap().len() == 3).await;
     carol.node.shutdown().await.unwrap();
-    alice.node.sync().await;
     let sent = alice.node.send(&gid.0, &message("through the service"), None).await.unwrap();
     let got = bob.until(|e| match e {
         Event::Message(message) => Some(message),
@@ -453,7 +453,6 @@ async fn chat_and_removal() {
 
     let bob_key = bob.node.key();
     alice.node.remove(&gid.0, &bob_key.0).await.unwrap();
-    bob.node.sync().await;
     bob.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
     eventually("Bob forgot the group", || bob.node.groups().is_empty()).await;
 }
@@ -553,7 +552,6 @@ async fn an_invite_dies_when_its_inviter_leaves() {
 
     alice.node.remove(&gid.0, &bob.node.key().0).await.unwrap();
     carol.node.leave(&gid.0).unwrap();
-    alice.node.sync().await;
     eventually("Bob and Carol are out", || alice.node.members(&gid.0).unwrap().len() == 1).await;
     let dave = session(&relay, "Dave").await;
     let at_alice = alice.node.address().0;
@@ -710,32 +708,46 @@ async fn a_contradiction_is_reported_once() {
     assert_eq!(warnings, 1);
 }
 
-/// A session whose service answers with another key, as a domain whose directory names another key does, is told once,
-/// however often it asks.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_directory_naming_another_key_is_reported_once() {
-    let relay = relay().await;
-    let dir = folder("misdirected");
-    let (membership, _service) = signing_service(&relay, &dir.join("first")).await;
-    let (other, _other_service) = signing_service(&relay, &dir.join("other")).await;
-    let Service::Serve { domain: elsewhere, .. } = other else { unreachable!() };
-    let switched = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (base, flag) = (relay.post(), switched.clone());
-    let post: Post = Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
-        let domain = if flag.load(std::sync::atomic::Ordering::SeqCst) { elsewhere.clone() } else { domain };
-        base(domain, route, body)
-    });
-    let mut alice = session_with(&relay, "Alice", post).await;
-    let (identity, _laptop) = identity(&relay, &alice.node, membership).await;
-    alice.node.read_public(&identity).await.unwrap();
-    switched.store(true, std::sync::atomic::Ordering::SeqCst);
-    alice.node.sync().await;
-    alice.node.sync().await;
-    let mut warnings = 0;
-    while let Ok(event) = alice.events.try_recv() {
-        warnings += matches!(&event, Event::Warning { group, text } if group.is_none() && text.contains("names another key")) as usize;
+/// A membership service whose answers name another key than its directory's is reported once, however often sends ask
+/// it about the directory of an identity a member speaks as.
+#[test]
+fn a_directory_naming_another_key_is_reported_once() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
     }
-    assert_eq!(warnings, 1);
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let dir = folder("misdirected");
+        let (membership, _service) = signing_service(&relay, &dir.join("first")).await;
+        let (other, _other_service) = signing_service(&relay, &dir.join("other")).await;
+        let Service::Serve { domain: elsewhere, .. } = other else { unreachable!() };
+        let switched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (base, flag) = (relay.post(), switched.clone());
+        let post: Post = Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
+            let domain = if flag.load(std::sync::atomic::Ordering::SeqCst) { elsewhere.clone() } else { domain };
+            base(domain, route, body)
+        });
+        let mut alice = session_with(&relay, "Alice", post).await;
+        let (carol, laptop) = identity(&relay, &alice.node, membership).await;
+        let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+        let tablet = session(&relay, "tablet").await;
+        let certified = certificate(&carol, &laptop, &tablet.node.key(), "Carol", "laptop");
+        tablet.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), Some(certified)).await.unwrap();
+        eventually("Alice holds Carol's session", || alice.node.members(&gid.0).unwrap().len() == 2).await;
+        switched.store(true, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..2 {
+            SHIFT.fetch_add(FRESH_MS, std::sync::atomic::Ordering::Relaxed);
+            alice.node.send(&gid.0, &message("asks"), None).await.unwrap();
+        }
+        let mut warnings = 0;
+        while let Ok(event) = alice.events.try_recv() {
+            warnings += matches!(&event, Event::Warning { group, text } if group.is_none() && text.contains("names another key")) as usize;
+        }
+        assert_eq!(warnings, 1);
+        alice.node.shutdown().await.unwrap();
+        tablet.node.shutdown().await.unwrap();
+    });
 }
 
 impl<P: Provider + Send + 'static> Session<P> {
@@ -1148,11 +1160,12 @@ async fn a_pending_leave_is_finished_once_the_log_is_reachable() {
     held_leave("leave-reachable", false).await;
 }
 
-/// A commit reaches a member that no peer brings it to at the member's poll, which also runs as it starts.
+/// A commit reaches a member that no peer brings it to as the member starts: it opens its group's log, and reads it, as
+/// it moved.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_commit_reaches_a_member_with_no_peer_online_at_its_poll() {
+async fn a_commit_reaches_a_member_with_no_peer_online_as_it_starts() {
     let relay = relay().await;
-    let dir = folder("polled");
+    let dir = folder("opened");
     std::fs::create_dir_all(&dir).unwrap();
     let mut alice = stored(&relay, "Alice", &dir.join("alice.db")).await;
     let bob = stored(&relay, "Bob", &dir.join("bob.db")).await;
@@ -1167,63 +1180,6 @@ async fn a_commit_reaches_a_member_with_no_peer_online_at_its_poll() {
     let bob = stored(&relay, "Bob", &dir.join("bob.db")).await;
     eventually("Bob reads the commit", || bob.node.settings(&gid.0).unwrap().name == "Moved").await;
     bob.node.shutdown().await.unwrap();
-}
-
-/// A session that follows an identity's directory applies its change at its poll, when no peer brings it.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_directory_change_reaches_its_follower_at_the_poll() {
-    let relay = relay().await;
-    let alice = session(&relay, "Alice").await;
-    let mut bob = session(&relay, "Bob").await;
-    let (carol, laptop) = identity(&relay, &alice.node, relay.service.clone()).await;
-    bob.node.read_public(&carol).await.unwrap();
-    bob.until(|e| matches!(e, Event::Public { identity } if identity.0 == carol.id.0).then_some(())).await;
-    let tablet: [u8; 32] = lmk_core::random();
-    let mut writers: Vec<Bytes> = vec![lmk_core::device::public(&laptop).into(), lmk_core::device::public(&tablet).into()];
-    writers.sort();
-    let log = alice.node.read_public(&carol).await.unwrap();
-    publish(&relay, &alice.node, &carol, log.next(&laptop, writers.clone())).await;
-    bob.node.sync().await;
-    bob.until(|e| matches!(e, Event::Public { identity } if identity.0 == carol.id.0).then_some(())).await;
-    assert_eq!(bob.node.read_public(&carol).await.unwrap().writers, writers);
-    bob.node.shutdown().await.unwrap();
-}
-
-/// A poll asks each service once for every 256 logs followed there.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_poll_asks_each_service_once_for_every_256_logs() {
-    let relay = relay().await;
-    let dir = folder("heads");
-    let (other, _service) = served(&relay, &dir).await;
-    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let (counting, post) = (asked.clone(), relay.post());
-    let alice = session_with(&relay, "Alice", Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
-        if route == "/membership/2/heads" {
-            let heads: lmk_proto::membership::Heads = serde_json::from_slice(&body).unwrap();
-            counting.lock().unwrap().push((domain.clone(), heads.logs.len()));
-        }
-        post(domain, route, body)
-    })).await;
-    for _ in 0..300 {
-        alice.node.create(settings(CHAT, &relay), None).unwrap();
-    }
-    alice.node.create(Settings { membership: other.clone(), ..settings(CHAT, &relay) }, None).unwrap();
-    asked.lock().unwrap().clear();
-    alice.node.sync().await;
-    let domain = |service: &Service| match service {
-        Service::Serve { domain, .. } => domain.clone(),
-        _ => unreachable!(),
-    };
-    let once = vec![(domain(&relay.service), 256), (domain(&relay.service), 44), (domain(&other), 1)];
-    let mut asked = asked.lock().unwrap().clone();
-    asked.sort();
-    // The background poll, every two minutes, may land in this window and ask the same.
-    let polls = asked.len() / once.len();
-    assert!(polls >= 1, "the poll asked no service");
-    let mut expected: Vec<_> = (0..polls).flat_map(|_| once.clone()).collect();
-    expected.sort();
-    assert_eq!(asked, expected);
-    alice.node.shutdown().await.unwrap();
 }
 
 /// Each commit moves a group to its new epoch's log, at a reference only the epoch's members can derive: a joiner reads
@@ -1246,7 +1202,6 @@ async fn each_commit_moves_the_group_to_its_new_epochs_log() {
         logs.push(log);
     }
     alice.node.remove(&gid.0, &carol.node.key_in(&gid.0).0).await.unwrap();
-    carol.node.sync().await;
     carol.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
     assert!(!logs.contains(&alice.node.log(&gid.0).unwrap()), "the Remove moved the group to a log Carol cannot name");
     let after = alice.node.send(&gid.0, &message("after Carol"), None).await.unwrap();
@@ -1461,7 +1416,7 @@ async fn an_expired_directory_ends_its_identity_on_its_devices() {
     store.expire(lmk_node::now() / lmk_membership::store::DAY_MS + 1).unwrap();
 
     let (mut bob, bob_devices) = start("Bob").await;
-    bob.node.sync().await;
+    bob.node.open_logs().await;
     bob.until(|e| matches!(&e, Event::Removed { group, kind, .. } if *group == gid && kind == IDENTITY).then_some(())).await;
     let text = bob.until(|e| match e {
         Event::Warning { group, text } if group == Some(gid.clone()) => Some(text),
@@ -1614,10 +1569,10 @@ fn a_member_whose_log_the_service_let_go_leaves_when_no_peer_brings_it_within_wa
         SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         while relay.membership.expire().await {}
         let mut bob = stored(&relay, "Bob", &dir.join("bob.db")).await;
-        bob.node.sync().await;
+        bob.node.open_logs().await;
         assert!(bob.node.groups().contains(&gid), "a log let go is left only after WAIT with no entry of it brought");
         SHIFT.fetch_add(lmk_net::peers::WAIT + 60_000, std::sync::atomic::Ordering::Relaxed);
-        bob.node.sync().await;
+        bob.node.open_logs().await;
         let (by, not_kept) = bob.until(|e| match e {
             Event::Removed { group, by, not_kept, .. } if group == gid => Some((by, not_kept)),
             _ => None,
@@ -1655,9 +1610,9 @@ fn a_group_nobody_is_online_in_past_the_retention_ends() {
         while relay.membership.expire().await {}
         for name in ["alice", "bob"] {
             let mut member = stored(&relay, name, &db(name)).await;
-            member.node.sync().await;
+            member.node.open_logs().await;
             SHIFT.fetch_add(lmk_net::peers::WAIT + 60_000, std::sync::atomic::Ordering::Relaxed);
-            member.node.sync().await;
+            member.node.open_logs().await;
             member.until(|e| matches!(&e, Event::Removed { group, by: None, .. } if *group == gid).then_some(())).await;
             assert!(member.node.groups().is_empty());
             member.node.shutdown().await.unwrap();
@@ -1694,9 +1649,9 @@ fn a_group_whose_last_member_went_a_day_after_its_last_commit_lives_six_and_a_ha
         while relay.membership.expire().await {}
         let alice = stored(&relay, "Alice", &db("alice")).await;
         let mut bob = stored(&relay, "Bob", &db("bob")).await;
-        alice.node.sync().await;
+        alice.node.open_logs().await;
         SHIFT.fetch_add(lmk_net::peers::WAIT + 60_000, std::sync::atomic::Ordering::Relaxed);
-        alice.node.sync().await;
+        alice.node.open_logs().await;
         alice.node.send(&gid.0, &message("still here"), None).await.unwrap();
         bob.until(|e| matches!(e, Event::Message(m) if m.payload == message("still here")).then_some(())).await;
         alice.node.shutdown().await.unwrap();
@@ -1759,15 +1714,15 @@ fn a_device_missing_its_identitys_commits_past_the_retention_is_revoked_and_told
         laptop.until(|e| matches!(e, Event::Left { member, .. } if member.name == "phone").then_some(())).await;
         assert_eq!(laptop.node.members(&gid.0).unwrap().len(), 1);
         lists(&laptop.node, &identity, &[laptop_devices.key().unwrap()]).await;
-        agent.node.sync().await;
+        agent.node.send(&chat.0, &message("after the phone"), None).await.unwrap();
         agent.until(|e| matches!(&e, Event::Revoked { group, removed, .. } if *group == chat && removed.iter().any(|m| m.name == "phone")).then_some(())).await;
         assert_eq!(agent.node.members(&chat.0).unwrap().len(), 1, "the phone's session left the chat");
         assert!(laptop_devices.identity().is_some(), "the device in use keeps its identity");
 
         let (mut phone, phone_devices) = start("phone").await;
-        phone.node.sync().await;
+        phone.node.open_logs().await;
         SHIFT.fetch_add(lmk_net::peers::WAIT + 60_000, std::sync::atomic::Ordering::Relaxed);
-        phone.node.sync().await;
+        phone.node.open_logs().await;
         phone.until(|e| matches!(&e, Event::Removed { group, kind, .. } if *group == gid && kind == IDENTITY).then_some(())).await;
         let text = phone.until(|e| match e {
             Event::Warning { group, text } if group == Some(gid.clone()) => Some(text),
@@ -1804,9 +1759,9 @@ fn a_joiner_whose_key_is_in_the_tree_of_a_lapsed_member_is_removed_before_its_ad
         alice.node.open_logs().await;
         while relay.membership.expire().await {}
         let mut bob = stored(&relay, "Bob", &dir.join("bob.db")).await;
-        bob.node.sync().await;
+        bob.node.open_logs().await;
         SHIFT.fetch_add(lmk_net::peers::WAIT + 60_000, std::sync::atomic::Ordering::Relaxed);
-        bob.node.sync().await;
+        bob.node.open_logs().await;
         bob.until(|e| matches!(&e, Event::Removed { group, .. } if *group == gid).then_some(())).await;
         bob.node.shutdown().await.unwrap();
 
@@ -1844,12 +1799,12 @@ fn an_untouched_directory_ends_its_identity_for_the_chats_its_sessions_are_in() 
         SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         alice.node.open_logs().await;
         while relay.membership.expire().await {}
-        alice.node.sync().await;
+        alice.node.send(&chat.0, &message("after the laptop"), None).await.unwrap();
         alice.until(|e| matches!(&e, Event::Left { member, .. } if member.name == "laptop").then_some(())).await;
         alice.until(|e| matches!(&e, Event::Revoked { removed, .. } if removed.iter().any(|m| m.name == "laptop")).then_some(())).await;
         assert_eq!(alice.node.members(&chat.0).unwrap().len(), 1);
 
-        laptop.node.sync().await;
+        laptop.node.open_logs().await;
         laptop.until(|e| matches!(&e, Event::Warning { text, .. } if text.contains("identity join")).then_some(())).await;
         assert!(laptop_devices.identity().is_none());
         for node in [&laptop.node, &agent.node, &alice.node] {
@@ -1873,7 +1828,6 @@ async fn a_device_that_leaves_its_identity_is_removed_without_a_warning() {
 
     assert!(!phone_devices.leave().await.unwrap(), "the laptop stays in the identity");
     lists(&laptop.node, &identity, &[laptop_devices.key().unwrap()]).await;
-    laptop.node.sync().await;
     laptop_devices.duties(&gid.0).await.unwrap();
     laptop.until(|e| matches!(&e, Event::Left { member, .. } if member.name == "phone").then_some(())).await;
     phone.until(|e| matches!(&e, Event::Removed { group, kind, .. } if *group == gid && kind == IDENTITY).then_some(())).await;
@@ -1904,9 +1858,9 @@ fn a_device_last_online_a_day_after_its_identitys_last_commit_keeps_it_six_and_a
         laptop.node.open_logs().await;
         SHIFT.store(23 * HOUR_MS + 13 * DAY_MS / 2, std::sync::atomic::Ordering::Relaxed);
         while relay.membership.expire().await {}
-        laptop.node.sync().await;
+        laptop.node.open_logs().await;
         SHIFT.fetch_add(lmk_net::peers::WAIT + 60_000, std::sync::atomic::Ordering::Relaxed);
-        laptop.node.sync().await;
+        laptop.node.open_logs().await;
         laptop.node.sync_members().await.unwrap();
         assert_eq!(laptop_devices.identity().map(|(_, name)| name), Some("Bob".into()));
         laptop.node.shutdown().await.unwrap();
@@ -1955,7 +1909,7 @@ async fn an_announced_loss_reaches_every_member() {
     alice.node.shutdown().await.unwrap();
 
     let mut carol = stored(&relay, "Carol", &db("carol")).await;
-    carol.node.sync().await;
+    carol.node.open_logs().await;
     let lost = carol.until(|e| match e {
         Event::Lost(lost) => Some(lost),
         _ => None,
@@ -2010,7 +1964,7 @@ async fn catching_up() {
     SHIFT.store(8 * 24 * 3600 * 1000, std::sync::atomic::Ordering::Relaxed);
     let started = std::time::Instant::now();
     let mut carol = stored(&relay, "Carol", &db("carol")).await;
-    carol.node.sync().await;
+    carol.node.open_logs().await;
     let lost = carol.until(|e| match e {
         Event::Lost(lost) => Some(lost),
         _ => None,
@@ -3198,7 +3152,7 @@ async fn lost_seqs_are_told_once_across_restarts() {
 
     // Carol, back with no holder online, loses Bob's message and says so in its summary.
     let mut carol = stored(&relay, "Carol", &db("carol")).await;
-    carol.node.sync().await;
+    carol.node.open_logs().await;
     let lost = carol.until(|e| match e {
         Event::Lost(lost) => Some(lost),
         _ => None,
@@ -3570,7 +3524,6 @@ async fn a_removed_session_drops_its_groups_hints() {
     eventually("Alice holds Bob's relay", || alice.node.hint(&bob_iroh).is_some()).await;
     let alice_key = bob.node.members(&gid.0).unwrap().into_iter().find(|m| m.name == "Alice").unwrap().key;
     assert!(bob.node.remove(&gid.0, &alice_key.0).await.unwrap());
-    alice.node.sync().await;
     alice.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
     assert_eq!(alice.node.hint(&bob_iroh), None);
     assert!(hint_records(&alice_db).is_empty());
@@ -3687,6 +3640,44 @@ async fn entering_an_epoch_takes_one_request() {
 
 /// How long a read of a group's logs stands for a send.
 const FRESH_MS: u64 = 2 * 60 * 1000;
+
+/// A send asks each service about its group's logs in one request: the group's, and that of the identity a member speaks
+/// as, which lives on another.
+#[test]
+fn a_send_asks_each_service_once() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let dir = folder("heads");
+        let (other, _service) = served(&relay, &dir).await;
+        let (requests, post) = recording(relay.post());
+        let alice = session_with(&relay, "Alice", post).await;
+        let (carol, laptop) = identity(&relay, &alice.node, other.clone()).await;
+        let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+        let tablet = session(&relay, "tablet").await;
+        let certified = certificate(&carol, &laptop, &tablet.node.key(), "Carol", "laptop");
+        tablet.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), Some(certified)).await.unwrap();
+        eventually("Alice holds Carol's session", || alice.node.members(&gid.0).unwrap().len() == 2).await;
+        quiet(&requests).await;
+        SHIFT.fetch_add(FRESH_MS, std::sync::atomic::Ordering::Relaxed);
+        let before = requests.lock().unwrap().len();
+        alice.node.send(&gid.0, &message("asks"), None).await.unwrap();
+        let mut asked: Vec<String> = requests.lock().unwrap()[before..].iter().filter(|(_, route)| *route == "/membership/2/heads").map(|(domain, _)| domain.clone()).collect();
+        asked.sort();
+        let domain = |service: &Service| match service {
+            Service::Serve { domain, .. } => domain.clone(),
+            _ => unreachable!(),
+        };
+        let mut expected = vec![domain(&relay.service), domain(&other)];
+        expected.sort();
+        assert_eq!(asked, expected);
+        alice.node.shutdown().await.unwrap();
+        tablet.node.shutdown().await.unwrap();
+    });
+}
 
 /// A send asks the service about its group's logs when this session has not read them within 2 minutes, and then only,
 /// and reads on through each epoch a commit moves the group to: a member that the second of two commits no peer pushed

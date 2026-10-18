@@ -285,13 +285,6 @@ impl<P: Provider> State<P> {
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Asks each service for the heads of the logs this session follows, and reads those that moved. A log the answer
-    /// leaves out is unchanged as of the request, which counts as a read of it; one it lets go is lapsed.
-    pub(crate) async fn ask_heads(self: &Arc<Self>) {
-        let followed = self.lock().followed();
-        self.ask(followed).await;
-    }
-
     /// Asks about the logs of a group, its current log and the public logs of the identities in it, that this session
     /// has not read or asked about within `FRESH`, and reads the group's logs on through each epoch a commit read moves
     /// it to, waiting at most `FRESH_WAIT`: before it sends to the group.
@@ -316,6 +309,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
         timeout(FRESH_WAIT, asked).await.ok();
     }
 
+    /// Asks each service for the heads of these logs, and reads those that moved. A log the answer leaves out is unchanged
+    /// as of the request, which counts as a read of it; one it lets go is lapsed.
     async fn ask(self: &Arc<Self>, followed: Vec<(Vec<u8>, Service, Known)>) {
         let mut services: Vec<Asked> = Vec::new();
         for (id, service, known) in followed {

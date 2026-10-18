@@ -20,7 +20,6 @@ rusqlite = { workspace = true, features = ["bundled"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 
 [dev-dependencies]
-libc = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 iroh = { workspace = true, features = ["tls-ring"] }
 tempfile.workspace = true
