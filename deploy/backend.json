@@ -1,7 +1,7 @@
 {
   "domain": "relay.letmeknow.dev",
   "directory": {
-    "key": "d732776edca30c1026c8751efd7e39bf618ac54e83b4f1b794d1af4b063dbfa7",
+    "key": "07eac707a5c6f5485a9e757a1af00d51dc029843bb122a57eb9940b85853e2bc",
     "relay": "https://relay.letmeknow.dev",
     "relays": ["https://relay.letmeknow.dev"]
   }
