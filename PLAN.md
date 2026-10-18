@@ -2,7 +2,7 @@
 
 Draft 1. 0.20's plan went with 0.20.1, which shipped its last step; its one open item, the delivery measurement, is step 11 here. A patch: nothing changes on the wire, in a group's records or in either store's format, so 0.20.0 and 0.20.1 members and services run beside it. Steps 1 to 5 are fixes; 6 to 10 take out what 0.20 left without a use, or costly. The plan goes when its last step ships.
 
-## 1. A send reads every epoch it moves through
+## 1. A send reads every epoch it moves through (done)
 
 For: a removed member reads nothing sent more than 2 minutes after its removal.
 

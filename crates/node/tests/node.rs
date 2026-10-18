@@ -3621,8 +3621,9 @@ fn counting(post: Post) -> (Arc<std::sync::atomic::AtomicUsize>, Post) {
 /// How long a read of a group's logs stands for a send.
 const FRESH_MS: u64 = 2 * 60 * 1000;
 
-/// A send asks the service about its group's logs when this session has not read them within 2 minutes, and then only:
-/// a member a commit no peer pushed removed gets nothing sealed after the send reads it.
+/// A send asks the service about its group's logs when this session has not read them within 2 minutes, and then only,
+/// and reads on through each epoch a commit moves the group to: a member that the second of two commits no peer pushed
+/// removed gets nothing sealed after the send reads them.
 #[test]
 fn a_send_reads_the_group_first_when_its_copy_is_older_than_2_minutes() {
     static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3643,6 +3644,7 @@ fn a_send_reads_the_group_first_when_its_copy_is_older_than_2_minutes() {
         eventually("Carol holds the three members", || carol.node.members(&gid.0).unwrap().len() == 3).await;
 
         bob.node.shutdown().await.unwrap();
+        alice.node.change_settings(&gid.0, |s| Settings { name: "Moved".into(), ..s }).await.unwrap();
         alice.node.remove(&gid.0, &bob.node.key().0).await.unwrap();
         SHIFT.fetch_add(FRESH_MS, std::sync::atomic::Ordering::Relaxed);
         let before = asked.load(std::sync::atomic::Ordering::Relaxed);
@@ -3650,8 +3652,6 @@ fn a_send_reads_the_group_first_when_its_copy_is_older_than_2_minutes() {
         assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), before + 1, "the send asked about the group's log");
         assert_eq!(carol.node.members(&gid.0).unwrap().len(), 2, "the message was sealed to Alice and Carol alone");
         carol.until(|e| matches!(&e, Event::Left { member, .. } if member.name == "Bob").then_some(())).await;
-        // The commit moved the group to a log of its own, which is read as it is entered.
-        carol.node.sync().await;
         let read = asked.load(std::sync::atomic::Ordering::Relaxed);
         carol.node.send(&gid.0, &message("again"), None).await.unwrap();
         assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), read, "a send within 2 minutes of a read asks nothing");

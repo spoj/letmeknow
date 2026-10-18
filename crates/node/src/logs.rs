@@ -291,9 +291,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Asks about the logs of a group, its current log and the public logs of the identities in it, that this session
-    /// has not read or asked about within `FRESH`, waiting at most `FRESH_WAIT`: before it sends to the group.
+    /// has not read or asked about within `FRESH`, and reads the group's logs on through each epoch a commit read moves
+    /// it to, waiting at most `FRESH_WAIT`: before it sends to the group.
     pub(crate) async fn refresh(self: &Arc<Self>, gid: &[u8]) {
-        let stale = {
+        let (stale, log) = {
             let mut st = self.lock();
             let now = corrected();
             let mut followed = st.followed();
@@ -301,9 +302,16 @@ impl<P: Provider + Send + 'static> Inner<P> {
             for (id, ..) in &followed {
                 st.logs.get_mut(id).unwrap().asked = now;
             }
-            followed
+            (followed, st.group(gid).map(|g| g.rec.log.clone()).ok())
         };
-        timeout(FRESH_WAIT, self.ask(stale)).await.ok();
+        let asked = async {
+            self.ask(stale).await;
+            let moved = self.lock().group(gid).is_ok_and(|g| Some(&g.rec.log) != log.as_ref());
+            if moved && let Err(error) = self.read_group(gid).await {
+                self.report(&error);
+            }
+        };
+        timeout(FRESH_WAIT, asked).await.ok();
     }
 
     async fn ask(self: &Arc<Self>, followed: Vec<(Vec<u8>, Service, Known)>) {
