@@ -2185,17 +2185,18 @@ async fn missed_commits(test: &str) -> (Vec<u64>, Vec<u64>) {
 
     let mut carol = stored(&relay, &db("carol")).await;
     let (mut delivered, mut lost) = (Vec::new(), Vec::new());
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match carol.events.recv().await {
-                Some(Event::Message(message)) => delivered.push(message.seq),
-                Some(Event::Lost(lost_now)) => lost.extend(lost_now.messages.iter().flat_map(|of| of.seqs.clone())),
-                _ => {}
-            }
+    // Carol's events until she accounted for both messages, and for 2 seconds more, in which a second account shows.
+    let mut end = tokio::time::Instant::now() + WAIT;
+    while let Ok(Some(event)) = tokio::time::timeout_at(end, carol.events.recv()).await {
+        match event {
+            Event::Message(message) => delivered.push(message.seq),
+            Event::Lost(lost_now) => lost.extend(lost_now.messages.iter().flat_map(|of| of.seqs.clone())),
+            _ => {}
         }
-    })
-    .await
-    .unwrap_err();
+        if delivered.len() + lost.len() >= sent.len() {
+            end = end.min(tokio::time::Instant::now() + Duration::from_secs(2));
+        }
+    }
     eventually("Carol applied every commit", || carol.node.epoch(&gid.0).unwrap() == epoch).await;
     for session in [&alice, &bob, &carol] {
         session.node.shutdown().await.unwrap();
