@@ -152,7 +152,7 @@ async fn serves_relay_and_membership_without_frontend() {
     server.abort();
 }
 
-const APPEND: &str = "/membership/4/append";
+const APPEND: &str = "/membership/5/append";
 
 fn append_json(capability: u8, entry: &[u8]) -> Vec<u8> {
     serde_json::to_vec(&Append { capability: [capability; 32], entries: vec![Bytes(entry.to_vec())] }).unwrap()
@@ -187,11 +187,11 @@ async fn membership_refuses_what_pages_send() {
     let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, Some("https://letmeknow.dev"), &append_json(8, b"x"))).await;
     assert!(response.starts_with("HTTP/1.1 403"), "{response}");
     let read = serde_json::to_vec(&Read { capability: [8; 32], after: 0 }).unwrap();
-    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/4/read", None, &read)).await;
+    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/5/read", None, &read)).await;
     let Answer::Ok(page) = answer::<Page>(&response) else { panic!("{response}") };
     assert!(page.entries.is_empty(), "a page appended");
 
-    let response = https_raw("127.0.0.1", https, &cert, b"GET /membership/4/read HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await;
+    let response = https_raw("127.0.0.1", https, &cert, b"GET /membership/5/read HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await;
     assert!(response.starts_with("HTTP/1.1 405"), "{response}");
     let response = https_raw("127.0.0.1", https, &cert, &post("/membership/2/append", None, &append_json(7, b"x"))).await;
     assert!(response.starts_with("HTTP/1.1 404"), "{response}");
@@ -292,7 +292,7 @@ async fn an_answer_that_does_not_drain_closes_its_connection() {
     let server = tokio::spawn(serve(config));
     wait_for_https(https).await;
 
-    let read = post("/membership/4/read", None, &serde_json::to_vec(&Read { capability: [3; 32], after: 0 }).unwrap());
+    let read = post("/membership/5/read", None, &serde_json::to_vec(&Read { capability: [3; 32], after: 0 }).unwrap());
     let page = https_raw("127.0.0.1", https, &cert, &read).await.len();
 
     let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
@@ -367,9 +367,9 @@ async fn the_journal_holds_no_addresses_keys_or_capabilities() {
     let append = post(APPEND, None, &append_json(7, b"one"));
     assert!(https_raw("127.0.0.1", https, &cert, &append).await.starts_with("HTTP/1.1 200"));
     let read = serde_json::to_vec(&Read { capability, after: 0 }).unwrap();
-    assert!(https_raw("127.0.0.1", https, &cert, &post("/membership/4/read", None, &read)).await.starts_with("HTTP/1.1 200"));
+    assert!(https_raw("127.0.0.1", https, &cert, &post("/membership/5/read", None, &read)).await.starts_with("HTTP/1.1 200"));
     let heads = serde_json::to_vec(&Heads { logs: vec![Known(capability, 0)] }).unwrap();
-    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/4/heads", None, &heads)).await;
+    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/5/heads", None, &heads)).await;
     let Answer::<Moved>::Ok(moved) = answer(&response) else { panic!("{response}") };
     assert_eq!(moved.heads.len(), 1);
     let mut failed = TcpStream::connect((Ipv4Addr::LOCALHOST, https)).await.unwrap();
@@ -402,9 +402,9 @@ async fn the_journal_holds_no_addresses_keys_or_capabilities() {
     let store = lmk_membership::store::Store::open(&state).unwrap();
     while store.expire(i64::MAX as u64).unwrap() {}
     drop(store);
-    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/4/read", None, &read)).await;
+    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/5/read", None, &read)).await;
     assert!(matches!(answer::<Page>(&response), Answer::Expired { .. }), "{response}");
-    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/4/heads", None, &heads)).await;
+    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/5/heads", None, &heads)).await;
     assert!(matches!(answer::<Moved>(&response), Answer::Ok(moved) if moved.expired.len() == 1), "{response}");
     router.shutdown().await.unwrap();
     server.abort();

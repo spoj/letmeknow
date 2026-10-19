@@ -2,8 +2,8 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// The one ALPN of all our protocols except file transfer.
-pub const ALPN: &[u8] = b"letmeknow/7";
+/// The one ALPN of all our protocols.
+pub const ALPN: &[u8] = b"letmeknow/8";
 
 /// The largest frame a reader takes.
 pub const MAX_FRAME: u32 = 32 << 20;

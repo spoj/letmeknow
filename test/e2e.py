@@ -131,7 +131,7 @@ def main():
 
         # An invite, and chat.
         invite = run("alice", "invite")
-        check(invite["link"].startswith("https://letmeknow.dev/i#11."), "invite gives a link to a new chat")
+        check(invite["link"].startswith("https://letmeknow.dev/i#12."), "invite gives a link to a new chat")
         group = invite["group"]
         check("serve" in run("alice", "groups")[0]["membership"], "its log is on the local letmeknow serve")
         joined = run("bob", "join", invite["link"])

@@ -217,7 +217,7 @@ async fn pair(world: &World, hold: Duration) -> (Agent, Agent, String) {
     let invite = alice.cmd(&["invite"]).await.unwrap();
     assert_eq!(keys(&invite), keys(&json!({ "link": 0, "group": 0, "expires_in": 0 })));
     let link = invite["link"].as_str().unwrap();
-    assert!(link.starts_with("https://letmeknow.dev/i#11."));
+    assert!(link.starts_with("https://letmeknow.dev/i#12."));
     let joined = bob.cmd(&["join", link]).await.unwrap();
     assert_eq!(joined["group"], invite["group"]);
     assert_eq!(joined["members"].as_array().unwrap().len(), 2);
@@ -684,7 +684,7 @@ fn a_restarted_session_prints_what_came_after_the_last_it_showed() {
 fn a_home_of_another_format_is_refused() {
     local(async {
         let world = world("format").await;
-        for (format, names) in [("10", "an earlier letmeknow"), ("12", "a newer letmeknow")] {
+        for (format, names) in [("11", "an earlier letmeknow"), ("13", "a newer letmeknow")] {
             let home = world.root.path().join(format!("format-{format}"));
             std::fs::create_dir_all(&home).unwrap();
             std::fs::write(home.join("format"), format!("{format}\n")).unwrap();

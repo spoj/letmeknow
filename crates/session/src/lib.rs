@@ -221,15 +221,15 @@ pub async fn listen(
     let format = home.join("format");
     let found = std::fs::read_to_string(&format).ok().map(|found| found.trim().to_owned());
     match found.as_deref() {
-        Some("11") | None => {}
-        Some(newer) if newer.parse::<u32>().is_ok_and(|format| format > 11) => bail!(
+        Some("12") | None => {}
+        Some(newer) if newer.parse::<u32>().is_ok_and(|format| format > 12) => bail!(
             "{home} holds state that a newer letmeknow wrote (format {newer}), which this one cannot read: run the newest release, `npx -y @letmeknow/cli@latest --home {home} listen`, or use another --home for this one",
             home = home.display()
         ),
         _ => bail!("{} holds the state of an earlier letmeknow, which this one cannot read: move it away, or use another --home", home.display()),
     }
     cli::private_dir(&config.dir)?;
-    std::fs::write(&format, "11\n")?;
+    std::fs::write(&format, "12\n")?;
     let directory = own_directory(home, &network, &config.membership).await?;
     let membership = Service::Serve { key: Bytes(directory.key.to_vec()), domain: config.membership.clone(), rest: Default::default() };
     // One process runs a session, even when two start at once.

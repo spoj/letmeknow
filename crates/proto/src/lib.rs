@@ -17,7 +17,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
 use serde_json::Value;
 
-/// The first `n` elements of a JSON array, as a tuple: a later 0.22.x may append elements, which this one ignores.
+/// The first `n` elements of a JSON array, as a tuple: a later 0.23.x may append elements, which this one ignores.
 pub(crate) fn leading<T: DeserializeOwned>(mut values: Vec<Value>, n: usize) -> serde_json::Result<T> {
     values.truncate(n);
     serde_json::from_value(Value::Array(values))

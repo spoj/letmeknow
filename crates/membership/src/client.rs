@@ -125,7 +125,7 @@ impl ServeClient {
             && entries.iter().map(Vec::len).sum::<usize>() <= membership::APPEND_BYTES, Refused("size".into()));
         let sent = clock::now();
         let body = json(&Append { capability: *capability, entries: entries.iter().cloned().map(Bytes).collect() })?;
-        let appended: Appended = self.request("/membership/4/append", body, Some(head::reference(self.0.key.as_bytes(), capability))).await?;
+        let appended: Appended = self.request("/membership/5/append", body, Some(head::reference(self.0.key.as_bytes(), capability))).await?;
         Frontier::empty(*self.0.key.as_bytes(), head::reference(self.0.key.as_bytes(), capability)).check(&appended.head, None)?;
         record_time(sent, &appended.head)?;
         Ok(appended)
@@ -135,7 +135,7 @@ impl ServeClient {
         ensure!(anchor.service() == self.0.key.as_bytes() && anchor.log_ref() == &head::reference(self.0.key.as_bytes(), capability), WrongLog);
         let sent = clock::now();
         let body = json(&Read { capability: *capability, after: anchor.length() })?;
-        let page: Page = self.request("/membership/4/read", body, Some(*anchor.log_ref())).await?;
+        let page: Page = self.request("/membership/5/read", body, Some(*anchor.log_ref())).await?;
         let page = anchor.verify_page(page)?;
         record_time(sent, &page.head)?;
         Ok(page)
@@ -148,7 +148,7 @@ impl ServeClient {
         let mut moved = Vec::new();
         for chunk in logs.chunks(membership::HEAD_LOGS) {
             let sent = clock::now();
-            let Moved { heads, expired } = self.request("/membership/4/heads", json(&Heads { logs: chunk.to_vec() })?, None).await?;
+            let Moved { heads, expired } = self.request("/membership/5/heads", json(&Heads { logs: chunk.to_vec() })?, None).await?;
             for head in heads {
                 if !head.verify(&self.0.key) {
                     return Err(WrongDirectory(self.0.domain.clone()).into());

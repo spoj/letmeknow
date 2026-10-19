@@ -60,9 +60,9 @@ pub enum Route { Append, Read, Heads }
 impl Route {
     pub fn parse(path: &str) -> Option<Self> {
         match path {
-            "/membership/4/append" => Some(Self::Append),
-            "/membership/4/read" => Some(Self::Read),
-            "/membership/4/heads" => Some(Self::Heads),
+            "/membership/5/append" => Some(Self::Append),
+            "/membership/5/read" => Some(Self::Read),
+            "/membership/5/heads" => Some(Self::Heads),
             _ => None,
         }
     }
