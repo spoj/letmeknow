@@ -387,6 +387,10 @@ impl Inner {
         let Ok((claim, epoch)) = core::claim(&ciphertext) else { return Ok(None) };
         let current = g.mls.epoch();
         let room = |g: &G| g.early.iter().map(|(_, c)| c.len()).chain(g.unopened.values().map(|(_, c)| c.len())).sum::<usize>() + ciphertext.len() <= UNOPENED;
+        if let Some(peer) = from.filter(|_| epoch > current) {
+            st.peers.behind(peer.as_bytes());
+        }
+        let g = st.group_mut(gid)?;
         if epoch == current + 1 {
             if let Some(peer) = from
                 && room(g)

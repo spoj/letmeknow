@@ -709,3 +709,18 @@ fn twelve_members_converge_through_loss_and_reconnection() {
         assert!(sim.peers[i].next(now).is_none_or(|at| at > now + 60_000), "member {i} is idle");
     }
 }
+
+/// A peer that sent what shows it is past this member, as a message of a later epoch, is sent a `hello`, so that it sends
+/// the entries this member lacks: nothing else would tell it where this member is.
+#[test]
+fn a_peer_past_this_member_is_told_where_it_is() {
+    let hellos = |out: &[Out]| out.iter().filter(|o| matches!(o, Out::Frame(_, Frame::Hello { .. }))).count();
+    let mut p = peers();
+    p.group(id(), own(1, &[1]), 0);
+    p.connect(key(1), gs(), false, 0);
+    assert_eq!(hellos(&p.poll(DEBOUNCE)), 1, "on connecting");
+    assert_eq!(hellos(&p.poll(DEBOUNCE + 1)), 0);
+    p.behind(&key(1));
+    assert_eq!(p.next(DEBOUNCE + 2), Some(DEBOUNCE + 2));
+    assert_eq!(hellos(&p.poll(DEBOUNCE + 2)), 1);
+}

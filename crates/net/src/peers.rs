@@ -233,6 +233,14 @@ impl Peers {
         }
     }
 
+    /// The peer sent what shows it is past this member in a group, as a message of a later epoch: a `hello` tells it where
+    /// this member is, so that it sends the entries this member lacks.
+    pub fn behind(&mut self, peer: &Key) {
+        if let Some(c) = self.conns.get_mut(peer) {
+            c.hello = true;
+        }
+    }
+
     /// The peers connected now.
     pub fn connected(&self) -> Vec<Key> {
         self.conns.keys().copied().collect()
