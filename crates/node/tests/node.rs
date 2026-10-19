@@ -599,9 +599,10 @@ async fn a_pending_leave_is_finished_once_the_log_is_reachable() {
     held_leave("leave-reachable", false).await;
 }
 
-/// A commit reaches a member that no peer brings it to at the member's next update, which reads the log as it commits.
+/// A member of a group that delivered nothing and changed nothing since its last update reads and commits nothing, days
+/// later: the commit it missed reaches it at its next send, which stirs its update.
 #[test]
-fn a_commit_reaches_a_member_with_no_peer_online_at_its_update() {
+fn an_idle_member_commits_nothing_until_it_sends() {
     static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     fn shifted() -> u64 {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
@@ -628,13 +629,18 @@ fn a_commit_reaches_a_member_with_no_peer_online_at_its_update() {
         drop(bob);
         SHIFT.store(2 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         let bob = stored(&relay, &dir.join("bob.db")).await;
-        eventually("Bob reads the commit, and commits his update past it", || bob.node.epoch(&gid.0).unwrap() == epoch + 1).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(bob.node.epoch(&gid.0).unwrap() < epoch, "an idle member reads and commits nothing");
+        bob.node.send(&gid.0, &message("back"), None).await.unwrap();
+        assert!(bob.node.epoch(&gid.0).unwrap() >= epoch, "the send read the commit first");
+        eventually("Bob's send stirs his update", || bob.node.epoch(&gid.0).unwrap() == epoch + 1).await;
         bob.node.shutdown().await.unwrap();
     });
 }
 
 /// Each commit moves a group to its new epoch's log, at a reference only the epoch's members can derive: a joiner reads
-/// from the log its Add moved the group to, and a removed member is left behind on the last one it could name.
+/// from the log its own update past its Add moved the group to, and a removed member is left behind on the last one it
+/// could name.
 #[tokio::test(flavor = "multi_thread")]
 async fn each_commit_moves_the_group_to_its_new_epochs_log() {
     let relay = relay().await;
@@ -648,8 +654,8 @@ async fn each_commit_moves_the_group_to_its_new_epochs_log() {
         joiner.node.join(&alice.node.invite(&gid.0, INVITE_VALID).await.unwrap()).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
         let log = joiner.node.log(&gid.0).unwrap();
-        assert!(!logs.contains(&log), "the Add moved the group to a new log");
-        assert_eq!(alice.node.log(&gid.0).unwrap(), log, "the joiner reads from the log its Add moved the group to");
+        assert!(!logs.contains(&log), "the Add, and the joiner's update past it, moved the group to a new log");
+        eventually("Alice reads the joiner's update", || alice.node.log(&gid.0).unwrap() == log).await;
         logs.push(log);
     }
     alice.node.remove(&gid.0, &carol.node.key().0).await.unwrap();
@@ -879,7 +885,8 @@ fn a_group_forgets_the_adds_of_members_gone_past_h() {
 }
 
 /// A member whose epoch's log its service let go is removed by the others, which hold the commits it missed: the next
-/// commit a member builds, its update as it starts, asks the service about the logs members are behind in first.
+/// commit a member builds, its update once its message stirs it, asks the service about the logs members are behind in
+/// first.
 #[test]
 fn a_member_in_an_epoch_the_service_let_go_is_removed_by_the_others() {
     static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -906,6 +913,7 @@ fn a_member_in_an_epoch_the_service_let_go_is_removed_by_the_others() {
         SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         while relay.membership.expire().await {}
         let mut alice = stored(&relay, &dir.join("alice.db")).await;
+        alice.node.send(&gid.0, &message("back"), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Left { member, .. } if member.key == bob_key).then_some(())).await;
         assert_eq!(alice.node.members(&gid.0).unwrap().len(), 1);
         alice.node.shutdown().await.unwrap();
@@ -1038,6 +1046,8 @@ fn a_group_nobody_is_online_in_lives_until_stale() {
         let gid = alice.node.create(settings(&relay)).unwrap();
         bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID).await.unwrap()).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+        let epoch = bob.node.epoch(&gid.0).unwrap();
+        eventually("Alice reads Bob's update", || alice.node.epoch(&gid.0).unwrap() == epoch).await;
         bob.node.shutdown().await.unwrap();
         drop(bob);
         alice.node.shutdown().await.unwrap();
@@ -1243,8 +1253,9 @@ async fn remove_others_removes_every_other_member_in_one_commit() {
     for joiner in [&bob, &carol] {
         joiner.node.join(&alice.node.invite(&gid.0, INVITE_VALID).await.unwrap()).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+        let epoch = joiner.node.epoch(&gid.0).unwrap();
+        eventually("Alice reads the joiner's update", || alice.node.epoch(&gid.0).unwrap() == epoch).await;
     }
-    eventually("Alice has three members", || alice.node.members(&gid.0).unwrap().len() == 3).await;
     eventually("Bob has three members", || bob.node.members(&gid.0).unwrap().len() == 3).await;
     let epoch = alice.node.epoch(&gid.0).unwrap();
     alice.node.remove_others(&gid.0).await.unwrap();
@@ -1253,10 +1264,10 @@ async fn remove_others_removes_every_other_member_in_one_commit() {
     carol.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
 }
 
-/// Members update their leaves every T. A leaver that updates while the others are away reseals its `leave` in each
-/// epoch it moves to, and is removed once a member that holds it is back.
+/// A `leave` stirs its sender's update. A leaver that updates while the others are away reseals its `leave` in the epoch
+/// it moves to, and is removed once a member that holds it is back.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_leaver_asks_again_while_it_updates_every_t() {
+async fn a_leaver_asks_again_past_its_update() {
     let relay = relay().await;
     let dir = folder("leave-again-t");
     std::fs::create_dir_all(&dir).unwrap();
@@ -1270,7 +1281,7 @@ async fn a_leaver_asks_again_while_it_updates_every_t() {
 
     let epoch = bob.node.epoch(&gid.0).unwrap();
     bob.node.leave(&gid.0).unwrap().unwrap();
-    eventually("Bob updates its leaf", || bob.node.epoch(&gid.0).unwrap() >= epoch + 2).await;
+    eventually("Bob updates its leaf", || bob.node.epoch(&gid.0).unwrap() > epoch).await;
 
     let alice = stored(&relay, &alice_db).await;
     bob.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
@@ -1585,25 +1596,26 @@ async fn a_joiner_asks_its_committer_again_past_a_silent_member() {
     assert_eq!(alice.node.epoch(&gid.0).unwrap(), epoch + 1, "one Add");
 }
 
-/// Two asks with one KeyPackage at once, as a joiner's again after one failed in transit: the member adds it once and
-/// answers both with its Welcome, refusing neither.
+/// Two asks with one KeyPackage at once, as a joiner's again after one failed in transit: the member adds it once, and
+/// answers the other with its Welcome too unless the joiner's update past its Add came first.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_asks_with_one_key_package_add_it_once() {
     let relay = relay().await;
-    let alice = session(&relay).await;
+    let mut alice = session(&relay).await;
     let bob = session(&relay).await;
     let gid = alice.node.create(settings(&relay)).unwrap();
     let link = alice.node.invite(&gid.0, INVITE_VALID).await.unwrap();
-    let epoch = alice.node.epoch(&gid.0).unwrap();
     let (one, two) = tokio::join!(bob.node.join(&link), bob.node.join(&link));
-    // The joiner applies one Welcome; the other answer finds its KeyPackage spent.
-    let (joined, other) = match (one, two) {
-        (Ok((joined, _)), Err(other)) | (Err(other), Ok((joined, _))) => (joined, other),
+    // The joiner applies one Welcome; the other answer finds its KeyPackage spent, or the invite used.
+    let joined = match (one, two) {
+        (Ok((joined, _)), Err(_)) | (Err(_), Ok((joined, _))) => joined,
         answers => panic!("{answers:?}"),
     };
     assert_eq!(joined, gid);
-    assert!(!format!("{other:#}").contains("refused"), "{other:#}");
-    assert_eq!(alice.node.epoch(&gid.0).unwrap(), epoch + 1, "one Add");
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    let epoch = bob.node.epoch(&gid.0).unwrap();
+    eventually("Alice reads Bob's update", || alice.node.epoch(&gid.0).unwrap() == epoch).await;
+    assert_eq!(alice.node.members(&gid.0).unwrap().len(), 2, "one Add");
 }
 
 /// A member connected is online, though not heard from yet.
@@ -1924,8 +1936,8 @@ async fn a_message_an_online_member_holds_is_kept_by_the_next_commit() {
 }
 
 /// An update waiting for what connected members list commits once HEAR is up, not later: Bob's stand-in lists seqs that
-/// Alice never got, and nothing sends them. It lists right after one of Alice's updates, so that the next, due within T,
-/// waits in the epoch it lists for.
+/// Alice never got, and nothing sends them. It lists right after an update Alice's message stirred; her next message
+/// stirs the next update, due within T, which waits in the epoch it lists for.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_update_waits_for_what_connected_members_list_for_at_most_hear() {
     const T: u32 = 10;
@@ -1946,10 +1958,12 @@ async fn an_update_waits_for_what_connected_members_list_for_at_most_hear() {
     let (iroh, mls) = member_of(&bob_db);
     let mut bob_hand = hand(&relay, iroh, &alice.node).await;
     let before = alice.node.epoch(&gid.0).unwrap();
+    alice.node.send(&gid.0, &message("stir"), None).await.unwrap();
     eventually("Alice updates", || alice.node.epoch(&gid.0).unwrap() > before).await;
     let epoch = alice.node.epoch(&gid.0).unwrap();
     let listed_at = std::time::Instant::now();
     list(&mut bob_hand, &mls, &gid, joined, epoch, lmk_node::now() + 3_600_000, vec![seqs(&Bytes(mls.key().to_vec()), joined, &[1, 2, 3])]).await;
+    alice.node.send(&gid.0, &message("stir"), None).await.unwrap();
     tokio::time::timeout(Duration::from_millis(T as u64 * 1000 + lmk_net::peers::HEAR + 5_000), async {
         while alice.node.epoch(&gid.0).unwrap() == epoch {
             tokio::time::sleep(Duration::from_millis(100)).await;

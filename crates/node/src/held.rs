@@ -583,6 +583,9 @@ impl Inner {
         let author = g.author_mut(&h.author.0, h.joined).context("an author")?;
         let late = author.given_up.contains(h.seq);
         author.delivered.insert(h.seq);
+        if !std::mem::replace(&mut g.rec.stirred, true) {
+            self.work.send(Work::Duties(gid.to_vec())).ok();
+        }
         g.rec.index += 1;
         let index = g.rec.index;
         record.delivered = Some(Delivered { index, at: now, sender, missing, late });

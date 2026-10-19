@@ -14,6 +14,9 @@ use lmk_proto::ranges::Ranges;
 use crate::held::Author;
 use crate::{Epoch, Event, Inner, Lost, LostOf, Out, State, Work, days, put};
 
+/// How many of a group's last logs a commit tells the connected members it removes.
+const TOLD: usize = 8;
+
 /// The answer to the Add that ended an epoch, which its committer keeps for H for a joiner whose answer was lost.
 pub(crate) fn commit_key(gid: &[u8], epoch: u64) -> Vec<u8> {
     [b"node/commit/".as_slice(), gid, b"/", &epoch.to_be_bytes()].concat()
@@ -107,10 +110,13 @@ impl Inner {
         g.changed = true;
         let members = g.mls.members();
         let by = members.iter().find(|m| m.index == applied.by).cloned();
+        if !applied.added.is_empty() || !applied.removed.is_empty() {
+            g.rec.stirred = true;
+        }
         if applied.own {
             g.rec.committed = current;
             if applied.updated {
-                g.rec.updated = now;
+                (g.rec.updated, g.rec.stirred) = (now, false);
             }
         }
         if let Some(core::Admission { welcome, cut, sig }) = applied.admission.take() {
@@ -126,11 +132,19 @@ impl Inner {
             st.unhear(gid, &member.key)?;
         }
         st.unhint(removed.iter().filter_map(|member| member.leaf.as_ref().map(|leaf| leaf.key.clone())).collect())?;
-        // The members it removed that are connected are told at once: no peer brings them later commits.
-        let ended = st.group(gid)?.rec.log.0.clone();
-        let (entries, head) = (st.entries(&ended, 0), st.log(&ended)?.head.clone().context("an applied entry without its head")?);
+        // The members it removed that are connected are told at once, by the group's last logs in order, as one may be a
+        // commit or two behind: no peer brings them later commits.
+        let mut logs: Vec<(u64, Vec<u8>)> = st.group_logs(gid).into_iter().filter_map(|id| Some((st.logs.get(&id)?.since, id))).collect();
+        logs.sort();
+        let told = logs.len().saturating_sub(TOLD);
+        let frames: Vec<Frame> = logs[told..].iter().filter_map(|(_, id)| {
+            let head = st.logs.get(id)?.head.clone()?;
+            Some(Frame::Entries { log: Bytes(id.clone()), entries: st.entries(id, 0), head })
+        }).collect();
         for peer in removed.iter().filter_map(|member| crate::endpoint_id(&member.leaf.as_ref()?.key.0)).filter(|peer| st.peers.is_connected(peer.as_bytes())) {
-            st.out.push(Out::Frame { peer, frame: Frame::Entries { log: Bytes(ended.clone()), entries: entries.clone(), head: head.clone() } });
+            for frame in &frames {
+                st.out.push(Out::Frame { peer, frame: frame.clone() });
+            }
         }
         self.work.send(Work::Applied { group: gid.to_vec(), by, added, removed, gone }).ok();
         st.group_mut(gid)?.rec.position = position;

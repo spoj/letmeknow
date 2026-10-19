@@ -1,9 +1,11 @@
 //! A group's duties, each derived from committed records and idempotent: a pass runs at the log's head after each
 //! advance, at start, and at this session's next update, and one whose commit failed again after `RETRY`. It drops what
 //! the group kept past H, and commits at most once, with every Remove due (members whose `leave` the cut it builds
-//! keeps, and members left behind in an epoch whose log was let go, as the service answers just before) and this
-//! session's update if due (each T, at an offset of its own), which first fetches for at most `HEAR` what the last
-//! commit kept and connected members hold past the cut.
+//! keeps, and members left behind in an epoch whose log was let go, as the service answered at most a day before) and
+//! this session's update if due: T after the last, at an offset of its own, once the group delivered a message or
+//! changed its members since. The update first fetches for at most `HEAR` what the last commit kept and connected
+//! members hold past the cut. T grows with the group, so that its members update about hourly between them, up to three
+//! days: an online member's update shows it is there well within the services' retention.
 
 use std::sync::Arc;
 
@@ -26,14 +28,26 @@ use crate::{G, Inner, State, Work, days, get, now};
 const BLOCKED: u64 = 10_000;
 /// How soon a pass runs again after its commit failed, as while the service is down.
 const RETRY: u64 = 10 * 60 * 1000;
+/// How often a member asks which members' logs their services let go, at most, in milliseconds.
+const EVICT: u64 = 24 * 3600 * 1000;
+
+/// T, in milliseconds, for a group of `members` whose settings name `update` seconds: that, times the members past 24
+/// over 24, up to three times that.
+pub(crate) fn interval(update: u32, members: usize) -> u64 {
+    update.max(1) as u64 * 1000 * (members as u64).clamp(24, 72) / 24
+}
 
 /// When the leaf of the member with key `key`, last updated at `updated`, is next due an update, in milliseconds: at its
-/// first slot after `updated`, its slots every `update` seconds at an offset by a hash of its key, so that members
+/// first slot after `updated`, its slots every `t` milliseconds at an offset by a hash of its key, so that members
 /// update apart.
-pub(crate) fn next_update(updated: u64, update: u32, key: &[u8]) -> u64 {
-    let t = update.max(1) as u64 * 1000;
+pub(crate) fn next_update(updated: u64, t: u64, key: &[u8]) -> u64 {
     let offset = u64::from_be_bytes(Sha256::digest(key)[..8].try_into().unwrap()) % t;
     (updated + t - offset) / t * t + offset
+}
+
+/// When this session's update in a group is next due, if the group stirred since its last.
+fn next(g: &G, me: &[u8]) -> u64 {
+    next_update(g.rec.updated, interval(g.mls.settings().update, g.mls.members().len()), me)
 }
 
 impl State {
@@ -128,7 +142,7 @@ fn due(st: &State, g: &G) -> Result<Option<Change>> {
     let remove: Vec<u32> = members.iter().filter(|m| m.key != me).filter(|m| kept(m) || g.left_behind(&m.key)).map(|m| m.index).collect();
     let Some(own) = members.iter().find(|m| m.index == g.mls.own_index()) else { return Ok(None) };
     let leaf = &st.session.leaf;
-    let update = own.leaf.as_ref() != Some(leaf) || now() >= next_update(g.rec.updated, g.mls.settings().update, me);
+    let update = own.leaf.as_ref() != Some(leaf) || g.rec.stirred && now() >= next(g, me);
     Ok((update || !remove.is_empty()).then(|| Change { remove, leaf: Some(leaf.clone()), cut, ..Change::default() }))
 }
 
@@ -175,7 +189,7 @@ impl Inner {
             st.expire(gid)?;
             let tick = st.tick();
             let g = st.group(gid)?;
-            let next = next_update(g.rec.updated, g.mls.settings().update, st.me());
+            let next = if g.rec.stirred { next(g, st.me()) } else { u64::MAX };
             let pending = due(&st, g)?;
             // A pass that removes commits at once.
             let removing = pending.as_ref().is_some_and(|change| !change.remove.is_empty());
@@ -191,7 +205,13 @@ impl Inner {
             return Ok(());
         }
         let committed = async {
-            self.ask_behind(gid).await?;
+            let asked = self.lock().group(gid)?.rec.evicted;
+            if now() >= asked + EVICT {
+                self.ask_behind(gid).await?;
+                let mut st = self.lock();
+                st.group_mut(gid)?.rec.evicted = now();
+                st.save(gid)?;
+            }
             self.commit(gid, due).await
         };
         if let Err(error) = committed.await {
@@ -201,10 +221,16 @@ impl Inner {
         Ok(())
     }
 
+    /// Commits this session's update at once, as a joiner does to merge its leaf, which its Add left unmerged, into the
+    /// tree: what it costs each later commit then grows with the log of the group's size, not with its size.
+    pub(crate) async fn merge(self: &Arc<Self>, gid: &[u8]) -> Result<()> {
+        self.commit(gid, due).await.map(drop)
+    }
+
     /// Runs the group's duties again at `at`, unless a run is timed sooner.
     fn time(self: &Arc<Self>, gid: &[u8], at: u64) {
         let wait = at.saturating_sub(now());
-        if wait == 0 {
+        if wait == 0 || at == u64::MAX {
             return;
         }
         {
@@ -252,14 +278,22 @@ mod tests {
     }
 
     #[test]
-    fn each_member_updates_every_t_at_an_offset_of_its_own() {
+    fn t_grows_with_the_group_from_24_members_up_to_three_times() {
         let day = 24 * 3600;
+        assert_eq!(interval(day, 3), interval(day, 24));
+        assert_eq!(interval(day, 48), 2 * interval(day, 24));
+        assert_eq!(interval(day, 1000), 3 * interval(day, 24));
+    }
+
+    #[test]
+    fn each_member_updates_every_t_at_an_offset_of_its_own() {
+        let day = 24 * 3600 * 1000;
         let (a, b) = (next_update(0, day, b"a"), next_update(0, day, b"b"));
-        assert!(a != b && a <= day as u64 * 1000 && b <= day as u64 * 1000);
+        assert!(a != b && a <= day && b <= day);
         for updated in [1, a - 1, a, a + 1, a + 5 * 3600 * 1000] {
             let next = next_update(updated, day, b"a");
-            assert!(next > updated && next <= updated + day as u64 * 1000, "{updated}: {next}");
-            assert_eq!(next % (day as u64 * 1000), a % (day as u64 * 1000), "on the member's slot");
+            assert!(next > updated && next <= updated + day, "{updated}: {next}");
+            assert_eq!(next % day, a % day, "on the member's slot");
         }
     }
 }

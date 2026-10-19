@@ -192,10 +192,15 @@ impl Inner {
             let admission = lmk_core::group::Admission { welcome: admitted.welcome.0, cut: admitted.cut, sig: admitted.sig.0 };
             let mls = Group::join(&st.provider, &admitted.commit.0, &admission, &key_package_reference(&st.provider, key_package)?)?;
             ensure!(!st.groups.contains_key(mls.id()), "this session is in that group already");
-            st.add_group(mls, Rec::default())?
+            // Its Add had no update path: its first update, due at once, merges its leaf into the tree (`merge`).
+            st.add_group(mls, Rec { stirred: true, ..Rec::default() })?
         };
         if let Err(error) = self.read_group(&gid).await {
             self.warn(Some(&gid), format!("reading the group's log: {error:#}"));
+        }
+        // Its duties commit the update later if this one fails.
+        if let Err(error) = self.merge(&gid).await {
+            tracing::debug!("merging this session's leaf: {error:#}");
         }
         Ok(Bytes(gid))
     }

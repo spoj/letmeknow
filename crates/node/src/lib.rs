@@ -201,6 +201,11 @@ struct Rec {
     leaving: bool,
     /// When this session's leaf was last updated, in milliseconds.
     updated: u64,
+    /// The group delivered a message or changed its members since this session's leaf was last updated: an update is
+    /// due once T passed.
+    stirred: bool,
+    /// When this session last asked which members' logs their services let go, in milliseconds.
+    evicted: u64,
     /// The memberships this session knows of in the group: the current ones, and those ended within H.
     authors: Vec<Author>,
     /// The last delivery index given, and the first one whose message is still kept.
@@ -503,7 +508,6 @@ impl State {
     fn add_group(&mut self, mls: Group, mut rec: Rec) -> Result<Vec<u8>> {
         let gid = mls.id().to_vec();
         let base = rec.position;
-        rec.updated = now();
         rec.resealed = mls.epoch();
         let own = mls.own_index();
         rec.members = mls.members().into_iter().filter(|m| m.index != own).map(|m| (Bytes(m.key), mls.epoch())).collect();

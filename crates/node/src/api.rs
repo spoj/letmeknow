@@ -9,7 +9,7 @@ use lmk_proto::group::Settings;
 use lmk_proto::Bytes;
 use serde_json::{Value, json};
 
-use crate::{G, Member, Message, Node, Rec, State};
+use crate::{G, Member, Message, Node, Rec, State, now};
 
 impl Node {
     /// Stops the peers and every task, and closes the provider.
@@ -66,7 +66,7 @@ impl Node {
             let mut st = self.inner.lock();
             let st = &mut *st;
             let mls = Group::create(&st.provider, &st.session, &settings)?;
-            st.add_group(mls, Rec::default())?
+            st.add_group(mls, Rec { updated: now(), ..Rec::default() })?
         };
         Ok(Bytes(gid))
     }
