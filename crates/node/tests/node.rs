@@ -811,7 +811,7 @@ async fn a_log_let_go_is_no_removal_while_a_peer_brings_the_commits() {
     alice.node.shutdown().await.unwrap();
     drop(alice);
     let store = Store::open(&dir.join("membership")).unwrap();
-    store.expire(lmk_node::now() / lmk_membership::store::DAY_MS + 1).unwrap();
+    store.expire(lmk_node::now() + 1).unwrap();
     let expired: bool = rusqlite::Connection::open(dir.join("membership").join("membership.db")).unwrap()
         .query_row("SELECT EXISTS(SELECT 1 FROM expired WHERE reference=?)", [log_ref], |r| r.get(0)).unwrap();
     assert!(expired);

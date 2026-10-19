@@ -504,8 +504,8 @@ impl Peers {
         self.groups[group].own.members.iter().filter(|(_, k)| self.dialing.contains(k)).count()
     }
 
-    /// Each member with a kept summary or a connection, what it holds by that summary and by what it announced on that
-    /// connection, and what its summary shows sealed in this epoch.
+    /// Each member with a kept summary or announcements on its connection, what it holds by them, and what its summary
+    /// shows sealed in this epoch.
     fn holds(&self, group: &Bytes) -> Vec<(Key, Set, Set)> {
         let g = &self.groups[group];
         g.own.members.iter().filter_map(|(m, k)| {
