@@ -377,14 +377,19 @@ async fn join_by_sibling(home: &Path, config: &lmk_node::Config, node: &Node, gr
     bail!("no session of this home in it could invite this one")
 }
 
-/// This machine's sessions: each one's handle, whether its process answers, and its groups as it last wrote them.
+/// This machine's sessions: each one's handle, its fingerprint, whether its process answers, and its groups as it last
+/// wrote them.
 pub async fn sessions(home: &Path) -> Result<Value> {
     let running = cli::running(home).await;
     let mut sessions = Vec::new();
     for entry in std::fs::read_dir(home.join("sessions")).into_iter().flatten().flatten() {
         let (dir, handle) = (entry.path(), entry.file_name().to_string_lossy().into_owned());
         let groups: Value = std::fs::read(dir.join("groups.json")).ok().and_then(|groups| serde_json::from_slice(&groups).ok()).unwrap_or(json!([]));
-        sessions.push(json!({ "running": running.contains(&handle), "handle": handle, "groups": groups }));
+        let mut session = json!({ "running": running.contains(&handle), "handle": handle, "groups": groups });
+        if let Ok(fp) = std::fs::read_to_string(dir.join("fp")) {
+            session["fp"] = json!(fp);
+        }
+        sessions.push(session);
     }
     sessions.sort_by(|a, b| a["handle"].as_str().cmp(&b["handle"].as_str()));
     Ok(json!({ "sessions": sessions }))

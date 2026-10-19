@@ -83,6 +83,7 @@ impl Session {
         };
         session.forget_old()?;
         session.write_groups();
+        private_file(&session.config.dir.join("fp"), fp(&session.node.key().0).as_bytes())?;
         let groups = session.node.groups();
         for gid in &groups {
             session.outbox.catch_up(&b64(&gid.0));

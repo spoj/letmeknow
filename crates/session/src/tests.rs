@@ -602,7 +602,7 @@ fn a_session_stops_once_it_cannot_print_and_prints_the_rest_when_started_again()
     });
 }
 
-/// `sessions` lists this machine's sessions, each with its group ids and whether it runs.
+/// `sessions` lists this machine's sessions, each with its fingerprint, its group ids and whether it runs.
 #[test]
 fn sessions_lists_this_machines_sessions_running_or_stopped() {
     local(async {
@@ -611,9 +611,10 @@ fn sessions_lists_this_machines_sessions_running_or_stopped() {
         let mut desk = world.start_in("bob", "desk", HOUR).await;
         let invite = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap();
         desk.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
+        let desk_fp = desk.fp.clone();
         let listed = |desk: bool| json!({ "sessions": [
-            { "handle": "bob", "running": true, "groups": [group] },
-            { "handle": "desk", "running": desk, "groups": [group] },
+            { "handle": "bob", "fp": bob.fp, "running": true, "groups": [group] },
+            { "handle": "desk", "fp": desk_fp, "running": desk, "groups": [group] },
         ] });
         let running = until(|| async { crate::sessions(&bob.home).await.unwrap() }, |running| *running == listed(true)).await;
         assert_eq!(running, listed(true));
