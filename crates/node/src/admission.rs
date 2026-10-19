@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use crate::reading::commit_key;
 use crate::{G, Inner, MEMBER_WAIT, Member, Node, Rec, Rule, State, endpoint_id, get, put};
 
-/// How many members besides the inviter a link names, of those online that hold the invite's message.
+/// How many members besides the inviter a link names, of those connected to it that hold the invite's message.
 const LINK_MEMBERS: usize = 3;
 /// How long a joiner waits to reach each member it names.
 const DIAL_WAIT: Duration = Duration::from_secs(30);
@@ -38,7 +38,8 @@ const INVITER_FIRST: Duration = Duration::from_secs(3);
 
 impl Node {
     /// An invite into a group, valid for `valid` milliseconds: shared with the members as a held message, unless it is
-    /// for one member (`to`), and a link that names this session and, when shared, up to three members online that hold it.
+    /// for one member (`to`), and a link that names this session and, when shared, up to three members connected to it
+    /// that hold it.
     pub async fn invite(&self, gid: &[u8], valid: u64, to: Option<&[u8]>) -> Result<Invite> {
         let secret: [u8; 16] = lmk_core::random();
         let hash = Bytes(Sha256::digest(secret).to_vec());
@@ -59,17 +60,17 @@ impl Node {
                 let rule = serde_json::to_value(Control::Invite { hash, expires })?;
                 let id = self.send(gid, &rule, None).await?;
                 let seq = self.inner.lock().record(gid, &id.0)?.context("the invite's message")?.header.seq;
-                // The members online whose summaries hold the invite's message admit by it too: a member asked before its push
-                // arrived would refuse the joiner.
-                let online = self.online(gid)?;
+                // The members connected whose summaries hold the invite's message admit by it too: a member asked before its
+                // push arrived would refuse the joiner.
+                let connected = self.connected(gid)?;
                 let holding = || -> Result<Vec<Member>> {
                     let holders = self.inner.lock().holders_of(gid, seq)?;
-                    Ok(online.iter().filter(|m| holders.contains(&m.key)).cloned().collect())
+                    Ok(connected.iter().filter(|m| holders.contains(&m.key)).cloned().collect())
                 };
                 let all = async {
                     loop {
                         let heard = self.inner.heard.notified();
-                        if holding()?.len() == online.len() {
+                        if holding()?.len() == connected.len() {
                             return anyhow::Ok(());
                         }
                         heard.await;

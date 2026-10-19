@@ -207,7 +207,7 @@ pub enum Request {
         #[serde(default)]
         end: bool,
     },
-    /// The members online in each group, and what only this session holds
+    /// The members this session is connected to in each group, and what only this session holds
     #[command(display_order = 21)]
     Status {
         /// Only this group

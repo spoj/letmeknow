@@ -267,7 +267,8 @@ impl Session {
         Ok(Value::Array(groups))
     }
 
-    /// The members online in each of its groups, or only `group`, and its chat messages no other member holds yet.
+    /// The members this session is connected to in each of its groups, or only `group`, and its chat messages no other
+    /// member holds yet.
     fn status(&self, group: Option<String>) -> Result<Value> {
         let gids = match group {
             Some(group) => vec![self.resolve(Some(group))?],
@@ -277,11 +278,11 @@ impl Session {
         let mut groups = Vec::new();
         let mut only_here_count = 0;
         for gid in gids {
-            let online: Vec<Value> = self.node.online(&gid.0)?.iter().map(|m| describe(&me, m)).collect();
+            let connected: Vec<Value> = self.node.connected(&gid.0)?.iter().map(|m| describe(&me, m)).collect();
             let only_here: Vec<Value> =
                 self.node.only_here(&gid.0)?.iter().map(|(id, payload)| json!({ "what": payload["type"], "id": hex::encode(&id.0) })).collect();
             only_here_count += only_here.len();
-            groups.push(json!({ "group": b64(&gid.0), "online": online, "only_here": only_here }));
+            groups.push(json!({ "group": b64(&gid.0), "connected": connected, "only_here": only_here }));
         }
         let mut status = json!({ "groups": groups });
         if only_here_count > 0 {

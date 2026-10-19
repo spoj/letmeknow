@@ -286,8 +286,8 @@ fn send_answers_its_id_and_refuses_a_message_too_large() {
         let sent = alice.cmd(&["send", "--urgent", "anyone?"]).await.unwrap();
         assert!(sent["id"].is_string() && sent.get("pos").is_none(), "{sent}");
         // Alice finds out that Bob's connection closed once his close reaches her.
-        let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["online"].is_null()).await;
-        assert!(status["groups"][0]["online"].is_null(), "{status}");
+        let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["connected"].is_null()).await;
+        assert!(status["groups"][0]["connected"].is_null(), "{status}");
         // Once Bob is back, he takes it.
         let mut bob = world.start("bob", HOUR).await;
         let message = bob.expect("message").await;
@@ -421,7 +421,8 @@ fn a_message_taken_in_is_forgotten_after_h_with_its_attachments_copy() {
     });
 }
 
-/// `status` lists this session's sends that no other member holds yet, with a warning, until a member online holds them.
+/// `status` lists this session's sends that no other member holds yet, with a warning, until a member connected to it holds
+/// them.
 #[test]
 fn status_lists_sends_held_only_here() {
     local(async {

@@ -80,10 +80,10 @@ impl Session {
             .await;
             waited.unwrap_or_else(|_| {
                 let groups: Vec<_> = self.node.groups().into_iter().map(|gid| {
-                    let online: Vec<Bytes> = self.node.online(&gid.0).unwrap_or_default().into_iter().map(|m| m.key).collect();
-                    (self.node.epoch(&gid.0).ok(), online)
+                    let connected: Vec<Bytes> = self.node.connected(&gid.0).unwrap_or_default().into_iter().map(|m| m.key).collect();
+                    (self.node.epoch(&gid.0).ok(), connected)
                 }).collect();
-                panic!("the event awaited at {at} did not come; each group's epoch and members online: {groups:?}")
+                panic!("the event awaited at {at} did not come; each group's epoch and members connected: {groups:?}")
             })
         }
     }
@@ -1546,7 +1546,7 @@ async fn a_peer_not_admitted_changes_nothing() {
     let sent = bob.node.send(&gid.0, &message("real"), None).await.unwrap();
     alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
     bob.node.shutdown().await.unwrap();
-    eventually("Bob is gone", || alice.node.online(&gid.0).unwrap().is_empty()).await;
+    eventually("Bob is gone", || alice.node.connected(&gid.0).unwrap().is_empty()).await;
     // Alice signs her summary a moment after what she holds changes: her state is taken once it stays still.
     let mut before = dump(&alice_db);
     loop {
@@ -1756,7 +1756,7 @@ async fn a_member_connected_is_online() {
     eventually("Alice has Carol's Add", || alice.node.members(&gid.0).unwrap().len() == 3).await;
     let key = lmk_node::iroh_key(&SqliteProvider::open(&carol_db).unwrap()).unwrap();
     let _carol = hand(&relay, key, &alice.node).await;
-    eventually("Carol is online", || alice.node.online(&gid.0).unwrap().iter().any(|m| m.key == carol_key)).await;
+    eventually("Alice connects to Carol", || alice.node.connected(&gid.0).unwrap().iter().any(|m| m.key == carol_key)).await;
     alice.node.shutdown().await.unwrap();
 }
 
@@ -2021,7 +2021,7 @@ async fn a_message_held_in_an_ended_epoch_is_only_here_until_its_holder_takes_th
 
     let (iroh, mls) = member_of(&db);
     let mut bob_hand = hand(&relay, iroh, &alice.node).await;
-    eventually("Bob is back, and still holds the message sealed in the ended epoch", || alice.node.online(&gid.0).unwrap().iter().any(|m| m.key == bob_key)).await;
+    eventually("Bob is back, and still holds the message sealed in the ended epoch", || alice.node.connected(&gid.0).unwrap().iter().any(|m| m.key == bob_key)).await;
     assert!(alice.node.only_here(&gid.0).unwrap().iter().any(|(id, _)| *id == m), "a summary of an ended epoch does not count");
 
     let epoch = alice.node.epoch(&gid.0).unwrap();
@@ -2048,7 +2048,7 @@ async fn a_message_an_online_member_holds_is_kept_by_the_next_commit() {
     let spares = strangers(&mut alice, &gid, &relay, 1).await;
     alice.node.remove(&gid.0, &spares[0].0).await.unwrap();
     bob.node.shutdown().await.unwrap();
-    eventually("Alice sees Bob go", || alice.node.online(&gid.0).unwrap().is_empty()).await;
+    eventually("Alice sees Bob go", || alice.node.connected(&gid.0).unwrap().is_empty()).await;
     assert!(alice.node.only_here(&gid.0).unwrap().is_empty(), "the commit kept it");
     alice.node.shutdown().await.unwrap();
 }
@@ -2385,7 +2385,7 @@ async fn a_removed_members_send_past_its_final_cut_reaches_no_one() {
     let epoch = alice.node.epoch(&gid.0).unwrap();
     eventually("Bob applies the removal", || bob.node.epoch(&gid.0).unwrap() == epoch).await;
     let dave = stored_with(&relay, &dir.join("dave.db"), gate.post("Dave", relay.post())).await;
-    eventually("Dave reaches Alice", || dave.node.online(&gid.0).unwrap().iter().any(|m| m.key == alice.node.key())).await;
+    eventually("Dave reaches Alice", || dave.node.connected(&gid.0).unwrap().iter().any(|m| m.key == alice.node.key())).await;
     let sealed_on = dave.node.send(&gid.0, &message("sealed on after the removal"), None).await.unwrap();
     let quiet = tokio::time::timeout(Duration::from_secs(3), async {
         tokio::join!(
@@ -2603,7 +2603,7 @@ async fn a_home_relay_reaches_the_neighbours_in_a_group_over_seven() {
     bob.node.shutdown().await.unwrap();
     drop(bob);
     let _bob = stored(&moved, &bob_db).await;
-    let neighbour = |s: &Session| s.node.online(&gid.0).unwrap().iter().any(|m| m.key == bob_key);
+    let neighbour = |s: &Session| s.node.connected(&gid.0).unwrap().iter().any(|m| m.key == bob_key);
     eventually("Bob has neighbours", || sessions.iter().any(neighbour)).await;
     eventually("each neighbour holds Bob's new relay", || sessions.iter().filter(|s| neighbour(s)).all(|s| s.node.hint(&bob_iroh) == Some(moved.url.to_string()))).await;
 }

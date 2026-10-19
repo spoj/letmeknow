@@ -53,8 +53,8 @@ impl Node {
         self.inner.lock().members(gid)
     }
 
-    /// The members connected now.
-    pub fn online(&self, gid: &[u8]) -> Result<Vec<Member>> {
+    /// The members this session is connected to now: above seven members, only some of those online.
+    pub fn connected(&self, gid: &[u8]) -> Result<Vec<Member>> {
         let connected = self.inner.net().connected();
         let members = self.members(gid)?;
         Ok(members.into_iter().filter(|m| connected.iter().any(|peer| peer.as_bytes()[..] == m.iroh.0[..])).collect())
