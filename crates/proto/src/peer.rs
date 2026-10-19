@@ -87,9 +87,6 @@ pub struct Summary {
     /// When it signed it, by its clock, in milliseconds.
     pub time: u64,
     pub epoch: u64,
-    /// The signer's home relay, when it knows one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub relay: Option<String>,
     /// Per membership with any, the seqs it holds a sealing of, to serve.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub held: Vec<Seqs>,
@@ -142,7 +139,6 @@ mod tests {
         assert!(serde_json::from_str::<Frame>(r#"{"doc":{"group":"AQ"}}"#).is_err(), "a frame this version does not know");
         let summary = r#"{"group":"AQ","member":"Ag","joined":0,"version":1,"time":2,"epoch":3}"#;
         let parsed: Summary = serde_json::from_str(summary).unwrap();
-        assert_eq!(parsed.relay, None);
         assert_eq!(serde_json::to_string(&parsed).unwrap(), summary);
         let at = At { group: Bytes(vec![1]), log: [0; 32], head: None, seen: BTreeMap::from([(Bytes(vec![2]), 5)]) };
         let text = serde_json::to_string(&at).unwrap();

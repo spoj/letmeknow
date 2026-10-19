@@ -7,11 +7,12 @@ fn letmeknow(home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_letmeknow")).arg("--home").arg(home).args(args).env_remove("LETMEKNOW_SESSION").output().unwrap()
 }
 
-/// A home in `dir` whose membership directory is its built-in copy, stored as fresh: `listen` fetches nothing.
+/// A home in `dir` holding a fresh directory of `localhost:1`, where nothing listens: `listen --membership localhost:1`
+/// fetches nothing, and lives on a relay that is down.
 fn seeded_home(dir: &Path) -> PathBuf {
     let home = dir.join("home");
     std::fs::create_dir_all(home.join("directories")).unwrap();
-    std::fs::write(home.join("directories/relay.letmeknow.dev.json"), serde_json::to_vec(&Directory::builtin()).unwrap()).unwrap();
+    std::fs::write(home.join("directories/localhost_1.json"), serde_json::to_vec(&Directory::builtin()).unwrap()).unwrap();
     home
 }
 
@@ -38,7 +39,7 @@ fn the_binary_logs_what_rust_log_asks_without_colour_in_a_pipe() {
         let dir = tempfile::tempdir().unwrap();
         let home = seeded_home(dir.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_letmeknow"));
-        command.arg("--home").arg(&home).args(["listen", "--relay", "http://127.0.0.1:1"]).env_remove("LETMEKNOW_SESSION").env_remove("RUST_LOG");
+        command.arg("--home").arg(&home).args(["listen", "--membership", "localhost:1"]).env_remove("LETMEKNOW_SESSION").env_remove("RUST_LOG");
         command.env("LETMEKNOW_REGISTRY", "http://127.0.0.1:1");
         if let Some(rust_log) = rust_log {
             command.env("RUST_LOG", rust_log);
@@ -60,7 +61,7 @@ fn the_binary_names_itself_as_termux_names_it() {
     use std::io::BufRead;
     let dir = tempfile::tempdir().unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_letmeknow"));
-    command.arg("--home").arg(seeded_home(dir.path())).args(["listen", "--relay", "http://127.0.0.1:1"]).env_remove("LETMEKNOW_SESSION");
+    command.arg("--home").arg(seeded_home(dir.path())).args(["listen", "--membership", "localhost:1"]).env_remove("LETMEKNOW_SESSION");
     command.env("TERMUX_EXEC__PROC_SELF_EXE", "/data/data/com.termux/files/home/letmeknow");
     command.env("LETMEKNOW_REGISTRY", "http://127.0.0.1:1");
     let mut child = command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
@@ -77,7 +78,7 @@ fn the_binary_leaves_an_earlier_home_as_it_is() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     std::fs::write(home.join("format"), "4\n").unwrap();
-    let listen = letmeknow(home, &["listen", "--relay", "http://127.0.0.1:1"]);
+    let listen = letmeknow(home, &["listen"]);
     assert!(!listen.status.success());
     assert!(String::from_utf8(listen.stderr).unwrap().contains("earlier letmeknow"));
     assert_eq!(std::fs::read_to_string(home.join("format")).unwrap(), "4\n");

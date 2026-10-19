@@ -1,11 +1,10 @@
-//! Session processes in one test process, each in a home of its own (sessions may share one), talking over a local relay with a self-signed
-//! certificate, their logs on a membership service served through it. The CLI talks to them over their command
-//! channels.
+//! Session processes in one test process, each in a home of its own (sessions may share one), living on the relay of a
+//! local membership service with a self-signed certificate, which keeps their logs. The CLI talks to them over their
+//! command channels.
 
 use anyhow::Result;
 use lmk_proto::directory::Directory;
 use lmk_serve::{Certificate, ServeConfig};
-use lmk_testing::{Relay, relay};
 use n0_future::boxed::BoxFuture;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -24,8 +23,6 @@ const HOUR: Duration = Duration::from_secs(3600);
 const WAIT: Duration = Duration::from_secs(60);
 
 struct World {
-    /// Keeps the relay running.
-    _relay: Relay,
     network: crate::Network,
     root: tempfile::TempDir,
     /// The membership service its own `serve` runs at: its domain, and its key in hex.
@@ -35,15 +32,14 @@ struct World {
 
 async fn world(test: &str) -> World {
     let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).with_test_writer().try_init();
-    let relay = relay().await;
     let root = tempfile::Builder::new().prefix(&format!("lmk-session-{test}-")).tempdir().unwrap();
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     std::fs::write(root.path().join("cert.pem"), certified.cert.pem()).unwrap();
     std::fs::write(root.path().join("key.pem"), certified.signing_key.serialize_pem()).unwrap();
     let (domain, key) = service(root.path(), "service", &tokio::runtime::Handle::current()).await;
-    let ca = iroh::tls::CaTlsConfig::custom_roots([relay.cert.clone(), certified.cert.der().clone()]);
-    let network = crate::Network::new(root.path(), &[relay.url.to_string()], ca).unwrap();
-    World { _relay: relay, network, root, domain, key }
+    let ca = iroh::tls::CaTlsConfig::custom_roots([certified.cert.der().clone()]);
+    let network = crate::Network::new(root.path(), ca).unwrap();
+    World { network, root, domain, key }
 }
 
 /// A port free for TCP and UDP, below the ephemeral range: a port `bind(0)` returned could be taken by another test's relay
@@ -646,7 +642,7 @@ fn a_session_goes_on_while_a_join_waits() {
         let (alice, mut bob, group) = pair(&world, HOUR).await;
         let link = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap().to_owned();
         let mut invite = lmk_proto::links::Invite::parse(&link).unwrap();
-        invite.members[0] = *iroh::SecretKey::generate().public().as_bytes();
+        invite.members[0].0 = *iroh::SecretKey::generate().public().as_bytes();
         let (home, handle) = (bob.home.clone(), bob.handle.clone());
         let join = Request::Join { target: invite.link() };
         let joining = tokio::task::spawn_local(async move { crate::cli::call(&home, &handle, join).await });
@@ -736,7 +732,7 @@ fn a_membership_domain_is_checked_pinned_and_fetched() {
 #[tokio::test]
 async fn a_directory_is_cached_and_the_built_in_one_answers_for_letmeknow_dev() {
     let dir = tempfile::tempdir().unwrap();
-    let served = Directory { key: [1; 32], relay: "https://relay.example".into(), relays: vec!["https://relay.example".into()] };
+    let served = Directory { key: [1; 32] };
     let calls = Arc::new(AtomicU32::new(0));
     let fetch: lmk_membership::client::Resolve = {
         let (served, calls) = (served.clone(), calls.clone());

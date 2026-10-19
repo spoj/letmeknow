@@ -23,10 +23,10 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use anyhow::{Context, Result};
 use iroh::tls::CaTlsConfig;
-use iroh::{EndpointId, RelayUrl, SecretKey};
+use iroh::{EndpointId, SecretKey};
 use lmk_core::group::{self as core, Group, Session};
 use lmk_core::provider::SqliteProvider;
-use lmk_membership::client::{Post, Resolve};
+use lmk_membership::client::Post;
 use lmk_net::peers::Peers;
 use lmk_net::Net;
 use lmk_proto::group::Service;
@@ -53,13 +53,8 @@ const MEMBER_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct Config {
-    /// The relays of this session's directory: the relays it lives on unless `chosen` names others, and the fallback of
-    /// every dial.
-    pub relays: Vec<RelayUrl>,
-    /// The relays this session lives on instead of its directory's; every dial hints them.
-    pub chosen: Vec<RelayUrl>,
-    /// Resolves a domain to its directory, as the shell holds it.
-    pub resolve: Resolve,
+    /// The domain of this session's own membership service, whose relay it lives on.
+    pub home: String,
     /// Posts to a membership service's routes, as the shell does over https.
     pub post: Post,
     pub ca: CaTlsConfig,
@@ -74,6 +69,8 @@ pub struct Member {
     pub iroh: Bytes,
     /// The protocol revision its leaf names.
     pub revision: u32,
+    /// The domain of its own service, whose relay it lives on, as its leaf names it.
+    pub home: String,
 }
 
 impl From<&core::Member> for Member {
@@ -82,6 +79,7 @@ impl From<&core::Member> for Member {
             key: Bytes(member.key.clone()),
             iroh: member.leaf.as_ref().map(|leaf| leaf.key.clone()).unwrap_or_default(),
             revision: member.leaf.as_ref().map_or(0, |leaf| leaf.revision),
+            home: member.leaf.as_ref().map(|leaf| leaf.home.clone()).unwrap_or_default(),
         }
     }
 }
@@ -341,10 +339,6 @@ pub(crate) struct State {
     gate: bool,
     /// The current step is the poll's own: its end wakes no poll.
     quiet: bool,
-    /// This endpoint's home relay, as net last reported it.
-    home: Option<String>,
-    /// Where each member last said it was, by iroh key.
-    hints: BTreeMap<Bytes, peering::Hint>,
     /// Hellos of groups not added yet, with the peers that sent them: taken once the group is.
     early_hellos: Vec<(EndpointId, At)>,
     /// The latest time a step saw, in milliseconds: `Peers` takes no time from before.
@@ -426,9 +420,8 @@ pub(crate) struct Inner {
     state: Mutex<State>,
     net: OnceLock<Net>,
     clients: logs::Clients,
-    resolve: Resolve,
-    relays: Vec<RelayUrl>,
-    chosen: Vec<RelayUrl>,
+    /// The domain of this session's own service, whose relay it lives on.
+    home: String,
     events: mpsc::UnboundedSender<Event>,
     work: mpsc::UnboundedSender<Work>,
     /// Peer output and client events from steps, in order.
@@ -606,10 +599,7 @@ mod tests {
     use lmk_testing::Relay;
 
     async fn node(relay: &Relay, post: Post) -> Node {
-        let config = Config {
-            relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), post,
-            ca: relay.ca(),
-        };
+        let config = Config { home: relay.domain.clone(), post, ca: relay.ca() };
         Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0
     }
 

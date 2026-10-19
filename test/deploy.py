@@ -5,8 +5,7 @@ import copy, io, json, os, pathlib, re, subprocess, sys, tarfile, tempfile
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 VERSION = re.search(r'^version = "(.+)"', (ROOT / "Cargo.toml").read_text(), re.M).group(1)
 REPO, TAG, SHA = "spoj/letmeknow", f"v{VERSION}", "a" * 40
-BACKEND = {"domain": "relay.example.com", "directory": {"key": "11" * 32, "relay": "https://relay.example.com",
-                                                     "relays": ["https://relay.example.com"]}}
+BACKEND = {"domain": "relay.example.com", "directory": {"key": "11" * 32}}
 RUN = {"name": "release", "path": ".github/workflows/release.yml", "workflow_id": 17,
        "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO},
        "status": "completed", "conclusion": "success", "event": "push", "head_branch": TAG, "head_sha": SHA}

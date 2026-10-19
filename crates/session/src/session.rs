@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn a_member_shows_by_its_fingerprint() {
-        let member = |key: u8| Member { key: Bytes(vec![key]), iroh: Bytes(vec![key]), revision: 1 };
+        let member = |key: u8| Member { key: Bytes(vec![key]), iroh: Bytes(vec![key]), revision: 1, home: "h.example".into() };
         let me = Bytes(vec![1]);
         assert_eq!(describe(&me, &member(1)), json!({ "fp": fp(&[1]), "you": true }));
         assert_eq!(describe(&me, &member(2)), json!({ "fp": fp(&[2]) }));

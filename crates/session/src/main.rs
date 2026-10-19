@@ -24,8 +24,8 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> anyhow::Result<()> {
     let home = home_dir(cli.home)?;
     match cli.command {
-        Command::Listen { hold, membership, relay } => {
-            let network = Network::new(&home, &relay, letmeknow::ca()?)?;
+        Command::Listen { hold, membership } => {
+            let network = Network::new(&home, letmeknow::ca()?)?;
             let handle = match cli.session {
                 Some(session) => session,
                 None => new_handle(&home)?,

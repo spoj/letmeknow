@@ -3,7 +3,7 @@
 - `https://letmeknow.dev`: a static page, `site/`, served by GitHub Pages, which invite links open: it shows the commands that join with them.
 - `https://relay.letmeknow.dev`: `letmeknow serve`, the membership service and iroh relay, on the VPS (129.212.227.207, 2400:6180:0:d2:0:3:37cd:7000; Ubuntu with a `letmeknow` user, a swap file and unattended security updates). It needs TCP 22, 80 and 443 and UDP 7842 open, gets its own TLS certificate, and serves no pages: it answers `/health` (version and public key), `/ping` and `/.well-known/letmeknow.json` (its directory).
 
-Its domain, directory and public key are in deploy/backend.json; crates/proto/src/links.rs holds its domain, relay and key. Its private key exists only in the VPS's state directory, /var/lib/letmeknow, which has no backup.
+Its domain, directory and public key are in deploy/backend.json; crates/proto/src/links.rs holds its domain and key. Its private key exists only in the VPS's state directory, /var/lib/letmeknow, which has no backup.
 
 ## A release
 
@@ -29,7 +29,7 @@ Nothing carries over: it gets a new service, and the previous minor's sessions s
     ./letmeknow serve --initialize --domain relay.letmeknow.dev --state /var/lib/letmeknow.new
     chown -R letmeknow: /var/lib/letmeknow.new
 
-It prints the new domain and public key: put the key in deploy/backend.json's directory and in crates/proto/src/links.rs, and release. The directory is what the service publishes at `/.well-known/letmeknow.json` once it runs; its `relay` names the domain. A new key is a new service: groups of the old one do not move to it.
+It prints the new domain and public key: put the key in deploy/backend.json's directory and in crates/proto/src/links.rs, and release. The directory is what the service publishes at `/.well-known/letmeknow.json` once it runs. A new key is a new service: groups of the old one do not move to it.
 
 ## Limits
 

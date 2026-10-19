@@ -103,18 +103,18 @@ def until(produce, accept, timeout=20):
 
 
 def serve():
-    """A local `letmeknow serve` with a self-signed certificate; returns it. Sessions name its domain. Its directory names
-    two URLs of its relay: the name and 127.0.0.1."""
+    """A local `letmeknow serve` with a self-signed certificate; returns it. Sessions name its domain, and live on its
+    relay."""
     cert, key = os.path.join(TMP, "cert.pem"), os.path.join(TMP, "key.pem")
     subprocess.run(["cargo", "run", "-q", "-p", "letmeknow", "--example", "self_signed", "--", cert, key], cwd=ROOT, check=True)
     https = free_port()
     args = [BIN, "serve", "--domain", "localhost", "--https-port", str(https), "--http-port", str(free_port()),
             "--qad-port", str(free_port()), "--state", os.path.join(TMP, "serve"), "--cert", cert, "--key", key]
     subprocess.run(args + ["--initialize"], env=ENV, check=True, stdout=subprocess.DEVNULL)
-    proc = subprocess.Popen(args + ["--relays", f"https://localhost:{https}", f"https://127.0.0.1:{https}"], env=ENV, stdout=subprocess.PIPE, stderr=open(os.path.join(TMP, "serve.log"), "w"), text=True)
+    proc = subprocess.Popen(args, env=ENV, stdout=subprocess.PIPE, stderr=open(os.path.join(TMP, "serve.log"), "w"), text=True)
     domain = proc.stdout.readline().strip().removeprefix("membership: ")
     proc.stdout.readline()  # key: its public key, which the directory names
-    ENV.update(LETMEKNOW_CA=cert, LETMEKNOW_RELAY=f"https://localhost:{https}", LETMEKNOW_OTHER_RELAY=f"https://127.0.0.1:{https}", LETMEKNOW_MEMBERSHIP=domain)
+    ENV.update(LETMEKNOW_CA=cert, LETMEKNOW_MEMBERSHIP=domain)
     return proc
 
 

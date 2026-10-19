@@ -11,21 +11,22 @@ use lmk_core::group::{Group, Session};
 use lmk_core::provider::SqliteProvider;
 use lmk_net::peers::{Peers, WAIT};
 use lmk_net::Net;
+use lmk_proto::directory::relay_url;
 use lmk_proto::group::{Leaf, REVISION};
 use lmk_proto::Bytes;
 use n0_future::time::{Duration, sleep};
-use n0_future::{join_all, task::spawn};
+use n0_future::task::spawn;
 use tokio::sync::mpsc;
 
-use crate::{Config, Event, G, Inner, Node, Out, Rec, State, Work, admission, endpoint_id, get, hex, iroh_key, logs, now, peering, rec_key};
+use crate::{Config, Event, G, Inner, Node, Out, Rec, State, Work, admission, get, hex, iroh_key, logs, now, rec_key};
 
 impl Node {
     /// Opens the session in `provider`, creating it on first use, and starts its peers.
     pub async fn start(provider: SqliteProvider, mut config: Config) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
         let ca = std::mem::take(&mut config.ca);
-        let home = if config.chosen.is_empty() { config.relays.clone() } else { config.chosen.clone() };
-        let endpoint = lmk_net::builder(home).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
-        let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), revision: REVISION };
+        let relay: RelayUrl = relay_url(&config.home).parse()?;
+        let endpoint = lmk_net::builder([relay]).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
+        let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), revision: REVISION, home: config.home.clone() };
         let clients = logs::Clients::new(config.post.clone());
         let state = State::open(provider, leaf)?;
         let (events, events_rx) = mpsc::unbounded_channel();
@@ -35,9 +36,7 @@ impl Node {
             state: Mutex::new(state),
             net: OnceLock::new(),
             clients,
-            relays: config.relays.clone(),
-            chosen: config.chosen.clone(),
-            resolve: config.resolve.clone(),
+            home: config.home.clone(),
             events,
             work,
             outbox,
@@ -75,14 +74,6 @@ impl State {
             let rec: Rec = get(&provider, &rec_key(&gid.0))?.context("a group without its record")?;
             groups.insert(gid.0, G::new(mls, rec));
         }
-        let mut hints = BTreeMap::new();
-        for g in groups.values() {
-            for leaf in g.mls.members().iter().filter_map(|member| member.leaf.as_ref()) {
-                if let Some(hint) = get::<peering::Hint>(&provider, &peering::hint_key(&leaf.key.0))? {
-                    hints.insert(leaf.key.clone(), hint);
-                }
-            }
-        }
         let peers = Peers::new(now(), *iroh_key(&provider)?.public().as_bytes());
         let mut state = State {
             provider,
@@ -95,8 +86,6 @@ impl State {
             peers,
             gate: true,
             quiet: false,
-            home: None,
-            hints,
             early_hellos: Vec::new(),
             time: now(),
         };
@@ -164,12 +153,12 @@ impl Inner {
     }
 
 
-    /// Dials a member, at the relay it last said it was on, then its fallback, and tells `Peers` how it went.
+    /// Dials a member at the relay its leaves name, and tells `Peers` how it went.
     fn dial(self: &Arc<Self>, peer: EndpointId) {
-        let hint: Vec<RelayUrl> = self.lock().hint_of(&peer).into_iter().chain(self.chosen.clone()).collect();
+        let relays = self.lock().relays_of(&peer);
         let inner = self.clone();
         spawn(async move {
-            let dialed = inner.net().dial(peer, hint, Box::pin(inner.clone().fallback(peer))).await;
+            let dialed = inner.net().dial(peer, relays).await;
             if let Err(error) = &dialed {
                 tracing::debug!("dialing {}: {error:#}", peer.fmt_short());
             }
@@ -177,31 +166,6 @@ impl Inner {
             let now = st.tick();
             st.peers.dialed(peer.as_bytes(), dialed.is_ok(), now);
         });
-    }
-
-    /// The relays a member may be reached at: this session's own, and the relay of the service of each group the member
-    /// is in. The directories resolve together; one that does not adds none.
-    async fn fallback(self: Arc<Self>, peer: EndpointId) -> Vec<RelayUrl> {
-        let services = {
-            let st = self.lock();
-            let mut services = Vec::new();
-            for g in st.groups.values() {
-                let in_group = g.mls.members().iter().any(|m| m.leaf.as_ref().and_then(|leaf| endpoint_id(&leaf.key.0)) == Some(peer));
-                let service = g.mls.settings().membership;
-                if in_group && !services.contains(&service) {
-                    services.push(service);
-                }
-            }
-            services
-        };
-        let resolve = &self.resolve;
-        let found = join_all(services.iter().map(|service| async move {
-            lmk_membership::client::directory(resolve, service).await.map(|found| vec![found.relay]).unwrap_or_default()
-        }))
-        .await;
-        let mut relays = self.relays.clone();
-        relays.extend(found.iter().flatten().filter_map(|relay| relay.parse().ok()));
-        relays
     }
 
     /// Handles what the group logic and the peers hand on, one at a time.

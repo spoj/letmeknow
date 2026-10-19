@@ -55,7 +55,6 @@ pub async fn serve(serve: cli::Serve) -> Result<()> {
     let mut config = lmk_serve::ServeConfig::new(serve.domain, serve.state);
     config.https_port = serve.https_port;
     config.http_port = Some(serve.http_port);
-    config.relays = serve.relays;
     config.qad_port = serve.qad_port;
     config.policy = policy;
     config.relay_rate_limit = std::num::NonZeroU32::new(serve.relay_kib_per_second << 10).expect("a parsed rate is at least 1 KiB");
@@ -70,21 +69,17 @@ pub async fn serve(serve: cli::Serve) -> Result<()> {
     lmk_serve::serve(config).await
 }
 
-/// The relays and certificate authorities a session process reaches its peers through, and the directories it resolves.
+/// The certificate authorities a session process trusts, the directories it resolves and how it posts to services.
 #[derive(Clone)]
 pub struct Network {
-    /// The relays the session lives on instead of its directory's: `--relay`'s.
-    pub chosen: Vec<iroh::RelayUrl>,
-    /// The relays of its own directory, which `listen` fills in.
-    pub relays: Vec<iroh::RelayUrl>,
     pub ca: iroh::tls::CaTlsConfig,
     pub resolve: Resolve,
     pub post: Post,
 }
 
 impl Network {
-    /// The network of the session at `home`: living on `chosen` relays, and trusting `ca`.
-    pub fn new(home: &Path, chosen: &[String], ca: iroh::tls::CaTlsConfig) -> Result<Self> {
+    /// The network of the session at `home`, trusting `ca`.
+    pub fn new(home: &Path, ca: iroh::tls::CaTlsConfig) -> Result<Self> {
         let tls = ca.client_config(Arc::new(rustls::crypto::ring::default_provider()))?;
         let mut builder = reqwest::Client::builder()
             .tls_backend_preconfigured(tls)
@@ -97,8 +92,6 @@ impl Network {
         }
         let http = builder.build()?;
         Ok(Network {
-            chosen: chosen.iter().map(|relay| relay.parse()).collect::<Result<_, _>>()?,
-            relays: Vec::new(),
             ca,
             resolve: cached(home.join("directories"), fetch(http.clone())),
             post: https(http),
@@ -239,8 +232,6 @@ pub async fn listen(
     std::fs::write(&format, "11\n")?;
     let directory = own_directory(home, &network, &config.membership).await?;
     let membership = Service::Serve { key: Bytes(directory.key.to_vec()), domain: config.membership.clone(), rest: Default::default() };
-    let relays = directory.relays.iter().map(|relay| relay.parse()).collect::<Result<_, _>>()?;
-    let network = Network { relays, ..network };
     // One process runs a session, even when two start at once.
     let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(config.dir.join("session.lock"))?;
     match held.try_lock() {
@@ -252,13 +243,7 @@ pub async fn listen(
     cli::open_channel(&config.dir.join("endpoint"), inbound).await?;
     let db = store::open(&config.dir.join("session.db"))?;
     let provider = SqliteProvider::open(&config.dir.join("session.db"))?;
-    let node_config = lmk_node::Config {
-        relays: network.relays.clone(),
-        chosen: network.chosen.clone(),
-        resolve: network.resolve.clone(),
-        post: network.post.clone(),
-        ca: network.ca.clone(),
-    };
+    let node_config = lmk_node::Config { home: config.membership.clone(), post: network.post.clone(), ca: network.ca.clone() };
     let (node, events) = Node::start(provider, node_config.clone()).await?;
     let handle = config.handle.clone();
     let mut session = session::Session::open(config, db, node.clone(), held, membership).await?;

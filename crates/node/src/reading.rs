@@ -133,7 +133,6 @@ impl Inner {
         for member in &removed {
             st.unhear(gid, &member.key)?;
         }
-        st.unhint(removed.iter().filter_map(|member| member.leaf.as_ref().map(|leaf| leaf.key.clone())).collect())?;
         // The members it removed that are connected are told at once, by the group's last logs in order, as one may be a
         // commit or two behind: no peer brings them later commits.
         let mut logs: Vec<(u64, Vec<u8>)> = st.group_logs(gid).into_iter().filter_map(|id| Some((st.logs.get(&id)?.since, id))).collect();

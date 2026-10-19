@@ -41,9 +41,6 @@ pub enum Command {
         /// The domain of the membership service for groups this session creates
         #[arg(long, env = "LETMEKNOW_MEMBERSHIP", default_value = lmk_proto::links::DOMAIN)]
         membership: String,
-        /// A relay this session is reached through, instead of its directory's; repeat for several
-        #[arg(long, env = "LETMEKNOW_RELAY", value_delimiter = ',')]
-        relay: Vec<String>,
     },
     /// This machine's sessions: each one's handle, whether it runs, and its groups
     Sessions,
@@ -85,9 +82,6 @@ pub struct Serve {
     pub https_port: u16,
     #[arg(long, default_value_t = 80)]
     pub http_port: u16,
-    /// The relays its directory names, which members live on; default its own
-    #[arg(long, num_args = 1..)]
-    pub relays: Vec<String>,
     /// QUIC address discovery's UDP port
     #[arg(long, default_value_t = 7842)]
     pub qad_port: u16,
@@ -448,10 +442,9 @@ mod tests {
     }
 
     #[test]
-    fn relays_repeat_and_the_membership_is_a_domain() {
-        let cli = parse(["letmeknow", "listen", "--relay", "https://a.example", "--relay", "https://b.example"]).unwrap();
-        let Command::Listen { membership, relay, .. } = cli.command else { panic!("not listen") };
-        assert_eq!((membership.as_str(), relay), ("relay.letmeknow.dev", vec!["https://a.example".to_owned(), "https://b.example".into()]));
+    fn the_membership_is_a_domain() {
+        let Command::Listen { membership, .. } = parse(["letmeknow", "listen"]).unwrap().command else { panic!("not listen") };
+        assert_eq!(membership, "relay.letmeknow.dev");
     }
 
     #[test]

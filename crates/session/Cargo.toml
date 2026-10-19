@@ -38,6 +38,5 @@ tokio = { workspace = true, features = ["rt-multi-thread", "rt", "macros", "net"
 dirs = "7"
 
 [dev-dependencies]
-lmk-testing.workspace = true
 rcgen = "0.14"
 tempfile.workspace = true

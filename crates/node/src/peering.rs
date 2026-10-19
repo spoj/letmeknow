@@ -12,6 +12,7 @@ use lmk_membership::Contradiction;
 use lmk_net::Groups;
 use lmk_net::peers::{self, Own};
 use lmk_proto::Bytes;
+use lmk_proto::directory::relay_url;
 use lmk_proto::head::Head;
 use lmk_proto::peer::{At, Frame, SUMMARY, Seqs, Signed, Summary};
 use n0_future::time::{Duration, timeout};
@@ -38,18 +39,6 @@ pub struct Heard {
 struct Saved {
     signed: Signed,
     at: u64,
-}
-
-/// Where a member said it was: its home relay, and when the summary that said so was signed. Saved when the relay
-/// changes, with that summary's time; the newest time is held in memory.
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct Hint {
-    pub relay: String,
-    time: u64,
-}
-
-pub(crate) fn hint_key(key: &[u8]) -> Vec<u8> {
-    [b"node/hint/".as_slice(), key].concat()
 }
 
 fn heard_key(gid: &[u8], key: &[u8], joined: u64) -> Vec<u8> {
@@ -106,9 +95,20 @@ impl State {
         }
     }
 
-    /// The relay a member last said it was on, which a dial to it tries first.
-    pub(crate) fn hint_of(&self, peer: &EndpointId) -> Option<RelayUrl> {
-        self.hints.get(&Bytes(peer.as_bytes().to_vec())).and_then(|hint| hint.relay.parse().ok())
+    /// The relays a member lives on, as its leaves in this session's groups name them.
+    pub(crate) fn relays_of(&self, peer: &EndpointId) -> Vec<RelayUrl> {
+        let mut relays = Vec::new();
+        for g in self.groups.values() {
+            for member in g.mls.members() {
+                if let Some(leaf) = member.leaf.filter(|leaf| leaf.key.0 == peer.as_bytes())
+                    && let Ok(relay) = relay_url(&leaf.home).parse()
+                    && !relays.contains(&relay)
+                {
+                    relays.push(relay);
+                }
+            }
+        }
+        relays
     }
 
     /// Hands `Peers` this session's state of a group.
@@ -204,7 +204,6 @@ impl State {
             version: (g.rec.version + 1).max(now),
             time: now,
             epoch,
-            relay: self.home.clone(),
             held: list(|a| &a.servable),
             sealed,
         };
@@ -259,18 +258,6 @@ impl State {
         if summary.epoch == self.group(gid)?.mls.epoch() {
             self.at(gid, &summary.member.0, summary.epoch)?;
         }
-        if let Some(relay) = &summary.relay
-            && relay.parse::<RelayUrl>().is_ok_and(|url| url.scheme() == "https")
-            && let Some(leaf) = leaf
-            && self.hints.get(&leaf.key).is_none_or(|hint| hint.time <= summary.time)
-        {
-            let moved = self.hints.get(&leaf.key).is_none_or(|hint| hint.relay != *relay);
-            let hint = Hint { relay: relay.clone(), time: summary.time };
-            if moved {
-                put(&self.provider, &hint_key(&leaf.key.0), &hint)?;
-            }
-            self.hints.insert(leaf.key, hint);
-        }
         put(&self.provider, &heard_key(gid, &summary.member.0, summary.joined), &Saved { signed, at: now })?;
         let g = self.groups.get_mut(gid).unwrap();
         let membership = (summary.member.clone(), summary.joined);
@@ -301,17 +288,6 @@ impl State {
             let Some(saved) = get::<Saved>(&self.provider, &heard_key(gid, &key.0, joined))? else { continue };
             let summary = serde_json::from_slice(&saved.signed.body.0)?;
             self.peers.summary(&group, peers::Heard { signed: saved.signed, summary, at: saved.at }, false);
-        }
-        Ok(())
-    }
-
-    /// Drops the hints of members, by iroh key, that no group of this session has any longer.
-    pub(crate) fn unhint(&mut self, keys: Vec<Bytes>) -> Result<()> {
-        for key in keys {
-            let held = self.groups.values().any(|g| g.mls.members().iter().any(|m| m.leaf.as_ref().is_some_and(|leaf| leaf.key == key)));
-            if !held && self.hints.remove(&key).is_some() {
-                self.provider.delete(&hint_key(&key.0))?;
-            }
         }
         Ok(())
     }
@@ -444,12 +420,6 @@ impl Inner {
                     self.warn(None, format!("a frame from {}: {error:#}", peer.fmt_short()));
                 }
             }
-            lmk_net::Event::Home(relay) => {
-                st.home = Some(relay.to_string());
-                for g in st.groups.values_mut() {
-                    g.changed = true;
-                }
-            }
             _ => {}
         }
     }
@@ -532,11 +502,6 @@ impl Inner {
 }
 
 impl Node {
-    /// The relay a member last said it was on, which a dial to it tries first.
-    pub fn hint(&self, key: &[u8]) -> Option<String> {
-        self.inner.lock().hints.get(&Bytes(key.to_vec())).map(|hint| hint.relay.clone())
-    }
-
     /// The other current members' latest summaries of the group, whatever the gate.
     pub fn heard(&self, gid: &[u8]) -> Result<Vec<Heard>> {
         let st = self.inner.lock();

@@ -5,6 +5,7 @@ use anyhow::{Context, Result, ensure};
 use iroh::RelayUrl;
 use lmk_core::group::{Change, Group};
 use lmk_net::Net;
+use lmk_proto::directory::relay_url;
 use lmk_proto::group::Settings;
 use lmk_proto::Bytes;
 use serde_json::{Value, json};
@@ -31,10 +32,9 @@ impl Node {
         self.inner.net()
     }
 
-    /// This session's iroh key and the relays it lives on.
-    pub fn address(&self) -> ([u8; 32], Vec<RelayUrl>) {
-        let relays = if self.inner.chosen.is_empty() { self.inner.relays.clone() } else { self.inner.chosen.clone() };
-        (*self.inner.net().id().as_bytes(), relays)
+    /// This session's iroh key and the relay it lives on.
+    pub fn address(&self) -> ([u8; 32], RelayUrl) {
+        (*self.inner.net().id().as_bytes(), relay_url(&self.inner.home).parse().expect("parsed as the node started"))
     }
 
     pub fn groups(&self) -> Vec<Bytes> {

@@ -219,7 +219,7 @@ fn staged_oversize_and_malformed_builds_restore_everything() {
     let mut w = World::new(&["A", "B"]);
     w.found(0, &[1]);
     let a = &mut w.m[0];
-    let padded = |n: usize| Leaf { key: Bytes(vec![b'x'; n]), revision: REVISION };
+    let padded = |n: usize| Leaf { key: Bytes(vec![b'x'; n]), revision: REVISION, home: "lmk.example".into() };
     let cut = a.cut();
     let top = a.commit(Change { cut, leaf: Some(padded(700_000)), ..Change::default() });
     assert_eq!(top.entry.len(), 1 << 20);

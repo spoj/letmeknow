@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail, ensure};
 use iroh::{EndpointId, RelayUrl};
 use lmk_core::group::{Change, Group, key_package_key, key_package_reference};
 use lmk_net::Admit;
+use lmk_proto::directory::relay_url;
 use lmk_proto::group::{Control, Service};
 use lmk_proto::links::Invite;
 use lmk_proto::peer::{Admitted, Join};
@@ -82,24 +83,17 @@ impl Node {
         };
         let st = self.inner.lock();
         let Service::Serve { domain, .. } = st.group(gid)?.mls.settings().membership else { bail!("unsupported membership service") };
-        let mut members = vec![*self.inner.net().id().as_bytes()];
-        members.extend(holders.iter().take(LINK_MEMBERS).filter_map(|member| endpoint_id(&member.iroh.0)).map(|peer| *peer.as_bytes()));
+        let mut members = vec![(*self.inner.net().id().as_bytes(), self.inner.home.clone())];
+        members.extend(holders.iter().take(LINK_MEMBERS).filter_map(|member| Some((*endpoint_id(&member.iroh.0)?.as_bytes(), member.home.clone()))));
         Ok(Invite { secret, domain, members })
     }
 
     /// Joins through an invite link: asks the members it names in turn, as each is reached. Returns the group, and the
     /// iroh key of the member that admitted this session.
     pub async fn join(&self, link: &Invite) -> Result<(Bytes, [u8; 32])> {
-        let service: Vec<RelayUrl> = match (self.inner.resolve)(link.domain.clone()).await {
-            Ok(directory) => vec![directory.relay.parse()?],
-            Err(error) => {
-                self.inner.warn(None, format!("joining without the directory of {}: {error:#}", link.domain));
-                Vec::new()
-            }
-        };
-        // Each member is dialed at the relay it last said it was on, and at the link's service.
-        let hint = |peer: EndpointId| -> Vec<RelayUrl> { self.inner.lock().hint_of(&peer).into_iter().chain(service.clone()).chain(self.inner.chosen.clone()).collect() };
-        let members = link.members.iter().map(|member| Ok(EndpointId::from_bytes(member)?)).collect::<Result<Vec<_>>>()?;
+        // Each member is dialed at the relay of its own service.
+        let member = |(key, home): &([u8; 32], String)| -> Result<(EndpointId, Vec<RelayUrl>)> { Ok((EndpointId::from_bytes(key)?, vec![relay_url(home).parse()?])) };
+        let members = link.members.iter().map(member).collect::<Result<Vec<_>>>()?;
         let secret = Bytes(link.secret.to_vec());
         // The KeyPackage, whose private keys openmls keeps, is kept until this session joins or every member it asks
         // refuses it: a member that added it asked again answers with the commit entry it kept.
@@ -121,14 +115,13 @@ impl Node {
         let mut dials: FuturesUnordered<_> = members
             .into_iter()
             .enumerate()
-            .map(|(i, peer)| {
+            .map(|(i, (peer, relays))| {
                 let net = self.inner.net().clone();
-                let (hint, own) = (hint(peer), self.inner.relays.clone());
                 spawn(async move {
                     // A dial that fails at once, as one from a node that has just started can, is tried again until the wait
                     // is up.
                     let dialed = timeout(DIAL_WAIT, async {
-                        while let Err(error) = net.dial(peer, hint.clone(), Box::pin(std::future::ready(own.clone()))).await {
+                        while let Err(error) = net.dial(peer, relays.clone()).await {
                             tracing::debug!("dialing {}: {error:#}", peer.fmt_short());
                             sleep(Duration::from_secs(1)).await;
                         }
@@ -137,7 +130,7 @@ impl Node {
                     if i > 0 {
                         sleep_until(inviter_first).await;
                     }
-                    (peer, dialed)
+                    (peer, relays, dialed)
                 })
             })
             .collect();
@@ -148,22 +141,22 @@ impl Node {
         let until = Instant::now() + JOIN_LIMIT;
         let mut silent = VecDeque::new();
         loop {
-            let peer = match dials.next().await {
+            let (peer, relays) = match dials.next().await {
                 Some(dialed) => {
-                    let (peer, dialed) = dialed?;
+                    let (peer, relays, dialed) = dialed?;
                     if dialed.is_err() {
                         tracing::debug!("{} is not online", peer.fmt_short());
                         refused_by_all = false;
                         continue;
                     }
-                    peer
+                    (peer, relays)
                 }
                 None => match silent.pop_front() {
-                    Some(peer) if Instant::now() < until => peer,
+                    Some(member) if Instant::now() < until => member,
                     _ => break,
                 },
             };
-            let answer = timeout(JOIN_WAIT, self.inner.net().join(peer, hint(peer), Box::pin(std::future::ready(self.inner.relays.clone())), join.clone())).await;
+            let answer = timeout(JOIN_WAIT, self.inner.net().join(peer, relays.clone(), join.clone())).await;
             match answer {
                 Ok(Ok(Answer::Ok(admitted))) => {
                     let gid = self.inner.welcomed(admitted, &join.key_package.0).await?;
@@ -177,12 +170,12 @@ impl Node {
                     refused_by_all = false;
                     tracing::debug!("asking {} to admit this session: {error:#}", peer.fmt_short());
                     sleep(Duration::from_secs(1)).await;
-                    silent.push_back(peer);
+                    silent.push_back((peer, relays));
                 }
                 Err(_) => {
                     refused_by_all = false;
                     tracing::debug!("{} did not answer", peer.fmt_short());
-                    silent.push_back(peer);
+                    silent.push_back((peer, relays));
                 }
             }
         }

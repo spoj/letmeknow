@@ -69,8 +69,6 @@ pub struct ServeConfig {
     pub http_port: Option<u16>,
     /// QUIC address discovery. Clients given only the relay's URL assume 7842.
     pub qad_port: u16,
-    /// The relays the directory names, which members live on; empty names this service's own `relay_url()`.
-    pub relays: Vec<String>,
     /// Holds the service's key, its database and the ACME cache.
     pub state: PathBuf,
     pub certificate: Certificate,
@@ -86,7 +84,6 @@ impl ServeConfig {
             https_port: 443,
             http_port: Some(80),
             qad_port: 7842,
-            relays: vec![],
             state: state.into(),
             certificate: Certificate::Acme { contact: None },
             relay_rate_limit: NonZeroU32::new(RELAY_RATE).unwrap(),
@@ -103,7 +100,7 @@ impl ServeConfig {
     }
 
     pub fn relay_url(&self) -> String {
-        format!("https://{}", self.domain())
+        directory::relay_url(&self.domain())
     }
 
     /// The address members put in their settings: the service's key and domain.
@@ -188,13 +185,7 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
         tokio::spawn(redirect(http, config.relay_url()));
     }
 
-    let directory = Directory {
-        key: *store.key().verifying_key().as_bytes(),
-        relay: config.relay_url(),
-        relays: if config.relays.is_empty() { vec![config.relay_url()] } else { config.relays.clone() },
-    };
-    directory.check()?;
-    let directory = Bytes::from(serde_json::to_vec(&directory)?);
+    let directory = Bytes::from(serde_json::to_vec(&Directory { key: *store.key().verifying_key().as_bytes() })?);
     let health = Bytes::from(format!(
         r#"{{"version":"{}","membership":"{}"}}"#,
         env!("CARGO_PKG_VERSION"),

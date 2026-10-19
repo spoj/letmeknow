@@ -2243,7 +2243,6 @@ dependencies = [
  "lmk-node",
  "lmk-proto",
  "lmk-serve",
- "lmk-testing",
  "n0-future",
  "rand 0.9.5",
  "rcgen",

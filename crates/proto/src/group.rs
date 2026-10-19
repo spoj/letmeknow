@@ -50,6 +50,8 @@ pub struct Leaf {
     /// The session's protocol revision.
     #[serde(default)]
     pub revision: u32,
+    /// The domain of the session's own membership service, whose relay it lives on.
+    pub home: String,
 }
 
 /// The core's own payloads. The plaintext of an MLS application message is JSON with a `type`; every type but these
@@ -128,7 +130,7 @@ mod tests {
         let settings: Settings = serde_json::from_str(text).unwrap();
         let Service::Serve { rest, .. } = &settings.membership else { panic!("a service this version knows") };
         assert_eq!(rest["future"], "t");
-        let leaf: Leaf = serde_json::from_str(r#"{"key":"AQ"}"#).unwrap();
-        assert_eq!(leaf.revision, 0);
+        let leaf: Leaf = serde_json::from_str(r#"{"key":"AQ","home":"h.example","later":1}"#).unwrap();
+        assert_eq!((leaf.revision, leaf.home.as_str()), (0, "h.example"));
     }
 }
