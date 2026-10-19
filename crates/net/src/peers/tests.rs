@@ -71,6 +71,29 @@ fn summaries_to(out: &[Out]) -> Vec<Key> {
         .collect()
 }
 
+/// A `hello` of the group at no position, telling these sightings, each `ago` milliseconds old.
+fn telling(seen: &[(Key, u64)]) -> Frame {
+    let seen = seen.iter().map(|(k, ago)| (Bytes(k.to_vec()), *ago)).collect();
+    Frame::Hello { groups: vec![At { group: id(), log: [7; 32], head: None, seen }] }
+}
+
+/// The sightings each `hello` in `out` tells, by peer.
+fn told(out: &[Out]) -> BTreeMap<Key, BTreeMap<Bytes, u64>> {
+    out.iter()
+        .filter_map(|o| match o {
+            Out::Frame(k, Frame::Hello { groups }) => Some((*k, groups[0].seen.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The other members of a group of twenty, best-ranked first.
+fn ranked() -> Vec<Key> {
+    let mut ranked: Vec<Key> = (1..=19).map(key).collect();
+    ranked.sort_by_key(|k| rank(&id(), &key(100), k));
+    ranked
+}
+
 fn wants(out: &[Out]) -> Vec<(Key, Vec<Seqs>)> {
     out.iter()
         .filter_map(|o| match o {
@@ -142,7 +165,7 @@ fn a_push_dials_again_past_the_backoff_and_a_connection_clears_it() {
     assert_eq!(dials(&p.poll(30_000)), vec![key(1)]);
     p.dialed(&key(1), false, 30_000);
     p.connect(key(1), gs(), false, 35_000);
-    p.disconnect(&key(1));
+    p.disconnect(&key(1), 36_000);
     p.push(&id());
     assert_eq!(dials(&p.poll(40_000)), vec![key(1)], "a connection cleared the backoff");
 }
@@ -177,6 +200,100 @@ fn recently_seen_members_are_targets_before_stale_ones() {
     assert!(!p.targets(&id(), 0).contains(&key(last)));
     p.summary(&id(), heard(last, 1, 0, vec![]), false);
     assert!(p.targets(&id(), 0).contains(&key(last)));
+}
+
+/// Targets are the connected members first, then those seen online, then those heard from, then the best-ranked rest.
+#[test]
+fn targets_are_the_members_surest_to_be_online() {
+    let mut p = peers();
+    p.group(id(), own(1, &(1..=19).collect::<Vec<_>>()), 0);
+    let r = ranked();
+    let worst: Vec<Key> = r.iter().rev().take(4).copied().collect();
+    p.connect(worst[0], gs(), true, 0);
+    p.frame(&worst[0], &telling(&[(worst[1], 0), (worst[2], 0)]), 0);
+    p.summary(&id(), heard(worst[3][0], 1, 0, vec![]), false);
+    assert_eq!(p.targets(&id(), 1), vec![worst[0], worst[2], worst[1], worst[3], r[0], r[1]]);
+}
+
+/// A sighting of a member this member did not know to be online is news: it dials the member, and tells its other
+/// neighbours, but not the one that told it.
+#[test]
+fn news_of_a_member_online_is_dialed_and_passed_on() {
+    let mut p = peers();
+    p.group(id(), own(1, &(1..=19).collect::<Vec<_>>()), 0);
+    let r = ranked();
+    let (a, b, far) = (r[18], r[17], r[16]);
+    p.connect(a, gs(), false, 0);
+    p.connect(b, gs(), false, 0);
+    p.frame(&a, &telling(&[(far, 0)]), 0);
+    let out = p.poll(0);
+    assert_eq!(dials(&out)[0], far);
+    let told = told(&out);
+    assert!(told[&b].contains_key(&Bytes(far.to_vec())));
+    assert!(!told[&a].contains_key(&Bytes(far.to_vec())));
+}
+
+/// A failed dial outweighs the sightings from before it, not those after.
+#[test]
+fn a_failed_dial_outweighs_the_sightings_before_it() {
+    let mut p = peers();
+    p.group(id(), own(1, &(1..=19).collect::<Vec<_>>()), 0);
+    let r = ranked();
+    let (a, far) = (r[18], r[17]);
+    p.connect(a, gs(), false, 0);
+    p.frame(&a, &telling(&[(far, 0)]), 0);
+    assert!(p.targets(&id(), 0).contains(&far));
+    p.dialed(&far, false, 5_000);
+    assert!(!p.targets(&id(), 20_000).contains(&far), "past its backoff");
+    p.frame(&a, &telling(&[(far, 0)]), 20_000);
+    assert!(p.targets(&id(), 20_000).contains(&far));
+}
+
+/// A `hello` tells a neighbour each sighting once, and again only once it is `RETELL` fresher.
+#[test]
+fn a_sighting_is_told_again_only_once_it_is_retell_fresher() {
+    let mut p = peers();
+    let members: Vec<u8> = (1..=8).collect();
+    p.group(id(), own(1, &members), 0);
+    p.connect(key(1), gs(), false, 0);
+    p.connect(key(2), gs(), false, 0);
+    let to_1 = |out: Vec<Out>| told(&out).remove(&key(1)).expect("a hello to 1");
+    let sighted = BTreeMap::from([(Bytes(key(2).to_vec()), 0)]);
+    assert_eq!(to_1(p.poll(0)), sighted);
+    let moved = |length| Own { head: Some(Head { log_ref: [7; 32], length, hash: [0; 32], time: 0, sig: Bytes::default() }), ..own(1, &members) };
+    p.group(id(), moved(1), 10);
+    assert_eq!(to_1(p.poll(10 + DEBOUNCE)), BTreeMap::new());
+    p.group(id(), moved(2), RETELL);
+    assert_eq!(to_1(p.poll(RETELL + DEBOUNCE)), sighted);
+}
+
+/// Sightings count only of current members, from neighbours the group is served to, and for `RECENT`.
+#[test]
+fn sightings_count_of_members_from_neighbours_of_the_group_for_recent() {
+    let mut p = peers();
+    p.group(id(), own(1, &(1..=19).collect::<Vec<_>>()), 0);
+    let r = ranked();
+    let (a, far) = (r[18], r[17]);
+    p.connect(key(50), BTreeSet::new(), false, 0);
+    p.frame(&key(50), &telling(&[(far, 0)]), 0);
+    assert!(!p.targets(&id(), 0).contains(&far), "told by a stranger");
+    p.connect(a, gs(), false, 0);
+    p.frame(&a, &telling(&[(key(60), 0), (far, 0)]), 0);
+    assert!(!p.groups[&id()].seen.contains_key(&key(60)), "not a member");
+    assert!(p.targets(&id(), RECENT - 1).contains(&far));
+    assert!(!p.targets(&id(), RECENT).contains(&far));
+}
+
+/// A neighbour that disconnects was online until then.
+#[test]
+fn a_neighbour_that_disconnects_was_online_until_then() {
+    let mut p = peers();
+    p.group(id(), own(1, &(1..=19).collect::<Vec<_>>()), 0);
+    let far = ranked()[18];
+    p.connect(far, gs(), true, 0);
+    p.disconnect(&far, 1_000);
+    assert!(p.targets(&id(), 1_000 + RECENT - 1).contains(&far));
+    assert!(!p.targets(&id(), 1_000 + RECENT).contains(&far));
 }
 
 /// A dialed connection no group targets closes after five idle minutes; a targeted one stays.
@@ -236,7 +353,7 @@ fn hello_on_connect_carries_the_served_groups_positions() {
     let head = Head { log_ref: [7; 32], length: 3, hash: [0; 32], time: 0, sig: Bytes::default() };
     p.group(id(), Own { head: Some(head.clone()), ..own(1, &[1]) }, 0);
     p.connect(key(1), gs(), false, 0);
-    let groups = vec![At { group: id(), log: [7; 32], head: Some(head) }];
+    let groups = vec![At { group: id(), log: [7; 32], head: Some(head), seen: BTreeMap::new() }];
     assert!(p.poll(0).contains(&Out::Frame(key(1), Frame::Hello { groups })));
 }
 
@@ -494,7 +611,7 @@ fn a_wait_holds_for_summaries_after_coming_online() {
     assert!(p.wait(&id(), &lacking, 0, 1_000));
     p.summary(&id(), heard(1, 1, 1_500, lacking.clone()), false);
     assert!(p.wait(&id(), &lacking, 0, 1_000 + HEAR), "a holder is untried");
-    p.disconnect(&key(1));
+    p.disconnect(&key(1), 1_000 + HEAR);
     p.dialed(&key(1), false, 1_000 + HEAR);
     assert!(!p.wait(&id(), &lacking, 0, 1_000 + HEAR));
 }
@@ -573,6 +690,10 @@ struct Sim {
     links: BTreeSet<(usize, usize)>,
     queue: BTreeMap<(u64, u64), Ev>,
     sent: u64,
+    /// Members whose dials fail after 32 s, as iroh's do to a key nobody holds.
+    offline: BTreeSet<usize>,
+    /// Per member, its dials to members offline.
+    offline_dials: Vec<u64>,
 }
 
 fn pair(a: usize, b: usize) -> (usize, usize) {
@@ -593,8 +714,8 @@ impl Sim {
 
     fn unlink(&mut self, a: usize, b: usize) {
         self.links.remove(&pair(a, b));
-        self.peers[a].disconnect(&key(b as u8));
-        self.peers[b].disconnect(&key(a as u8));
+        self.peers[a].disconnect(&key(b as u8), self.now);
+        self.peers[b].disconnect(&key(a as u8), self.now);
     }
 
     fn act(&mut self, at: usize, outs: Vec<Out>) {
@@ -608,9 +729,15 @@ impl Sim {
                     }
                 }
                 Out::Dial(to) => {
-                    let ok = !self.chaos || self.rng.below(10) < 8;
-                    let delay = 100 + self.rng.below(2_000);
-                    self.schedule(delay, Ev::Dialed { from: at, to: to[0] as usize, ok });
+                    let to = to[0] as usize;
+                    if self.offline.contains(&to) {
+                        self.offline_dials[at] += 1;
+                        self.schedule(32_000, Ev::Dialed { from: at, to, ok: false });
+                    } else {
+                        let ok = !self.chaos || self.rng.below(10) < 8;
+                        let delay = 100 + self.rng.below(2_000);
+                        self.schedule(delay, Ev::Dialed { from: at, to, ok });
+                    }
                 }
                 Out::Close(to) => self.unlink(at, to[0] as usize),
                 Out::Entries { .. } => unreachable!("no member has a head"),
@@ -659,7 +786,7 @@ fn twelve_members_converge_through_loss_and_reconnection() {
     const TICK: u64 = 250;
     const CHAOS: u64 = 5 * 60_000;
     const END: u64 = 20 * 60_000;
-    let mut sim = Sim { now: 0, chaos: true, rng: Rng(0x9e37_79b9_7f4a_7c15), peers: Vec::new(), versions: vec![0; N], links: BTreeSet::new(), queue: BTreeMap::new(), sent: 0 };
+    let mut sim = Sim { now: 0, chaos: true, rng: Rng(0x9e37_79b9_7f4a_7c15), peers: Vec::new(), versions: vec![0; N], links: BTreeSet::new(), queue: BTreeMap::new(), sent: 0, offline: BTreeSet::new(), offline_dials: vec![0; N] };
     for i in 0..N {
         let members = (0..N).filter(|&j| j != i).map(|j| ((Bytes(vec![j as u8]), 0), key(j as u8))).collect();
         let own = Own { me: (Bytes(vec![i as u8]), 0), epoch: 1, log: [1; 32], head: None, earlier: vec![], members, wanted: vec![], stale: vec![] };
@@ -723,4 +850,64 @@ fn a_peer_past_this_member_is_told_where_it_is() {
     p.behind(&key(1));
     assert_eq!(p.next(DEBOUNCE + 2), Some(DEBOUNCE + 2));
     assert_eq!(hellos(&p.poll(DEBOUNCE + 2)), 1);
+}
+
+/// Of 200 members only 20 are online, linked in a ring at first; a dial to any other fails after 32 s. The 20 learn of
+/// each other from the sightings their neighbours tell: past the dials of their first poll, they dial no member
+/// offline, and end in one piece. A newcomer that takes its admitter's `hello` before its first poll, as a joiner does,
+/// has six neighbours within a minute, without dialing a member offline.
+#[test]
+fn members_online_in_a_mostly_offline_group_find_each_other() {
+    const MEMBERS: usize = 200;
+    const ONLINE: usize = 20;
+    const JOIN: u64 = 10 * 60_000;
+    const TICK: u64 = 1_000;
+    let newcomer = ONLINE;
+    let offline = (ONLINE + 1..MEMBERS).collect();
+    let mut sim = Sim { now: 0, chaos: false, rng: Rng(0x2545_f491_4f6c_dd1d), peers: Vec::new(), versions: vec![0; MEMBERS], links: BTreeSet::new(), queue: BTreeMap::new(), sent: 0, offline, offline_dials: vec![0; MEMBERS] };
+    for i in 0..MEMBERS {
+        let members = (0..MEMBERS).filter(|&j| j != i).map(|j| ((Bytes(vec![j as u8]), 0), key(j as u8))).collect();
+        let own = Own { me: (Bytes(vec![i as u8]), 0), epoch: 1, log: [1; 32], head: None, earlier: vec![], members, wanted: vec![], stale: vec![] };
+        sim.peers.push(Peers::new(0, key(i as u8)));
+        sim.peers[i].group(id(), own, 0);
+    }
+    for i in 0..ONLINE {
+        sim.connect(i, (i + 1) % ONLINE);
+    }
+    let mut now = 0;
+    while now <= JOIN + 60_000 {
+        sim.now = now;
+        if now == JOIN {
+            sim.connect(newcomer, 0);
+            for out in sim.peers[0].poll(now) {
+                match out {
+                    Out::Frame(to, frame) if to == key(newcomer as u8) => sim.peers[newcomer].frame(&key(0), &frame, now),
+                    out => sim.act(0, vec![out]),
+                }
+            }
+        }
+        let due: Vec<(u64, u64)> = sim.queue.range(..=(now, u64::MAX)).map(|(k, _)| *k).collect();
+        for k in due {
+            let ev = sim.queue.remove(&k).unwrap();
+            sim.deliver(ev);
+        }
+        for i in (0..ONLINE).chain((now >= JOIN).then_some(newcomer)) {
+            let outs = sim.peers[i].poll(now);
+            sim.act(i, outs);
+        }
+        now += TICK;
+    }
+    assert!(sim.offline_dials[..ONLINE].iter().all(|&n| n <= DIALS as u64), "{:?}", &sim.offline_dials[..ONLINE]);
+    assert_eq!(sim.offline_dials[newcomer], 0);
+    assert!(sim.peers[newcomer].neighbours(&id()).len() >= K);
+    let mut reached = BTreeSet::from([0]);
+    let mut next = vec![0];
+    while let Some(i) = next.pop() {
+        for k in sim.peers[i].neighbours(&id()) {
+            if reached.insert(k[0] as usize) {
+                next.push(k[0] as usize);
+            }
+        }
+    }
+    assert_eq!(reached, (0..=ONLINE).collect(), "one piece");
 }

@@ -437,7 +437,7 @@ impl Inner {
                 st.peers.connect(*peer.as_bytes(), served, dialed, now);
             }
             lmk_net::Event::Disconnected(peer) => {
-                st.peers.disconnect(peer.as_bytes());
+                st.peers.disconnect(peer.as_bytes(), now);
             }
             lmk_net::Event::Frame(peer, frame) if st.peers.is_connected(peer.as_bytes()) => {
                 if let Err(error) = self.frame(&mut st, peer, frame) {

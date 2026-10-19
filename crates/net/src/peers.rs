@@ -1,8 +1,9 @@
 //! The peer protocol without I/O, across a member's connections: which peers to dial and close, the summaries
-//! neighbours exchange, repair by pull, and the wait before a commit that deletes an epoch's keys. The node feeds it
-//! state and frames, polls it when `next` says or something changed, and sends what it returns. Nothing in it is
-//! periodic: a member dials as it starts, as its groups change and as it has something to push, so of two members the
-//! later one online dials. Times are milliseconds.
+//! neighbours exchange, whom they know to be online, repair by pull, and the wait before a commit that deletes an
+//! epoch's keys. The node feeds it state and frames, polls it when `next` says or something changed, and sends what it
+//! returns. Nothing in it is periodic: a member dials as it starts, as its groups change, as a neighbour tells it of a
+//! member online it did not know of, and as it has something to push, so of two members the later one online dials.
+//! Times are milliseconds.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -31,7 +32,10 @@ pub const K: usize = 6;
 const MESH: usize = 7;
 pub const BACKOFF: u64 = 10_000;
 pub const MAX_BACKOFF: u64 = 600_000;
+/// How long a sighting, or a summary heard, shows a member online.
 pub const RECENT: u64 = 7_200_000;
+/// How much fresher than the one a neighbour was last told a sighting must be to be told again.
+pub const RETELL: u64 = 1_800_000;
 /// How often `poll` is due while a repair or a wait is on.
 pub const BUSY: u64 = 250;
 pub const IDLE: u64 = 300_000;
@@ -100,6 +104,8 @@ struct Group {
     own: Own,
     /// The kept summaries of the current memberships, own included: neighbours', as they came.
     heard: BTreeMap<Membership, Heard>,
+    /// When each other member was last known online: connected to this member until then, or to a neighbour that said so.
+    seen: BTreeMap<Key, u64>,
     /// Per holder and membership, the seqs it covered without sending, struck for the epoch.
     struck: BTreeMap<(Key, Membership), Ranges>,
     request: Option<Request>,
@@ -130,12 +136,16 @@ struct Conn {
     sent: BTreeMap<Bytes, u64>,
     /// Per log, the longest the peer showed or was sent.
     theirs: BTreeMap<[u8; 32], u64>,
+    /// Per group, the latest sighting of each member the peer told or was told.
+    told: BTreeMap<Bytes, BTreeMap<Key, u64>>,
 }
 
 #[derive(Default)]
 struct Backoff {
     failures: u32,
     until: u64,
+    /// When its last dial failed: no sighting from before shows it online.
+    failed: u64,
 }
 
 impl Peers {
@@ -161,13 +171,14 @@ impl Peers {
                     g.struck.clear();
                 }
                 g.heard.retain(|m, _| *m == own.me || own.members.iter().any(|(n, _)| n == m));
+                g.seen.retain(|k, _| own.members.iter().any(|(_, n)| n == k));
                 let changed = (g.own.epoch, g.own.log, &g.own.head) != (own.epoch, own.log, &own.head);
                 let members = g.own.members != own.members;
                 g.own = own;
                 (changed, members)
             }
             None => {
-                let group = Group { own, heard: BTreeMap::new(), struck: BTreeMap::new(), request: None, waiting: Set::new() };
+                let group = Group { own, heard: BTreeMap::new(), seen: BTreeMap::new(), struck: BTreeMap::new(), request: None, waiting: Set::new() };
                 self.groups.insert(id.clone(), group);
                 (true, true)
             }
@@ -192,24 +203,33 @@ impl Peers {
             c.served.remove(id);
             c.opened.remove(id);
             c.sent.remove(id);
+            c.told.remove(id);
         }
     }
 
-    /// A connection to the peer, replacing any other, with the groups the gate admits it to.
+    /// A connection to the peer, replacing any other, with the groups the gate admits it to. The other neighbours of
+    /// those groups are told of it.
     pub fn connect(&mut self, peer: Key, served: BTreeSet<Bytes>, dialed: bool, now: u64) {
-        self.disconnect(&peer);
+        self.disconnect(&peer, now);
         if self.conns.is_empty() {
             self.online = now;
         }
+        if !served.is_empty() {
+            self.changed.get_or_insert(now);
+        }
         self.backoff.remove(&peer);
-        let conn = Conn { dialed, served_at: now, active: now, hello: true, opened: served.clone(), served, sent: BTreeMap::new(), theirs: BTreeMap::new() };
+        let conn = Conn { dialed, served_at: now, active: now, hello: true, opened: served.clone(), served, sent: BTreeMap::new(), theirs: BTreeMap::new(), told: BTreeMap::new() };
         self.conns.insert(peer, conn);
     }
 
-    pub fn disconnect(&mut self, peer: &Key) {
+    /// The connection to the peer ended: a member was online until now.
+    pub fn disconnect(&mut self, peer: &Key, now: u64) {
         self.conns.remove(peer);
         for g in self.groups.values_mut() {
             g.request.take_if(|r| r.holder == *peer);
+            if g.own.members.iter().any(|(_, k)| k == peer) {
+                g.seen.insert(*peer, now);
+            }
         }
     }
 
@@ -220,11 +240,13 @@ impl Peers {
         if !newly.is_empty() {
             c.hello = true;
             c.opened.extend(newly);
+            self.changed.get_or_insert(now);
         }
         if !served.is_empty() {
             c.served_at = now;
         }
         c.sent.retain(|id, _| served.contains(id));
+        c.told.retain(|id, _| served.contains(id));
         c.served = served;
         for (id, g) in &mut self.groups {
             if !c.served.contains(id) {
@@ -262,6 +284,7 @@ impl Peers {
             let b = self.backoff.entry(*peer).or_default();
             b.failures += 1;
             b.until = now + (BACKOFF << (b.failures - 1).min(6)).min(MAX_BACKOFF);
+            b.failed = now;
             let of: Vec<Bytes> = self.groups.iter().filter(|(_, g)| g.own.members.iter().any(|(_, k)| k == peer)).map(|(id, _)| id.clone()).collect();
             self.dial.extend(of);
         }
@@ -282,6 +305,10 @@ impl Peers {
                 for (log, length) in groups.iter().map(|at| (at.log, at.head.as_ref().map_or(0, |h| h.length))) {
                     let theirs = c.theirs.entry(log).or_default();
                     *theirs = (*theirs).max(length);
+                }
+                let served: Vec<&At> = groups.iter().filter(|at| c.served.contains(&at.group)).collect();
+                for at in served {
+                    self.saw(peer, &at.group, &at.seen, now);
                 }
             }
             Frame::Held { group, items, answers: Some(answers) } => {
@@ -392,19 +419,65 @@ impl Peers {
         }
     }
 
-    fn recent(&self, g: &Group, member: &Membership, peer: &Key, now: u64) -> bool {
-        self.conns.contains_key(peer) || g.heard.get(member).is_some_and(|h| now < h.at + RECENT)
+    /// Whether a sighting at `at` shows the member online now: within `RECENT`, and since its last failed dial.
+    fn alive(&self, peer: &Key, at: u64, now: u64) -> bool {
+        now < at + RECENT && self.backoff.get(peer).is_none_or(|b| at > b.failed)
     }
 
-    /// The members the group targets: all members in a full mesh, else the best `K` by rank, recent ones first.
+    /// How sure this member is that a member is online, surest first: connected, seen online, heard from within
+    /// `RECENT`, or none of these.
+    fn tier(&self, g: &Group, member: &Membership, peer: &Key, now: u64) -> u8 {
+        match () {
+            _ if self.conns.contains_key(peer) => 0,
+            _ if g.seen.get(peer).is_some_and(|at| self.alive(peer, *at, now)) => 1,
+            _ if g.heard.get(member).is_some_and(|h| now < h.at + RECENT) => 2,
+            _ => 3,
+        }
+    }
+
+    /// Takes the sightings of a group's members that a neighbour told: as told to it, and as this member's own when
+    /// fresher. One of a member this member did not know to be online is news: it tells its neighbours, and dials the
+    /// group's targets again.
+    fn saw(&mut self, peer: &Key, group: &Bytes, seen: &BTreeMap<Bytes, u64>, now: u64) {
+        let Some(g) = self.groups.get(group) else { return };
+        let members: BTreeSet<&Key> = g.own.members.iter().map(|(_, k)| k).collect();
+        let sightings: Vec<(Key, u64)> = seen
+            .iter()
+            .filter_map(|(key, ago)| Key::try_from(key.0.as_slice()).ok().filter(|k| members.contains(k)).map(|k| (k, now.saturating_sub(*ago))))
+            .collect();
+        let known = |k: &Key| self.conns.contains_key(k) || g.seen.get(k).is_some_and(|at| self.alive(k, *at, now));
+        let news = sightings.iter().any(|(k, at)| self.alive(k, *at, now) && !known(k));
+        let told = self.conns.get_mut(peer).expect("a connected peer").told.entry(group.clone()).or_default();
+        let mine = &mut self.groups.get_mut(group).expect("a group of ours").seen;
+        for (k, at) in sightings {
+            for latest in [told.entry(k).or_default(), mine.entry(k).or_default()] {
+                *latest = (*latest).max(at);
+            }
+        }
+        if news {
+            self.changed.get_or_insert(now);
+            self.dial.insert(group.clone());
+        }
+    }
+
+    /// The group's members this member knows to be online, with when it last knew: now for its neighbours.
+    fn sightings(&self, group: &Bytes, now: u64) -> BTreeMap<Key, u64> {
+        let g = &self.groups[group];
+        let mut seen: BTreeMap<Key, u64> = g.seen.iter().filter(|(k, at)| self.alive(k, **at, now)).map(|(k, at)| (*k, *at)).collect();
+        seen.extend(self.neighbours(group).into_iter().map(|k| (k, now)));
+        seen
+    }
+
+    /// The members the group targets: all members in a full mesh, else the best `K` by rank, the surest to be online
+    /// first.
     fn targets(&self, group: &Bytes, now: u64) -> Vec<Key> {
         let g = &self.groups[group];
-        let mut ranked: Vec<(bool, [u8; 32], Key)> = g
+        let mut ranked: Vec<(u8, [u8; 32], Key)> = g
             .own
             .members
             .iter()
             .filter(|(_, k)| !self.backing(k, now))
-            .map(|(m, k)| (!self.recent(g, m, k, now), rank(group, &self.me, k), *k))
+            .map(|(m, k)| (self.tier(g, m, k, now), rank(group, &self.me, k), *k))
             .collect();
         ranked.sort();
         ranked.iter().take(K).map(|(_, _, k)| *k).collect()
@@ -432,9 +505,14 @@ impl Peers {
         }
     }
 
-    /// `entries` to peers that lack them, and `hello`s.
+    /// `entries` to peers that lack them, and `hello`s: each tells the peer the sightings it was not told, or was told
+    /// `RETELL` staler.
     fn hellos(&mut self, now: u64) -> Vec<Out> {
         let due = self.changed.is_some_and(|since| now - since >= DEBOUNCE);
+        let sightings: BTreeMap<Bytes, BTreeMap<Key, u64>> = match due || self.conns.values().any(|c| c.hello) {
+            true => self.groups.keys().map(|id| (id.clone(), self.sightings(id, now))).collect(),
+            false => BTreeMap::new(),
+        };
         let mut out = Vec::new();
         for (key, c) in &mut self.conns {
             let served: Vec<(&Bytes, &Group)> = c.served.iter().filter_map(|id| Some((id, self.groups.get(id)?))).collect();
@@ -451,7 +529,16 @@ impl Peers {
             if c.hello || due {
                 c.hello = false;
                 if !served.is_empty() {
-                    let groups = served.iter().map(|(id, g)| At { group: (*id).clone(), log: g.own.log, head: g.own.head.clone() }).collect();
+                    let groups = served
+                        .iter()
+                        .map(|(id, g)| {
+                            let told = c.told.entry((*id).clone()).or_default();
+                            let untold: BTreeMap<Key, u64> = sightings[*id].iter().filter(|(k, at)| *k != key && told.get(*k).is_none_or(|t| **at > t + RETELL)).map(|(k, at)| (*k, *at)).collect();
+                            told.extend(&untold);
+                            let seen = untold.iter().map(|(k, at)| (Bytes(k.to_vec()), now - at)).collect();
+                            At { group: (*id).clone(), log: g.own.log, head: g.own.head.clone(), seen }
+                        })
+                        .collect();
                     out.push(Out::Frame(*key, Frame::Hello { groups }));
                 }
             }
@@ -561,7 +648,7 @@ impl Peers {
         }
         let mut out = Vec::new();
         for k in close {
-            self.disconnect(&k);
+            self.disconnect(&k, now);
             out.push(Out::Close(k));
         }
         out

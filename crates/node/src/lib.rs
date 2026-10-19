@@ -537,6 +537,8 @@ impl State {
         self.save_groups()?;
         self.gate = true;
         self.refresh(&gid);
+        // The early hellos' sightings count only from peers the gate admits to the group.
+        self.gate();
         let now = self.tick();
         let (early, others) = std::mem::take(&mut self.early_hellos).into_iter().partition(|(_, at)| at.group.0 == gid);
         self.early_hellos = others;

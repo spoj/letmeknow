@@ -1,6 +1,8 @@
 //! The `peer` stream between two members sharing groups, and the `admission` stream on which a joiner asks a member to
 //! admit it.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use serde_json::Value;
@@ -13,7 +15,7 @@ pub const SUMMARY: &[u8] = b"letmeknow summary v1\0";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Frame {
-    /// Where the sender is in each group it shares with the receiver.
+    /// Where the sender is in each group it shares with the receiver, and whom of it the sender knows to be online.
     Hello { groups: Vec<At> },
     /// Entries of a log the other lacks, by its reference, ending at `head`.
     Entries { log: Bytes, entries: Vec<Bytes>, head: Head },
@@ -41,6 +43,10 @@ pub struct At {
     #[serde(with = "fixed32")]
     pub log: [u8; 32],
     pub head: Option<Head>,
+    /// Members the sender knows to be online, by iroh key, with how many milliseconds ago it last knew: 0 for those it
+    /// is connected to. Only sightings it has not told the receiver, or told it half an hour staler.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub seen: BTreeMap<Bytes, u64>,
 }
 
 /// A membership's seqs, carried as `[key, joined, seqs]`.
@@ -133,6 +139,14 @@ mod tests {
         let parsed: Summary = serde_json::from_str(summary).unwrap();
         assert_eq!(parsed.relay, None);
         assert_eq!(serde_json::to_string(&parsed).unwrap(), summary);
+        let at = At { group: Bytes(vec![1]), log: [0; 32], head: None, seen: BTreeMap::from([(Bytes(vec![2]), 5)]) };
+        let text = serde_json::to_string(&at).unwrap();
+        assert!(text.ends_with(r#""head":null,"seen":{"Ag":5}}"#), "{text}");
+        assert_eq!(serde_json::from_str::<At>(&text).unwrap(), at);
+        let quiet = At { seen: BTreeMap::new(), ..at };
+        let text = serde_json::to_string(&quiet).unwrap();
+        assert!(text.ends_with(r#""head":null}"#), "a hello of 0.22.3 and before: {text}");
+        assert_eq!(serde_json::from_str::<At>(&text).unwrap(), quiet);
         let join = Join { secret: Bytes(vec![2]), key_package: Bytes(vec![3]) };
         assert_eq!(serde_json::to_string(&join).unwrap(), r#"{"secret":"Ag","key_package":"Aw"}"#);
     }
