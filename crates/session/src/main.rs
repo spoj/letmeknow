@@ -48,6 +48,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", letmeknow::sessions(&home).await?);
             Ok(())
         }
+        Command::Auto { change } => {
+            println!("{}", letmeknow::change_auto(&home, change)?);
+            Ok(())
+        }
         Command::Skill => {
             print!("{}", letmeknow::SKILL);
             Ok(())

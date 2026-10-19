@@ -798,3 +798,51 @@ async fn lookups_during_a_fetch_do_not_start_another() {
     }
     assert_eq!(calls.load(Ordering::Relaxed), 1);
 }
+
+/// A group on a home's auto list is joined by each new session of the home as it starts: through a running session of
+/// the home in it, or else through a stopped one, whose node alone runs meanwhile. A group no session of the home is in
+/// leaves the list.
+#[test]
+fn a_new_session_joins_the_auto_groups_of_its_home() {
+    local(async {
+        let world = world("auto").await;
+        let home = world.root.path().join("h");
+        let mut alice = world.start_in("h", "alice", HOUR).await;
+        let group = alice.cmd(&["invite"]).await.unwrap()["group"].as_str().unwrap().to_owned();
+        let added = crate::change_auto(&home, Some(crate::cli::Auto::Add { group: group.clone() })).unwrap();
+        assert_eq!(added, json!({ "groups": [group] }));
+        assert!(crate::change_auto(&home, Some(crate::cli::Auto::Add { group: "nope".into() })).unwrap_err().to_string().contains("no session of this home is in nope"));
+
+        let bob = world.start_in("h", "bob", HOUR).await;
+        let joined = alice.told(&["joined"]).await;
+        assert_eq!(joined["member"], json!(bob.fp));
+        assert_eq!(bob.cmd(&["groups"]).await.unwrap()[0]["group"], json!(group));
+
+        let mut bob = bob;
+        alice.stop().await;
+        bob.stop().await;
+        let carol = world.start_in("h", "carol", HOUR).await;
+        let members = async {
+            loop {
+                if let Ok(members) = carol.cmd(&["members"]).await {
+                    return members;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        };
+        let members = tokio::time::timeout(WAIT, members).await.expect("Carol joins through a stopped session");
+        assert_eq!(members["members"].as_array().unwrap().len(), 3);
+
+        // Once no session of the home is in it, the next session drops it from the list.
+        let mut carol = carol;
+        carol.cmd(&["leave", "--end"]).await.unwrap();
+        carol.stop().await;
+        for gone in ["alice", "bob"] {
+            std::fs::write(session_dir(&home, gone).unwrap().join("groups.json"), "[]").unwrap();
+        }
+        let mut dave = world.start_in("h", "dave", HOUR).await;
+        let warning = dave.expect("warning").await;
+        assert!(warning["text"].as_str().unwrap().contains("leaves the list"), "{warning}");
+        assert_eq!(crate::change_auto(&home, None).unwrap(), json!({ "groups": [] }));
+    });
+}

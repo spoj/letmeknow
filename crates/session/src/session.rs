@@ -38,8 +38,9 @@ pub struct Config {
 /// A request on a command channel, and where its answer goes.
 pub type Inbound = (Request, oneshot::Sender<Value>);
 
-/// A request's answer that work the session loop started gave, and where it goes.
-pub struct Answered(Result<Value>, oneshot::Sender<Value>);
+/// What work the session loop started gave: a request's answer, and where it goes; or, with no request, warnings to
+/// print.
+pub struct Answered(Result<Value>, Option<oneshot::Sender<Value>>);
 
 pub struct Session {
     db: Connection,
@@ -189,7 +190,7 @@ impl Session {
             Request::Send { group, to, reply_to, urgent, attach, attach_name, text } => {
                 match self.message(group, to, reply_to, urgent, attach.map(|data| (data, attach_name)), text) {
                     Ok((gid, payload, reply_to)) => {
-                        _ = self.running.spawn_local(async move { Answered(send(&node, &gid, payload, reply_to).await, reply) });
+                        _ = self.running.spawn_local(async move { Answered(send(&node, &gid, payload, reply_to).await, Some(reply)) });
                         return;
                     }
                     Err(error) => Err(error),
@@ -205,12 +206,12 @@ impl Session {
                     let link = node.invite(&gid.0, INVITE_VALID).await?.link();
                     Ok(json!({ "group": b64(&gid.0), "link": link, "expires_in": INVITE_VALID / 1000 }))
                 };
-                _ = self.running.spawn_local(async move { Answered(invite.await, reply) });
+                _ = self.running.spawn_local(async move { Answered(invite.await, Some(reply)) });
                 return;
             }
             Request::Join { target } => {
                 let joining = self.joining.clone();
-                _ = self.running.spawn_local(async move { Answered(join(&node, &joining, &target).await, reply) });
+                _ = self.running.spawn_local(async move { Answered(join(&node, &joining, &target).await, Some(reply)) });
                 return;
             }
             Request::Remove { group, member } => {
@@ -221,7 +222,7 @@ impl Session {
                     node.remove(&gid.0, &member.key.0).await?;
                     Ok(json!({ "group": b64(&gid.0), "members": described_members(&node, &gid)? }))
                 };
-                _ = self.running.spawn_local(async move { Answered(remove.await, reply) });
+                _ = self.running.spawn_local(async move { Answered(remove.await, Some(reply)) });
                 return;
             }
             Request::Leave { group, end } => {
@@ -240,7 +241,7 @@ impl Session {
                     }
                     Ok(answer)
                 };
-                _ = self.running.spawn_local(async move { Answered(leave.await, reply) });
+                _ = self.running.spawn_local(async move { Answered(leave.await, Some(reply)) });
                 return;
             }
         };
@@ -300,6 +301,11 @@ impl Session {
         self.publish();
         let _ = reply.send(answer.unwrap_or_else(|e| json!({ "error": format!("{e:#}") })));
         self.outbox.flush_held();
+    }
+
+    /// Runs work of the session's own, as requests run: what it warns of prints.
+    pub fn start(&mut self, work: impl Future<Output = Result<Vec<String>>> + 'static) {
+        self.running.spawn_local(async move { Answered(work.await.map(|warnings| json!(warnings)), None) });
     }
 
     /// Takes an event of the node.
@@ -617,8 +623,17 @@ pub async fn run(
             tokio::select! {
                 Some(item) = inbound.recv() => session.handle(item),
                 Some(done) = session.running.join_next() => {
-                    let Answered(answer, reply) = done.expect("work in flight runs until shutdown");
-                    session.answer(answer, reply);
+                    match done.expect("work in flight runs until shutdown") {
+                        Answered(answer, Some(reply)) => session.answer(answer, reply),
+                        Answered(warnings, None) => {
+                            session.publish();
+                            match warnings {
+                                Ok(Value::Array(warnings)) => warnings.into_iter().for_each(|text| session.outbox.print(json!({ "type": "warning", "text": text }))),
+                                Ok(_) => {}
+                                Err(error) => session.warn(format!("{error:#}")),
+                            }
+                        }
+                    }
                 }
                 Some(event) = events.recv() => session.event(event),
                 _ = tokio::time::sleep_until(due) => session.tick().await,

@@ -51,6 +51,7 @@ pub const INVITE_VALID: u64 = 10 * 60 * 1000;
 /// How long an invite waits for the members online to hold it.
 const MEMBER_WAIT: Duration = Duration::from_secs(5);
 
+#[derive(Clone)]
 pub struct Config {
     /// The relays of this session's directory: the relays it lives on unless `chosen` names others, and the fallback of
     /// every dial.

@@ -47,12 +47,30 @@ pub enum Command {
     },
     /// This machine's sessions: each one's handle, whether it runs, and its groups
     Sessions,
+    /// The groups each new session of this home joins as it starts, through a session of the home in it
+    Auto {
+        #[command(subcommand)]
+        change: Option<Auto>,
+    },
     /// Print instructions for agents
     Skill,
     /// Run a membership service and an iroh relay
     Serve(Serve),
     #[command(flatten)]
     Request(Request),
+}
+
+#[derive(Subcommand)]
+pub enum Auto {
+    /// Add a group that a session of this home is in
+    Add {
+        #[arg(long)]
+        group: String,
+    },
+    Remove {
+        #[arg(long)]
+        group: String,
+    },
 }
 
 #[derive(clap::Args, Debug)]

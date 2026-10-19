@@ -283,9 +283,109 @@ pub async fn listen(
         post: network.post.clone(),
         ca: network.ca.clone(),
     };
-    let (node, events) = Node::start(provider, node_config).await?;
-    let session = session::Session::open(config, db, node, held, membership).await?;
+    let (node, events) = Node::start(provider, node_config.clone()).await?;
+    let handle = config.handle.clone();
+    let mut session = session::Session::open(config, db, node.clone(), held, membership).await?;
+    let missing: Vec<String> = auto(home)?.into_iter().filter(|group| !node.groups().iter().any(|gid| b64(&gid.0) == *group)).collect();
+    if !missing.is_empty() {
+        session.start(join_auto(home.to_owned(), handle, node_config, node, missing));
+    }
     session::run(session, queue, events, print, shutdown).await
+}
+
+fn b64(bytes: &[u8]) -> String {
+    serde_json::to_value(Bytes(bytes.to_vec())).expect("JSON").as_str().expect("a string").to_owned()
+}
+
+/// The groups each new session of a home joins as it starts, by id: its `auto.json`.
+fn auto(home: &Path) -> Result<Vec<String>> {
+    match std::fs::read(home.join("auto.json")) {
+        Ok(auto) => Ok(serde_json::from_slice(&auto)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Changes the auto groups as `change` says, and answers them.
+pub fn change_auto(home: &Path, change: Option<cli::Auto>) -> Result<Value> {
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(home.join("auto.lock"))?;
+    lock.lock()?;
+    let mut groups = auto(home)?;
+    match change {
+        Some(cli::Auto::Add { group }) => {
+            ensure!(!members_of(home, &group, "").is_empty(), "no session of this home is in {group}");
+            if !groups.contains(&group) {
+                groups.push(group);
+            }
+        }
+        Some(cli::Auto::Remove { group }) => groups.retain(|g| *g != group),
+        None => return Ok(json!({ "groups": groups })),
+    }
+    cli::private_file(&home.join("auto.json"), &serde_json::to_vec(&groups)?)?;
+    Ok(json!({ "groups": groups }))
+}
+
+/// The sessions of a home but `me` that, as they last wrote, are in `group`.
+fn members_of(home: &Path, group: &str, me: &str) -> Vec<String> {
+    let mut members = Vec::new();
+    for entry in std::fs::read_dir(home.join("sessions")).into_iter().flatten().flatten() {
+        let handle = entry.file_name().to_string_lossy().into_owned();
+        let groups: Vec<String> = std::fs::read(entry.path().join("groups.json")).ok().and_then(|groups| serde_json::from_slice(&groups).ok()).unwrap_or_default();
+        if handle != me && groups.iter().any(|g| g == group) {
+            members.push(handle);
+        }
+    }
+    members.sort();
+    members
+}
+
+/// Joins each auto group this session is not in, by an invite from a session of the home in it: a running one, or else
+/// a stopped one whose node alone runs here meanwhile, so that what it has not shown stays unshown. A group no session
+/// of the home is in any longer leaves the list. Answers what it warns of.
+async fn join_auto(home: PathBuf, me: String, config: lmk_node::Config, node: Node, groups: Vec<String>) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    for group in groups {
+        let members = members_of(&home, &group, &me);
+        if members.is_empty() {
+            change_auto(&home, Some(cli::Auto::Remove { group: group.clone() }))?;
+            warnings.push(format!("no session of this home is in the auto group {group} any longer: it leaves the list"));
+            continue;
+        }
+        if let Err(error) = join_by_sibling(&home, &config, &node, &group, &members).await {
+            warnings.push(format!("joining the auto group {group}: {error:#}"));
+        }
+    }
+    Ok(warnings)
+}
+
+async fn join_by_sibling(home: &Path, config: &lmk_node::Config, node: &Node, group: &str, members: &[String]) -> Result<()> {
+    let running = cli::running(home).await;
+    for member in members.iter().filter(|member| running.contains(member)) {
+        let invite = cli::Request::Invite { group: Some(group.to_owned()), carry: 7 };
+        // One that stopped meanwhile, or left the group, gives none.
+        let Ok(answer) = cli::call(home, member, invite).await else { continue };
+        let link = answer["link"].as_str().context("an invite answers its link")?.to_owned();
+        node.join(&lmk_proto::links::Invite::parse(&link)?).await?;
+        return Ok(());
+    }
+    for member in members.iter().filter(|member| !running.contains(member)) {
+        let dir = cli::session_dir(home, member)?;
+        let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("session.lock"))?;
+        if held.try_lock().is_err() {
+            continue;
+        }
+        let (sibling, _events) = Node::start(SqliteProvider::open(&dir.join("session.db"))?, config.clone()).await?;
+        let gid = sibling.groups().into_iter().find(|gid| b64(&gid.0) == group);
+        let joined = async {
+            let invite = sibling.invite(&gid.context("the session left the group")?.0, lmk_node::INVITE_VALID).await?;
+            node.join(&invite).await
+        };
+        let joined = joined.await;
+        sibling.shutdown().await?;
+        joined?;
+        return Ok(());
+    }
+    bail!("no session of this home in it could invite this one")
 }
 
 /// This machine's sessions: each one's handle, whether its process answers, and its groups as it last wrote them.
