@@ -965,13 +965,11 @@ fn an_idle_member_shows_itself_present_before_its_epochs_log_goes() {
         SHIFT.store(3 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         let bob = stored(&relay, &bob_db).await;
         let alice = stored(&relay, &alice_db).await;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        bob.node.shutdown().await.unwrap();
-        drop(bob);
-        assert!(payload_types(&bob_db, &gid).contains(&(bob_key.clone(), "present".into())), "Bob sent a present");
-        alice.node.shutdown().await.unwrap();
-        drop(alice);
-        assert!(payload_types(&alice_db, &gid).contains(&(bob_key.clone(), "present".into())), "Alice holds it");
+        let present = (bob_key.clone(), "present".to_string());
+        eventually("Bob sends a present, and Alice holds it", || payload_types(&alice_db, &gid).contains(&present)).await;
+        for session in [bob, alice] {
+            session.node.shutdown().await.unwrap();
+        }
 
         SHIFT.store(9 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         while relay.membership.expire().await {}
