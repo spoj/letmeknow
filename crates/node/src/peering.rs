@@ -21,6 +21,8 @@ use crate::{G, Inner, Member, Node, Out, State, get, now, put};
 
 /// How many summaries of memberships not known yet a group keeps.
 const UNVERIFIED: usize = 32;
+/// How many hellos of groups it has not added yet this session keeps.
+const EARLY: usize = 32;
 
 /// A member's latest summary of a group: what it holds, and when it was signed, at most when it came.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -457,8 +459,13 @@ impl Inner {
         if let Frame::Hello { groups } = frame {
             // An `at` of a log this session does not hold, of an epoch it has not reached or has dropped, is taken unchecked.
             let shown = |at: &At| at.head.as_ref().is_none_or(|head| head.log_ref == at.log && (!st.logs.contains_key(at.log.as_slice()) || self.vouched(st, head, &peer)));
-            let groups: Vec<At> = groups.into_iter().filter(|at| st.groups.contains_key(&at.group.0) && shown(at)).collect();
+            let (held, early): (Vec<At>, Vec<At>) = groups.into_iter().partition(|at| st.groups.contains_key(&at.group.0));
+            let groups: Vec<At> = held.into_iter().filter(|at| shown(at)).collect();
             st.peers.frame(&key, &Frame::Hello { groups }, now);
+            // A joiner's admitter says where it is as it applies the Add, which may be before the Welcome adds the group here.
+            st.early_hellos.extend(early.into_iter().map(|at| (peer, at)));
+            let excess = st.early_hellos.len().saturating_sub(EARLY);
+            st.early_hellos.drain(..excess);
             return Ok(());
         }
         if let Frame::Entries { log, entries, head } = frame {

@@ -30,7 +30,7 @@ use lmk_membership::client::{Post, Resolve};
 use lmk_net::peers::Peers;
 use lmk_net::Net;
 use lmk_proto::group::Service;
-use lmk_proto::peer::{Frame, Seqs, Signed};
+use lmk_proto::peer::{At, Frame, Seqs, Signed};
 use lmk_proto::Bytes;
 use n0_future::task::{JoinHandle, spawn};
 use n0_future::time::Duration;
@@ -345,6 +345,8 @@ pub(crate) struct State {
     home: Option<String>,
     /// Where each member last said it was, by iroh key.
     hints: BTreeMap<Bytes, peering::Hint>,
+    /// Hellos of groups not added yet, with the peers that sent them: taken once the group is.
+    early_hellos: Vec<(EndpointId, At)>,
     /// The latest time a step saw, in milliseconds: `Peers` takes no time from before.
     time: u64,
 }
@@ -535,6 +537,12 @@ impl State {
         self.save_groups()?;
         self.gate = true;
         self.refresh(&gid);
+        let now = self.tick();
+        let (early, others) = std::mem::take(&mut self.early_hellos).into_iter().partition(|(_, at)| at.group.0 == gid);
+        self.early_hellos = others;
+        for (peer, at) in early {
+            self.peers.frame(peer.as_bytes(), &Frame::Hello { groups: vec![at] }, now);
+        }
         Ok(gid)
     }
 }

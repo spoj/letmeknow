@@ -256,10 +256,7 @@ async fn a_committer_stopped_once_its_add_is_logged_answers_the_retry_with_it() 
         tokio::spawn(async move { node.join(&link).await })
     };
     assert_eq!(tokio::time::timeout(WAIT, joining).await.unwrap().unwrap().unwrap().0, gid);
-    // Bob commits his first update at once: once Alice reads it, the group stands at the logged Add's epoch and his.
-    eventually("Bob's first update lands", || bob.node.epoch(&gid.0).unwrap() >= epoch + 2).await;
-    alice.node.read_group(&gid.0).await.unwrap();
-    assert_eq!(alice.node.epoch(&gid.0).unwrap(), epoch + 2, "the retry got the logged Add, not another");
+    added_once(&alice.node, &bob.node, &gid, epoch, "the retry got the logged Add, not another").await;
     alice.node.shutdown().await.unwrap();
     bob.node.shutdown().await.unwrap();
 }
@@ -514,6 +511,14 @@ async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
     })
     .await
     .unwrap_or_else(|_| panic!("{what}"));
+}
+
+/// Checks that admitting `joiner` moved the group one epoch on from `epoch`: the joiner commits its first update at once,
+/// so once it lands and `admitter` reads it, the group stands two epochs on.
+async fn added_once(admitter: &Node, joiner: &Node, gid: &Bytes, epoch: u64, what: &str) {
+    eventually("the joiner's first update lands", || joiner.epoch(&gid.0).unwrap() >= epoch + 2).await;
+    admitter.read_group(&gid.0).await.unwrap();
+    assert_eq!(admitter.epoch(&gid.0).unwrap(), epoch + 2, "{what}");
 }
 
 /// A `leave` sent while the membership service is unreachable reaches the other member, which removes the leaver once the
@@ -1593,7 +1598,7 @@ async fn a_joiner_whose_answer_was_lost_is_admitted_by_the_committers_answer() {
 
     let (joined, _) = tokio::time::timeout(WAIT, bob.node.join(&link)).await.unwrap().unwrap();
     assert_eq!(joined, gid);
-    assert_eq!(alice.node.epoch(&gid.0).unwrap(), epoch + 1, "no second Add");
+    added_once(&alice.node, &bob.node, &gid, epoch, "no second Add").await;
     assert_eq!(bob.node.members(&gid.0).unwrap().len(), 2);
 }
 
@@ -1648,8 +1653,36 @@ async fn a_joiner_asks_again_once_the_committers_answer_is_late() {
     late.store(true, std::sync::atomic::Ordering::SeqCst);
     let (joined, _) = tokio::time::timeout(Duration::from_secs(120), bob.node.join(&link)).await.unwrap().unwrap();
     assert_eq!(joined, gid);
-    assert_eq!(alice.node.epoch(&gid.0).unwrap(), epoch + 1, "one Add");
+    added_once(&alice.node, &bob.node, &gid, epoch, "one Add").await;
     assert_eq!(bob.node.members(&gid.0).unwrap().len(), 2);
+}
+
+/// A joiner whose first ask was dropped hears its admitter's hellos, as the admitter applies the Add and once its change
+/// settles, before its group is added: it keeps them, so its first update reaches the admitter, which asks for nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_joiner_keeps_its_admitters_hellos_from_before_its_group() {
+    let relay = relay().await;
+    let (late, mut landing, post) = late_append(relay.post(), Duration::from_secs(3));
+    let alice = session_with(&relay, post).await;
+    let bob = session(&relay).await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    let link = alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
+    let epoch = alice.node.epoch(&gid.0).unwrap();
+    late.store(true, std::sync::atomic::Ordering::SeqCst);
+    let first = {
+        let (node, link) = (bob.node.clone(), link.clone());
+        tokio::spawn(async move { node.join(&link).await })
+    };
+    tokio::time::timeout(WAIT, landing.recv()).await.unwrap().unwrap();
+    first.abort();
+    eventually("Alice applies the Add", || alice.node.epoch(&gid.0).unwrap() == epoch + 1).await;
+    tokio::time::sleep(Duration::from_millis(2 * lmk_net::peers::DEBOUNCE)).await;
+    assert_eq!(bob.node.join(&link).await.unwrap().0, gid);
+    eventually("Bob's first update lands", || bob.node.epoch(&gid.0).unwrap() == epoch + 2).await;
+    eventually("Alice has Bob's first update", || alice.node.epoch(&gid.0).unwrap() == epoch + 2).await;
+    for session in [alice, bob] {
+        session.node.shutdown().await.unwrap();
+    }
 }
 
 /// A joiner's committer is busy past its wait, and a second member it names gives no answer: the joiner asks the committer
@@ -1673,7 +1706,7 @@ async fn a_joiner_asks_its_committer_again_past_a_silent_member() {
     late.store(true, std::sync::atomic::Ordering::SeqCst);
     let (joined, _) = tokio::time::timeout(Duration::from_secs(120), bob.node.join(&link)).await.unwrap().unwrap();
     assert_eq!(joined, gid);
-    assert_eq!(alice.node.epoch(&gid.0).unwrap(), epoch + 1, "one Add");
+    added_once(&alice.node, &bob.node, &gid, epoch, "one Add").await;
 }
 
 /// Two asks with one KeyPackage at once, as a joiner's again after one failed in transit: the member adds it once, and

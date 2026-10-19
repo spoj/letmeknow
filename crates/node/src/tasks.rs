@@ -97,6 +97,7 @@ impl State {
             quiet: false,
             home: None,
             hints,
+            early_hellos: Vec::new(),
             time: now(),
         };
         for gid in state.groups.keys().cloned().collect::<Vec<_>>() {
