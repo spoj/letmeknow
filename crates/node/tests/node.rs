@@ -129,7 +129,14 @@ async fn strangers(member: &mut Session, gid: &Bytes, relay: &Relay, n: usize) -
     for _ in 0..n {
         let joiner = session(relay).await;
         keys.push(joiner.node.key());
-        joiner.node.join(&member.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        // A loaded machine may read the last joiner's update past the invite's 5 s: the invite asks to be made again.
+        let link = loop {
+            match member.node.invite(&gid.0, INVITE_VALID, None).await {
+                Err(error) if matches!(error.downcast_ref::<SendError>(), Some(SendError::Behind)) => continue,
+                link => break link.unwrap(),
+            }
+        };
+        joiner.node.join(&link).await.unwrap();
         member.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
         joiner.node.shutdown().await.unwrap();
     }
