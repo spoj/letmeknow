@@ -108,10 +108,13 @@ impl Inner {
         let members = g.mls.members();
         let by = members.iter().find(|m| m.index == applied.by).cloned();
         if applied.own {
-            (g.rec.updated, g.rec.committed) = (now, current);
+            g.rec.committed = current;
+            if applied.updated {
+                g.rec.updated = now;
+            }
         }
-        if let Some(core::Admission { welcome, sig }) = applied.admission.take() {
-            put(&st.provider, &commit_key(gid, ending), &Admitted { commit: Bytes(inner), welcome: Bytes(welcome), sig: Bytes(sig) })?;
+        if let Some(core::Admission { welcome, cut, sig }) = applied.admission.take() {
+            put(&st.provider, &commit_key(gid, ending), &Admitted { commit: Bytes(inner), welcome: Bytes(welcome), cut, sig: Bytes(sig) })?;
             st.group_mut(gid)?.rec.commits.push((ending, now));
         }
         self.cuts(st, gid, &applied, ending)?;

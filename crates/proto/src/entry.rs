@@ -19,11 +19,12 @@ pub fn signed(commit: &[u8]) -> Vec<u8> {
     [COMMIT_SIGNED, commit].concat()
 }
 
-/// What a Welcome's signature covers: the entry of the commit it came with, and the Welcome.
-const WELCOME_SIGNED: &[u8] = b"letmeknow welcome v1\0";
+/// What a Welcome's signature covers: the entry of the commit it came with, the cut the joiner starts at (as JSON), and
+/// the Welcome.
+const WELCOME_SIGNED: &[u8] = b"letmeknow welcome v2\0";
 
-pub fn welcome_signed(entry: &[u8], welcome: &[u8]) -> Vec<u8> {
-    [WELCOME_SIGNED, Sha256::digest(entry).as_slice(), welcome].concat()
+pub fn welcome_signed(entry: &[u8], cut: &[u8], welcome: &[u8]) -> Vec<u8> {
+    [WELCOME_SIGNED, Sha256::digest(entry).as_slice(), Sha256::digest(cut).as_slice(), welcome].concat()
 }
 
 impl Entry {

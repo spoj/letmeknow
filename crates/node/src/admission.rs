@@ -189,7 +189,8 @@ impl Inner {
         let gid = {
             let mut st = self.lock();
             let st = &mut *st;
-            let mls = Group::join(&st.provider, &admitted.commit.0, &admitted.welcome.0, &admitted.sig.0, &key_package_reference(&st.provider, key_package)?)?;
+            let admission = lmk_core::group::Admission { welcome: admitted.welcome.0, cut: admitted.cut, sig: admitted.sig.0 };
+            let mls = Group::join(&st.provider, &admitted.commit.0, &admission, &key_package_reference(&st.provider, key_package)?)?;
             ensure!(!st.groups.contains_key(mls.id()), "this session is in that group already");
             st.add_group(mls, Rec::default())?
         };

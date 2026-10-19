@@ -169,7 +169,8 @@ fn key_package_in(provider: &SqliteProvider, bytes: &[u8]) -> Result<KeyPackage>
     Ok(key_package.validate(provider.crypto(), ProtocolVersion::Mls10)?)
 }
 
-/// Everything one commit changes, all inline. The default is an empty key update.
+/// Everything one commit changes, all inline. The default is an empty key update. Only a commit that adds and changes
+/// nothing else goes without an update path.
 #[derive(Clone, Debug, Default)]
 pub struct Change {
     pub add: Vec<Vec<u8>>,
@@ -179,18 +180,18 @@ pub struct Change {
     pub remove: Vec<u32>,
     pub leaf: Option<Leaf>,
     /// The cut of the epoch the commit ends: for each member, by key, the seq up to which the committer holds every
-    /// held message, sealed in this epoch, and the id there (see `Group::cut`).
+    /// held message, sealed in this epoch, and the id there (see `Group::cut`). The commit carries the entries that moved.
     pub cut: Vec<Ref>,
 }
 
-/// A commit's authenticated data, inside its sealed entry: the invite the member it adds came in by, the cut of the
-/// epoch it ends, and when it was made, by the committer's corrected clock.
+/// A commit's authenticated data, inside its sealed entry: the invite the member it adds came in by, the entries of the
+/// cut state it moves, and when it was made, by the committer's corrected clock.
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Aad {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     invite: Option<Bytes>,
     #[serde(default)]
-    cut: Vec<Ref>,
+    moved: Vec<Ref>,
     #[serde(default)]
     time: u64,
 }
@@ -214,11 +215,12 @@ pub struct Commit {
     pub admission: Option<Admission>,
 }
 
-/// An Add's Welcome, and the committer's signature over it and the commit entry (`welcome_signed`). Only the committer
-/// keeps it, to answer the joiner.
+/// An Add's Welcome, the whole cut of the epoch its commit ended, where the joiner starts, and the committer's signature
+/// over the commit entry, the cut and the Welcome (`welcome_signed`). Only the committer keeps it, to answer the joiner.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Admission {
     pub welcome: Vec<u8>,
+    pub cut: Vec<Ref>,
     pub sig: Vec<u8>,
 }
 
@@ -269,6 +271,8 @@ pub struct Applied {
     pub removed: Vec<Member>,
     /// This session was removed.
     pub gone: bool,
+    /// It carried an update path: its committer's leaf is new.
+    pub updated: bool,
     /// The cut of the epoch it ended, by the members of that epoch: the removed ones' last.
     pub cut: Vec<Ref>,
     /// For a commit this session made that adds a member: its Welcome.
@@ -355,12 +359,14 @@ impl Group {
         Ok(group)
     }
 
-    /// Joins by the Welcome that admitted this session to the commit entry it came with, whose signatures it checks against
-    /// the Welcome's sender, its committer, and whose cut, which it cannot judge, is where it starts: the cut state of the
-    /// members it names, and every other at seq 0 of the new epoch. OpenMLS consumes a package during `build_from_welcome`,
-    /// before `into_group`, so an error here rolls back this call's writes, the package's consumption included.
-    pub fn join(provider: &SqliteProvider, entry: &[u8], welcome_bytes: &[u8], welcome_sig: &[u8], expected_package: &[u8; 32]) -> Result<Self> {
+    /// Joins by the admission that admitted this session to the commit entry it came with, whose signatures it checks
+    /// against the Welcome's sender, its committer, and whose cut, which it cannot judge, is where it starts: the cut state
+    /// of the members it names, and every other at seq 0 of the new epoch. OpenMLS consumes a package during
+    /// `build_from_welcome`, before `into_group`, so an error here rolls back this call's writes, the package's consumption
+    /// included.
+    pub fn join(provider: &SqliteProvider, entry: &[u8], admission: &Admission, expected_package: &[u8; 32]) -> Result<Self> {
         let Entry { commit, sig } = Entry::parse(entry)?;
+        let Admission { welcome: welcome_bytes, cut: ended, sig: welcome_sig } = admission;
         let MlsMessageBodyIn::Welcome(welcome) = parse::<MlsMessageIn>(welcome_bytes)?.extract() else {
             bail!("not a Welcome")
         };
@@ -391,17 +397,18 @@ impl Group {
                 "a commit entry its Welcome's sender did not sign"
             );
             ensure!(
-                provider.crypto().verify_signature(SignatureScheme::ED25519, &welcome_signed(entry, welcome_bytes), &committer, welcome_sig).is_ok(),
+                provider.crypto().verify_signature(SignatureScheme::ED25519, &welcome_signed(entry, &serde_json::to_vec(ended)?, welcome_bytes), &committer, welcome_sig).is_ok(),
                 "a Welcome its sender did not sign"
             );
-            ensure!(aad.cut.windows(2).all(|pair| pair[0].key < pair[1].key) && aad.cut.iter().all(well_formed), "a malformed cut");
+            ensure!(ended.windows(2).all(|pair| pair[0].key < pair[1].key) && ended.iter().all(well_formed), "a malformed cut");
+            ensure!(aad.moved.iter().all(|moved| ended.contains(moved)), "a cut the commit does not move to");
             let cut = mls.members().map(|m| {
-                let found = aad.cut.iter().find(|r| r.key.0 == m.signature_key).cloned();
+                let found = ended.iter().find(|r| r.key.0 == m.signature_key).cloned();
                 found.unwrap_or(Ref { key: Bytes(m.signature_key), joined: epoch, seq: 0, id: Bytes::default(), epoch: 0 })
             });
             let mut cut: Vec<Ref> = cut.collect();
             cut.sort();
-            let group = Group { state: State { cut, ended: aad.cut, ..State::default() }, mls };
+            let group = Group { state: State { cut, ended: ended.clone(), ..State::default() }, mls };
             group.save(provider)?;
             Ok(group)
         })();
@@ -574,7 +581,8 @@ impl Group {
             // One staged but never saved, so never posted.
             g.mls.clear_pending_commit(provider.storage())?;
             let adds = change.add.iter().map(|bytes| key_package_in(provider, bytes)).collect::<Result<Vec<_>>>()?;
-            let aad = Aad { invite: change.invite, cut: change.cut, time: corrected() };
+            let moved = change.cut.iter().filter(|r| !g.state.cut.contains(r)).cloned().collect();
+            let aad = Aad { invite: change.invite, moved, time: corrected() };
             g.mls.set_aad(serde_json::to_vec(&aad)?);
             let mut parameters = LeafNodeParameters::builder();
             if let Some(leaf) = &change.leaf {
@@ -584,7 +592,7 @@ impl Group {
                 .mls
                 .commit_builder()
                 .consume_proposal_store(false)
-                .force_self_update(true)
+                .force_self_update(change.add.is_empty() || change.leaf.is_some())
                 .propose_adds(adds)
                 .propose_removals(change.remove.into_iter().map(LeafNodeIndex::new))
                 .leaf_node_parameters(parameters.build());
@@ -600,8 +608,8 @@ impl Group {
             let admission = welcome
                 .map(|welcome| -> Result<Admission> {
                     let welcome = welcome.to_bytes()?;
-                    let sig = session.sign(&welcome_signed(&entry, &welcome));
-                    Ok(Admission { welcome, sig })
+                    let sig = session.sign(&welcome_signed(&entry, &serde_json::to_vec(&change.cut)?, &welcome));
+                    Ok(Admission { welcome, cut: change.cut.clone(), sig })
                 })
                 .transpose()?;
             let wire = g.seal_entry(provider, &entry)?;
@@ -797,13 +805,20 @@ fn observe(
         }).collect::<Result<Vec<_>>>()?;
         state.added.extend(records);
     }
+    let mut cut = state.cut.clone();
+    for moved in aad.moved {
+        if let Some(r) = cut.iter_mut().find(|r| r.key == moved.key) {
+            *r = moved;
+        }
+    }
     Ok(Applied {
         by: by.u32(),
         own,
         added,
         removed,
         gone: staged.self_removed(),
-        cut: aad.cut,
+        updated: staged.update_path_leaf_node().is_some(),
+        cut,
         admission: None,
     })
 }
@@ -819,8 +834,8 @@ fn well_formed(r: &Ref) -> bool {
 
 /// The app's rules on a commit, from MLS state alone, binding the committer too: changes inline only, of the kinds we
 /// make: Adds, which name the invite they came in by, and none of a key it removes, and Removes; the committer's key
-/// unchanged; and a cut that names every member of the cut state `cut`, by key, in order, at its membership, never below
-/// it nor more than `MAX_CUT_STEP` past it.
+/// unchanged; and cut entries that each name a member of the cut state `cut` once, by key, in order, at its membership,
+/// past its entry there by at most `MAX_CUT_STEP`.
 fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad, cut: &[Ref]) -> Result<()> {
     let removed: Vec<Vec<u8>> = staged.remove_proposals().filter_map(|r| group.member_at(r.remove_proposal().removed())).map(|m| m.signature_key).collect();
     for proposal in staged.queued_proposals() {
@@ -836,11 +851,11 @@ fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad, 
         }
     }
     ensure!(aad.invite.is_some() == staged.add_proposals().next().is_some(), "an Add that names no invite, or an invite with no Add");
-    let named = aad.cut.len() == cut.len() && aad.cut.iter().zip(cut).all(|(new, old)| new.key == old.key && new.joined == old.joined);
-    ensure!(named, "a cut that does not name each member once, in order, at its membership");
-    for (new, old) in aad.cut.iter().zip(cut) {
+    ensure!(aad.moved.windows(2).all(|pair| pair[0].key < pair[1].key), "a cut that does not name each member once, in order");
+    for new in &aad.moved {
+        let old = cut.iter().find(|old| old.key == new.key && old.joined == new.joined).context("a cut that names no member at its membership")?;
         ensure!(well_formed(new), "a cut whose id does not fit its seq");
-        ensure!(new.seq > old.seq || (new.seq == old.seq && new.id == old.id && new.epoch == old.epoch), "a cut below the last");
+        ensure!(new.seq > old.seq, "a cut below the last");
         ensure!(new.seq - old.seq <= MAX_CUT_STEP, "a cut too far past the last");
     }
     if let Some(leaf) = staged.update_path_leaf_node() {

@@ -134,10 +134,12 @@ pub struct Join {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Admitted {
-    /// The log entry that added the joiner: its cut is where the joiner starts.
+    /// The log entry that added the joiner.
     pub commit: Bytes,
-    /// The Welcome to the joiner, and the committer's signature over it and the entry (`welcome_signed`).
+    /// The Welcome to the joiner; the whole cut of the epoch the entry ended, where the joiner starts; and the
+    /// committer's signature over the entry, the cut and the Welcome (`welcome_signed`).
     pub welcome: Bytes,
+    pub cut: Vec<crate::held::Ref>,
     pub sig: Bytes,
 }
 

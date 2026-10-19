@@ -119,7 +119,7 @@ impl Member {
     /// posted at `pos`.
     pub fn join(&mut self, entry: &[u8], admission: &Admission, pos: usize, package: &[u8]) {
         let reference = key_package_reference(&self.provider, package).unwrap();
-        self.group = Some(Group::join(&self.provider, entry, &admission.welcome, &admission.sig, &reference).unwrap());
+        self.group = Some(Group::join(&self.provider, entry, admission, &reference).unwrap());
         self.pos = pos;
     }
 }
@@ -160,16 +160,16 @@ fn stranger() -> SignatureKeyPair {
     SignatureKeyPair::from_raw(SignatureScheme::ED25519, key.to_bytes().to_vec(), key.verifying_key().to_bytes().to_vec())
 }
 
-/// The authenticated data of a commit that names `cut`, for commits built past `Group::commit`.
-fn cut_aad(cut: &[Ref]) -> Vec<u8> {
-    serde_json::to_vec(&Aad { cut: cut.to_vec(), ..Aad::default() }).unwrap()
+/// The authenticated data of a commit that moves `moved`, for commits built past `Group::commit`.
+fn cut_aad(moved: &[Ref]) -> Vec<u8> {
+    serde_json::to_vec(&Aad { moved: moved.to_vec(), ..Aad::default() }).unwrap()
 }
 
-/// A commit built past `Group::commit`'s rules: a key update naming `cut`, proposing `settings` if given. It is kept as
-/// `m`'s pending commit, as `Group::commit` keeps one.
-fn unruled(m: &mut Member, cut: Vec<Ref>, settings: Option<Settings>) -> Vec<u8> {
+/// A commit built past `Group::commit`'s rules: a key update moving `moved`, proposing `settings` if given. It is kept
+/// as `m`'s pending commit, as `Group::commit` keeps one.
+fn unruled(m: &mut Member, moved: Vec<Ref>, settings: Option<Settings>) -> Vec<u8> {
     let group = m.group.as_mut().unwrap();
-    let aad = Aad { cut, ..Aad::default() };
+    let aad = Aad { moved, ..Aad::default() };
     group.mls.set_aad(serde_json::to_vec(&aad).unwrap());
     let mut builder = group.mls.commit_builder().consume_proposal_store(false).force_self_update(true);
     if let Some(settings) = &settings {
@@ -198,7 +198,7 @@ fn refused(m: &mut Member, change: Change) -> String {
 /// The refusal `Group::join` gives an entry and its Welcome for `package`, which must be refused.
 fn join_error(m: &Member, entry: &[u8], admission: &Admission, package: &[u8]) -> String {
     let reference = key_package_reference(&m.provider, package).unwrap();
-    Group::join(&m.provider, entry, &admission.welcome, &admission.sig, &reference).err().expect("refused").to_string()
+    Group::join(&m.provider, entry, admission, &reference).err().expect("refused").to_string()
 }
 
 /// The entry of `cut` for the member with `key`.
@@ -206,28 +206,23 @@ fn at<'a>(cut: &'a mut [Ref], key: &[u8]) -> &'a mut Ref {
     cut.iter_mut().find(|r| r.key.0 == key).unwrap()
 }
 
-/// Cuts that `rules` refuses, each with a word of its refusal, made from the valid cut `good`, where `a` is at seq 2 and
-/// `b` at seq 0.
+/// Moved cut entries that `rules` refuses, each with a word of its refusal, against a cut state where `a` is at seq 2
+/// and `b` at seq 0.
 fn refusable(good: &[Ref], a: &[u8], b: &[u8]) -> Vec<(Vec<Ref>, &'static str)> {
-    let mut cases = vec![(good[1..].to_vec(), "does not name each member"), (good.iter().rev().cloned().collect(), "does not name each member")];
-    let mut joined = good.to_vec();
-    at(&mut joined, b).joined = 9;
-    cases.push((joined, "does not name each member"));
-    let mut below = good.to_vec();
-    let behind = at(&mut below, a);
-    behind.seq = 1;
-    behind.id = Bytes(vec![4; 32]);
-    cases.push((below, "below the last"));
-    let mut same = good.to_vec();
-    at(&mut same, a).id = Bytes(vec![7; 32]);
-    cases.push((same, "below the last"));
-    let mut short = good.to_vec();
-    at(&mut short, a).id = Bytes(vec![7; 31]);
-    cases.push((short, "does not fit its seq"));
-    let mut zero = good.to_vec();
-    at(&mut zero, b).id = Bytes(vec![1; 32]);
-    cases.push((zero, "does not fit its seq"));
-    cases
+    let entry = |key: &[u8], seq: u64, id: Vec<u8>| Ref { id: Bytes(id), seq, ..good.iter().find(|r| r.key.0 == key).unwrap().clone() };
+    let mut two = vec![entry(a, 3, vec![6; 32]), entry(b, 1, vec![5; 32])];
+    two.sort();
+    two.reverse();
+    let joined = Ref { joined: 9, ..entry(b, 1, vec![5; 32]) };
+    vec![
+        (two, "does not name each member"),
+        (vec![entry(a, 3, vec![6; 32]), entry(a, 3, vec![6; 32])], "does not name each member"),
+        (vec![joined], "names no member"),
+        (vec![entry(a, 1, vec![4; 32])], "below the last"),
+        (vec![entry(a, 2, vec![7; 32])], "below the last"),
+        (vec![entry(a, 3, vec![7; 31])], "does not fit its seq"),
+        (vec![entry(b, 0, vec![1; 32])], "does not fit its seq"),
+    ]
 }
 
 /// A header from `m` in `group`, as its first message would be, but for the membership it claims.
@@ -735,9 +730,10 @@ fn another_protocol_is_refused_at_join() {
     let (commit, welcome, _) = bundle.into_messages();
     let entry = entry_of(&a.session.signer, commit.to_bytes().unwrap());
     let welcome = welcome.unwrap().to_bytes().unwrap();
-    let sig = a.session.signer.sign(&welcome_signed(&entry, &welcome)).unwrap();
+    let sig = a.session.signer.sign(&welcome_signed(&entry, &serde_json::to_vec(&cut).unwrap(), &welcome)).unwrap();
+    let admission = Admission { welcome, cut, sig };
     group.mls.merge_pending_commit(&a.provider).unwrap();
-    let error = Group::join(&w.m[1].provider, &entry, &welcome, &sig, &reference).err().unwrap();
+    let error = Group::join(&w.m[1].provider, &entry, &admission, &reference).err().unwrap();
     assert!(error.to_string().contains(&format!("protocol {}", PROTOCOL + 1)), "{error}");
 }
 
@@ -986,7 +982,7 @@ fn a_joiner_starts_at_the_commits_cut() {
     let by_another_member = entry_of(&w.m[1].session.signer, bytes.clone());
     assert!(join_error(&w.m[2], &by_another_member, &admission, &kp_c).contains("did not sign"), "only the committer vouches for its cut");
     assert_eq!(w.m[2].provider.rows(), before);
-    let welcome = Admission { sig: stranger().sign(&welcome_signed(&inner, &admission.welcome)).unwrap(), ..admission.clone() };
+    let welcome = Admission { sig: stranger().sign(&welcome_signed(&inner, &serde_json::to_vec(&admission.cut).unwrap(), &admission.welcome)).unwrap(), ..admission.clone() };
     assert!(join_error(&w.m[2], &inner, &welcome, &kp_c).contains("a Welcome its sender did not sign"));
     assert_eq!(w.m[2].provider.rows(), before);
     let kp_d = w.key_package(3);
@@ -1054,7 +1050,7 @@ fn a_credential_that_names_another_key_is_refused() {
     let package = w.key_package(2);
     let m = &mut w.m[0];
     let g = m.group.as_mut().unwrap();
-    g.mls.set_aad(serde_json::to_vec(&Aad { invite: Some(INVITE.into()), cut, ..Aad::default() }).unwrap());
+    g.mls.set_aad(serde_json::to_vec(&Aad { invite: Some(INVITE.into()), ..Aad::default() }).unwrap());
     let bundle = g
         .mls
         .commit_builder()
@@ -1065,7 +1061,7 @@ fn a_credential_that_names_another_key_is_refused() {
     let (commit, welcome, _) = bundle.stage_commit(&m.provider).unwrap().into_messages();
     let entry = entry_of(&m.session.signer, commit.to_bytes().unwrap());
     let welcome = welcome.unwrap().to_bytes().unwrap();
-    let admission = Admission { sig: m.session.signer.sign(&welcome_signed(&entry, &welcome)).unwrap(), welcome };
+    let admission = Admission { sig: m.session.signer.sign(&welcome_signed(&entry, &serde_json::to_vec(&cut).unwrap(), &welcome)).unwrap(), welcome, cut };
     assert!(join_error(&w.m[2], &entry, &admission, &package).contains("a member whose credential names another key"));
     let m = &w.m[0];
     let wire = m.group.as_ref().unwrap().seal_entry(&m.provider, &entry).unwrap();
@@ -1174,3 +1170,24 @@ fn a_forgotten_group_leaves_no_epoch_keys() {
 
 #[path = "group_epoch_tests.rs"]
 mod epoch;
+
+/// An Add alone carries no update path, so the joiner's own update merges it into the tree; an update carries one.
+#[test]
+fn only_an_add_alone_goes_without_an_update_path() {
+    let mut w = World::new(&["A", "B", "C"]);
+    w.found(0, &[1]);
+    let package = w.key_package(2);
+    let cut = w.m[0].cut();
+    let add = w.m[0].commit(Change { cut, add: vec![package.clone()], invite: Some(INVITE.into()), ..Change::default() });
+    let (admission, inner) = (add.admission.clone().unwrap(), w.m[0].open_inner(&add.entry));
+    let pos = w.post(add.entry);
+    let read = w.read(&[0, 1]);
+    assert!(!applied(&read[0][0]).updated && !applied(&read[1][0]).updated);
+    w.m[2].join(&inner, &admission, pos, &package);
+    let cut = w.m[2].cut();
+    let update = w.m[2].commit(Change { cut, ..Change::default() });
+    w.post(update.entry);
+    let read = w.read(&[0, 1, 2]);
+    assert!(read.iter().all(|reader| applied(&reader[0]).updated));
+    w.agree(&[0, 1, 2]);
+}
