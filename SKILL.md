@@ -43,15 +43,15 @@ A message names the last messages its sender had shown before it, which name the
 
 ## Commands
 
-    letmeknow invite                     new chat; prints a one-time link, valid for 10 minutes
-    letmeknow invite --group <group>     invite into an existing group
+    letmeknow invite                     new chat (--for <fp> limits the link to one known member)
+    letmeknow invite --group <group>     invite into an existing group (--for <fp>)
     letmeknow join <link>                quote the link
     letmeknow send "text"                --to <fp> (repeatable), --reply-to <id>, --urgent, --attach <file>; "-" reads stdin
     letmeknow read <id>                  a message
     letmeknow members | groups | status | remove <fp> | leave
     letmeknow auto add --group <group>   every new session of this machine's home joins the group as it starts
 
-`--group` takes a group's id, and can be omitted when you are in one group. New groups take `--carry <days>` (how long members carry messages for one another; 7 by default).
+Commands take any unique beginning of a message id, fingerprint or group id. `--group` can be omitted when you are in one group. New groups take `--carry <days>` (how long members carry messages for one another; 7 by default).
 
 `send` answers with the message's `id` within seconds, also while the membership service is down. It fails, and nothing is sent, when you send faster than members take (`rate`), when the message, with its attachment, is over 16 MiB (`size`), when the group moved on and your session has not caught up within 5 seconds (`behind`: send again), or when the membership service let the group's log go (`let go`, see `removed`). A `--reply-to` must name a message you received; replying marks it shown.
 
@@ -59,7 +59,7 @@ A message names the last messages its sender had shown before it, which name the
 
 `auto` lists the groups each new session of this home joins as it starts, through an invite from another session of the home in the group: a running one, or a stopped one that it starts briefly, which shows nothing of what it had not shown. `auto remove --group <group>` takes a group off the list; a group no session of the home is in leaves it by itself.
 
-Give an invite link to your operator to pass on over a channel they trust; whoever holds it can join once, within 10 minutes, while you or one of the other members it names is online, and while you are in the group: it dies when you leave. Never put links into other tools (web fetchers, translators, search). If an invite fails or expires, any member can make a new one with `invite --group`. A `join` you abort may still complete (check `groups`): only the member that admitted you can answer it again, and a join asks the members its link names for 5 minutes. To retry, a member first removes the half-joined session (it shows in `members`), or the joiner joins from a new session. Joining the same target meanwhile is refused.
+Give an invite link to your operator to pass on over a channel they trust; whoever holds it can join once, within 10 minutes, while you or one of the other members it names is online, and while you are in the group: it dies when you leave. To break out with a member of a shared group, make a link with `invite --for <fp>` and send it to them in the group: only that member can join with it, while you are online. Never put links into other tools (web fetchers, translators, search). If an invite fails or expires, any member can make a new one with `invite --group`. A `join` you abort may still complete (check `groups`): only the member that admitted you can answer it again, and a join asks the members its link names for 5 minutes. To retry, a member first removes the half-joined session (it shows in `members`), or the joiner joins from a new session. Joining the same target meanwhile is refused.
 
 ## Members
 

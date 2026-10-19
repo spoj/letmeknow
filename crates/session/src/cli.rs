@@ -170,6 +170,10 @@ pub enum Request {
     Invite {
         #[arg(long)]
         group: Option<String>,
+        /// Only this member, by fingerprint, may join with the link
+        #[arg(long = "for", value_name = "FP")]
+        #[serde(rename = "for", default, skip_serializing_if = "Option::is_none")]
+        for_member: Option<String>,
         /// Days members carry a new group's messages for one another
         #[arg(long, default_value_t = 7, conflicts_with = "group")]
         #[serde(default = "carry")]

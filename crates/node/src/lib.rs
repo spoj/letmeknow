@@ -246,7 +246,7 @@ struct Epoch {
     service: Service,
 }
 
-/// An invite, as its inviter shared it with the group.
+/// An invite, as its inviter shared it with the group, or kept for one member.
 #[derive(Clone, Serialize, Deserialize)]
 struct Rule {
     /// SHA-256 of its secret.
@@ -254,6 +254,9 @@ struct Rule {
     expires: u64,
     /// The inviter's session key.
     by: Bytes,
+    /// The only session key it admits, when made for one member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    to: Option<Bytes>,
 }
 
 /// H, in milliseconds.
@@ -608,7 +611,7 @@ mod tests {
         let (alice, bob, carol) = (node(&relay, relay.post()).await, node(&relay, relay.post()).await, node(&relay, relay.post()).await);
         let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone() };
         let gid = bob.create(settings.clone()).unwrap();
-        alice.join(&bob.invite(&gid.0, INVITE_VALID).await.unwrap()).await.unwrap();
+        alice.join(&bob.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
         // Alice no longer polls.
         let tasks: Vec<_> = alice.inner.tasks.lock().unwrap().drain(..).collect();
         for task in &tasks {
@@ -616,7 +619,7 @@ mod tests {
         }
         let other = alice.create(settings).unwrap();
         alice.inner.lock().peers.full_mesh(&other);
-        carol.join(&bob.invite(&gid.0, INVITE_VALID).await.unwrap()).await.unwrap();
+        carol.join(&bob.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
         alice.read_group(&gid.0).await.unwrap();
         let mut st = alice.inner.lock();
         let (member, epoch) = (carol.key(), st.group(&gid.0).unwrap().mls.epoch());
@@ -637,7 +640,7 @@ mod tests {
         let (alice, bob) = (node(&relay, relay.post()).await, node(&relay, relay.post()).await);
         let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone() };
         let gid = alice.create(settings).unwrap();
-        bob.join(&alice.invite(&gid.0, INVITE_VALID).await.unwrap()).await.unwrap();
+        bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
         let text = serde_json::json!({ "type": "message", "content": "hi" });
         alice.send(&gid.0, &text, None).await.unwrap();
         let idle = |node: &Node| node.inner.lock().next_poll().is_none_or(|at| at > now() + 60_000);

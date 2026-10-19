@@ -350,7 +350,7 @@ async fn join_auto(home: PathBuf, me: String, config: lmk_node::Config, node: No
 async fn join_by_sibling(home: &Path, config: &lmk_node::Config, node: &Node, group: &str, members: &[String]) -> Result<()> {
     let running = cli::running(home).await;
     for member in members.iter().filter(|member| running.contains(member)) {
-        let invite = cli::Request::Invite { group: Some(group.to_owned()), carry: 7 };
+        let invite = cli::Request::Invite { group: Some(group.to_owned()), for_member: None, carry: 7 };
         // One that stopped meanwhile, or left the group, gives none.
         let Ok(answer) = cli::call(home, member, invite).await else { continue };
         let link = answer["link"].as_str().context("an invite answers its link")?.to_owned();
@@ -366,7 +366,7 @@ async fn join_by_sibling(home: &Path, config: &lmk_node::Config, node: &Node, gr
         let (sibling, _events) = Node::start(SqliteProvider::open(&dir.join("session.db"))?, config.clone()).await?;
         let gid = sibling.groups().into_iter().find(|gid| b64(&gid.0) == group);
         let joined = async {
-            let invite = sibling.invite(&gid.context("the session left the group")?.0, lmk_node::INVITE_VALID).await?;
+            let invite = sibling.invite(&gid.context("the session left the group")?.0, lmk_node::INVITE_VALID, None).await?;
             node.join(&invite).await
         };
         let joined = joined.await;

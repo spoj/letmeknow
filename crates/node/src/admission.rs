@@ -37,39 +37,48 @@ const JOIN_LIMIT: Duration = Duration::from_secs(300);
 const INVITER_FIRST: Duration = Duration::from_secs(3);
 
 impl Node {
-    /// An invite into a group, valid for `valid` milliseconds: shared with the members as a held message, and a link that
-    /// names this session and up to three members online that hold it.
-    pub async fn invite(&self, gid: &[u8], valid: u64) -> Result<Invite> {
+    /// An invite into a group, valid for `valid` milliseconds: shared with the members as a held message, unless it is
+    /// for one member (`to`), and a link that names this session and, when shared, up to three members online that hold it.
+    pub async fn invite(&self, gid: &[u8], valid: u64, to: Option<&[u8]>) -> Result<Invite> {
         let secret: [u8; 16] = lmk_core::random();
         let hash = Bytes(Sha256::digest(secret).to_vec());
         let expires = corrected() + valid;
+        let to = to.map(|key| Bytes(key.to_vec()));
         {
             let mut st = self.inner.lock();
             let by = Bytes(st.me().to_vec());
-            st.group_mut(gid)?.rec.invites.push(Rule { hash: hash.clone(), expires, by });
+            st.group_mut(gid)?.rec.invites.push(Rule { hash: hash.clone(), expires, by, to: to.clone() });
             st.save(gid)?;
         }
-        let rule = serde_json::to_value(Control::Invite { hash, expires })?;
-        let id = self.send(gid, &rule, None).await?;
-        let seq = self.inner.lock().record(gid, &id.0)?.context("the invite's message")?.header.seq;
-        // The members online whose summaries hold the invite's message admit by it too: a member asked before its push
-        // arrived would refuse the joiner.
-        let online = self.online(gid)?;
-        let holding = || -> Result<Vec<Member>> {
-            let holders = self.inner.lock().holders_of(gid, seq)?;
-            Ok(online.iter().filter(|m| holders.contains(&m.key)).cloned().collect())
-        };
-        let all = async {
-            loop {
-                let heard = self.inner.heard.notified();
-                if holding()?.len() == online.len() {
-                    return anyhow::Ok(());
-                }
-                heard.await;
+        let holders = match to {
+            Some(_) => {
+                self.inner.caught_up(gid).await?;
+                Vec::new()
+            }
+            None => {
+                let rule = serde_json::to_value(Control::Invite { hash, expires })?;
+                let id = self.send(gid, &rule, None).await?;
+                let seq = self.inner.lock().record(gid, &id.0)?.context("the invite's message")?.header.seq;
+                // The members online whose summaries hold the invite's message admit by it too: a member asked before its push
+                // arrived would refuse the joiner.
+                let online = self.online(gid)?;
+                let holding = || -> Result<Vec<Member>> {
+                    let holders = self.inner.lock().holders_of(gid, seq)?;
+                    Ok(online.iter().filter(|m| holders.contains(&m.key)).cloned().collect())
+                };
+                let all = async {
+                    loop {
+                        let heard = self.inner.heard.notified();
+                        if holding()?.len() == online.len() {
+                            return anyhow::Ok(());
+                        }
+                        heard.await;
+                    }
+                };
+                timeout(MEMBER_WAIT, all).await.unwrap_or(Ok(()))?;
+                holding()?
             }
         };
-        timeout(MEMBER_WAIT, all).await.unwrap_or(Ok(()))?;
-        let holders = holding()?;
         let st = self.inner.lock();
         let Service::Serve { domain, .. } = st.group(gid)?.mls.settings().membership else { bail!("unsupported membership service") };
         let mut members = vec![*self.inner.net().id().as_bytes()];
@@ -210,6 +219,7 @@ impl Inner {
 const UNKNOWN: &str = "unknown, used or expired invite";
 const INVITER_LEFT: &str = "its inviter left the group";
 const MEMBER_ALREADY: &str = "this session is a member already";
+const FOR_ANOTHER: &str = "this invite is for another member";
 
 /// Whether `g`, as it stands, admits a joiner by an invite: checked when its request comes, and each time the commit
 /// that adds it is built. An invite dies when its inviter leaves the group.
@@ -217,6 +227,7 @@ fn admits(g: &G, joiner: &[u8], rule: &Rule) -> Result<()> {
     let members = g.mls.members();
     ensure!(corrected() < rule.expires && !g.mls.used(&rule.hash.0), UNKNOWN);
     ensure!(members.iter().any(|m| m.key == rule.by.0) && g.left(&rule.by.0).is_none(), INVITER_LEFT);
+    ensure!(rule.to.as_ref().is_none_or(|to| to.0 == joiner), FOR_ANOTHER);
     ensure!(members.iter().all(|member| member.key != joiner), MEMBER_ALREADY);
     Ok(())
 }
@@ -320,7 +331,7 @@ impl Admit for Admitter {
                 Err(error) => {
                     let refused = format!("{error:#}");
                     // A joiner asks every member a link names, so routine refusals are many and no one's concern.
-                    if [UNKNOWN, INVITER_LEFT, MEMBER_ALREADY].contains(&refused.as_str()) {
+                    if [UNKNOWN, INVITER_LEFT, MEMBER_ALREADY, FOR_ANOTHER].contains(&refused.as_str()) {
                         tracing::debug!("refused a join: {refused}");
                     } else {
                         inner.warn(None, format!("refused a join: {refused}"));

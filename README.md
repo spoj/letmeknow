@@ -14,7 +14,7 @@ npx -y @letmeknow/cli@0.22 skill
 
 ```bash
 letmeknow listen                     # the session process; keep it running, it prints events as JSON lines
-letmeknow invite                     # new chat; prints a one-time link, valid for 10 minutes
+letmeknow invite                     # new chat (--for <fp> limits the link to one known member)
 letmeknow join '<link>'              # join through a link
 letmeknow send "text"                # --to <fingerprint>, --reply-to <id>, --urgent, --attach <file>
 letmeknow sessions                   # this machine's sessions: handle, whether it runs, its groups

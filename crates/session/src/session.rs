@@ -196,15 +196,22 @@ impl Session {
                     Err(error) => Err(error),
                 }
             }
-            Request::Invite { group, carry } => {
-                let gid = match group {
-                    Some(group) => self.resolve(Some(group)),
-                    None => node.create(Settings { protocol: PROTOCOL, carry, update: UPDATE, membership: self.membership.clone() }),
+            Request::Invite { group, for_member, carry } => {
+                let target = for_member.map(|fp| known_member(&node, &fp)).transpose();
+                let gid = match (target, group) {
+                    (Err(error), _) => Err(error),
+                    (Ok(target), Some(group)) => self.resolve(Some(group)).and_then(|gid| {
+                        if let Some(member) = &target {
+                            ensure!(!node.members(&gid.0)?.iter().any(|m| m.key == member.key), "{} is a member of {} already", fp(&member.key.0), b64(&gid.0));
+                        }
+                        Ok((gid, target))
+                    }),
+                    (Ok(target), None) => node.create(Settings { protocol: PROTOCOL, carry, update: UPDATE, membership: self.membership.clone() }).map(|gid| (gid, target)),
                 };
                 let invite = async move {
-                    let gid = gid?;
-                    let link = node.invite(&gid.0, INVITE_VALID).await?.link();
-                    Ok(json!({ "group": b64(&gid.0), "link": link, "expires_in": INVITE_VALID / 1000 }))
+                    let (gid, target) = gid?;
+                    let link = node.invite(&gid.0, INVITE_VALID, target.as_ref().map(|m| &m.key.0[..])).await?.link();
+                    Ok(json!({ "group": b64(&gid.0), "link": link, "expires_in": INVITE_VALID / 1000, "for": target.map(|m| fp(&m.key.0)) }))
                 };
                 _ = self.running.spawn_local(async move { Answered(invite.await, Some(reply)) });
                 return;
@@ -584,6 +591,24 @@ fn member_by_fp(node: &Node, gid: &Bytes, fp: &str) -> Result<Member> {
         1 => Ok(found.remove(0)),
         0 => bail!("no member of {} has a fingerprint that begins {fp}", b64(&gid.0)),
         _ => bail!("several members of {} have fingerprints that begin {fp}; give more of it", b64(&gid.0)),
+    }
+}
+
+/// The member of any of this session's groups, other than this session, whose fingerprint begins with `fp`.
+fn known_member(node: &Node, fp: &str) -> Result<Member> {
+    let me = node.key();
+    let mut found: Vec<Member> = Vec::new();
+    for gid in node.groups() {
+        for member in node.members(&gid.0)? {
+            if member.key != me && !fp.is_empty() && lmk_node::fp(&member.key.0).starts_with(fp) && !found.iter().any(|m| m.key == member.key) {
+                found.push(member);
+            }
+        }
+    }
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => bail!("no known member has a fingerprint that begins {fp}"),
+        _ => bail!("several members have fingerprints that begin {fp}; give more of it"),
     }
 }
 

@@ -839,3 +839,32 @@ fn a_new_session_joins_the_auto_groups_of_its_home() {
         assert_eq!(crate::change_auto(&home, None).unwrap(), json!({ "groups": [] }));
     });
 }
+
+/// An invite made with --for admits only that known member: another member of the shared group is refused without
+/// warning the inviter, and the link stays usable for the member it names.
+#[test]
+fn an_invite_for_a_member_admits_only_that_member() {
+    local(async {
+        let world = world("for").await;
+        let (mut alice, bob, group) = pair(&world, HOUR).await;
+        let carol = world.start("carol", HOUR).await;
+        carol.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
+        alice.told(&["joined"]).await;
+
+        assert!(alice.cmd(&["invite", "--for", "nope"]).await.unwrap_err().to_string().contains("no known member"));
+        assert!(alice.cmd(&["invite", "--group", &group, "--for", &bob.fp[..8]]).await.unwrap_err().to_string().contains("is a member of"));
+        assert_eq!(alice.cmd(&["groups"]).await.unwrap().as_array().unwrap().len(), 1, "a failed invite creates no group");
+
+        let breakout = alice.cmd(&["invite", "--for", &bob.fp[..8]]).await.unwrap();
+        assert_eq!(breakout["for"], bob.fp);
+        let link = breakout["link"].as_str().unwrap();
+        let refused = carol.cmd(&["join", link]).await.unwrap_err().to_string();
+        assert!(refused.contains("for another member"), "{refused}");
+        assert!(alice.printed().await.iter().all(|e| e["type"] != "warning"));
+
+        let joined = bob.cmd(&["join", link]).await.unwrap();
+        assert_eq!(joined["group"], breakout["group"]);
+        assert_eq!(alice.told(&["joined"]).await["member"], bob.fp);
+    });
+}
+
