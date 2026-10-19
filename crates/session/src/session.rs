@@ -283,11 +283,18 @@ impl Session {
         Ok(status)
     }
 
-    /// The group a request acts on: the one it names by id, or else the session's one group.
+    /// The group a request acts on: the one it names by id, or any unique beginning of it, or else the session's one group.
     fn resolve(&self, group: Option<String>) -> Result<Bytes> {
         let gids = self.node.groups();
         match group {
-            Some(group) => gids.into_iter().find(|gid| b64(&gid.0) == group).with_context(|| format!("unknown group {group}")),
+            Some(group) => {
+                let mut found: Vec<Bytes> = gids.into_iter().filter(|gid| !group.is_empty() && b64(&gid.0).starts_with(&group)).collect();
+                match found.len() {
+                    1 => Ok(found.remove(0)),
+                    0 => bail!("unknown group {group}"),
+                    _ => bail!("several groups have ids that begin {group}; give more of it"),
+                }
+            }
             None => match &gids[..] {
                 [gid] => Ok(gid.clone()),
                 [] => bail!("this session is in no group; create one with `invite`, or join one with `join`"),
@@ -521,7 +528,7 @@ impl Session {
         let node = &self.node;
         let mut found = Vec::new();
         for gid in node.groups() {
-            found.extend(node.messages(&gid.0)?.into_iter().filter(|m| hex::encode(&m.id.0).starts_with(id)));
+            found.extend(node.messages(&gid.0)?.into_iter().filter(|m| !id.is_empty() && hex::encode(&m.id.0).starts_with(id)));
         }
         match found.len() {
             1 => Ok(found.remove(0)),
@@ -570,10 +577,14 @@ async fn send(node: &Node, gid: &Bytes, mut payload: ChatMessage, reply_to: Opti
     Ok(answer)
 }
 
-/// The member of a group with the fingerprint `fp`.
+/// The member of a group whose fingerprint begins with `fp`.
 fn member_by_fp(node: &Node, gid: &Bytes, fp: &str) -> Result<Member> {
-    let members = node.members(&gid.0)?;
-    members.into_iter().find(|m| lmk_node::fp(&m.key.0) == fp).with_context(|| format!("no member of {} has the fingerprint {fp}", b64(&gid.0)))
+    let mut found: Vec<Member> = node.members(&gid.0)?.into_iter().filter(|m| !fp.is_empty() && lmk_node::fp(&m.key.0).starts_with(fp)).collect();
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => bail!("no member of {} has a fingerprint that begins {fp}", b64(&gid.0)),
+        _ => bail!("several members of {} have fingerprints that begin {fp}; give more of it", b64(&gid.0)),
+    }
 }
 
 /// A member as the agent sees it: by its fingerprint, and whether it is this session; a peer that is no member, by its

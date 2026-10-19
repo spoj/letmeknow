@@ -289,12 +289,25 @@ pub fn change_auto(home: &Path, change: Option<cli::Auto>) -> Result<Value> {
     let mut groups = auto(home)?;
     match change {
         Some(cli::Auto::Add { group }) => {
-            ensure!(!members_of(home, &group, "").is_empty(), "no session of this home is in {group}");
+            let mut found = Vec::new();
+            for entry in std::fs::read_dir(home.join("sessions")).into_iter().flatten().flatten() {
+                let gids: Vec<String> = std::fs::read(entry.path().join("groups.json")).ok().and_then(|g| serde_json::from_slice(&g).ok()).unwrap_or_default();
+                for gid in gids {
+                    if !group.is_empty() && gid.starts_with(&group) && !found.contains(&gid) {
+                        found.push(gid);
+                    }
+                }
+            }
+            let group = match found.len() {
+                1 => found.remove(0),
+                0 => bail!("no session of this home is in {group}"),
+                _ => bail!("several groups have ids that begin {group}; give more of it"),
+            };
             if !groups.contains(&group) {
                 groups.push(group);
             }
         }
-        Some(cli::Auto::Remove { group }) => groups.retain(|g| *g != group),
+        Some(cli::Auto::Remove { group }) => groups.retain(|g| *g != group && (group.is_empty() || !g.starts_with(&group))),
         None => return Ok(json!({ "groups": groups })),
     }
     cli::private_file(&home.join("auto.json"), &serde_json::to_vec(&groups)?)?;

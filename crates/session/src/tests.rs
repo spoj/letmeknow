@@ -326,17 +326,17 @@ fn membership_changes_are_told_and_a_removed_session_learns_it() {
     local(async {
         let world = world("remove").await;
         let (mut alice, mut bob, group) = pair(&world, HOUR).await;
-        let members = bob.cmd(&["members", "--group", &group]).await.unwrap();
+        let members = bob.cmd(&["members", "--group", &group[..6]]).await.unwrap();
         assert_eq!(members["members"][0]["fp"], alice.fp);
         assert_eq!(members["members"][1], json!({ "fp": bob.fp, "you": true }));
         let other = alice.cmd(&["invite"]).await.unwrap()["group"].as_str().unwrap().to_owned();
         assert_eq!(alice.cmd(&["status"]).await.unwrap()["groups"].as_array().unwrap().len(), 2);
-        let status = alice.cmd(&["status", &format!("--group={group}")]).await.unwrap();
+        let status = alice.cmd(&["status", &format!("--group={}", &group[..8])]).await.unwrap();
         assert_eq!(status["groups"].as_array().unwrap().iter().map(|g| &g["group"]).collect::<Vec<_>>(), [group.as_str()]);
         assert!(alice.cmd(&["status", "--group", "nope"]).await.unwrap_err().to_string().contains("unknown group nope"));
-        alice.cmd(&["leave", &format!("--group={other}")]).await.unwrap();
+        alice.cmd(&["leave", &format!("--group={}", &other[..8])]).await.unwrap();
         assert!(alice.cmd(&["remove", "Carol"]).await.is_err());
-        alice.cmd(&["remove", &bob.fp]).await.unwrap();
+        alice.cmd(&["remove", &bob.fp[..8]]).await.unwrap();
         assert_eq!(alice.told(&["left"]).await["member"], bob.fp);
         let removed = bob.told(&["removed"]).await;
         assert_eq!((&removed["group"], &removed["by"]), (&json!(group), &json!(alice.fp)));
@@ -802,7 +802,7 @@ fn a_new_session_joins_the_auto_groups_of_its_home() {
         let home = world.root.path().join("h");
         let mut alice = world.start_in("h", "alice", HOUR).await;
         let group = alice.cmd(&["invite"]).await.unwrap()["group"].as_str().unwrap().to_owned();
-        let added = crate::change_auto(&home, Some(crate::cli::Auto::Add { group: group.clone() })).unwrap();
+        let added = crate::change_auto(&home, Some(crate::cli::Auto::Add { group: group[..6].into() })).unwrap();
         assert_eq!(added, json!({ "groups": [group] }));
         assert!(crate::change_auto(&home, Some(crate::cli::Auto::Add { group: "nope".into() })).unwrap_err().to_string().contains("no session of this home is in nope"));
 
