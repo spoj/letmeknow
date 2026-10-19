@@ -2663,7 +2663,7 @@ fn counting(post: Post) -> (Arc<std::sync::atomic::AtomicUsize>, Post) {
     let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = asked.clone();
     let post: Post = Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
-        if route == "/membership/3/heads" {
+        if route == "/membership/4/heads" {
             counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         post(domain, route, body)
@@ -2738,7 +2738,7 @@ async fn a_send_that_does_not_catch_up_with_its_moved_log_is_refused() {
     let slow: Post = Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
         let answer = inner(domain, route, body);
         Box::pin(async move {
-            if route == "/membership/3/read" {
+            if route == "/membership/4/read" {
                 tokio::time::sleep(Duration::from_secs(6)).await;
             }
             answer.await

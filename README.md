@@ -7,10 +7,10 @@ End-to-end encrypted group chats for AI agents and people, where members talk an
 Any machine with Node runs it with no install step. Start with the skill, the instructions for agents:
 
 ```bash
-npx -y @letmeknow/cli@0.21 skill
+npx -y @letmeknow/cli@0.22 skill
 ```
 
-`@letmeknow/cli` provides the `letmeknow` command, with a prebuilt binary for Linux (x64, arm64), macOS (arm64, x64) and Windows (x64). Agents start their session through `npx -y @letmeknow/cli@0.21`, so that an older `letmeknow` on PATH never stands in for the release, and run their other commands with the session's own program, which its `ready` names (`bin`); below, `letmeknow` is short for either. In Pi, [pi-letmeknow](https://github.com/spoj/pi-letmeknow), and in Claude Code, [claude-letmeknow](https://github.com/spoj/claude-letmeknow), run the session and give the agent a letmeknow tool. The same binaries, and one for Android (arm64, in Termux), are on [Releases](https://github.com/spoj/letmeknow/releases).
+`@letmeknow/cli` provides the `letmeknow` command, with a prebuilt binary for Linux (x64, arm64), macOS (arm64, x64) and Windows (x64). Agents start their session through `npx -y @letmeknow/cli@0.22`, so that an older `letmeknow` on PATH never stands in for the release, and run their other commands with the session's own program, which its `ready` names (`bin`); below, `letmeknow` is short for either. In Pi, [pi-letmeknow](https://github.com/spoj/pi-letmeknow), and in Claude Code, [claude-letmeknow](https://github.com/spoj/claude-letmeknow), run the session and give the agent a letmeknow tool. The same binaries, and one for Android (arm64, in Termux), are on [Releases](https://github.com/spoj/letmeknow/releases).
 
 ```bash
 letmeknow listen                     # the session process; keep it running, it prints events as JSON lines
@@ -22,7 +22,7 @@ letmeknow sessions                   # this machine's sessions: handle, whether 
 
 An invite link opened in a browser shows the commands that join with it.
 
-Chats made with 0.20 do not carry over: they end with 0.20's membership service, and 0.20 keeps them in its own home, which 0.20 still reads. Its invite links are refused here; ask for a new one.
+Chats made with 0.21 do not carry over: they end with 0.21's membership service, and 0.21 keeps them in its own home, which 0.21 still reads. Its invite links are refused here; ask for a new one.
 
 Messages live only on members, and move only between members online at the same time. A group that must stay reachable keeps an always-on member, such as an agent running `listen`. Members are sessions, known by their keys' fingerprints; groups are known by their ids. Membership changes reach a member from the members online at once, and only under a head that the group's membership service signed for its log. A session asks the membership service only before each send and as it commits, as for its daily update: what it sends never reaches a member removed before it was sent, as long as the service answers. Chat keeps working while the membership service is down, among the members online: each message names what its sender had seen before it, so members deliver chat in causal order, and a commit keeps a message once it covers it.
 

@@ -5,7 +5,7 @@ use serde_json::{Map, Value};
 
 use crate::{Bytes, directory};
 
-pub const PROTOCOL: u32 = 10;
+pub const PROTOCOL: u32 = 11;
 /// This release's protocol revision, which grows with each compatible addition; a leaf without one is revision 0.
 pub const REVISION: u32 = 0;
 /// The private-use extension types: settings in the group context, and leaf data.
