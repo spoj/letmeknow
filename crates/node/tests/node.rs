@@ -775,7 +775,13 @@ async fn a_log_let_go_is_no_removal_while_a_peer_brings_the_commits() {
     let spares = strangers(&mut alice, &gid, &relay, 2).await;
     bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID).await.unwrap()).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-    let held = bob.node.send(&gid.0, &message("held before refusal"), None).await.unwrap();
+    // A joiner's update that its join could not land lands meanwhile: a send then asks to be sent again.
+    let held = loop {
+        match bob.node.send(&gid.0, &message("held before refusal"), None).await {
+            Err(error) if matches!(error.downcast_ref::<SendError>(), Some(SendError::Behind)) => continue,
+            sent => break sent.unwrap(),
+        }
+    };
     let members = bob.node.members(&gid.0).unwrap();
     let epoch = bob.node.epoch(&gid.0).unwrap();
     let log_ref: [u8; 32] = bob.node.log(&gid.0).unwrap().0.try_into().unwrap();
