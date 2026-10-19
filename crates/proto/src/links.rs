@@ -1,6 +1,6 @@
 //! Invite links.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
 use crate::directory;
@@ -36,11 +36,7 @@ impl Invite {
     pub fn parse(link: &str) -> Result<Self> {
         let fragment = link.split_once('#').context("an invite link has a part after #")?.1;
         let mut fields = fragment.split('.');
-        match fields.next() {
-            Some("11") => {}
-            Some("10") => bail!("this invite link is from letmeknow 0.21, whose groups this version cannot join: ask for an invite to a group made with letmeknow 0.22"),
-            _ => bail!("this invite link is from another version of letmeknow"),
-        }
+        ensure!(fields.next() == Some("11"), "this invite link is from another version of letmeknow");
         let secret = URL_SAFE_NO_PAD.decode(fields.next().context("no secret")?)?.try_into().ok().context("a secret is 16 bytes")?;
         let domain = String::from_utf8(URL_SAFE_NO_PAD.decode(fields.next().context("no domain")?)?)?;
         directory::check_domain(&domain)?;
@@ -72,8 +68,7 @@ mod tests {
         assert!(Invite::parse("https://letmeknow.dev/i#11.AA.AA").is_err());
         assert!(Invite::parse("https://letmeknow.dev/i#11.AgICAgICAgICAgICAgICAg.AA").is_err(), "a link names a member");
         let link = Invite { secret: [2; 16], domain: "relay.example".into(), members }.link();
-        assert!(Invite::parse(&link.replacen("#11.", "#10.", 1)).unwrap_err().to_string().contains("letmeknow 0.21"));
-        assert!(Invite::parse(&link.replacen("#11.", "#9.", 1)).unwrap_err().to_string().contains("another version"));
+        assert!(Invite::parse(&link.replacen("#11.", "#10.", 1)).unwrap_err().to_string().contains("another version"));
         assert!(Invite::parse(&link.replacen("#11.", "#12.", 1)).unwrap_err().to_string().contains("another version"));
     }
 

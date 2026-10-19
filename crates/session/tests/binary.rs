@@ -71,7 +71,7 @@ fn the_binary_names_itself_as_termux_names_it() {
     assert!(ready.contains(r#""bin":"/data/data/com.termux/files/home/letmeknow""#), "{ready}");
 }
 
-/// A home that 0.15 made is refused, and left as it is.
+/// A home that an earlier release made is refused, and left as it is.
 #[test]
 fn the_binary_leaves_an_earlier_home_as_it_is() {
     let dir = tempfile::tempdir().unwrap();

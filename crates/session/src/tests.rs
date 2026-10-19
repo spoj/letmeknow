@@ -681,25 +681,18 @@ fn a_restarted_session_prints_what_came_after_the_last_it_showed() {
     });
 }
 
-/// A home another release wrote is refused and left as it is, and the refusal names the release that wrote it.
+/// A home another release wrote is refused and left as it is.
 #[test]
-fn a_home_of_another_format_is_refused_and_names_its_release() {
+fn a_home_of_another_format_is_refused() {
     local(async {
         let world = world("format").await;
-        for (format, names, run) in [
-            ("5", "letmeknow 0.16", "@letmeknow/cli@0.16"),
-            ("7", "letmeknow 0.18", "@letmeknow/cli@0.18"),
-            ("8", "letmeknow 0.19", "@letmeknow/cli@0.19"),
-            ("9", "letmeknow 0.20", "@letmeknow/cli@0.20"),
-            ("10", "letmeknow 0.21", "@letmeknow/cli@0.21"),
-            ("12", "a newer letmeknow", "@letmeknow/cli@latest"),
-        ] {
+        for (format, names) in [("10", "an earlier letmeknow"), ("12", "a newer letmeknow")] {
             let home = world.root.path().join(format!("format-{format}"));
             std::fs::create_dir_all(&home).unwrap();
             std::fs::write(home.join("format"), format!("{format}\n")).unwrap();
             let config = Config { dir: session_dir(&home, "alice").unwrap(), ..world.config("alice", "alice") };
             let error = crate::listen(config, &home, world.network.clone(), |_| Ok(()), std::future::pending()).await.unwrap_err().to_string();
-            assert!(error.contains(names) && error.contains(run), "{error}");
+            assert!(error.contains(names), "{error}");
             assert_eq!(std::fs::read_to_string(home.join("format")).unwrap(), format!("{format}\n"));
             assert!(!home.join("sessions").exists());
         }
@@ -717,10 +710,10 @@ fn a_membership_domain_is_checked_pinned_and_fetched() {
             let network = network.clone();
             async move { crate::listen(config, &home, network, |_| Ok(()), std::future::pending()).await.unwrap_err().to_string() }
         };
-        for address in ["letmeknow.dev", "a1b2@https://relay.example.com"] {
+        for address in ["Relay.example.com", "a1b2@https://relay.example.com"] {
             let config = Config { membership: address.into(), ..world.config("alice", "alice") };
             let error = listen(config, world.root.path().join("alice")).await;
-            assert!(error.contains("--membership <domain>"), "{error}");
+            assert!(error.contains("canonical host"), "{error}");
         }
         let unreachable = free_port();
         let config = Config { membership: format!("localhost:{unreachable}"), ..world.config("bob", "bob") };

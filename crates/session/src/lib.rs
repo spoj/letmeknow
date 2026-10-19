@@ -201,10 +201,6 @@ fn age(file: &Path) -> Option<Duration> {
 /// The directory of the own membership service at `domain`. Its key is pinned in `home` at the first directory that names
 /// one; a later directory naming another key is refused, and letmeknow.dev's must name the built-in key.
 async fn own_directory(home: &Path, network: &Network, domain: &str) -> Result<Directory> {
-    ensure!(
-        !domain.contains('@') && domain != "letmeknow.dev",
-        "--membership <domain> names a membership service by its domain, such as {DOMAIN}, not {domain}: letmeknow 0.17's <key>@<relay> and letmeknow.dev are refused"
-    );
     check_domain(domain)?;
     let directory = (network.resolve)(domain.to_owned()).await.with_context(|| format!("the membership service {domain} has no directory"))?;
     let key = hex::encode(directory.key);
@@ -233,26 +229,6 @@ pub async fn listen(
     let found = std::fs::read_to_string(&format).ok().map(|found| found.trim().to_owned());
     match found.as_deref() {
         Some("11") | None => {}
-        Some("10") => bail!(
-            "{home} holds state that letmeknow 0.21 wrote (format 10), which this one cannot read: to keep using it, run `npx -y @letmeknow/cli@0.21 --home {home} listen`, or use another --home for this one",
-            home = home.display()
-        ),
-        Some("9") => bail!(
-            "{home} holds state that letmeknow 0.20 wrote (format 9), which this one cannot read: to keep using it, run `npx -y @letmeknow/cli@0.20 --home {home} listen`, or use another --home for this one",
-            home = home.display()
-        ),
-        Some("8") => bail!(
-            "{home} holds state that letmeknow 0.19 wrote (format 8), which this one cannot read: to keep using it, run `npx -y @letmeknow/cli@0.19 --home {home} listen`, or use another --home for this one",
-            home = home.display()
-        ),
-        Some("7") => bail!(
-            "{home} holds state that letmeknow 0.18 wrote (format 7), which this one cannot read: to keep using it, run `npx -y @letmeknow/cli@0.18 --home {home} listen`, or use another --home for this one",
-            home = home.display()
-        ),
-        Some("5") => bail!(
-            "{home} holds state that letmeknow 0.16 wrote (format 5), which this one cannot read: to keep using it, run `npx -y @letmeknow/cli@0.16 --home {home} listen`, or use another --home for this one",
-            home = home.display()
-        ),
         Some(newer) if newer.parse::<u32>().is_ok_and(|format| format > 11) => bail!(
             "{home} holds state that a newer letmeknow wrote (format {newer}), which this one cannot read: run the newest release, `npx -y @letmeknow/cli@latest --home {home} listen`, or use another --home for this one",
             home = home.display()
