@@ -34,6 +34,9 @@ pub enum Frame {
         epoch: u64,
         wants: Vec<Seqs>,
     },
+    /// Held messages the sender holds that are too large to push, by membership and seq: a member that lacks one asks
+    /// for it.
+    Have { group: Bytes, held: Vec<Seqs> },
 }
 
 /// Where a member is in a group: its current epoch's log, by its reference, with its newest signed head held.
@@ -134,6 +137,8 @@ mod tests {
         assert_eq!(serde_json::from_str::<Frame>(&text).unwrap(), want);
         let push = Frame::Held { group: Bytes(vec![1]), items: vec![Bytes(vec![2])], answers: None };
         assert_eq!(serde_json::to_string(&push).unwrap(), r#"{"held":{"group":"AQ","items":["Ag"]}}"#);
+        let have = Frame::Have { group: Bytes(vec![1]), held: vec![Seqs { key: Bytes(vec![2]), joined: 3, seqs: Ranges::from(vec![(7, 7)]) }] };
+        assert_eq!(serde_json::to_string(&have).unwrap(), r#"{"have":{"group":"AQ","held":[["Ag",3,[[7,7]]]]}}"#);
         assert!(serde_json::from_str::<Frame>(r#"{"doc":{"group":"AQ"}}"#).is_err(), "a frame this version does not know");
         let summary = r#"{"group":"AQ","member":"Ag","joined":0,"version":1,"time":2,"epoch":3}"#;
         let parsed: Summary = serde_json::from_str(summary).unwrap();

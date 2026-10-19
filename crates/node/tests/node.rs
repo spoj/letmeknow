@@ -1512,6 +1512,110 @@ async fn a_member_waits_for_the_kept_message_its_only_holder_gives() {
     rita.node.shutdown().await.unwrap();
 }
 
+/// The size of the large message the announcement tests send: well over what members push.
+const LARGE: usize = 100_000;
+
+/// Reads a hand's frames until a `have` comes, and answers what it announced: no push before it carried a large
+/// ciphertext.
+async fn announced(hand: &mut Hand) -> Vec<Seqs> {
+    loop {
+        match hand.until(|f| matches!(f, Frame::Held { answers: None, .. } | Frame::Have { .. }).then_some(f)).await {
+            Frame::Held { items, .. } => assert!(items.iter().all(|item| item.0.len() < LARGE), "a large message was pushed"),
+            Frame::Have { held, .. } => return held,
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// Past a full mesh, a large message is announced, by its sender and by each member that takes it, and each member asks
+/// one holder for it. Rita, by hand, hears Sam announce his; Quinn, by hand, hears Alice announce it once she took it
+/// from Sam, and is given it when she asks.
+#[tokio::test(flavor = "multi_thread")]
+async fn past_a_full_mesh_a_large_message_is_announced_and_fetched() {
+    let relay = relay().await;
+    let dir = folder("announced");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut sam = session(&relay).await;
+    let gid = sam.node.create(settings(&relay)).unwrap();
+    strangers(&mut sam, &gid, &relay, 4).await;
+    let mut keys = Vec::new();
+    for name in ["quinn", "rita"] {
+        let db = dir.join(format!("{name}.db"));
+        let member = stored(&relay, &db).await;
+        member.node.join(&sam.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        member.node.shutdown().await.unwrap();
+        keys.push(member_of(&db).0);
+    }
+    let mut alice = session(&relay).await;
+    alice.node.join(&sam.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    eventually("Sam has eight members", || sam.node.members(&gid.0).unwrap().len() == 8).await;
+    let mut quinn = hand(&relay, keys[0].clone(), &alice.node).await;
+    let mut rita = hand(&relay, keys[1].clone(), &sam.node).await;
+    let reached = |node: &Node, key: &iroh::SecretKey| node.connected(&gid.0).unwrap().iter().any(|m| m.iroh.0 == key.public().as_bytes());
+    eventually("Alice reaches Quinn, and Sam Rita", || reached(&alice.node, &keys[0]) && reached(&sam.node, &keys[1])).await;
+
+    sam.node.send(&gid.0, &message("small"), None).await.unwrap();
+    let large = sam.node.send(&gid.0, &message(&"L".repeat(LARGE)), None).await.unwrap();
+    let by_sam = announced(&mut rita).await;
+    alice.until(|e| matches!(e, Event::Message(m) if m.id == large).then_some(())).await;
+    let by_alice = announced(&mut quinn).await;
+    assert_eq!(by_alice, by_sam);
+    assert_eq!(by_sam[0].key, sam.node.key());
+    let epoch = alice.node.epoch(&gid.0).unwrap();
+    quinn.send(&Frame::Want { group: gid.clone(), epoch, wants: by_alice }).await;
+    let items = quinn.until(|f| match f {
+        Frame::Held { items, answers: Some(_), .. } => Some(items),
+        _ => None,
+    }).await;
+    assert!(items.len() == 1 && items[0].0.len() > LARGE, "Alice gives the large message");
+}
+
+/// A member asks for what a peer announced, though nothing else shows it was sent: Quinn, by hand, announces Sam's
+/// message sent while Alice was away, and Alice asks her for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_asks_for_what_a_peer_announced() {
+    let relay = relay().await;
+    let dir = folder("asked");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (quinn_db, alice_db) = (dir.join("quinn.db"), dir.join("alice.db"));
+    let sam = session(&relay).await;
+    let gid = sam.node.create(settings(&relay)).unwrap();
+    let mut quinn = stored(&relay, &quinn_db).await;
+    quinn.node.join(&sam.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    let alice = stored(&relay, &alice_db).await;
+    let epoch = sam.node.epoch(&gid.0).unwrap();
+    alice.node.join(&sam.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    added_once(&sam.node, &alice.node, &gid, epoch, "Alice is added").await;
+    alice.node.shutdown().await.unwrap();
+    drop(alice);
+    let sent = sam.node.send(&gid.0, &message("while Alice was away"), None).await.unwrap();
+    let got = quinn.until(|e| match e {
+        Event::Message(message) => Some(message),
+        _ => None,
+    }).await;
+    assert_eq!(got.id, sent);
+    sam.node.shutdown().await.unwrap();
+    quinn.node.shutdown().await.unwrap();
+    drop(quinn);
+
+    let mut alice = stored(&relay, &alice_db).await;
+    let mut quinn = hand(&relay, member_of(&quinn_db).0, &alice.node).await;
+    quinn.send(&Frame::Have { group: gid.clone(), held: vec![seqs(&got.sender.key, got.joined, &[got.seq])] }).await;
+    let wants = quinn.until(|f| match f {
+        Frame::Want { wants, .. } => Some(wants),
+        _ => None,
+    }).await;
+    assert!(wants.iter().any(|w| w.key == got.sender.key && w.seqs.contains(got.seq)), "{wants:?}");
+    let sealing = sealed(&quinn_db, &gid, &sent).1;
+    quinn.send(&Frame::Held { group: gid.clone(), items: vec![sealing], answers: Some(wants) }).await;
+    let delivered = alice.until(|e| match e {
+        Event::Message(message) => Some(message),
+        _ => None,
+    }).await;
+    assert_eq!(delivered.id, sent);
+    alice.node.shutdown().await.unwrap();
+}
+
 /// Every row of every table in a session's database.
 fn dump(db: &Path) -> Vec<String> {
     let db = rusqlite::Connection::open(db).unwrap();

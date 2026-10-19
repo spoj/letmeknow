@@ -1,5 +1,5 @@
 //! Sending held messages: a send is sealed, saved and delivered to this session in one step, and pushed to the
-//! neighbours; nothing of it involves the membership service. The author keeps its plaintext until a cut keeps it, and
+//! neighbours, or announced to them if it is large beyond a full mesh; nothing of it involves the membership service. The author keeps its plaintext until a cut keeps it, and
 //! seals it again in each epoch until then, once it is at the head of its log.
 
 use anyhow::{Context, Result};
@@ -12,7 +12,7 @@ use lmk_proto::peer::{Frame, Seqs, Summary};
 use lmk_proto::ranges::Ranges;
 use serde_json::Value;
 
-use crate::held::Record;
+use crate::held::{PUSH, Record};
 use crate::{Inner, SendError, State};
 
 impl State {
@@ -78,8 +78,8 @@ impl State {
 
 impl Inner {
     /// Sends a held payload in a step: seals it in the current epoch with this session's next seq, after the messages
-    /// it seals again first, and with the deps its client showed; delivers it to this session and pushes it. Answers
-    /// its id.
+    /// it seals again first, and with the deps its client showed; delivers it to this session, and pushes it, or announces
+    /// it if it is over `PUSH` beyond a full mesh. Answers its id.
     pub(crate) fn send(&self, st: &mut State, gid: &[u8], payload: &Value, reply_to: Option<&[u8]>) -> Result<Bytes> {
         self.reseal(st, gid)?;
         let now = st.tick();
@@ -153,7 +153,13 @@ impl Inner {
         st.store(gid, &record)?;
         self.control(st, gid, &record.header)?;
         self.deliver(st, gid, record)?;
-        st.broadcast(gid, Frame::Held { group: Bytes(gid.to_vec()), items: vec![Bytes(ciphertext)], answers: None });
+        let group = Bytes(gid.to_vec());
+        let frame = if ciphertext.len() > PUSH && !st.peers.full_mesh(&group) {
+            Frame::Have { group, held: vec![Seqs { key: Bytes(me), joined, seqs: Ranges::range(seq, seq) }] }
+        } else {
+            Frame::Held { group, items: vec![Bytes(ciphertext)], answers: None }
+        };
+        st.broadcast(gid, frame);
         st.save(gid)?;
         Ok(id)
     }

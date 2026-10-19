@@ -27,6 +27,9 @@ type Set = BTreeMap<Membership, Ranges>;
 
 pub const DEBOUNCE: u64 = 1_000;
 pub const TIMEOUT: u64 = 10_000;
+/// How long a request for messages its holder announced waits for the answer: one may be 16 MiB, through a relay that
+/// passes 1 MiB a second, shared.
+pub const LARGE_TIMEOUT: u64 = 120_000;
 pub const ANSWER: usize = 1 << 20;
 pub const K: usize = 6;
 const MESH: usize = 7;
@@ -118,7 +121,8 @@ struct Request {
     asked: Set,
     /// The epoch it was made in: once this member is in a later one, its answer or silence strikes nothing.
     epoch: u64,
-    at: u64,
+    /// When it times out: `TIMEOUT` after it was made, or `LARGE_TIMEOUT` if it asks for what the holder announced.
+    until: u64,
 }
 
 struct Conn {
@@ -138,6 +142,8 @@ struct Conn {
     theirs: BTreeMap<[u8; 32], u64>,
     /// Per group, the latest sighting of each member the peer told or was told.
     told: BTreeMap<Bytes, BTreeMap<Key, u64>>,
+    /// Per group, the held messages the peer announced it holds.
+    has: BTreeMap<Bytes, Set>,
 }
 
 #[derive(Default)]
@@ -204,6 +210,7 @@ impl Peers {
             c.opened.remove(id);
             c.sent.remove(id);
             c.told.remove(id);
+            c.has.remove(id);
         }
     }
 
@@ -218,7 +225,7 @@ impl Peers {
             self.changed.get_or_insert(now);
         }
         self.backoff.remove(&peer);
-        let conn = Conn { dialed, served_at: now, active: now, hello: true, opened: served.clone(), served, sent: BTreeMap::new(), theirs: BTreeMap::new(), told: BTreeMap::new() };
+        let conn = Conn { dialed, served_at: now, active: now, hello: true, opened: served.clone(), served, sent: BTreeMap::new(), theirs: BTreeMap::new(), told: BTreeMap::new(), has: BTreeMap::new() };
         self.conns.insert(peer, conn);
     }
 
@@ -247,6 +254,7 @@ impl Peers {
         }
         c.sent.retain(|id, _| served.contains(id));
         c.told.retain(|id, _| served.contains(id));
+        c.has.retain(|id, _| served.contains(id));
         c.served = served;
         for (id, g) in &mut self.groups {
             if !c.served.contains(id) {
@@ -327,6 +335,10 @@ impl Peers {
                 }
             }
             Frame::Want { .. } => c.active = now,
+            Frame::Have { group, held } if c.served.contains(group) => {
+                let has = c.has.entry(group.clone()).or_default();
+                *has = union(mem::take(has), &to_set(held));
+            }
             _ => {}
         }
     }
@@ -374,11 +386,11 @@ impl Peers {
         untried
     }
 
-    /// Whether a holder of any of `lacking`, by its summary, may still be asked: connected and not struck, or not
-    /// connected and past its backoff.
+    /// Whether a holder of any of `lacking`, by its summary or what it announced, may still be asked: connected and not
+    /// struck, or not connected and past its backoff.
     pub fn holder(&self, group: &Bytes, lacking: &[Seqs], now: u64) -> bool {
         let (lack, g) = (to_set(lacking), &self.groups[group]);
-        holds(g).iter().any(|(k, held, _)| self.untried(group, k, now) && !offer(&lack, held, &g.struck, k).is_empty())
+        self.holds(group).iter().any(|(k, held, _)| self.untried(group, k, now) && !offer(&lack, held, &g.struck, k).is_empty())
     }
 
     /// What is due, in order: request timeouts, entries and `hello`s, own summaries, repair, dials, closes.
@@ -492,9 +504,29 @@ impl Peers {
         self.groups[group].own.members.iter().filter(|(_, k)| self.dialing.contains(k)).count()
     }
 
+    /// Each member with a kept summary or a connection, what it holds by that summary and by what it announced on that
+    /// connection, and what its summary shows sealed in this epoch.
+    fn holds(&self, group: &Bytes) -> Vec<(Key, Set, Set)> {
+        let g = &self.groups[group];
+        g.own.members.iter().filter_map(|(m, k)| {
+            let summary = g.heard.get(m).map(|h| &h.summary);
+            let announced = self.conns.get(k).and_then(|c| c.has.get(group));
+            if summary.is_none() && announced.is_none() {
+                return None;
+            }
+            let held = summary.map_or_else(Set::new, |s| to_set(&s.held));
+            let held = match announced {
+                Some(announced) => union(held, announced),
+                None => held,
+            };
+            let sealed = summary.filter(|s| s.epoch == g.own.epoch).map_or_else(Set::new, |s| to_set(&s.sealed));
+            Some((*k, held, sealed))
+        }).collect()
+    }
+
     fn timeouts(&mut self, now: u64) {
         for g in self.groups.values_mut() {
-            if let Some(r) = g.request.take_if(|r| now - r.at >= TIMEOUT)
+            if let Some(r) = g.request.take_if(|r| now >= r.until)
                 && r.epoch == g.own.epoch
             {
                 for (m, asked) in r.asked {
@@ -570,7 +602,7 @@ impl Peers {
         for id in self.groups.keys().cloned().collect::<Vec<_>>() {
             let g = &self.groups[&id];
             let epoch = g.own.epoch;
-            let holders = holds(g);
+            let holders = self.holds(&id);
             let mut waiting: Vec<(Option<(Membership, u64)>, Key)> = holders
                 .iter()
                 .filter(|(k, _, _)| !self.conns.contains_key(k) && !self.dialing.contains(k) && !self.backing(k, now))
@@ -604,8 +636,11 @@ impl Peers {
             if let Some((holder, asked)) = request {
                 let asked: Set = asked.into_iter().map(|(m, r)| (m, r.iter().take(512).collect::<Ranges>())).collect();
                 let wants = to_seqs(&asked);
-                self.conns.get_mut(&holder).expect("a connected holder").active = now;
-                self.groups.get_mut(&id).expect("a group of ours").request = Some(Request { holder, asked, epoch, at: now });
+                let c = self.conns.get_mut(&holder).expect("a connected holder");
+                c.active = now;
+                let announced = c.has.get(&id).is_some_and(|has| !offer(&asked, has, &BTreeMap::new(), &holder).is_empty());
+                let until = now + if announced { LARGE_TIMEOUT } else { TIMEOUT };
+                self.groups.get_mut(&id).expect("a group of ours").request = Some(Request { holder, asked, epoch, until });
                 out.push(Out::Frame(holder, Frame::Want { group: id, epoch, wants }));
             }
         }
@@ -675,15 +710,6 @@ fn to_set(seqs: &[Seqs]) -> Set {
 
 fn to_seqs(set: &Set) -> Vec<Seqs> {
     set.iter().map(|((key, joined), seqs)| Seqs { key: key.clone(), joined: *joined, seqs: seqs.clone() }).collect()
-}
-
-/// Each member with a kept summary, what that summary says it holds, and what it shows sealed in this epoch.
-fn holds(g: &Group) -> Vec<(Key, Set, Set)> {
-    g.own.members.iter().filter_map(|(m, k)| {
-        let summary = &g.heard.get(m)?.summary;
-        let sealed = if summary.epoch == g.own.epoch { to_set(&summary.sealed) } else { Set::new() };
-        Some((*k, to_set(&summary.held), sealed))
-    }).collect()
 }
 
 fn union(mut a: Set, b: &Set) -> Set {

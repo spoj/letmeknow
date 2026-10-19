@@ -60,7 +60,7 @@ fn heard_key(gid: &[u8], key: &[u8], joined: u64) -> Vec<u8> {
 fn group_of(frame: &Frame) -> Option<&Bytes> {
     match frame {
         Frame::Hello { .. } | Frame::Entries { .. } => None,
-        Frame::Summary { group, .. } | Frame::Held { group, .. } | Frame::Want { group, .. } => Some(group),
+        Frame::Summary { group, .. } | Frame::Held { group, .. } | Frame::Want { group, .. } | Frame::Have { group, .. } => Some(group),
     }
 }
 
@@ -494,6 +494,18 @@ impl Inner {
                 st.peers.used(&key, now);
                 let answer = st.answer(&gid, peer, epoch, &wants)?;
                 st.out.push(Out::Frame { peer, frame: answer });
+            }
+            // No push brings what was announced: it is wanted at once, of the peers that announced it.
+            Frame::Have { held, .. } => {
+                let g = st.group_mut(&gid)?;
+                for held in &held {
+                    if let Some(author) = g.author_mut(&held.key.0, held.joined)
+                        && let Some(&(_, last)) = held.seqs.ranges().last()
+                    {
+                        author.known = author.known.max(last);
+                    }
+                }
+                st.save(&gid)?;
             }
             _ => {}
         }

@@ -485,6 +485,36 @@ fn an_answer_cut_at_its_size_strikes_only_what_it_covered() {
     assert_eq!(wants(&p.poll(100)), vec![(key(1), vec![seqs(1, &[(2, 2)])])]);
 }
 
+/// A peer that announced what this member wants is asked for it, though no summary shows it held, and is given
+/// `LARGE_TIMEOUT` to answer, as what it announced is large, before the next holder is asked.
+#[test]
+fn an_announcer_is_asked_and_given_long_to_answer() {
+    let mut p = peers();
+    let mut o = own(1, &[1, 2]);
+    o.wanted = ask();
+    p.group(id(), o, 0);
+    for n in [1, 2] {
+        p.connect(key(n), gs(), false, 0);
+    }
+    p.frame(&key(1), &Frame::Have { group: id(), held: ask() }, 0);
+    p.summary(&id(), heard(2, 1, 0, ask()), false);
+    assert_eq!(wants(&p.poll(0)), vec![(key(1), ask())]);
+    assert!(wants(&p.poll(LARGE_TIMEOUT - 1)).is_empty());
+    assert_eq!(wants(&p.poll(LARGE_TIMEOUT)), vec![(key(2), ask())]);
+}
+
+/// What a peer announced holds for its connection only: a new one starts with nothing announced.
+#[test]
+fn an_announcement_ends_with_its_connection() {
+    let mut p = peers();
+    p.group(id(), own(1, &[1]), 0);
+    p.connect(key(1), gs(), false, 0);
+    p.frame(&key(1), &Frame::Have { group: id(), held: ask() }, 0);
+    assert!(p.holder(&id(), &ask(), 0));
+    p.connect(key(1), gs(), false, 10);
+    assert!(!p.holder(&id(), &ask(), 10));
+}
+
 /// A request times out 10 s after it was made, however busy the connection is with other frames.
 #[test]
 fn a_request_times_out_though_the_holder_sends_other_frames() {

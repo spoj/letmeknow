@@ -29,6 +29,9 @@ const SEEN: usize = 8192;
 /// summary shows that requirement held, and at most.
 pub(crate) const HOLD_OFF: u64 = 2_000;
 pub(crate) const GIVE_UP: u64 = 30_000;
+/// The largest ciphertext pushed beyond a full mesh: a larger one is announced, and each member that lacks it asks one
+/// holder for it, rather than taking it from each of its neighbours.
+pub(crate) const PUSH: usize = 64 << 10;
 
 /// A membership of the group as this session knows it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -349,9 +352,9 @@ impl State {
 }
 
 impl Inner {
-    /// Takes held ciphertexts a peer sent, or that came early: opens what is in order, keeps a while what is not,
-    /// passes on what it opened unless they answered this session's `want`, to members that joined before it was sent,
-    /// and delivers what is ready.
+    /// Takes held ciphertexts a peer sent, or that came early: opens what is in order, keeps a while what is not, passes
+    /// on what it opened beyond a full mesh, to members that joined before it was sent: announces those over `PUSH`, and
+    /// pushes the rest unless they answered this session's `want`. Then delivers what is ready.
     pub(crate) fn take(&self, st: &mut State, gid: &[u8], from: Option<EndpointId>, ciphertexts: Vec<Vec<u8>>, forward: bool) -> Result<()> {
         let mut opened = Vec::new();
         for ciphertext in ciphertexts {
@@ -359,13 +362,22 @@ impl Inner {
         }
         self.open_unopened(st, gid, &mut opened)?;
         let group = Bytes(gid.to_vec());
-        if forward && !opened.is_empty() && !st.peers.full_mesh(&group) {
+        if !opened.is_empty() && !st.peers.full_mesh(&group) {
+            let (large, small): (Vec<_>, Vec<_>) = opened.into_iter().partition(|(ciphertext, _)| ciphertext.len() > PUSH);
+            let large = large.iter().map(|(ciphertext, sent)| Ok((core::claim(ciphertext)?.0, *sent))).collect::<Result<Vec<_>>>()?;
             for peer in st.peers.neighbours(&group) {
                 let peer = EndpointId::from_bytes(&peer)?;
+                if Some(peer) == from {
+                    continue;
+                }
                 let joined = st.joined_of(gid, &peer);
-                let items: Vec<Bytes> = opened.iter().filter(|(_, sent)| *sent >= joined).map(|(ciphertext, _)| Bytes(ciphertext.clone())).collect();
-                if Some(peer) != from && !items.is_empty() {
+                let items: Vec<Bytes> = small.iter().filter(|(_, sent)| forward && *sent >= joined).map(|(ciphertext, _)| Bytes(ciphertext.clone())).collect();
+                let held: Vec<Seqs> = large.iter().filter(|(_, sent)| *sent >= joined).map(|(c, _)| Seqs { key: c.key.clone(), joined: c.joined, seqs: Ranges::range(c.seq, c.seq) }).collect();
+                if !items.is_empty() {
                     st.emit(gid, peer, Frame::Held { group: group.clone(), items, answers: None });
+                }
+                if !held.is_empty() {
+                    st.emit(gid, peer, Frame::Have { group: group.clone(), held });
                 }
             }
         }
