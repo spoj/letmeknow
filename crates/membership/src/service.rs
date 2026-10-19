@@ -249,7 +249,7 @@ impl Service {
 
     /// One pass of expiry, as `Store::expire` runs it; whether more is left.
     pub async fn expire(&self) -> bool {
-        let before = (now() / DAY_MS).saturating_sub(self.0.policy.retention_days);
+        let before = now().saturating_sub(self.0.policy.retention_days * DAY_MS);
         match self.work(move |inner| inner.store.expire(before)).await {
             Ok(more) => more,
             Err(_) => {

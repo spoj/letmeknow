@@ -16,7 +16,7 @@ pub const APPEND_BYTES: usize = 2 << 20;
 pub const PAGE_ROWS: usize = 1024;
 pub const HEAD_LOGS: usize = 256;
 pub const PAGE_OVERHEAD: usize = 512;
-/// How many days a service answers that it let a log go, from the day it did; then it forgets the log.
+/// How many days a service answers that it let a log go, from when it did; then it forgets the log.
 pub const EXPIRED_DAYS: u64 = 30;
 /// How long after a member last saw a log alive it takes the log as let go without asking, in milliseconds: two days
 /// within `EXPIRED_DAYS`, so that a service that let the log go still answers so until then.

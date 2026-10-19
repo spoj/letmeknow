@@ -14,21 +14,19 @@ const MARK_LOGS: usize = 1024;
 const EXPIRE_ROWS: usize = 1024;
 const EXPIRE_BYTES: u64 = 4 << 20;
 pub const DAY_MS: u64 = 86_400_000;
-const FORMAT: u32 = 7;
+const FORMAT: u32 = 8;
 pub const DISK_BYTES: u64 = 4 << 30;
-const EXPIRY: &str = "SELECT reference FROM anchors WHERE day<? LIMIT ?";
+const EXPIRY: &str = "SELECT reference FROM anchors WHERE at<? LIMIT ?";
 const DOOMED: &str = "SELECT reference FROM doomed LIMIT 1";
 const DOOMED_RECORDS: &str = "SELECT position,length(sealed) FROM records WHERE reference=? ORDER BY position LIMIT ?";
 const READ_RECORDS: &str = "SELECT sealed FROM records WHERE reference=? AND position>? ORDER BY position LIMIT ?";
-const FORGOTTEN: &str = "SELECT reference FROM expired WHERE day<? AND NOT EXISTS(SELECT 1 FROM doomed WHERE doomed.reference=expired.reference) LIMIT ?";
+const FORGOTTEN: &str = "SELECT reference FROM expired WHERE at<? AND NOT EXISTS(SELECT 1 FROM doomed WHERE doomed.reference=expired.reference) LIMIT ?";
 
 pub struct Store {
     db: Mutex<Connection>,
     key: SigningKey,
     wal: PathBuf,
     pub(crate) disk: u64,
-    /// The days the service did not run: a log's day counts only days it ran, and is its first entry's day less these.
-    skipped: u64,
 }
 
 /// A log as the store addresses it: its reference, and the key its entries and state are sealed under. The capability
@@ -117,26 +115,26 @@ impl Store {
         db.execute_batch(
             "BEGIN IMMEDIATE;
              CREATE TABLE metadata (id INTEGER PRIMARY KEY CHECK(id=1), format INTEGER NOT NULL,
-                 authority BLOB NOT NULL CHECK(length(authority)=32), passed INTEGER NOT NULL, skipped INTEGER NOT NULL);
-             CREATE TABLE anchors (reference BLOB PRIMARY KEY CHECK(length(reference)=32), day INTEGER NOT NULL,
+                 authority BLOB NOT NULL CHECK(length(authority)=32));
+             CREATE TABLE anchors (reference BLOB PRIMARY KEY CHECK(length(reference)=32), at INTEGER NOT NULL,
                  sealed BLOB NOT NULL) WITHOUT ROWID;
-             CREATE INDEX expiry ON anchors(day);
-             CREATE TABLE expired (reference BLOB PRIMARY KEY CHECK(length(reference)=32), day INTEGER NOT NULL) WITHOUT ROWID;
-             CREATE INDEX forgetting ON expired(day);
+             CREATE INDEX expiry ON anchors(at);
+             CREATE TABLE expired (reference BLOB PRIMARY KEY CHECK(length(reference)=32), at INTEGER NOT NULL) WITHOUT ROWID;
+             CREATE INDEX forgetting ON expired(at);
              CREATE TABLE doomed (reference BLOB PRIMARY KEY CHECK(length(reference)=32)) WITHOUT ROWID;
              CREATE TABLE records (reference BLOB NOT NULL, position INTEGER NOT NULL, sealed BLOB NOT NULL,
                  PRIMARY KEY(reference,position)) WITHOUT ROWID;
-             CREATE VIEW logs AS SELECT reference,day FROM anchors;
+             CREATE VIEW logs AS SELECT reference,at FROM anchors;
              CREATE VIEW entries AS SELECT reference,position FROM records;",
         )?;
-        db.execute("INSERT INTO metadata VALUES(1,?,?,?,0)", params![FORMAT, key.verifying_key().as_bytes(), now() / DAY_MS])?;
+        db.execute("INSERT INTO metadata VALUES(1,?,?)", params![FORMAT, key.verifying_key().as_bytes()])?;
         db.execute_batch("COMMIT; PRAGMA wal_checkpoint(TRUNCATE);")?;
         sync_dir(state)?;
         let mut ready = options.open(state.join("membership.ready"))?;
         ready.write_all(key.verifying_key().as_bytes())?;
         ready.sync_all()?;
         sync_dir(state)?;
-        Ok(Self { db: Mutex::new(db), key, wal: state.join("membership.db-wal"), disk: DISK_BYTES, skipped: 0 })
+        Ok(Self { db: Mutex::new(db), key, wal: state.join("membership.db-wal"), disk: DISK_BYTES })
     }
 
     pub fn open(state: &Path) -> Result<Self> {
@@ -150,22 +148,13 @@ impl Store {
         let guards: u32 = check.query_row("SELECT count(*) FROM sqlite_schema WHERE type='view' AND name IN ('logs','entries')", [], |r| r.get(0))?;
         ensure!(guards == 2, "incompatible membership schema");
         drop(check);
-        let mut db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         db.busy_timeout(std::time::Duration::from_millis(250))?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "FULL")?;
         db.pragma_update(None, "fullfsync", true)?;
         db.pragma_update(None, "secure_delete", true)?;
-        // The retention counts only days the service runs: those since the last expiry pass are skipped.
-        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let (passed, mut skipped): (u64, u64) = tx.query_row("SELECT passed, skipped FROM metadata", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        let today = now() / DAY_MS;
-        if today > passed {
-            skipped += today - passed;
-            tx.execute("UPDATE metadata SET passed=?, skipped=?", params![today, skipped])?;
-        }
-        tx.commit()?;
-        Ok(Self { db: Mutex::new(db), key, wal: state.join("membership.db-wal"), disk: DISK_BYTES, skipped })
+        Ok(Self { db: Mutex::new(db), key, wal: state.join("membership.db-wal"), disk: DISK_BYTES })
     }
 
     pub fn key(&self) -> &SigningKey { &self.key }
@@ -178,7 +167,7 @@ impl Store {
         Head::sign(&self.key, log_ref, length, hash, now())
     }
 
-    /// Appends entries to a log. A log's first entry records it, with that day as its `day`; until then the store holds
+    /// Appends entries to a log. A log's first entry records it, with that time as its `at`; until then the store holds
     /// nothing of it.
     pub fn append(&self, log: &Log, entries: &[Bytes]) -> Result<Appended> {
         ensure!(membership::valid_append(entries), Refused("size".into()));
@@ -188,7 +177,6 @@ impl Store {
         let (length, mut hash) = self.state(&tx, log)?;
         ensure!(used(&tx, &self.wal)? + bytes <= self.disk, Refused("quota".into()));
         let end = length + entries.len() as u64;
-        let day = now() / DAY_MS - self.skipped;
         for (index, entry) in entries.iter().enumerate() {
             hash = head::next(&hash, &entry.0);
             let sealed = seal(&log.key, &[entry.0.as_slice(), &hash].concat());
@@ -197,7 +185,7 @@ impl Store {
         let state = seal(&log.key, &[&end.to_be_bytes()[..], &hash].concat());
         tx.execute(
             "INSERT INTO anchors VALUES(?1,?2,?3) ON CONFLICT(reference) DO UPDATE SET sealed=?3",
-            params![log.reference, day, state],
+            params![log.reference, now(), state],
         )?;
         tx.commit()?;
         Ok(Appended { head: self.sign(&log.reference, end, hash) })
@@ -248,27 +236,25 @@ impl Store {
         Ok(tip(db, log)?.unwrap_or((0, head::start(self.key.verifying_key().as_bytes(), &log.reference))))
     }
 
-    /// One bounded pass of expiry, then a truncating checkpoint of the WAL, recording its day. A log goes once its day,
-    /// with the days skipped since, is before `before_day`, and keeps only its reference and the day it went;
-    /// `EXPIRED_DAYS` after, once its entries are deleted, the reference goes too. Returns whether more is left for
-    /// another pass.
-    pub fn expire(&self, before_day: u64) -> Result<bool> {
-        let today = now() / DAY_MS;
+    /// One bounded pass of expiry, then a truncating checkpoint of the WAL. A log whose first entry was before `before`
+    /// goes, and keeps only its reference and when it went; `EXPIRED_DAYS` after, once its entries are deleted, the
+    /// reference goes too. Returns whether more is left for another pass.
+    pub fn expire(&self, before: u64) -> Result<bool> {
+        let now = now();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let forgotten = tx.execute(
             &format!("DELETE FROM expired WHERE reference IN ({FORGOTTEN})"),
-            params![today.saturating_sub(membership::EXPIRED_DAYS), MARK_LOGS as u64],
+            params![now.saturating_sub(membership::EXPIRED_DAYS * DAY_MS), MARK_LOGS as u64],
         )?;
         let logs: Vec<[u8; 32]> = tx.prepare_cached(EXPIRY)?
-            .query_map(params![before_day.saturating_sub(self.skipped), MARK_LOGS as u64], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            .query_map(params![before, MARK_LOGS as u64], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         for reference in &logs {
             tx.execute("DELETE FROM anchors WHERE reference=?", [reference])?;
-            tx.execute("INSERT INTO expired VALUES(?,?)", params![reference, today])?;
+            tx.execute("INSERT INTO expired VALUES(?,?)", params![reference, now])?;
             tx.execute("INSERT INTO doomed VALUES(?)", [reference])?;
         }
         let more = reap(&tx)?;
-        tx.execute("UPDATE metadata SET passed=?", [today])?;
         tx.commit()?;
         db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
         Ok(more || logs.len() == MARK_LOGS || forgotten == MARK_LOGS)
@@ -305,13 +291,13 @@ mod tests {
     use super::*;
 
     thread_local! {
-        static DAY: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static NOW: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
-    /// Sets this test thread's clock to the middle of `day`.
+    /// Sets this test thread's clock to the start of `day`.
     fn on(day: u64) {
-        DAY.set(day);
-        lmk_proto::clock::set(|| DAY.get() * DAY_MS + DAY_MS / 2);
+        NOW.set(day * DAY_MS);
+        lmk_proto::clock::set(|| NOW.get());
     }
 
     fn state() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -365,7 +351,7 @@ mod tests {
         store.append(&group, &[Bytes(vec![1])]).unwrap();
         on(110);
         store.append(&group, &[Bytes(vec![2])]).unwrap();
-        assert!(!store.expire(101).unwrap());
+        assert!(!store.expire(100 * DAY_MS + 1).unwrap());
         assert_eq!(store.read(&group, 0).unwrap_err().downcast_ref::<Expired>().unwrap().0, group.reference);
     }
 
@@ -377,7 +363,7 @@ mod tests {
         on(10);
         store.append(&log, &[Bytes(vec![1])]).unwrap();
         on(11);
-        store.expire(11).unwrap();
+        store.expire(11 * DAY_MS).unwrap();
         let db = store.db.lock().unwrap();
         assert_eq!(db.query_row("SELECT count(*) FROM anchors", [], |r| r.get::<_, u64>(0)).unwrap(), 0);
         assert_eq!(db.query_row("SELECT reference FROM expired", [], |r| r.get::<_, [u8; 32]>(0)).unwrap(), log.reference);
@@ -398,10 +384,10 @@ mod tests {
         on(10);
         store.append(&log, &[Bytes(vec![1])]).unwrap();
         on(11);
-        store.expire(11).unwrap();
+        store.expire(11 * DAY_MS).unwrap();
         on(11 + membership::EXPIRED_DAYS);
         store.expire(0).unwrap();
-        assert!(store.read(&log, 0).unwrap_err().is::<Expired>(), "through its last day");
+        assert!(store.read(&log, 0).unwrap_err().is::<Expired>(), "for `EXPIRED_DAYS`");
         on(12 + membership::EXPIRED_DAYS);
         store.db.lock().unwrap().execute("INSERT INTO doomed VALUES(?)", [log.reference]).unwrap();
         store.expire(0).unwrap();
@@ -410,12 +396,12 @@ mod tests {
         assert_eq!(store.read(&log, 0).unwrap().head.length, 0, "forgotten");
     }
 
-    fn first_day(store: &Store, log: &Log) -> u64 {
-        store.db.lock().unwrap().query_row("SELECT day FROM anchors WHERE reference=?", [log.reference], |r| r.get(0)).unwrap()
+    fn first_at(store: &Store, log: &Log) -> u64 {
+        store.db.lock().unwrap().query_row("SELECT at FROM anchors WHERE reference=?", [log.reference], |r| r.get(0)).unwrap()
     }
 
     #[test]
-    fn a_first_entry_records_a_log_and_its_day() {
+    fn a_first_entry_records_a_log_and_its_time() {
         let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
         let group = store.log(&[1; 32]);
@@ -426,43 +412,7 @@ mod tests {
         store.append(&group, &[Bytes(b"commit".to_vec())]).unwrap();
         on(15);
         store.append(&group, &[Bytes(b"another".to_vec())]).unwrap();
-        assert_eq!(first_day(&store, &group), 13, "its first entry sets the day");
-    }
-
-    #[test]
-    fn a_service_stopped_past_the_retention_lets_no_live_log_go_at_its_start() {
-        let (_dir, path) = state();
-        let store = Store::initialize(&path).unwrap();
-        let group = store.log(&[1; 32]);
-        on(10);
-        store.append(&group, &[Bytes(vec![1])]).unwrap();
-        store.expire(3).unwrap();
-        drop(store);
-        on(30);
-        let store = Store::open(&path).unwrap();
-        store.expire(30 - 7).unwrap();
-        assert!(store.records(&group).unwrap(), "the retention counts the days it ran");
-        drop(store);
-        let store = Store::open(&path).unwrap();
-        store.expire(32).unwrap();
-        assert!(store.records(&group).is_err(), "a start on the day of the last pass moves nothing");
-    }
-
-    #[test]
-    fn a_start_on_the_day_after_the_last_pass_skips_one_day() {
-        let (_dir, path) = state();
-        let store = Store::initialize(&path).unwrap();
-        let group = store.log(&[1; 32]);
-        on(10);
-        store.append(&group, &[Bytes(vec![1])]).unwrap();
-        store.expire(3).unwrap();
-        drop(store);
-        on(11);
-        let store = Store::open(&path).unwrap();
-        store.expire(11).unwrap();
-        assert!(store.records(&group).unwrap(), "day 10 counts as day 11");
-        store.expire(12).unwrap();
-        assert!(store.records(&group).is_err(), "and no further");
+        assert_eq!(first_at(&store, &group), 13 * DAY_MS, "its first entry sets the time");
     }
 
     #[test]
@@ -490,7 +440,7 @@ mod tests {
         let kept = store.log(&capabilities[LOGS - 1]).reference;
         assert!(leaked(&path, &kept), "the control: a kept log's reference is in the file");
         on(11);
-        while store.expire(11).unwrap() {}
+        while store.expire(11 * DAY_MS).unwrap() {}
         let files: Vec<Vec<u8>> = ["membership.db", "membership.db-wal"].iter().map(|f| fs::read(path.join(f)).unwrap()).collect();
         assert!(files.iter().all(|bytes| !bytes.windows(16).any(|window| gone.contains(window))), "an expired entry is in the file");
         assert!(!leaked(&path, &head_hash.unwrap()), "an expired log's head hash is in the file");
@@ -519,7 +469,7 @@ mod tests {
         let mut passes = 0;
         loop {
             let (rows, bytes) = (count("SELECT count(*) FROM records"), count("SELECT coalesce(sum(length(sealed)),0) FROM records"));
-            let more = store.expire(11).unwrap();
+            let more = store.expire(11 * DAY_MS).unwrap();
             assert!(rows - count("SELECT count(*) FROM records") <= EXPIRE_ROWS as u64);
             assert!(bytes - count("SELECT coalesce(sum(length(sealed)),0) FROM records") <= EXPIRE_BYTES);
             passes += 1;
