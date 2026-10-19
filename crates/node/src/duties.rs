@@ -32,8 +32,9 @@ const RETRY: u64 = 10 * 60 * 1000;
 /// How often a member asks which members' logs their services let go, at most, in milliseconds.
 const EVICT: u64 = 24 * 3600 * 1000;
 /// How long after the group moved past the last epoch this session showed itself in, by a commit or message of its own,
-/// it sends a `present`: well before the services let that epoch's log go, a week after.
-pub(crate) const PRESENT: u64 = 4 * 24 * 3600 * 1000;
+/// it sends a `present`: after the updates a message stirs, and well before the services let that epoch's log go, a
+/// week after.
+pub(crate) const PRESENT: u64 = 2 * 24 * 3600 * 1000;
 
 /// T, in milliseconds, for a group of `members` whose settings name `update` seconds: that, times the members past 24
 /// over 24, up to three times that.

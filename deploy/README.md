@@ -52,3 +52,10 @@ The protocol's limits (entry and page sizes, the 30 days a log let go is remembe
 | `--relay-kib-per-second` | 1024 | what the relay reads from each connection |
 
 Per address means an IPv4 address or an IPv6 /64, and a /48 gets 16 times as much.
+
+## Sizing
+
+The target is one node for 100,000 active devices, each starting 10 sessions a day in two groups (its own, and one it shares) and sending about 20 messages from each. Messages go between members, through the relay when they must; the service holds only commits. Each session's joins commit an Add and the joiner's first update in each group, and members update only after a message or membership change, a day apart at most: about 2.5 million appends a day of commits of 4 to 16 KiB, and 22 million reads (each send reads its group's log first). That is 29 appends and 255 reads a second on average; a peak of 10 times that is 290 and 2,500.
+
+A week's entries are then about 140 GB: `--disk` 204800 on a 250 GB SSD. `crates/membership/tests/load.rs` runs the store at the peak's mix (`cargo test --release -p lmk-membership --test load -- --ignored --nocapture`). Each append syncs the disk once, so appends are bound by its sync latency: on a Samsung 970 EVO Plus (consumer NVMe), 138 appends a second with 1,244 reads; where syncs are free (tmpfs), 1,813 with 16,320, on a Ryzen 9 7950X. The average needs any SSD; the peak needs one that syncs in about 3 ms or less, as datacenter SSDs with power-loss protection do. So: 4 cores, 16 GB of memory, a 250 GB datacenter SSD, and the relay's traffic, a few tens of GB a day.
+

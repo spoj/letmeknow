@@ -933,7 +933,7 @@ fn payload_types(db: &Path, gid: &Bytes) -> Vec<(Bytes, String)> {
     }).collect()
 }
 
-/// A member that showed itself in no epoch since the group moved past the last one it did sends a `present` four days
+/// A member that showed itself in no epoch since the group moved past the last one it did sends a `present` two days
 /// later, while online: the others see it in the current epoch, so their evictions spare it once the log of that last
 /// one is let go.
 #[test]
@@ -962,7 +962,7 @@ fn an_idle_member_shows_itself_present_before_its_epochs_log_goes() {
         }
         assert!(!payload_types(&bob_db, &gid).contains(&(bob_key.clone(), "present".into())));
 
-        SHIFT.store(5 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        SHIFT.store(3 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         let bob = stored(&relay, &bob_db).await;
         let alice = stored(&relay, &alice_db).await;
         tokio::time::sleep(Duration::from_secs(3)).await;
