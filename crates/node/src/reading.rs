@@ -114,10 +114,12 @@ impl Inner {
             g.rec.stirred = true;
         }
         if applied.own {
-            g.rec.committed = current;
+            (g.rec.committed, g.rec.present) = (current, current);
             if applied.updated {
                 (g.rec.updated, g.rec.stirred) = (now, false);
             }
+        } else if g.rec.present == ending {
+            g.rec.passed = time;
         }
         if let Some(core::Admission { welcome, cut, sig }) = applied.admission.take() {
             put(&st.provider, &commit_key(gid, ending), &Admitted { commit: Bytes(inner), welcome: Bytes(welcome), cut, sig: Bytes(sig) })?;
@@ -174,6 +176,7 @@ impl Inner {
             author.lost = author.lost.union(seqs);
         }
         g.changed = true;
+        g.rec.lost.extend(lacking.iter().cloned());
         let messages = lacking.iter().map(|lost| LostOf { from: st.member_by_key(gid, &lost.key.0), joined: lost.joined, seqs: lost.seqs.iter().collect(), ids: Vec::new() });
         let member = st.member_by_key(gid, st.me());
         st.events.push(Event::Lost(Lost { group: Bytes(gid.to_vec()), member, messages: messages.collect() }));

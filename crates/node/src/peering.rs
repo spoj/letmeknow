@@ -1,6 +1,7 @@
 //! The node's side of the peer protocol (`lmk_net::peers`): it hands `Peers` this session's state of each group and the
-//! frames peers send, takes those frames by the gate, signs this session's summaries and checks members', answers
-//! `want` from the sealings it holds, and sends what `Peers` produces once the step commits.
+//! frames peers send, takes those frames by the gate, signs this session's summaries and checks its neighbours', answers
+//! `want` from the sealings it holds, and sends what `Peers` produces once the step commits. It polls when a step
+//! changed something, and when `Peers` or a group's timed work is next due: never while idle.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -13,15 +14,11 @@ use lmk_net::peers::{self, Own};
 use lmk_proto::Bytes;
 use lmk_proto::head::Head;
 use lmk_proto::peer::{At, Frame, SUMMARY, Seqs, Signed, Summary};
-use n0_future::time::{Duration, sleep};
+use n0_future::time::{Duration, timeout};
 use serde::{Deserialize, Serialize};
 
-use crate::{Event, Inner, Lost, LostOf, Member, Node, Out, State, get, now, put};
+use crate::{G, Inner, Member, Node, Out, State, get, now, put};
 
-/// How often `Peers` is polled.
-const POLL: Duration = Duration::from_millis(250);
-/// A member signs its summary at least this often.
-const RESIGN: u64 = 60 * 60 * 1000;
 /// How many summaries of memberships not known yet a group keeps.
 const UNVERIFIED: usize = 32;
 
@@ -61,8 +58,13 @@ fn heard_key(gid: &[u8], key: &[u8], joined: u64) -> Vec<u8> {
 fn group_of(frame: &Frame) -> Option<&Bytes> {
     match frame {
         Frame::Hello { .. } | Frame::Entries { .. } => None,
-        Frame::Versions { group, .. } | Frame::Summaries { group, .. } | Frame::Held { group, .. } | Frame::Want { group, .. } => Some(group),
+        Frame::Summary { group, .. } | Frame::Held { group, .. } | Frame::Want { group, .. } => Some(group),
     }
+}
+
+/// How long a member waits after signing a summary of a group before it signs the next: longer in larger groups.
+fn gap(g: &G) -> u64 {
+    (g.mls.members().len() as u64 * 250).max(1000)
 }
 
 impl State {
@@ -172,8 +174,9 @@ impl State {
         self.admitted(&gid, peer).then_some(frame)
     }
 
-    /// Sends a frame of a group to every neighbour the gate lets it go to.
+    /// Sends a frame of a group to every neighbour the gate lets it go to, and dials the group's targets not connected.
     pub(crate) fn broadcast(&mut self, gid: &[u8], frame: Frame) {
+        self.peers.push(&Bytes(gid.to_vec()));
         for peer in self.peers.neighbours(&Bytes(gid.to_vec())) {
             if let Ok(peer) = EndpointId::from_bytes(&peer) {
                 self.emit(gid, peer, frame.clone());
@@ -181,12 +184,11 @@ impl State {
         }
     }
 
-    /// This session's summary of a group, signed and handed to `Peers`, when it changed and its last is old enough, or
-    /// hourly.
+    /// This session's summary of a group, signed and handed to `Peers` for its neighbours, when it changed and its last
+    /// is old enough.
     fn sign(&mut self, gid: &[u8], now: u64) -> Result<()> {
         let g = self.group(gid)?;
-        let gap = (g.mls.members().len() as u64 * 250).max(1000);
-        if !g.mls.active() || !(g.changed && now >= g.rec.signed + gap || now >= g.rec.signed + RESIGN) {
+        if !g.mls.active() || !g.changed || now < g.rec.signed + gap(g) {
             return Ok(());
         }
         let me = self.me().to_vec();
@@ -203,7 +205,6 @@ impl State {
             relay: self.home.clone(),
             held: list(|a| &a.servable),
             sealed,
-            lost: list(|a| &a.lost),
         };
         let body = serde_json::to_vec(&summary)?;
         let sig = self.session.sign(&[SUMMARY, &body].concat());
@@ -211,115 +212,82 @@ impl State {
         (g.rec.version, g.rec.signed, g.changed) = (summary.version, now, false);
         self.save(gid)?;
         let heard = peers::Heard { signed: Signed { body: Bytes(body), sig: Bytes(sig) }, summary, at: now };
-        self.peers.summary(&Bytes(gid.to_vec()), heard, None);
+        self.peers.summary(&Bytes(gid.to_vec()), heard, true);
         Ok(())
     }
 
-    /// Takes members' summaries a peer passed on: each checked against its membership, kept if newer, saved, and its
-    /// losses told once. One of a membership this session does not know yet is kept a while.
-    fn summaries(&mut self, gid: &[u8], peer: EndpointId, items: Vec<Signed>) -> Result<()> {
+    /// When the poll is next due, if no step changes anything before: at once, or `BUSY` on, while a group has timed
+    /// work on, its summary's gap after it changed, or when `Peers` says.
+    pub(crate) fn next_poll(&self) -> Option<u64> {
+        let now = now();
+        let mut next = self.peers.next(now);
+        for g in self.groups.values().filter(|g| g.mls.active()) {
+            let pending = g.rec.authors.iter().any(|a| !a.held.difference(&a.delivered).is_empty());
+            let busy = g.waiting || pending || !g.unopened.is_empty() || !g.fresh.is_empty() || g.rec.resealed < g.mls.epoch();
+            let times = [busy.then_some(now + peers::BUSY), g.changed.then(|| g.rec.signed + gap(g))];
+            next = times.into_iter().flatten().chain(next).min();
+        }
+        next
+    }
+
+    /// Takes a neighbour's own summary: checked against its membership, kept if newer, and saved. One of a membership
+    /// this session does not know yet is kept a while.
+    fn summary(&mut self, gid: &[u8], peer: EndpointId, signed: Signed) -> Result<()> {
         let now = self.tick();
         let group = Bytes(gid.to_vec());
-        for signed in items {
-            let Ok(summary) = serde_json::from_slice::<Summary>(&signed.body.0) else { continue };
-            if summary.group != group || summary.member.0 == self.me() {
-                continue;
-            }
-            let g = self.groups.get_mut(gid).unwrap();
-            if g.mls.joined(&summary.member.0) != Some(summary.joined) {
-                if summary.joined > g.mls.epoch() && g.unverified.len() < UNVERIFIED {
-                    g.unverified.push((peer, signed));
-                }
-                continue;
-            }
-            if !lmk_core::group::verify(&summary.member.0, SUMMARY, &signed.body.0, &signed.sig.0) {
-                continue;
-            }
-            let heard = peers::Heard { signed: signed.clone(), summary: summary.clone(), at: now };
-            if !self.peers.summary(&group, heard, Some(*peer.as_bytes())) {
-                continue;
-            }
-            if summary.epoch == self.group(gid)?.mls.epoch() {
-                self.at(gid, &summary.member.0, summary.epoch)?;
-                self.save(gid)?;
-            }
-            if let Some(relay) = &summary.relay
-                && relay.parse::<RelayUrl>().is_ok_and(|url| url.scheme() == "https")
-                && let Some(leaf) = self.group(gid)?.mls.members().into_iter().find(|m| m.key == summary.member.0).and_then(|m| m.leaf)
-                && self.hints.get(&leaf.key).is_none_or(|hint| hint.time <= summary.time)
-            {
-                let moved = self.hints.get(&leaf.key).is_none_or(|hint| hint.relay != *relay);
-                let hint = Hint { relay: relay.clone(), time: summary.time };
-                if moved {
-                    put(&self.provider, &hint_key(&leaf.key.0), &hint)?;
-                }
-                self.hints.insert(leaf.key, hint);
-            }
-            put(&self.provider, &heard_key(gid, &summary.member.0, summary.joined), &Saved { signed, at: now })?;
-            let g = self.groups.get_mut(gid).unwrap();
-            let membership = (summary.member.clone(), summary.joined);
-            if !g.rec.heard.contains(&membership) {
-                g.rec.heard.push(membership);
-            }
-            for held in &summary.held {
-                if let Some(&(_, last)) = held.seqs.ranges().last() {
-                    g.learn(&held.key.0, held.joined, last, now);
-                }
-            }
-            self.told(gid, &summary)?;
-        }
-        self.save(gid)
-    }
-
-    /// The losses a member's summary tells that it did not tell before: each seq once.
-    fn told(&mut self, gid: &[u8], summary: &Summary) -> Result<()> {
-        let me = self.me().to_vec();
-        let g = self.group_mut(gid)?;
-        let mut messages = Vec::new();
-        // Losses are told to their author alone, and only of seqs it knows it sent.
-        for lost in summary.lost.iter().filter(|lost| lost.key.0 == me) {
-            let Some(last) = g.author(&lost.key.0, lost.joined).map(|a| a.last().max(a.cut)) else { continue };
-            let seqs = lost.seqs.intersection(&lmk_proto::ranges::Ranges::range(1, last));
-            let of = |(k, j, s): &&mut (Bytes, u64, Seqs)| *k == summary.member && *j == summary.joined && s.key == lost.key && s.joined == lost.joined;
-            let new = match g.rec.told.iter_mut().find(of) {
-                Some((_, _, told)) => {
-                    let new = seqs.difference(&told.seqs);
-                    told.seqs = told.seqs.union(&new);
-                    new
-                }
-                None if !seqs.is_empty() => {
-                    g.rec.told.push((summary.member.clone(), summary.joined, Seqs { key: lost.key.clone(), joined: lost.joined, seqs: seqs.clone() }));
-                    seqs
-                }
-                None => continue,
-            };
-            if !new.is_empty() {
-                messages.push((lost.key.clone(), lost.joined, new));
-            }
-        }
-        if messages.is_empty() {
+        let Ok(summary) = serde_json::from_slice::<Summary>(&signed.body.0) else { return Ok(()) };
+        if summary.group != group || summary.member.0 == self.me() {
             return Ok(());
         }
-        let mut lost = Vec::new();
-        for (key, joined, seqs) in messages {
-            let mut ids = Vec::new();
-            if key.0 == me {
-                for seq in seqs.iter() {
-                    ids.extend(self.id_at(gid, &key.0, joined, seq)?);
-                }
+        let g = self.groups.get_mut(gid).unwrap();
+        if g.mls.joined(&summary.member.0) != Some(summary.joined) {
+            if summary.joined > g.mls.epoch() && g.unverified.len() < UNVERIFIED {
+                g.unverified.push((peer, signed));
             }
-            lost.push(LostOf { from: self.member_by_key(gid, &key.0), joined, seqs: seqs.iter().collect(), ids });
+            return Ok(());
         }
-        let member = self.member_by_key(gid, &summary.member.0);
-        self.events.push(Event::Lost(Lost { group: Bytes(gid.to_vec()), member, messages: lost }));
-        Ok(())
+        let leaf = g.mls.members().into_iter().find(|m| m.key == summary.member.0).and_then(|m| m.leaf);
+        if leaf.as_ref().is_none_or(|leaf| leaf.key.0 != peer.as_bytes()) || !lmk_core::group::verify(&summary.member.0, SUMMARY, &signed.body.0, &signed.sig.0) {
+            return Ok(());
+        }
+        let heard = peers::Heard { signed: signed.clone(), summary: summary.clone(), at: now };
+        if !self.peers.summary(&group, heard, false) {
+            return Ok(());
+        }
+        if summary.epoch == self.group(gid)?.mls.epoch() {
+            self.at(gid, &summary.member.0, summary.epoch)?;
+        }
+        if let Some(relay) = &summary.relay
+            && relay.parse::<RelayUrl>().is_ok_and(|url| url.scheme() == "https")
+            && let Some(leaf) = leaf
+            && self.hints.get(&leaf.key).is_none_or(|hint| hint.time <= summary.time)
+        {
+            let moved = self.hints.get(&leaf.key).is_none_or(|hint| hint.relay != *relay);
+            let hint = Hint { relay: relay.clone(), time: summary.time };
+            if moved {
+                put(&self.provider, &hint_key(&leaf.key.0), &hint)?;
+            }
+            self.hints.insert(leaf.key, hint);
+        }
+        put(&self.provider, &heard_key(gid, &summary.member.0, summary.joined), &Saved { signed, at: now })?;
+        let g = self.groups.get_mut(gid).unwrap();
+        let membership = (summary.member.clone(), summary.joined);
+        if !g.rec.heard.contains(&membership) {
+            g.rec.heard.push(membership);
+        }
+        for held in &summary.held {
+            if let Some(&(_, last)) = held.seqs.ranges().last() {
+                g.learn(&held.key.0, held.joined, last, now);
+            }
+        }
+        self.save(gid)
     }
 
     /// Takes again the summaries kept until a commit made their memberships known.
     pub(crate) fn reverify(&mut self, gid: &[u8]) -> Result<()> {
         let unverified = std::mem::take(&mut self.group_mut(gid)?.unverified);
         for (peer, signed) in unverified {
-            self.summaries(gid, peer, vec![signed])?;
+            self.summary(gid, peer, signed)?;
         }
         Ok(())
     }
@@ -330,7 +298,7 @@ impl State {
         for (key, joined) in self.group(gid)?.rec.heard.clone() {
             let Some(saved) = get::<Saved>(&self.provider, &heard_key(gid, &key.0, joined))? else { continue };
             let summary = serde_json::from_slice(&saved.signed.body.0)?;
-            self.peers.summary(&group, peers::Heard { signed: saved.signed, summary, at: saved.at }, None);
+            self.peers.summary(&group, peers::Heard { signed: saved.signed, summary, at: saved.at }, false);
         }
         Ok(())
     }
@@ -351,7 +319,6 @@ impl State {
         let g = self.group_mut(gid)?;
         let gone: Vec<(Bytes, u64)> = g.rec.heard.iter().filter(|(k, _)| k.0 == key).cloned().collect();
         g.rec.heard.retain(|(k, _)| k.0 != key);
-        g.rec.told.retain(|(k, _, _)| k.0 != key);
         for (key, joined) in gone {
             self.provider.delete(&heard_key(gid, &key.0, joined))?;
         }
@@ -384,15 +351,23 @@ impl State {
 }
 
 impl Inner {
-    /// Polls every `POLL`: signs summaries, seals this session's messages again in a new epoch, reads on in groups
-    /// that wait before a commit, opens what waited unopened, gives up what holds dependents too long, and sends what
-    /// `Peers` has due.
+    /// Polls as a step changed something, and when the next timed work is due: signs summaries, seals this session's
+    /// messages again in a new epoch, reads on in groups that wait before a commit, opens what waited unopened, gives up
+    /// what holds dependents too long, and sends what `Peers` has due.
     pub(crate) async fn polling(self: Arc<Self>) {
         loop {
-            sleep(POLL).await;
-            let mut st = self.lock();
-            if let Err(error) = self.poll(&mut st) {
-                self.warn(None, format!("{error:#}"));
+            let poked = self.poke.notified();
+            let next = {
+                let mut st = self.lock();
+                if let Err(error) = self.poll(&mut st) {
+                    self.warn(None, format!("{error:#}"));
+                }
+                st.quiet = true;
+                st.next_poll()
+            };
+            match next {
+                Some(at) => drop(timeout(Duration::from_millis(at.saturating_sub(now())), poked).await),
+                None => poked.await,
             }
         }
     }
@@ -483,9 +458,7 @@ impl Inner {
             // An `at` of a log this session does not hold, of an epoch it has not reached or has dropped, is taken unchecked.
             let shown = |at: &At| at.head.as_ref().is_none_or(|head| head.log_ref == at.log && (!st.logs.contains_key(at.log.as_slice()) || self.vouched(st, head, &peer)));
             let groups: Vec<At> = groups.into_iter().filter(|at| st.groups.contains_key(&at.group.0) && shown(at)).collect();
-            for out in st.peers.frame(&key, &Frame::Hello { groups }, now) {
-                self.out(st, out)?;
-            }
+            st.peers.frame(&key, &Frame::Hello { groups }, now);
             return Ok(());
         }
         if let Frame::Entries { log, entries, head } = frame {
@@ -503,11 +476,12 @@ impl Inner {
             }
             return Ok(());
         }
-        for out in st.peers.frame(&key, &frame, now) {
-            self.out(st, out)?;
-        }
+        st.peers.frame(&key, &frame, now);
         match frame {
-            Frame::Summaries { items, .. } => st.summaries(&gid, peer, items)?,
+            Frame::Summary { summary, .. } => {
+                st.summary(&gid, peer, summary)?;
+                self.heard.notify_waiters();
+            }
             Frame::Held { items, answers, .. } => self.take(st, &gid, Some(peer), items.into_iter().map(|item| item.0).collect(), answers.is_none())?,
             Frame::Want { epoch, wants, .. } => {
                 st.peers.used(&key, now);
@@ -560,7 +534,7 @@ impl Node {
         Ok(heard.collect())
     }
 
-    /// This session's held messages no other member that may have them holds yet: they need this session until one does.
+    /// This session's chat messages no other member that may have them holds yet: they need this session until one does.
     /// Their ids and payloads.
     pub fn only_here(&self, gid: &[u8]) -> Result<Vec<(Bytes, serde_json::Value)>> {
         let st = self.inner.lock();
@@ -570,6 +544,7 @@ impl Node {
         let mut unkept = Vec::new();
         for seq in mine.cut + 1..=mine.last() {
             if let Some(record) = st.record_at(gid, me, mine.joined, seq)?
+                && !lmk_proto::group::Control::TYPES.contains(&lmk_proto::group::type_of(&record.header.payload))
                 && st.unheld(gid, &record)?
             {
                 unkept.push((record.id, record.header.payload));

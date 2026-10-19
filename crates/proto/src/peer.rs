@@ -17,10 +17,8 @@ pub enum Frame {
     Hello { groups: Vec<At> },
     /// Entries of a log the other lacks, by its reference, ending at `head`.
     Entries { log: Bytes, entries: Vec<Bytes>, head: Head },
-    /// The versions of the summaries the sender holds, on connecting: each side then sends the other what it lacks.
-    Versions { group: Bytes, versions: Vec<Version> },
-    /// Members' signed summaries of the group: the sender's own, and those it passes on.
-    Summaries { group: Bytes, items: Vec<Signed> },
+    /// The sender's own signed summary of the group, on connecting and as it changes; it goes no further.
+    Summary { group: Bytes, summary: Signed },
     /// Held messages' ciphertexts: pushed, or the answer to `want`, which covered `answers`.
     Held {
         group: Bytes,
@@ -68,29 +66,6 @@ impl From<Seqs> for (Bytes, u64, Ranges) {
     }
 }
 
-/// The version of a membership's summary, carried as `[key, joined, version]`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "Vec<Value>", into = "(Bytes, u64, u64)")]
-pub struct Version {
-    pub key: Bytes,
-    pub joined: u64,
-    pub version: u64,
-}
-
-impl TryFrom<Vec<Value>> for Version {
-    type Error = serde_json::Error;
-    fn try_from(values: Vec<Value>) -> serde_json::Result<Self> {
-        let (key, joined, version) = leading(values, 3)?;
-        Ok(Version { key, joined, version })
-    }
-}
-
-impl From<Version> for (Bytes, u64, u64) {
-    fn from(v: Version) -> Self {
-        (v.key, v.joined, v.version)
-    }
-}
-
 /// A member's state of a group, as it signs it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Summary {
@@ -112,9 +87,6 @@ pub struct Summary {
     /// Per membership with any, the unkept seqs it holds sealed in `epoch`: a commit of that epoch keeps them on its word.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sealed: Vec<Seqs>,
-    /// Per membership with any, the seqs it lost.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub lost: Vec<Seqs>,
 }
 
 /// A signed summary: `body` a `Summary`'s JSON, `sig` its member's signature over `SUMMARY ‖ body`.

@@ -141,6 +141,7 @@ impl Inner {
         }
         let ciphertext = g.mls.seal(&st.provider, &st.session, &plaintext)?;
         let epoch = g.mls.epoch();
+        g.rec.present = epoch;
         let author = g.author_mut(&me, joined).unwrap();
         author.held.insert(seq);
         author.known = author.known.max(seq);
@@ -181,6 +182,9 @@ impl Inner {
         let g = st.group_mut(gid)?;
         g.rec.resealed = epoch;
         g.changed |= !items.is_empty();
+        if !items.is_empty() {
+            g.rec.present = epoch;
+        }
         for peer in st.peers.neighbours(&Bytes(gid.to_vec())) {
             let peer = EndpointId::from_bytes(&peer)?;
             let joined = st.joined_of(gid, &peer);

@@ -729,8 +729,8 @@ async fn a_removal_made_moot_commits_nothing() {
         joiner.node.join(&alice.node.invite(&gid.0, INVITE_VALID).await.unwrap()).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     }
-    eventually("Bob has both Adds", || bob.node.members(&gid.0).unwrap().len() == 3).await;
-    let epoch = alice.node.epoch(&gid.0).unwrap();
+    let epoch = carol.node.epoch(&gid.0).unwrap();
+    eventually("Alice and Bob have both Adds, and Carol's update", || [&alice, &bob].iter().all(|s| s.node.epoch(&gid.0).unwrap() == epoch)).await;
 
     let carol_key = carol.node.key();
     let remove = |node: &Node| {
@@ -920,6 +920,69 @@ fn a_member_in_an_epoch_the_service_let_go_is_removed_by_the_others() {
     });
 }
 
+/// The types of the payloads of a group's messages a stopped stored member holds, by its author's key.
+fn payload_types(db: &Path, gid: &Bytes) -> Vec<(Bytes, String)> {
+    let db = rusqlite::Connection::open(db).unwrap();
+    let mut select = db.prepare("SELECT value FROM lmk WHERE key >= ?1 AND key < ?2").unwrap();
+    let prefix = [b"node/message/".as_slice(), &gid.0, b"/"].concat();
+    let end = [b"node/message/".as_slice(), &gid.0, b"0"].concat();
+    let values: Vec<Vec<u8>> = select.query_map([prefix, end], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+    values.iter().map(|value| serde_json::from_slice::<Value>(value).unwrap()).map(|record| {
+        let author = serde_json::from_value(record["header"]["author"].clone()).unwrap();
+        (author, record["header"]["payload"]["type"].as_str().unwrap().to_string())
+    }).collect()
+}
+
+/// A member that showed itself in no epoch since the group moved past the last one it did sends a `present` four days
+/// later, while online: the others see it in the current epoch, so their evictions spare it once the log of that last
+/// one is let go.
+#[test]
+fn an_idle_member_shows_itself_present_before_its_epochs_log_goes() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let dir = folder("present");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (alice_db, bob_db) = (dir.join("alice.db"), dir.join("bob.db"));
+        let mut alice = stored(&relay, &alice_db).await;
+        let bob = stored(&relay, &bob_db).await;
+        let gid = alice.node.create(settings(&relay)).unwrap();
+        let spares = strangers(&mut alice, &gid, &relay, 1).await;
+        bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID).await.unwrap()).await.unwrap();
+        let epoch = bob.node.epoch(&gid.0).unwrap();
+        eventually("Alice has Bob's update", || alice.node.epoch(&gid.0).unwrap() == epoch).await;
+        alice.node.remove(&gid.0, &spares[0].0).await.unwrap();
+        eventually("Bob has the removal", || bob.node.epoch(&gid.0).unwrap() == epoch + 1).await;
+        let bob_key = bob.node.key();
+        for session in [alice, bob] {
+            session.node.shutdown().await.unwrap();
+        }
+        assert!(!payload_types(&bob_db, &gid).contains(&(bob_key.clone(), "present".into())));
+
+        SHIFT.store(5 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        let bob = stored(&relay, &bob_db).await;
+        let alice = stored(&relay, &alice_db).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        bob.node.shutdown().await.unwrap();
+        drop(bob);
+        assert!(payload_types(&bob_db, &gid).contains(&(bob_key.clone(), "present".into())), "Bob sent a present");
+        alice.node.shutdown().await.unwrap();
+        drop(alice);
+        assert!(payload_types(&alice_db, &gid).contains(&(bob_key.clone(), "present".into())), "Alice holds it");
+
+        SHIFT.store(9 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        while relay.membership.expire().await {}
+        let alice = stored(&relay, &alice_db).await;
+        alice.node.send(&gid.0, &message("stir"), None).await.unwrap();
+        eventually("Alice updates", || alice.node.epoch(&gid.0).unwrap() == epoch + 2).await;
+        assert_eq!(alice.node.members(&gid.0).unwrap().len(), 2, "Bob is spared");
+        alice.node.shutdown().await.unwrap();
+    });
+}
+
 /// A member away six days resumes: the service keeps the log of the commit it missed for a week.
 #[test]
 fn a_member_away_six_days_resumes() {
@@ -1084,7 +1147,10 @@ fn a_joiner_whose_key_is_in_the_tree_of_a_lapsed_member_is_removed_before_its_ad
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
         bob.node.shutdown().await.unwrap();
         alice.node.remove(&gid.0, &spares[0].0).await.unwrap();
+        alice.node.shutdown().await.unwrap();
+        drop(alice);
 
+        // Alice is away, so that no peer brings Bob the commits.
         SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         while relay.membership.expire().await {}
         let mut bob = stored(&relay, &dir.join("bob.db")).await;
@@ -1094,6 +1160,7 @@ fn a_joiner_whose_key_is_in_the_tree_of_a_lapsed_member_is_removed_before_its_ad
         bob.until(|e| matches!(&e, Event::Removed { group, .. } if *group == gid).then_some(())).await;
         bob.node.shutdown().await.unwrap();
 
+        let mut alice = stored(&relay, &dir.join("alice.db")).await;
         let bob = stored(&relay, &dir.join("bob.db")).await;
         bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID).await.unwrap()).await.unwrap();
         alice.until(|e| matches!(&e, Event::Left { member, .. } if member.key == bob_key).then_some(())).await;
@@ -1371,11 +1438,10 @@ async fn list(hand: &mut Hand, mls: &Mls, gid: &Bytes, joined: u64, epoch: u64, 
         relay: None,
         held: listed.clone(),
         sealed: listed,
-        lost: Vec::new(),
     };
     let body = serde_json::to_vec(&summary).unwrap();
     let sig = mls.sign(&[SUMMARY, &body].concat());
-    hand.send(&Frame::Summaries { group: gid.clone(), items: vec![Signed { body: Bytes(body), sig: Bytes(sig) }] }).await;
+    hand.send(&Frame::Summary { group: gid.clone(), summary: Signed { body: Bytes(body), sig: Bytes(sig) } }).await;
 }
 
 /// A member that reaches only one holder of a message a commit kept waits for it before applying the next commit, which
@@ -2467,10 +2533,10 @@ async fn a_home_relay_change_reaches_an_online_co_member() {
     eventually("Bob holds Alice's new relay", || bob.node.hint(&alice_key) == Some(moved.url.to_string())).await;
 }
 
-/// In a group over seven, where members do not all connect, a member's new home relay reaches every co-member, though
-/// most of them never connect to it.
+/// In a group over seven, where members do not all connect, a member's new home relay reaches the members it connects
+/// to: summaries go no further than neighbours.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_home_relay_reaches_every_member_of_a_group_over_seven() {
+async fn a_home_relay_reaches_the_neighbours_in_a_group_over_seven() {
     let relay = relay().await;
     let moved = relay_beside(&relay).await;
     let dir = folder("relays-seven");
@@ -2486,11 +2552,13 @@ async fn a_home_relay_reaches_every_member_of_a_group_over_seven() {
     }
     eventually("Alice has eight members", || sessions[0].node.members(&gid.0).unwrap().len() == 8).await;
 
-    let bob_key = bob.node.address().0;
+    let (bob_iroh, bob_key) = (bob.node.address().0, bob.node.key());
     bob.node.shutdown().await.unwrap();
     drop(bob);
     let _bob = stored(&moved, &bob_db).await;
-    eventually("every member holds Bob's new relay", || sessions.iter().all(|s| s.node.hint(&bob_key) == Some(moved.url.to_string()))).await;
+    let neighbour = |s: &Session| s.node.online(&gid.0).unwrap().iter().any(|m| m.key == bob_key);
+    eventually("Bob has neighbours", || sessions.iter().any(neighbour)).await;
+    eventually("each neighbour holds Bob's new relay", || sessions.iter().filter(|s| neighbour(s)).all(|s| s.node.hint(&bob_iroh) == Some(moved.url.to_string()))).await;
 }
 
 /// A summary without a relay leaves the hint saved before it.
@@ -2523,12 +2591,11 @@ async fn a_summary_without_relay_keeps_the_hint() {
         relay: None,
         held: vec![held.clone()],
         sealed: Vec::new(),
-        lost: Vec::new(),
     };
     let body = serde_json::to_vec(&summary).unwrap();
     let sig = mls.sign(&[SUMMARY, &body].concat());
     let mut bob_hand = hand(&relay, iroh, &alice.node).await;
-    bob_hand.send(&Frame::Summaries { group: gid.clone(), items: vec![Signed { body: Bytes(body), sig: Bytes(sig) }] }).await;
+    bob_hand.send(&Frame::Summary { group: gid.clone(), summary: Signed { body: Bytes(body), sig: Bytes(sig) } }).await;
     eventually("Alice takes the summary", || alice.node.heard(&gid.0).unwrap().iter().any(|heard| heard.held == [held.clone()])).await;
     assert_eq!(alice.node.hint(&bob_iroh), Some(url));
 }
@@ -2562,12 +2629,11 @@ async fn a_summary_relay_must_be_https() {
         relay: Some("http://127.0.0.1:1".into()),
         held: vec![held.clone()],
         sealed: Vec::new(),
-        lost: Vec::new(),
     };
     let body = serde_json::to_vec(&summary).unwrap();
     let sig = mls.sign(&[SUMMARY, &body].concat());
     let mut bob_hand = hand(&relay, iroh, &alice.node).await;
-    bob_hand.send(&Frame::Summaries { group: gid.clone(), items: vec![Signed { body: Bytes(body), sig: Bytes(sig) }] }).await;
+    bob_hand.send(&Frame::Summary { group: gid.clone(), summary: Signed { body: Bytes(body), sig: Bytes(sig) } }).await;
     eventually("Alice takes the summary", || alice.node.heard(&gid.0).unwrap().iter().any(|heard| heard.held == [held.clone()])).await;
     assert_eq!(alice.node.hint(&bob_iroh), Some(url));
 }
@@ -2604,12 +2670,11 @@ async fn a_hint_is_saved_when_the_relay_changes() {
         relay: Some(url.clone()),
         held: vec![held.clone()],
         sealed: Vec::new(),
-        lost: Vec::new(),
     };
     let body = serde_json::to_vec(&summary).unwrap();
     let sig = mls.sign(&[SUMMARY, &body].concat());
     let mut bob_hand = hand(&relay, iroh, &alice.node).await;
-    bob_hand.send(&Frame::Summaries { group: gid.clone(), items: vec![Signed { body: Bytes(body), sig: Bytes(sig) }] }).await;
+    bob_hand.send(&Frame::Summary { group: gid.clone(), summary: Signed { body: Bytes(body), sig: Bytes(sig) } }).await;
     eventually("Alice takes the summary", || alice.node.heard(&gid.0).unwrap().iter().any(|heard| heard.held == [held.clone()])).await;
     assert_eq!(hint_records(&alice_db), saved);
 }

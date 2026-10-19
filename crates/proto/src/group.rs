@@ -61,10 +61,14 @@ pub enum Control {
     Leave,
     /// An invite, which any member admits a joiner by once: SHA-256 of its secret, and when it expires (milliseconds).
     Invite { hash: Bytes, expires: u64 },
+    /// The sender gave up on these seqs: each author is told of its own.
+    Lost { lost: Vec<crate::peer::Seqs> },
+    /// The sender is in the epoch it sealed this in, as no commit or message of its own showed lately.
+    Present,
 }
 
 impl Control {
-    pub const TYPES: [&str; 2] = ["leave", "invite"];
+    pub const TYPES: [&str; 4] = ["leave", "invite", "lost", "present"];
 }
 
 /// A payload's `type`.

@@ -462,6 +462,10 @@ impl Inner {
         };
         let h = opened.header;
         let id = opened.id;
+        // Its sealing shows its author in that epoch, for its log's retention.
+        if h.author.0 != st.me() && st.group(gid)?.mls.joined(&h.author.0) == Some(h.joined) {
+            st.at(gid, &h.author.0, opened.epoch)?;
+        }
         match st.id_at(gid, &h.author.0, h.joined, h.seq)? {
             Some(held) if held.0 == id => {
                 let mut record = st.record(gid, &id)?.context("a held message without its record")?;
@@ -532,6 +536,8 @@ impl Inner {
         }
         author.lost.insert(claim.seq);
         g.changed = true;
+        g.rec.lost.push(Seqs { key: claim.key.clone(), joined: claim.joined, seqs: Ranges::range(claim.seq, claim.seq) });
+        self.work.send(Work::Duties(gid.to_vec())).ok();
         let from = st.member_by_key(gid, &claim.key.0);
         let messages = vec![LostOf { from, joined: claim.joined, seqs: vec![claim.seq], ids: Vec::new() }];
         let member = st.member_by_key(gid, st.me());
@@ -545,6 +551,7 @@ impl Inner {
             return Ok(());
         }
         let Ok(control) = serde_json::from_value(h.payload.clone()) else { return Ok(()) };
+        let me = st.me().to_vec();
         let rec = &mut st.group_mut(gid)?.rec;
         match control {
             Control::Leave => {
@@ -556,6 +563,26 @@ impl Inner {
                     rec.invites.push(Rule { hash, expires, by: h.author.clone() });
                 }
             }
+            // Each author is told of its own seqs lost, of those it knows it sent.
+            Control::Lost { lost } if h.author.0 != me => {
+                let mut messages = Vec::new();
+                for lost in lost.iter().filter(|lost| lost.key.0 == me) {
+                    let Some(last) = st.group(gid)?.author(&me, lost.joined).map(|a| a.last().max(a.cut)) else { continue };
+                    let seqs: Vec<u64> = lost.seqs.intersection(&Ranges::range(1, last)).iter().collect();
+                    let mut ids = Vec::new();
+                    for &seq in &seqs {
+                        ids.extend(st.id_at(gid, &me, lost.joined, seq)?);
+                    }
+                    if !seqs.is_empty() {
+                        messages.push(LostOf { from: st.member_by_key(gid, &me), joined: lost.joined, seqs, ids });
+                    }
+                }
+                if !messages.is_empty() {
+                    let member = st.member_by_key(gid, &h.author.0);
+                    st.events.push(Event::Lost(Lost { group: Bytes(gid.to_vec()), member, messages }));
+                }
+            }
+            Control::Lost { .. } | Control::Present => {}
         }
         Ok(())
     }
@@ -608,7 +635,8 @@ impl Inner {
         let author = g.author_mut(&h.author.0, h.joined).context("an author")?;
         let late = author.given_up.contains(h.seq);
         author.delivered.insert(h.seq);
-        if !std::mem::replace(&mut g.rec.stirred, true) {
+        // A `present` stirs no update: updates would move the others past what they showed, and they would answer.
+        if type_of(&h.payload) != "present" && !std::mem::replace(&mut g.rec.stirred, true) {
             self.work.send(Work::Duties(gid.to_vec())).ok();
         }
         g.rec.index += 1;

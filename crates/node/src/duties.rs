@@ -12,6 +12,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use lmk_core::group::{Change, MAX_CUT_STEP};
 use lmk_proto::Bytes;
+use lmk_proto::group::Control;
 use lmk_proto::clock::corrected;
 use lmk_proto::held::Ref;
 use n0_future::time::{Duration, sleep};
@@ -30,6 +31,9 @@ const BLOCKED: u64 = 10_000;
 const RETRY: u64 = 10 * 60 * 1000;
 /// How often a member asks which members' logs their services let go, at most, in milliseconds.
 const EVICT: u64 = 24 * 3600 * 1000;
+/// How long after the group moved past the last epoch this session showed itself in, by a commit or message of its own,
+/// it sends a `present`: well before the services let that epoch's log go, a week after.
+pub(crate) const PRESENT: u64 = 4 * 24 * 3600 * 1000;
 
 /// T, in milliseconds, for a group of `members` whose settings name `update` seconds: that, times the members past 24
 /// over 24, up to three times that.
@@ -193,7 +197,20 @@ impl Inner {
             st.expire(gid)?;
             let tick = st.tick();
             let g = st.group(gid)?;
-            let next = if g.rec.stirred { next(g, st.me()) } else { u64::MAX };
+            if !g.rec.lost.is_empty() {
+                let lost = Control::Lost { lost: g.rec.lost.clone() };
+                self.send(&mut st, gid, &serde_json::to_value(lost)?, None)?;
+                st.group_mut(gid)?.rec.lost.clear();
+                st.save(gid)?;
+            }
+            let g = st.group(gid)?;
+            let behind = g.rec.present < g.mls.epoch();
+            if behind && tick >= g.rec.passed + PRESENT {
+                self.send(&mut st, gid, &serde_json::to_value(Control::Present)?, None)?;
+            }
+            let g = st.group(gid)?;
+            let present = if g.rec.present < g.mls.epoch() { g.rec.passed + PRESENT } else { u64::MAX };
+            let next = if g.rec.stirred { next(g, st.me()) } else { u64::MAX }.min(present);
             let pending = due(&st, g)?;
             // A pass that removes commits at once.
             let removing = pending.as_ref().is_some_and(|change| !change.remove.is_empty());

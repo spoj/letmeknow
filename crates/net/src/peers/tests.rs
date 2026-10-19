@@ -35,12 +35,12 @@ fn own(epoch: u64, members: &[u8]) -> Own {
 }
 
 fn peers() -> Peers {
-    Peers::new(0, 1, key(100))
+    Peers::new(0, key(100))
 }
 
 /// Member `n`'s summary of version `version`, signed and heard at `time`, holding `held`.
 fn heard(n: u8, version: u64, time: u64, held: Vec<Seqs>) -> Heard {
-    let summary = Summary { group: id(), member: Bytes(vec![n]), joined: 0, version, time, epoch: 1, relay: None, held, sealed: vec![], lost: vec![] };
+    let summary = Summary { group: id(), member: Bytes(vec![n]), joined: 0, version, time, epoch: 1, relay: None, held, sealed: vec![] };
     Heard { signed: Signed { body: Bytes(vec![]), sig: Bytes(vec![]) }, summary, at: time }
 }
 
@@ -65,7 +65,7 @@ fn closes(out: &[Out]) -> Vec<Key> {
 fn summaries_to(out: &[Out]) -> Vec<Key> {
     out.iter()
         .filter_map(|o| match o {
-            Out::Frame(k, Frame::Summaries { .. }) => Some(*k),
+            Out::Frame(k, Frame::Summary { .. }) => Some(*k),
             _ => None,
         })
         .collect()
@@ -91,8 +91,10 @@ fn a_full_mesh_dials_every_member_four_at_a_time() {
         p.dialed(k, true, 0);
         p.connect(*k, gs(), true, 0);
     }
-    let rest = dials(&p.poll(REDIAL));
+    assert_eq!(p.next(0), Some(0), "the rest are due once dials end");
+    let rest = dials(&p.poll(1));
     assert_eq!(rest.len(), 2);
+    assert!(dials(&p.poll(2)).is_empty());
     let all: BTreeSet<Key> = first.iter().chain(&rest).copied().collect();
     assert_eq!(all, (1..=6).map(key).collect());
 }
@@ -119,21 +121,48 @@ fn the_pair_rank_is_symmetric() {
     assert_ne!(rank(&id(), &key(3), &key(9)), rank(&id(), &key(3), &key(8)));
 }
 
-/// A failed dial backs the peer off 10 s, then 20 s after the next failure; a connection clears the backoff.
+/// Nothing dials again by itself: a push dials the targets not connected, but a failed one only past its backoff, 10 s,
+/// then 20 s after the next failure; a connection clears the backoff.
 #[test]
-fn a_failed_dial_backs_off_and_a_connection_clears_it() {
+fn a_push_dials_again_past_the_backoff_and_a_connection_clears_it() {
     let mut p = peers();
     p.group(id(), own(1, &[1]), 0);
     assert_eq!(dials(&p.poll(0)), vec![key(1)]);
     p.dialed(&key(1), false, 0);
+    assert!(dials(&p.poll(1)).is_empty(), "backing off");
+    p.poll(DEBOUNCE);
+    assert_eq!(p.next(DEBOUNCE), None, "idle");
+    assert!(dials(&p.poll(10_000)).is_empty(), "no redial");
+    p.push(&id());
     assert_eq!(dials(&p.poll(10_000)), vec![key(1)]);
     p.dialed(&key(1), false, 10_000);
+    p.push(&id());
     assert!(dials(&p.poll(20_000)).is_empty());
+    p.push(&id());
     assert_eq!(dials(&p.poll(30_000)), vec![key(1)]);
     p.dialed(&key(1), false, 30_000);
     p.connect(key(1), gs(), false, 35_000);
     p.disconnect(&key(1));
+    p.push(&id());
     assert_eq!(dials(&p.poll(40_000)), vec![key(1)], "a connection cleared the backoff");
+}
+
+/// A failed dial dials the group's next target in its place.
+#[test]
+fn a_failed_dial_dials_the_next_target() {
+    let mut p = peers();
+    p.group(id(), own(1, &(1..=19).collect::<Vec<_>>()), 0);
+    let targets = p.targets(&id(), 0);
+    for k in dials(&p.poll(0)) {
+        p.dialed(&k, true, 0);
+        p.connect(k, gs(), true, 0);
+    }
+    let second = dials(&p.poll(1));
+    assert_eq!(second.len(), K - DIALS);
+    p.dialed(&second[0], false, 1);
+    let next = dials(&p.poll(2));
+    assert_eq!(next.len(), 1);
+    assert!(!targets.contains(&next[0]));
 }
 
 /// A member seen recently is a target ahead of a better-ranked member that is not.
@@ -146,26 +175,8 @@ fn recently_seen_members_are_targets_before_stale_ones() {
     ranked.sort_by_key(|&n| rank(&id(), &key(100), &key(n)));
     let last = *ranked.last().unwrap();
     assert!(!p.targets(&id(), 0).contains(&key(last)));
-    p.summary(&id(), heard(last, 1, 0, vec![]), Some(key(last)));
+    p.summary(&id(), heard(last, 1, 0, vec![]), false);
     assert!(p.targets(&id(), 0).contains(&key(last)));
-}
-
-/// Once a minute the member dials one recently seen member it is not connected to.
-#[test]
-fn the_minute_probe_dials_one_recent_member_not_connected() {
-    let mut p = peers();
-    p.group(id(), own(1, &(1..=19).collect::<Vec<_>>()), 0);
-    for n in 1..=8 {
-        p.summary(&id(), heard(n, 1, 0, vec![]), Some(key(n)));
-    }
-    let targets = p.targets(&id(), 0);
-    for k in &targets {
-        p.connect(*k, gs(), false, 0);
-    }
-    assert!(dials(&p.poll(0)).is_empty(), "every target is connected");
-    let probed = dials(&p.poll(PROBE));
-    assert_eq!(probed.len(), 1);
-    assert!(!targets.contains(&probed[0]) && (1..=8).any(|n| key(n) == probed[0]));
 }
 
 /// A dialed connection no group targets closes after five idle minutes; a targeted one stays.
@@ -204,15 +215,18 @@ fn over_128_connections_close_the_longest_idle_untargeted_one() {
     assert_eq!(closes(&p.poll(2_000)), vec![key(1)]);
 }
 
-/// On connecting, a member lists the versions of its kept summaries to the peer.
+/// On connecting, a member sends the peer its own summary, and no other.
 #[test]
-fn connecting_sends_the_versions_of_kept_summaries() {
+fn connecting_sends_the_own_summary() {
     let mut p = peers();
-    p.group(id(), own(1, &[1]), 0);
-    p.summary(&id(), heard(1, 3, 0, vec![]), Some(key(1)));
+    p.group(id(), own(1, &[1, 2]), 0);
+    p.summary(&id(), heard(2, 3, 0, vec![]), false);
+    p.summary(&id(), heard(100, 4, 0, vec![]), true);
     p.connect(key(1), gs(), false, 0);
-    let versions = vec![Version { key: Bytes(vec![1]), joined: 0, version: 3 }];
-    assert!(p.poll(0).contains(&Out::Frame(key(1), Frame::Versions { group: id(), versions })));
+    let summary = Signed { body: Bytes(vec![]), sig: Bytes(vec![]) };
+    let out = p.poll(0);
+    assert!(out.contains(&Out::Frame(key(1), Frame::Summary { group: id(), summary })));
+    assert_eq!(summaries_to(&out), vec![key(1)]);
 }
 
 /// `hello` on connecting carries each served group's position, with the newest signed head of its log.
@@ -226,51 +240,30 @@ fn hello_on_connect_carries_the_served_groups_positions() {
     assert!(p.poll(0).contains(&Out::Frame(key(1), Frame::Hello { groups })));
 }
 
-/// A peer's versions get back the summaries it lacks or holds older, and nothing it holds at the same version.
+/// A neighbour's summary goes no further; this member's own goes to every neighbour, once.
 #[test]
-fn versions_are_answered_with_what_the_peer_lacks() {
-    let mut p = peers();
-    p.group(id(), own(1, &[1, 2]), 0);
-    p.summary(&id(), heard(1, 3, 0, vec![]), Some(key(1)));
-    p.summary(&id(), heard(2, 5, 0, vec![]), Some(key(2)));
-    p.connect(key(1), gs(), false, 0);
-    p.poll(0);
-    let theirs = |one: u64, two: u64| Frame::Versions {
-        group: id(),
-        versions: vec![Version { key: Bytes(vec![1]), joined: 0, version: one }, Version { key: Bytes(vec![2]), joined: 0, version: two }],
-    };
-    let out = p.frame(&key(1), &theirs(2, 5), 1);
-    let [Out::Frame(k, Frame::Summaries { items, .. })] = &out[..] else { panic!("{out:?}") };
-    assert_eq!((*k, items.len()), (key(1), 1));
-    assert!(p.frame(&key(1), &theirs(3, 5), 2).is_empty());
-}
-
-/// A new summary from one peer goes on to the others the group is served to, once, and not back to its source.
-#[test]
-fn a_new_summary_goes_on_to_the_other_peers_once() {
+fn only_the_own_summary_goes_to_the_neighbours_once() {
     let mut p = peers();
     p.group(id(), own(1, &[1, 2]), 0);
     p.connect(key(1), gs(), false, 0);
     p.connect(key(2), gs(), false, 0);
     p.poll(0);
-    assert!(p.summary(&id(), heard(1, 2, 0, vec![]), Some(key(1))));
-    assert_eq!(summaries_to(&p.poll(1)), vec![key(2)]);
-    assert!(p.poll(2).is_empty());
+    assert!(p.summary(&id(), heard(1, 2, 0, vec![]), false));
+    assert!(summaries_to(&p.poll(1)).is_empty());
+    assert!(p.summary(&id(), heard(100, 2, 0, vec![]), true));
+    assert_eq!(summaries_to(&p.poll(2)), vec![key(1), key(2)]);
+    assert!(p.poll(3).is_empty());
 }
 
-/// A summary of a membership that has been removed is dropped, and not forwarded even if it was queued.
+/// A summary of a membership that has been removed is dropped, and a later one is not kept.
 #[test]
-fn a_removed_membership_s_summary_is_dropped_and_not_forwarded() {
+fn a_removed_membership_s_summary_is_dropped() {
     let mut p = peers();
     p.group(id(), own(1, &[1, 2]), 0);
-    p.connect(key(1), gs(), false, 0);
-    p.connect(key(2), gs(), false, 0);
-    p.poll(0);
-    p.summary(&id(), heard(1, 2, 0, vec![]), Some(key(1)));
+    p.summary(&id(), heard(1, 2, 0, vec![]), false);
     p.group(id(), own(2, &[2]), 1);
     assert!(p.heard(&id()).all(|h| h.summary.member != Bytes(vec![1])));
-    assert!(summaries_to(&p.poll(2)).is_empty());
-    assert!(!p.summary(&id(), heard(1, 3, 2, vec![]), Some(key(2))));
+    assert!(!p.summary(&id(), heard(1, 3, 2, vec![]), false));
 }
 
 /// A summary whose version is not above the one held is not kept.
@@ -278,9 +271,9 @@ fn a_removed_membership_s_summary_is_dropped_and_not_forwarded() {
 fn a_lower_or_equal_version_is_not_kept() {
     let mut p = peers();
     p.group(id(), own(1, &[1]), 0);
-    assert!(p.summary(&id(), heard(1, 4, 0, vec![]), Some(key(1))));
-    assert!(!p.summary(&id(), heard(1, 3, 0, vec![]), Some(key(1))));
-    assert!(!p.summary(&id(), heard(1, 4, 0, vec![]), Some(key(1))));
+    assert!(p.summary(&id(), heard(1, 4, 0, vec![]), false));
+    assert!(!p.summary(&id(), heard(1, 3, 0, vec![]), false));
+    assert!(!p.summary(&id(), heard(1, 4, 0, vec![]), false));
     assert_eq!(p.heard(&id()).map(|h| h.summary.version).collect::<Vec<_>>(), vec![4]);
 }
 
@@ -296,7 +289,7 @@ fn both_hold() -> Peers {
     p.group(id(), o, 0);
     for n in [1, 2] {
         p.connect(key(n), gs(), false, 0);
-        p.summary(&id(), heard(n, 1, 0, ask()), Some(key(n)));
+        p.summary(&id(), heard(n, 1, 0, ask()), false);
     }
     p
 }
@@ -312,10 +305,10 @@ fn a_seq_held_in_an_ended_epoch_is_asked_only_of_a_holder_that_shows_it_sealed_n
     for n in [1, 2] {
         p.connect(key(n), gs(), false, 0);
     }
-    p.summary(&id(), heard(1, 1, 0, ask()), Some(key(1)));
+    p.summary(&id(), heard(1, 1, 0, ask()), false);
     let mut sealed_now = heard(2, 1, 0, ask());
     (sealed_now.summary.epoch, sealed_now.summary.sealed) = (2, ask());
-    p.summary(&id(), sealed_now, Some(key(2)));
+    p.summary(&id(), sealed_now, false);
     assert_eq!(wants(&p.poll(0)), vec![(key(2), ask())]);
 }
 
@@ -329,8 +322,8 @@ fn repair_asks_the_holder_of_the_lowest_wanted_seq_one_at_a_time() {
     for n in [1, 2] {
         p.connect(key(n), gs(), false, 0);
     }
-    p.summary(&id(), heard(1, 1, 0, vec![seqs(1, &[(5, 5)])]), Some(key(1)));
-    p.summary(&id(), heard(2, 1, 0, ask()), Some(key(2)));
+    p.summary(&id(), heard(1, 1, 0, vec![seqs(1, &[(5, 5)])]), false);
+    p.summary(&id(), heard(2, 1, 0, ask()), false);
     assert_eq!(wants(&p.poll(0)), vec![(key(2), ask())]);
     assert!(wants(&p.poll(1)).is_empty());
 }
@@ -350,7 +343,7 @@ fn an_answer_strikes_what_it_covered_and_the_next_holder_is_asked() {
     let mut p = both_hold();
     assert_eq!(wants(&p.poll(0)), vec![(key(1), ask())]);
     let answer = Frame::Held { group: id(), items: vec![], answers: Some(ask()) };
-    assert!(p.frame(&key(1), &answer, 100).is_empty());
+    p.frame(&key(1), &answer, 100);
     assert_eq!(wants(&p.poll(100)), vec![(key(2), ask())]);
 }
 
@@ -391,38 +384,24 @@ fn the_commit_wait_dials_four_holders_at_a_time() {
     p.group(id(), own(1, &[1, 2, 3, 4, 5, 6]), 0);
     let lacking = vec![seqs(1, &[(5, 9)])];
     for n in 1..=6 {
-        p.summary(&id(), heard(n, 1, 0, vec![seqs(1, &[(10 - u64::from(n), 9)])]), Some(key(n)));
+        p.summary(&id(), heard(n, 1, 0, vec![seqs(1, &[(10 - u64::from(n), 9)])]), false);
     }
     assert!(p.wait(&id(), &lacking, 0, 0));
     assert_eq!(dials(&p.poll(0)), vec![key(5), key(6), key(4), key(3)]);
 }
 
-/// A summary sent to a peer is not assumed held: a peer whose versions do not show it is sent it again.
+/// A peer that stops being served a group, and is served it again, is sent the own summary anew: what it held before
+/// is not assumed.
 #[test]
-fn a_summary_a_peer_lacks_is_sent_again() {
+fn a_peer_served_a_group_again_is_sent_the_own_summary_anew() {
     let mut p = peers();
     p.group(id(), own(1, &[1, 2]), 0);
+    p.summary(&id(), heard(100, 1, 0, vec![]), true);
     p.connect(key(1), gs(), false, 0);
-    p.poll(0);
-    assert!(p.summary(&id(), heard(100, 2, 0, vec![]), None));
-    assert_eq!(summaries_to(&p.poll(1)), vec![key(1)]);
-    let answered = p.frame(&key(1), &Frame::Versions { group: id(), versions: vec![] }, 2);
-    assert_eq!(summaries_to(&answered), vec![key(1)]);
-}
-
-/// A peer that stops being served a group, and is served it again, is sent the group's summaries anew: what it held
-/// before is not assumed.
-#[test]
-fn a_peer_served_a_group_again_is_sent_its_summaries_anew() {
-    let mut p = peers();
-    p.group(id(), own(1, &[1, 2]), 0);
-    p.connect(key(1), gs(), false, 0);
-    p.summary(&id(), heard(2, 1, 0, ask()), Some(key(2)));
-    p.poll(0);
+    assert_eq!(summaries_to(&p.poll(0)), vec![key(1)]);
     p.served(&key(1), BTreeSet::new(), 10);
     p.served(&key(1), gs(), 20);
-    let answered = p.frame(&key(1), &Frame::Versions { group: id(), versions: vec![] }, 30);
-    assert_eq!(summaries_to(&answered), vec![key(1)]);
+    assert_eq!(summaries_to(&p.poll(30)), vec![key(1)]);
 }
 
 /// Strikes last for the epoch: when it grows, the struck holder is asked again.
@@ -433,7 +412,7 @@ fn strikes_clear_when_the_epoch_grows() {
     o.wanted = ask();
     p.group(id(), o.clone(), 0);
     p.connect(key(1), gs(), false, 0);
-    p.summary(&id(), heard(1, 1, 0, ask()), Some(key(1)));
+    p.summary(&id(), heard(1, 1, 0, ask()), false);
     assert_eq!(wants(&p.poll(0)), vec![(key(1), ask())]);
     p.frame(&key(1), &Frame::Held { group: id(), items: vec![], answers: Some(ask()) }, 100);
     assert!(wants(&p.poll(100)).is_empty(), "struck");
@@ -450,7 +429,7 @@ fn an_answer_to_a_request_of_an_earlier_epoch_strikes_nothing() {
     o.wanted = ask();
     p.group(id(), o.clone(), 0);
     p.connect(key(1), gs(), false, 0);
-    p.summary(&id(), heard(1, 1, 0, ask()), Some(key(1)));
+    p.summary(&id(), heard(1, 1, 0, ask()), false);
     assert_eq!(wants(&p.poll(0)), vec![(key(1), ask())]);
     p.group(id(), Own { epoch: 2, ..o }, 50);
     p.frame(&key(1), &Frame::Held { group: id(), items: vec![], answers: Some(vec![]) }, 100);
@@ -464,7 +443,7 @@ fn a_wanted_seq_held_only_by_an_unconnected_member_is_dialed() {
     let mut o = own(1, &[1]);
     o.wanted = ask();
     p.group(id(), o, 0);
-    p.summary(&id(), heard(1, 1, 0, ask()), Some(key(1)));
+    p.summary(&id(), heard(1, 1, 0, ask()), false);
     let out = p.poll(0);
     assert_eq!(dials(&out), vec![key(1)]);
     assert!(wants(&out).is_empty());
@@ -485,7 +464,7 @@ fn wait_holds_while_a_connected_holder_is_untried() {
     p.group(id(), own(1, &[1]), 0);
     p.connect(key(1), gs(), false, 0);
     let lacking = vec![seqs(1, &[(5, 5)])];
-    p.summary(&id(), heard(1, 1, 0, lacking.clone()), Some(key(1)));
+    p.summary(&id(), heard(1, 1, 0, lacking.clone()), false);
     assert!(p.wait(&id(), &lacking, 0, 1_000));
     assert_eq!(wants(&p.poll(1_000)), vec![(key(1), lacking.clone())]);
 }
@@ -497,7 +476,7 @@ fn wait_loses_once_every_holder_is_struck() {
     p.group(id(), own(1, &[1]), 0);
     p.connect(key(1), gs(), false, 0);
     let lacking = vec![seqs(1, &[(5, 5)])];
-    p.summary(&id(), heard(1, 1, 0, lacking.clone()), Some(key(1)));
+    p.summary(&id(), heard(1, 1, 0, lacking.clone()), false);
     assert!(p.wait(&id(), &lacking, 0, 0));
     p.poll(0);
     p.frame(&key(1), &Frame::Held { group: id(), items: vec![], answers: Some(lacking.clone()) }, 100);
@@ -513,7 +492,7 @@ fn a_wait_holds_for_summaries_after_coming_online() {
     let lacking = vec![seqs(1, &[(5, 5)])];
     p.connect(key(1), gs(), false, 1_000);
     assert!(p.wait(&id(), &lacking, 0, 1_000));
-    p.summary(&id(), heard(1, 1, 1_500, lacking.clone()), Some(key(1)));
+    p.summary(&id(), heard(1, 1, 1_500, lacking.clone()), false);
     assert!(p.wait(&id(), &lacking, 0, 1_000 + HEAR), "a holder is untried");
     p.disconnect(&key(1));
     p.dialed(&key(1), false, 1_000 + HEAR);
@@ -527,7 +506,7 @@ fn wait_gives_up_two_minutes_after_the_commit_was_read() {
     p.group(id(), own(1, &[1]), 0);
     p.connect(key(1), gs(), false, 0);
     let lacking = vec![seqs(1, &[(5, 5)])];
-    p.summary(&id(), heard(1, 1, 0, lacking.clone()), Some(key(1)));
+    p.summary(&id(), heard(1, 1, 0, lacking.clone()), false);
     assert!(p.wait(&id(), &lacking, 0, WAIT - 1));
     assert!(!p.wait(&id(), &lacking, 0, WAIT));
 }
@@ -538,7 +517,7 @@ fn a_holder_past_its_backoff_is_dialed_when_the_wait_starts() {
     let mut p = peers();
     p.group(id(), own(1, &[1]), 0);
     let lacking = vec![seqs(1, &[(5, 5)])];
-    p.summary(&id(), heard(1, 1, 0, lacking.clone()), Some(key(1)));
+    p.summary(&id(), heard(1, 1, 0, lacking.clone()), false);
     p.dialed(&key(1), false, HEAR - 1);
     assert!(!p.wait(&id(), &lacking, 0, HEAR), "backing off");
     assert!(p.wait(&id(), &lacking, 31_000, 31_000));
@@ -645,15 +624,11 @@ impl Sim {
                 if !self.links.contains(&pair(from, to)) {
                     return;
                 }
-                if let Frame::Summaries { group, items } = frame {
-                    for signed in items {
-                        let summary: Summary = serde_json::from_slice(&signed.body.0).unwrap();
-                        let heard = Heard { signed, summary, at: self.now };
-                        self.peers[to].summary(&group, heard, Some(key(from as u8)));
-                    }
+                if let Frame::Summary { group, summary: signed } = frame {
+                    let summary: Summary = serde_json::from_slice(&signed.body.0).unwrap();
+                    self.peers[to].summary(&group, Heard { signed, summary, at: self.now }, false);
                 } else {
-                    let outs = self.peers[to].frame(&key(from as u8), &frame, self.now);
-                    self.act(to, outs);
+                    self.peers[to].frame(&key(from as u8), &frame, self.now);
                 }
             }
             Ev::Dialed { from, to, ok } => {
@@ -665,17 +640,20 @@ impl Sim {
         }
     }
 
+    /// Member `i` signs a new summary, and has something to push, as a member that sends.
     fn publish(&mut self, i: usize) {
         self.versions[i] += 1;
-        let summary = Summary { group: id(), member: Bytes(vec![i as u8]), joined: 0, version: self.versions[i], time: self.now, epoch: 1, relay: None, held: vec![], sealed: vec![], lost: vec![] };
+        let summary = Summary { group: id(), member: Bytes(vec![i as u8]), joined: 0, version: self.versions[i], time: self.now, epoch: 1, relay: None, held: vec![], sealed: vec![] };
         let body = serde_json::to_vec(&summary).unwrap();
         let heard = Heard { signed: Signed { body: Bytes(body), sig: Bytes(vec![]) }, summary, at: self.now };
-        self.peers[i].summary(&id(), heard, None);
+        self.peers[i].summary(&id(), heard, true);
+        self.peers[i].push(&id());
     }
 }
 
 /// Twelve members on a simulated network: for five minutes frames are delayed, reordered and lost, dials fail and links
-/// drop; then nothing is. Each member ends with every member's latest summary, within the connection cap.
+/// drop, and members send; then nothing is lost, and each sends once more. Each member ends connected, within the cap,
+/// with each neighbour's latest summary, and nothing due.
 #[test]
 fn twelve_members_converge_through_loss_and_reconnection() {
     const TICK: u64 = 250;
@@ -685,7 +663,7 @@ fn twelve_members_converge_through_loss_and_reconnection() {
     for i in 0..N {
         let members = (0..N).filter(|&j| j != i).map(|j| ((Bytes(vec![j as u8]), 0), key(j as u8))).collect();
         let own = Own { me: (Bytes(vec![i as u8]), 0), epoch: 1, log: [1; 32], head: None, earlier: vec![], members, wanted: vec![], stale: vec![] };
-        sim.peers.push(Peers::new(0, i as u64 + 1, key(i as u8)));
+        sim.peers.push(Peers::new(0, key(i as u8)));
         sim.peers[i].group(id(), own, 0);
     }
     for i in 0..N {
@@ -694,7 +672,12 @@ fn twelve_members_converge_through_loss_and_reconnection() {
     let mut now = 0;
     while now < END {
         sim.now = now;
-        sim.chaos = now < CHAOS;
+        if sim.chaos && now >= CHAOS {
+            sim.chaos = false;
+            for i in 0..N {
+                sim.publish(i);
+            }
+        }
         if sim.chaos {
             if sim.rng.below(40) == 0 {
                 let i = sim.rng.below(N as u64) as usize;
@@ -717,10 +700,12 @@ fn twelve_members_converge_through_loss_and_reconnection() {
         now += TICK;
     }
     for i in 0..N {
-        assert!(sim.peers[i].neighbours(&id()).len() <= MAX_CONNECTIONS);
-        for j in 0..N {
+        let neighbours = sim.peers[i].neighbours(&id());
+        assert!(!neighbours.is_empty() && neighbours.len() <= MAX_CONNECTIONS);
+        for j in neighbours.iter().map(|k| k[0] as usize) {
             let heard = sim.peers[i].heard(&id()).find(|h| h.summary.member == Bytes(vec![j as u8]));
-            assert_eq!(heard.map(|h| h.summary.version), Some(sim.versions[j]), "member {i} holds member {j}'s latest summary");
+            assert_eq!(heard.map(|h| h.summary.version), Some(sim.versions[j]), "member {i} holds neighbour {j}'s latest summary");
         }
+        assert!(sim.peers[i].next(now).is_none_or(|at| at > now + 60_000), "member {i} is idle");
     }
 }

@@ -44,6 +44,7 @@ impl Node {
             committing: Mutex::default(),
             advanced: tokio::sync::Notify::new(),
             heard: tokio::sync::Notify::new(),
+            poke: tokio::sync::Notify::new(),
             passing: Mutex::default(),
             timers: Mutex::default(),
             tasks: Mutex::default(),
@@ -82,7 +83,7 @@ impl State {
                 }
             }
         }
-        let peers = Peers::new(now(), u64::from_be_bytes(lmk_core::random()), *iroh_key(&provider)?.public().as_bytes());
+        let peers = Peers::new(now(), *iroh_key(&provider)?.public().as_bytes());
         let mut state = State {
             provider,
             out: Vec::new(),
@@ -93,6 +94,7 @@ impl State {
             logs,
             peers,
             gate: true,
+            quiet: false,
             home: None,
             hints,
             time: now(),

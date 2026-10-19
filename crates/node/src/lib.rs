@@ -206,6 +206,12 @@ struct Rec {
     stirred: bool,
     /// When this session last asked which members' logs their services let go, in milliseconds.
     evicted: u64,
+    /// The latest epoch this session's own commit or message showed it in, and when the group moved past it: while
+    /// it is behind, a `present` is due `PRESENT` after that.
+    present: u64,
+    passed: u64,
+    /// The seqs this session lost and has not told the group of yet.
+    lost: Vec<Seqs>,
     /// The memberships this session knows of in the group: the current ones, and those ended within H.
     authors: Vec<Author>,
     /// The messages of others its client showed that no other it showed since depends on, directly: the deps of its
@@ -221,8 +227,6 @@ struct Rec {
     signed: u64,
     /// The memberships whose summaries are saved.
     heard: Vec<(Bytes, u64)>,
-    /// The seqs members' summaries told lost, each told once: the reporter's membership, and the author's seqs.
-    told: Vec<(Bytes, u64, Seqs)>,
     /// The epochs whose ending commits are saved, with when they applied.
     commits: Vec<(u64, u64)>,
     /// The epoch this session's messages past its cut were last sealed again in.
@@ -331,6 +335,8 @@ pub(crate) struct State {
     peers: Peers,
     /// The rosters changed since the groups the gate admits each connected peer to were worked out.
     gate: bool,
+    /// The current step is the poll's own: its end wakes no poll.
+    quiet: bool,
     /// This endpoint's home relay, as net last reported it.
     home: Option<String>,
     /// Where each member last said it was, by iroh key.
@@ -385,6 +391,9 @@ impl Drop for Step<'_> {
         if !out.is_empty() || !events.is_empty() {
             self.inner.outbox.send((out, events)).ok();
         }
+        if !std::mem::take(&mut self.guard.quiet) {
+            self.inner.poke.notify_one();
+        }
     }
 }
 
@@ -424,6 +433,8 @@ pub(crate) struct Inner {
     advanced: tokio::sync::Notify,
     /// Woken whenever a peer's summary is heard.
     heard: tokio::sync::Notify,
+    /// Woken at the end of each step but the poll's own, for the poll.
+    poke: tokio::sync::Notify,
     /// The groups whose duties run, each with whether another pass is due once it ends.
     passing: Mutex<HashMap<Vec<u8>, bool>>,
     /// When each group's next timed pass of its duties is due.
@@ -511,7 +522,7 @@ impl State {
     fn add_group(&mut self, mls: Group, mut rec: Rec) -> Result<Vec<u8>> {
         let gid = mls.id().to_vec();
         let base = rec.position;
-        rec.resealed = mls.epoch();
+        (rec.resealed, rec.present) = (mls.epoch(), mls.epoch());
         let own = mls.own_index();
         rec.members = mls.members().into_iter().filter(|m| m.index != own).map(|m| (Bytes(m.key), mls.epoch())).collect();
         rec.authors = mls.cut().iter().map(|r| Author::new(r.key.clone(), r.joined, r.seq)).collect();
@@ -611,9 +622,31 @@ mod tests {
         let joined = st.group(&gid.0).unwrap().mls.joined(&member.0).expect("Alice applied Carol's Add");
         let summary = serde_json::from_value(serde_json::json!({ "group": gid, "member": member, "joined": joined, "version": 1, "time": now(), "epoch": epoch })).unwrap();
         let heard = lmk_net::peers::Heard { signed: Signed { body: Bytes(Vec::new()), sig: Bytes(Vec::new()) }, summary, at: now() };
-        assert!(st.peers.summary(&gid, heard, None));
+        assert!(st.peers.summary(&gid, heard, false));
         drop(st);
         for node in [bob, carol] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    /// Two members that chatted, once all is delivered and said, poll for nothing: no timed work is due.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_idle_session_polls_for_nothing() {
+        let relay = lmk_testing::relay().await;
+        let (alice, bob) = (node(&relay, relay.post()).await, node(&relay, relay.post()).await);
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone() };
+        let gid = alice.create(settings).unwrap();
+        bob.join(&alice.invite(&gid.0, INVITE_VALID).await.unwrap()).await.unwrap();
+        let text = serde_json::json!({ "type": "message", "content": "hi" });
+        alice.send(&gid.0, &text, None).await.unwrap();
+        let idle = |node: &Node| node.inner.lock().next_poll().is_none_or(|at| at > now() + 60_000);
+        let quiet = async {
+            while !(idle(&alice) && idle(&bob)) {
+                n0_future::time::sleep(Duration::from_millis(500)).await;
+            }
+        };
+        n0_future::time::timeout(Duration::from_secs(60), quiet).await.expect("both go idle");
+        for node in [alice, bob] {
             node.shutdown().await.unwrap();
         }
     }
