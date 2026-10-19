@@ -97,20 +97,28 @@ impl Inner {
                 Some((prev.id, prev.header.epoch))
             }
         };
-        // Replying shows what it answers, so that the deps cover it, unless prev does.
+        // Replying shows what it answers; the deps name it unless prev or one of them covers it.
         let reply_to = match reply_to {
             Some(id) => {
                 let target = st.record(gid, id)?.filter(|record| record.delivered.is_some()).context("reply_to names no message delivered here")?;
+                st.show(gid, &target)?;
                 let h = target.header;
-                if let Some(author) = st.group_mut(gid)?.author_mut(&h.author.0, h.joined).filter(|_| h.author.0 != me || h.joined != joined) {
-                    author.shown.insert(h.seq);
-                }
                 Some(Ref { key: h.author, joined: h.joined, seq: h.seq, id: target.id, epoch: h.epoch })
             }
             None => None,
         };
         let control = lmk_proto::group::Control::TYPES.contains(&lmk_proto::group::type_of(payload));
-        let deps = if control { Vec::new() } else { st.deps(gid)? };
+        let mut deps = if control { Vec::new() } else { st.deps(gid)? };
+        if let Some(r) = reply_to.as_ref().filter(|r| r.key.0 != me || r.joined != joined) {
+            match deps.iter_mut().find(|d| d.key == r.key && d.joined == r.joined) {
+                Some(d) if d.seq < r.seq => *d = r.clone(),
+                Some(_) => {}
+                None => deps.push(r.clone()),
+            }
+        }
+        if !control {
+            st.group_mut(gid)?.rec.frontier.clear();
+        }
         let header = Header {
             group: Bytes(gid.to_vec()),
             author: Bytes(me.clone()),

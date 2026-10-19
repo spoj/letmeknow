@@ -307,19 +307,44 @@ impl State {
         found.map_or_else(|| Member { key: Bytes(key.to_vec()), iroh: Bytes::default(), revision: 0 }, |m| Member::from(&m))
     }
 
-    /// The deps of a message this session sends now: per membership but its own, the highest seq its client showed, of
-    /// messages it still holds.
+    /// The deps of a message this session sends now: its frontier, of messages it still holds.
     pub(crate) fn deps(&self, gid: &[u8]) -> Result<Vec<lmk_proto::held::Ref>> {
-        let g = self.group(gid)?;
-        let me = self.me();
         let mut deps = Vec::new();
-        for author in g.rec.authors.iter().filter(|a| !(a.key.0 == me && Some(a.joined) == g.mls.joined(me))) {
-            let Some(&(_, seq)) = author.shown.ranges().last() else { continue };
-            if let Some(record) = self.record_at(gid, &author.key.0, author.joined, seq)? {
-                deps.push(lmk_proto::held::Ref { key: author.key.clone(), joined: author.joined, seq, id: record.id, epoch: record.header.epoch });
+        for r in &self.group(gid)?.rec.frontier {
+            if self.record_at(gid, &r.key.0, r.joined, r.seq)?.is_some() {
+                deps.push(r.clone());
             }
         }
         Ok(deps)
+    }
+
+    /// Marks a message its client showed: the frontier drops what it depends on, and takes it unless a message there
+    /// depends on it, as one shown late does.
+    pub(crate) fn show(&mut self, gid: &[u8], record: &Record) -> Result<()> {
+        let h = &record.header;
+        let me = self.me().to_vec();
+        let g = self.group_mut(gid)?;
+        let own = h.author.0 == me && g.mls.joined(&me) == Some(h.joined);
+        let Some(author) = g.author_mut(&h.author.0, h.joined) else { return Ok(()) };
+        author.shown.insert(h.seq);
+        if own {
+            return Ok(());
+        }
+        let covers = |by: &Header, r: &lmk_proto::held::Ref| {
+            (by.author == r.key && by.joined == r.joined && by.seq > r.seq) || by.deps.iter().any(|d| d.key == r.key && d.joined == r.joined && d.seq >= r.seq)
+        };
+        let shown = lmk_proto::held::Ref { key: h.author.clone(), joined: h.joined, seq: h.seq, id: record.id.clone(), epoch: h.epoch };
+        let mut covered = false;
+        for r in self.group(gid)?.rec.frontier.clone() {
+            let Some(by) = self.record_at(gid, &r.key.0, r.joined, r.seq)? else { continue };
+            covered |= r == shown || covers(&by.header, &shown);
+        }
+        let frontier = &mut self.group_mut(gid)?.rec.frontier;
+        frontier.retain(|r| !covers(h, r));
+        if !covered {
+            frontier.push(shown);
+        }
+        Ok(())
     }
 }
 

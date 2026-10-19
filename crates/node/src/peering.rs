@@ -582,9 +582,8 @@ impl Node {
     pub fn mark_shown(&self, gid: &[u8], ids: &[Bytes]) -> Result<()> {
         let mut st = self.inner.lock();
         for id in ids {
-            let Some(record) = st.record(gid, &id.0)? else { continue };
-            if let Some(author) = st.group_mut(gid)?.author_mut(&record.header.author.0, record.header.joined) {
-                author.shown.insert(record.header.seq);
+            if let Some(record) = st.record(gid, &id.0)? {
+                st.show(gid, &record)?;
             }
         }
         st.save(gid)

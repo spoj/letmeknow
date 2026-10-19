@@ -208,6 +208,9 @@ struct Rec {
     evicted: u64,
     /// The memberships this session knows of in the group: the current ones, and those ended within H.
     authors: Vec<Author>,
+    /// The messages of others its client showed that no other it showed since depends on, directly: the deps of its
+    /// next message.
+    frontier: Vec<lmk_proto::held::Ref>,
     /// The last delivery index given, and the first one whose message is still kept.
     index: u64,
     first: u64,

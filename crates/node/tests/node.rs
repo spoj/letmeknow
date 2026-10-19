@@ -1653,9 +1653,10 @@ fn deps_of(db: &Path, gid: &Bytes, id: &Bytes) -> Vec<lmk_proto::held::Ref> {
     serde_json::from_value(header.get("deps").cloned().unwrap_or(json!([]))).unwrap()
 }
 
-/// Three members chat in causal order. Each sender's messages come with seqs 1, 2, 3, in order. A reply's deps are the
-/// messages its sender marked shown: Bob's replies depend on Alice's first message, which it showed, and not on her
-/// second, which it received but did not show. Answering a message shows it, so the answer's deps cover it.
+/// Three members chat in causal order. Each sender's messages come with seqs 1, 2, 3, in order. A message's deps are the
+/// frontier of what its sender marked shown since its last: Bob's first depends on Alice's first message, which he
+/// showed; his second on nothing, as its prev covers that and he received her second but did not show it. Answering a
+/// message shows it, so the answer's deps cover it.
 #[tokio::test(flavor = "multi_thread")]
 async fn three_members_chat_in_causal_order() {
     let relay = relay().await;
@@ -1705,6 +1706,9 @@ async fn three_members_chat_in_causal_order() {
     assert!(index(&a1) < index(&b1) && index(&a2) < index(&a3) && index(&a3) < index(&b3), "causal order: {taken:?}");
     assert_eq!(taken.iter().find(|m| m.id == b3).unwrap().reply_to, Some(a3.clone()));
     assert!(taken.iter().all(|m| m.index >= 1 && m.missing.is_empty() && !m.late));
+    // Carol shows all six: b3 depends on a3, which follows a1 and a2, and b1 and b2 precede it.
+    carol.node.mark_shown(&gid.0, &taken.iter().map(|m| m.id.clone()).collect::<Vec<_>>()).unwrap();
+    let c1 = carol.node.send(&gid.0, &message("c1"), None).await.unwrap();
 
     // Heard, Alice sees what Bob holds.
     let alice_key = alice.node.key();
@@ -1715,9 +1719,10 @@ async fn three_members_chat_in_causal_order() {
     bob.node.shutdown().await.unwrap();
     let sent = record(&db("bob"), &gid, &a1)["header"]["epoch"].as_u64().unwrap();
     assert_eq!(deps_of(&db("bob"), &gid, &b1), [lmk_proto::held::Ref { key: alice.node.key(), joined: 0, seq: 3, id: a1.clone(), epoch: sent }]);
-    assert_eq!(deps_of(&db("bob"), &gid, &b2), deps_of(&db("bob"), &gid, &b1), "b2 depends on a1 still: a2 was not shown");
+    assert_eq!(deps_of(&db("bob"), &gid, &b2), [], "b1 covers a1, and a2 was not shown");
     assert_eq!(deps_of(&db("bob"), &gid, &b3), [lmk_proto::held::Ref { key: alice.node.key(), joined: 0, seq: 5, id: a3.clone(), epoch: sent }]);
     carol.node.shutdown().await.unwrap();
+    assert_eq!(deps_of(&db("carol"), &gid, &c1).iter().map(|r| r.id.clone()).collect::<Vec<_>>(), [b3], "c1 names only b3");
     alice.node.shutdown().await.unwrap();
 }
 
@@ -2029,7 +2034,8 @@ async fn a_removal_and_an_add_do_not_wait_for_holders() {
 }
 
 /// A chat with no update due commits nothing: messages both members hold, and sends of either, move no epoch, even at the
-/// passes their sessions run when they start 21 minutes later. Its T is so long that no update falls due.
+/// passes their sessions run when they start 21 minutes later. Its T is so long that no update falls due but the
+/// joiner's first.
 #[test]
 fn a_chat_of_held_messages_commits_nothing() {
     static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2044,9 +2050,11 @@ fn a_chat_of_held_messages_commits_nothing() {
         let mut alice = stored(&relay, &db("alice")).await;
         let mut bob = stored(&relay, &db("bob")).await;
         let gid = alice.node.create(Settings { update: u32::MAX, ..settings(&relay) }).unwrap();
+        let created = alice.node.epoch(&gid.0).unwrap();
         bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID).await.unwrap()).await.unwrap();
-        eventually("Alice has Bob's Add", || alice.node.members(&gid.0).unwrap().len() == 2).await;
-        let epoch = alice.node.epoch(&gid.0).unwrap();
+        let epoch = bob.node.epoch(&gid.0).unwrap();
+        assert_eq!(epoch, created + 2, "a joiner updates at once past its Add, whatever T");
+        eventually("Alice has Bob's Add, and his update", || alice.node.epoch(&gid.0).unwrap() == epoch).await;
         alice.node.send(&gid.0, &message("one"), None).await.unwrap();
         bob.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
         bob.node.send(&gid.0, &message("two"), None).await.unwrap();

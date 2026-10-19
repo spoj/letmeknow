@@ -45,9 +45,13 @@ pub(crate) fn next_update(updated: u64, t: u64, key: &[u8]) -> u64 {
     (updated + t - offset) / t * t + offset
 }
 
-/// When this session's update in a group is next due, if the group stirred since its last.
+/// When this session's update in a group is next due, if the group stirred since its last: at once for a joiner that has
+/// not updated yet.
 fn next(g: &G, me: &[u8]) -> u64 {
-    next_update(g.rec.updated, interval(g.mls.settings().update, g.mls.members().len()), me)
+    match g.rec.updated {
+        0 => 0,
+        updated => next_update(updated, interval(g.mls.settings().update, g.mls.members().len()), me),
+    }
 }
 
 impl State {
