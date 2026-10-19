@@ -1,7 +1,7 @@
 //! The `letmeknow` command line: `listen` runs a session process; most other commands are requests to it, over a
 //! localhost port guarded by a token.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use lmk_membership::service::Policy;
@@ -38,9 +38,6 @@ pub enum Command {
         /// Seconds a message not addressed to this session may wait for something that wakes the agent anyway
         #[arg(long, env = "LETMEKNOW_HOLD", default_value_t = 3600)]
         hold: u64,
-        /// Keep the text of messages once delivered, for audit; by default only ids, senders and references are kept
-        #[arg(long)]
-        keep_log: bool,
         /// The domain of the membership service for groups this session creates
         #[arg(long, env = "LETMEKNOW_MEMBERSHIP", default_value = lmk_proto::links::DOMAIN)]
         membership: String,
@@ -145,10 +142,56 @@ impl Serve {
     }
 }
 
-/// Requests an agent sends to its session process: the client core's, and those of its own.
+/// Requests an agent sends to its session process: JSON objects tagged by `cmd`, which are also the command line's
+/// subcommands.
 #[derive(Subcommand, Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
+    /// Make a one-time invite link, valid for 10 minutes, into a chat: a new one unless --group is given
+    #[command(display_order = 10)]
+    Invite {
+        #[arg(long)]
+        group: Option<String>,
+        /// Days members carry a new group's messages for one another
+        #[arg(long, default_value_t = 7, conflicts_with = "group")]
+        #[serde(default = "carry")]
+        carry: u32,
+    },
+    /// Join a group through an invite link
+    #[command(display_order = 11)]
+    Join { target: String },
+    /// List members of a group
+    #[command(display_order = 14)]
+    Members {
+        #[arg(long)]
+        group: Option<String>,
+    },
+    /// List this session's groups
+    #[command(display_order = 15)]
+    Groups,
+    /// Remove a member, by fingerprint, from a group
+    #[command(display_order = 16)]
+    Remove {
+        #[arg(long)]
+        group: Option<String>,
+        member: String,
+    },
+    /// Leave a group; with --end, end it for everyone: remove the other members, and leave
+    #[command(display_order = 17)]
+    Leave {
+        #[arg(long)]
+        group: Option<String>,
+        #[arg(long)]
+        #[serde(default)]
+        end: bool,
+    },
+    /// The members online in each group, and what only this session holds
+    #[command(display_order = 21)]
+    Status {
+        /// Only this group
+        #[arg(long)]
+        group: Option<String>,
+    },
     /// Send a message in a chat ("-" reads the text from stdin)
     #[command(display_order = 12)]
     Send {
@@ -172,19 +215,16 @@ pub enum Request {
         attach_name: String,
         text: String,
     },
-    /// Show a chat message: of your own, who holds and who was shown it
+    /// Show a chat message
     #[command(display_order = 13)]
     Read {
         /// Its id, or any unique beginning of it
         id: String,
     },
-    /// `status --group <group>`: the client's `status`, of that group only.
-    #[command(skip)]
-    #[serde(skip)]
-    Status { group: String },
-    #[command(flatten)]
-    #[serde(untagged)]
-    Client(crate::client::Request),
+}
+
+fn carry() -> u32 {
+    7
 }
 
 /// Where a running session process accepts requests: a localhost port guarded by a token.
@@ -200,23 +240,9 @@ struct Call {
     request: Request,
 }
 
-/// Parses a command line. `status --group` is this command line's, beside the client core's commands.
+/// Parses a command line.
 pub fn parse<T: Into<OsString> + Clone>(args: impl IntoIterator<Item = T>) -> Result<Cli, clap::Error> {
-    let group = clap::Arg::new("group").long("group").value_name("GROUP").help("Only this group");
-    let command = Cli::command().mut_subcommand("status", |status| status.arg(group));
-    let mut matches = hyphens(command).try_get_matches_from(args)?;
-    let request = match matches.subcommand() {
-        Some(("status", status)) => status.get_one::<String>("group").map(|group| Request::Status { group: group.clone() }),
-        _ => None,
-    };
-    match request {
-        Some(request) => Ok(Cli {
-            session: matches.get_one::<String>("session").cloned(),
-            home: matches.get_one::<PathBuf>("home").cloned(),
-            command: Command::Request(request),
-        }),
-        None => Cli::from_arg_matches_mut(&mut matches),
-    }
+    Cli::from_arg_matches_mut(&mut hyphens(Cli::command()).try_get_matches_from(args)?)
 }
 
 /// Lets every value start with '-', as ids and fingerprints in base64url do, and text may. Known flags stay flags.
@@ -317,11 +343,6 @@ async fn answer(stream: TcpStream, token: String, inbound: mpsc::UnboundedSender
 /// Sends a request to the running session and returns its answer: made short, but for `members`. Files the request
 /// names are read here: the session process runs elsewhere.
 pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Value> {
-    let mut only = None;
-    if let Request::Status { group } = request {
-        only = Some(group);
-        request = Request::Client(crate::client::Request::Status);
-    }
     if let Request::Send { text, attach, attach_name, .. } = &mut request {
         if let Some(file) = attach {
             let (bytes, name) = match file.as_str() {
@@ -343,20 +364,11 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
             std::io::stdin().read_to_string(text)?;
         }
     }
-    let full = matches!(request, Request::Client(crate::client::Request::Members { .. }));
+    let full = matches!(request, Request::Members { .. });
     let channel = connect(&session_dir(home, session)?.join("endpoint"))
         .await
         .with_context(|| format!("session {session} is not running; start it with `letmeknow --session {session} listen`"))?;
     let mut answer = exchange(channel, request).await?;
-    if let Some(group) = only {
-        let groups = answer["groups"].as_array_mut().context("status lists groups")?;
-        groups.retain(|g| g["group"] == group.as_str());
-        ensure!(groups.len() == 1, "unknown group {group}");
-        // The warning counts the sends held only here in every group.
-        if groups[0]["only_here"] == json!([]) {
-            answer.as_object_mut().context("status is an object")?.remove("warning");
-        }
-    }
     if !full {
         crate::short::compact(&mut answer);
     }

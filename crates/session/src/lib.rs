@@ -1,5 +1,4 @@
 pub mod cli;
-pub mod client;
 pub mod policy;
 pub mod session;
 pub mod short;
@@ -32,6 +31,24 @@ const RETRY: Duration = Duration::from_secs(60);
 
 /// The skill text for agents.
 pub const SKILL: &str = include_str!("../../../SKILL.md");
+
+pub fn message_id(hex_id: &str) -> Result<[u8; 32]> {
+    hex::decode(hex_id).ok().and_then(|id| id.try_into().ok()).with_context(|| format!("{hex_id} is not a message id"))
+}
+
+/// letmeknow.dev's membership service.
+pub fn letmeknow_dev() -> Service {
+    let key = hex::decode(MEMBERSHIP_KEY).unwrap();
+    Service::Serve { key: Bytes(key), domain: DOMAIN.into(), rest: Default::default() }
+}
+
+/// How a member shows: this session as "you", another by its fingerprint.
+pub fn shown(member: &Value) -> String {
+    if member["you"] == true {
+        return "you".into();
+    }
+    member["fp"].as_str().unwrap_or_default().into()
+}
 
 pub async fn serve(serve: cli::Serve) -> Result<()> {
     let policy = serve.policy();

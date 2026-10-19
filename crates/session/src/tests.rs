@@ -108,7 +108,6 @@ impl World {
             handle: handle.into(),
             dir: session_dir(&self.root.path().join(home), handle).unwrap(),
             hold: HOUR,
-            keep_log: false,
             membership: self.domain.clone(),
         }
     }
@@ -647,8 +646,8 @@ fn a_session_goes_on_while_a_join_waits() {
         let mut invite = lmk_proto::links::Invite::parse(&link).unwrap();
         invite.members[0] = *iroh::SecretKey::generate().public().as_bytes();
         let (home, handle) = (bob.home.clone(), bob.handle.clone());
-        let join = crate::client::Request::Join { target: invite.link() };
-        let joining = tokio::task::spawn_local(async move { crate::cli::call(&home, &handle, Request::Client(join)).await });
+        let join = Request::Join { target: invite.link() };
+        let joining = tokio::task::spawn_local(async move { crate::cli::call(&home, &handle, join).await });
         tokio::time::sleep(Duration::from_millis(500)).await;
         let started = std::time::Instant::now();
         bob.cmd(&["status"]).await.unwrap();

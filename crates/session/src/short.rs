@@ -1,6 +1,6 @@
 //! What the agent reads, made short: it pays for every character.
 
-use crate::client::shown;
+use crate::shown;
 use serde_json::Value;
 
 /// How many characters of a message id show; commands take any unique beginning of one.
@@ -13,7 +13,7 @@ pub fn compact(value: &mut Value) {
     match value {
         Value::Object(map) if map.contains_key("fp") => *value = Value::String(shown(value)),
         Value::Object(map) => {
-            if map.get("membership").is_some_and(|service| *service == serde_json::json!(crate::client::letmeknow_dev())) {
+            if map.get("membership").is_some_and(|service| *service == serde_json::json!(crate::letmeknow_dev())) {
                 map.remove("membership");
             }
             for (key, v) in map.iter_mut() {
@@ -80,7 +80,7 @@ mod tests {
             "content": "hi \"there\"",
             "ids": ["b".repeat(64)],
             "carry": false,
-            "membership": crate::client::letmeknow_dev(),
+            "membership": crate::letmeknow_dev(),
         });
         compact(&mut item);
         assert_eq!(
