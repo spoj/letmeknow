@@ -256,7 +256,10 @@ async fn a_committer_stopped_once_its_add_is_logged_answers_the_retry_with_it() 
         tokio::spawn(async move { node.join(&link).await })
     };
     assert_eq!(tokio::time::timeout(WAIT, joining).await.unwrap().unwrap().unwrap().0, gid);
-    assert_eq!(alice.node.epoch(&gid.0).unwrap(), epoch + 1, "the retry got the logged Add, not another");
+    // Bob commits his first update at once: once Alice reads it, the group stands at the logged Add's epoch and his.
+    eventually("Bob's first update lands", || bob.node.epoch(&gid.0).unwrap() >= epoch + 2).await;
+    alice.node.read_group(&gid.0).await.unwrap();
+    assert_eq!(alice.node.epoch(&gid.0).unwrap(), epoch + 2, "the retry got the logged Add, not another");
     alice.node.shutdown().await.unwrap();
     bob.node.shutdown().await.unwrap();
 }
