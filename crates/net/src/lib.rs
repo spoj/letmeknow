@@ -114,7 +114,8 @@ impl Net {
     }
 
     /// Connects to a member, unless already connected: at the `hint` relays, or if that takes over 2 s, at those and the
-    /// `fallback` relays, giving up 5 s later. The fallback is resolved from the start, and awaited once the 2 s are up.
+    /// `fallback` relays, giving up when iroh's handshake does, 30 s later. The fallback is resolved from the start, and
+    /// awaited once the 2 s are up.
     pub async fn dial(&self, key: EndpointId, hint: Vec<RelayUrl>, fallback: BoxFuture<Vec<RelayUrl>>) -> Result<()> {
         self.inner.connection(key, hint, fallback).await?;
         Ok(())
