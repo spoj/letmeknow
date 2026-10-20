@@ -680,6 +680,8 @@ pub async fn run(
         }
     }
     session.running.shutdown().await;
+    // Its groups as it stops, which `listen` reads.
+    session.publish();
     session.shutdown().await;
     Ok(())
 }

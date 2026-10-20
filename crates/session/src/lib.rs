@@ -210,7 +210,8 @@ async fn own_directory(home: &Path, network: &Network, domain: &str) -> Result<D
     Ok(directory)
 }
 
-/// Runs a session process until `shutdown`: opens its command channel and its node.
+/// Runs a session process until `shutdown`: opens its command channel and its node. A session that stops in no group is
+/// deleted.
 pub async fn listen(
     config: session::Config,
     home: &Path,
@@ -245,7 +246,7 @@ pub async fn listen(
     let provider = SqliteProvider::open(&config.dir.join("session.db"))?;
     let node_config = lmk_node::Config { home: config.membership.clone(), post: network.post.clone(), ca: network.ca.clone() };
     let (node, events) = Node::start(provider, node_config.clone()).await?;
-    let handle = config.handle.clone();
+    let (handle, dir) = (config.handle.clone(), config.dir.clone());
     let mut session = session::Session::open(config, db, node.clone(), held, membership).await?;
     let joined = node.groups();
     let mut missing = Vec::new();
@@ -255,7 +256,12 @@ pub async fn listen(
     if !missing.is_empty() {
         session.start(join_auto(home.to_owned(), handle, node_config, node, missing));
     }
-    session::run(session, queue, events, print, shutdown).await
+    session::run(session, queue, events, print, shutdown).await?;
+    // A session that stops in no group leaves nothing behind.
+    if serde_json::from_slice::<Vec<String>>(&std::fs::read(dir.join("groups.json"))?)?.is_empty() {
+        std::fs::remove_dir_all(&dir)?;
+    }
+    Ok(())
 }
 
 fn b64(bytes: &[u8]) -> String {

@@ -598,12 +598,14 @@ fn a_session_stops_once_it_cannot_print_and_prints_the_rest_when_started_again()
     });
 }
 
-/// `sessions` lists this machine's sessions, each with its fingerprint, its group ids and whether it runs.
+/// `sessions` lists this machine's sessions, each with its fingerprint, its group ids and whether it runs. One that
+/// stopped in no group is gone.
 #[test]
 fn sessions_lists_this_machines_sessions_running_or_stopped() {
     local(async {
         let world = world("sessions").await;
         let (alice, mut bob, group) = pair(&world, HOUR).await;
+        world.start_in("bob", "lone", HOUR).await.stop().await;
         let mut desk = world.start_in("bob", "desk", HOUR).await;
         let invite = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap();
         desk.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
