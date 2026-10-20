@@ -1521,8 +1521,9 @@ async fn past_a_full_mesh_a_large_message_is_announced_and_fetched() {
     eventually("Sam has eight members", || sam.node.members(&gid.0).unwrap().len() == 8).await;
     let mut quinn = hand(&relay, keys[0].clone(), &alice.node).await;
     let mut rita = hand(&relay, keys[1].clone(), &sam.node).await;
-    let reached = |node: &Node, key: &iroh::SecretKey| node.connected(&gid.0).unwrap().iter().any(|m| m.iroh.0 == key.public().as_bytes());
-    eventually("Alice reaches Quinn, and Sam Rita", || reached(&alice.node, &keys[0]) && reached(&sam.node, &keys[1])).await;
+    // An answer shows the node took the hand's connection, which it serves the group from then on.
+    quinn.settle(&gid).await;
+    rita.settle(&gid).await;
 
     sam.node.send(&gid.0, &message("small"), None).await.unwrap();
     let large = sam.node.send(&gid.0, &message(&"L".repeat(LARGE)), None).await.unwrap();
