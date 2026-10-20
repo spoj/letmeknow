@@ -30,6 +30,9 @@ const FETCH: Duration = Duration::from_secs(5);
 const IDLE: Duration = Duration::from_secs(140);
 /// How long a domain whose last fetch failed, or is still under way, is not fetched again.
 const RETRY: Duration = Duration::from_secs(60);
+/// How long a stopped session started to invite a new one of its home has to catch up with its group first: the group
+/// may have moved many epochs on while it was stopped, more than a send waits to read.
+const CATCH_UP: Duration = Duration::from_secs(60);
 
 /// The skill text for agents.
 pub const SKILL: &str = include_str!("../../../SKILL.md");
@@ -339,7 +342,8 @@ fn members_of(home: &Path, group: &str, me: &str) -> Vec<String> {
 }
 
 /// Joins each group of the auto list that this session is not in, by an invite from a session of the home in it: a
-/// running one, or else a stopped one whose node alone runs here meanwhile, so that what it has not shown stays unshown.
+/// running one, or else a stopped one whose node alone runs here meanwhile, so that what it has not shown stays unshown,
+/// and which catches up with the group first.
 /// A group no session of the home is in any longer leaves the list. Answers what it warns of.
 async fn join_auto(home: PathBuf, me: String, config: lmk_node::Config, node: Node, groups: Vec<String>) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
@@ -425,6 +429,7 @@ async fn join_by_sibling(home: &Path, config: &lmk_node::Config, node: &Node, gr
         let (sibling, _events) = Node::start(SqliteProvider::open(&dir.join("session.db"))?, config.clone()).await?;
         let joined = async {
             let gid = sibling.groups().into_iter().find(|gid| b64(&gid.0) == group).context("the session left the group")?;
+            tokio::time::timeout(CATCH_UP, sibling.caught_up(&gid.0)).await.context("the session did not catch up with the group")??;
             let invite = sibling.invite(&gid.0, lmk_node::INVITE_VALID, None).await?;
             node.join(&invite).await
         };

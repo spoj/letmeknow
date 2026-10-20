@@ -841,6 +841,49 @@ fn a_new_session_joins_the_auto_groups_of_its_home() {
     });
 }
 
+/// A stopped session of the home that the group moved past while it was stopped catches up with the group before it
+/// invites a new session, however longer than a send waits its reading takes.
+#[test]
+fn a_new_session_joins_an_auto_group_through_a_stopped_one_the_group_moved_past() {
+    local(async {
+        let mut world = world("auto-behind").await;
+        let home = world.root.path().join("h");
+        let mut alice = world.start_in("h", "alice", HOUR).await;
+        let invite = alice.cmd(&["invite"]).await.unwrap();
+        let group = invite["group"].as_str().unwrap().to_owned();
+        crate::change_auto(&home, false, Some(crate::cli::Auto::Add { group: group.clone() })).unwrap();
+        let bob = world.start("bob", HOUR).await;
+        bob.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
+        let mut carol = world.start("carol", HOUR).await;
+        carol.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
+        alice.stop().await;
+        bob.cmd(&["remove", &carol.fp]).await.unwrap();
+        carol.stop().await;
+
+        let fast = world.network.post.clone();
+        world.network.post = Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| -> BoxFuture<Result<Vec<u8>>> {
+            let answer = fast(domain, route, body);
+            Box::pin(async move {
+                if route == "/membership/5/read" {
+                    tokio::time::sleep(Duration::from_secs(6)).await;
+                }
+                answer.await
+            })
+        });
+        let dave = world.start_in("h", "dave", HOUR).await;
+        let members = async {
+            loop {
+                if let Ok(members) = dave.cmd(&["members"]).await {
+                    return members;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        };
+        let members = tokio::time::timeout(2 * WAIT, members).await.expect("Dave joins through Alice, stopped");
+        assert_eq!(members["members"].as_array().unwrap().len(), 3);
+    });
+}
+
 /// One session of a home at a time represents it in a group of its autorep list: the first to start, and as that one
 /// stops, one of those running then. It joins the group through a session of the home in it, and removes the home's
 /// stopped sessions from it. A group added to one list leaves the other.

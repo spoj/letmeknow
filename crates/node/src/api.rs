@@ -148,6 +148,11 @@ impl Node {
         Ok(())
     }
 
+    /// Waits until this session has read the group's logs on to their heads, through each epoch a commit moves it to.
+    pub async fn caught_up(&self, gid: &[u8]) -> Result<()> {
+        self.inner.caught_up(gid).await
+    }
+
     /// Asks the services whether the logs the group's members are behind in were let go, as a commit does first.
     pub async fn ask_behind(&self, gid: &[u8]) -> Result<()> {
         self.inner.ask_behind(gid).await
