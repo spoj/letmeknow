@@ -131,7 +131,7 @@ impl World {
         });
         let mut agent = Agent { handle, home, fp: String::new(), events, stop: Some(stop), done: Some(done), ready: Value::Null };
         let ready = agent.expect("ready").await;
-        assert!(keys(&ready).is_superset(&keys(&json!({ "type": 0, "session": 0, "fp": 0, "bin": 0, "membership": 0 }))), "{ready}");
+        assert!(keys(&ready).is_superset(&keys(&json!({ "type": 0, "handle": 0, "fp": 0, "bin": 0, "membership": 0 }))), "{ready}");
         agent.fp = ready["fp"].as_str().unwrap().into();
         agent.ready = ready;
         agent
@@ -215,12 +215,13 @@ async fn pair(world: &World, hold: Duration) -> (Agent, Agent, String) {
     let mut alice = world.start("alice", hold).await;
     let bob = world.start("bob", hold).await;
     let invite = alice.cmd(&["invite"]).await.unwrap();
-    assert_eq!(keys(&invite), keys(&json!({ "link": 0, "group": 0, "expires_in": 0 })));
+    assert_eq!(keys(&invite), keys(&json!({ "link": 0, "group": 0, "expires": 0, "via": 0 })));
+    assert_eq!(invite["via"], json!(["you"]));
     let link = invite["link"].as_str().unwrap();
     assert!(link.starts_with("https://letmeknow.dev/i#12."));
     let joined = bob.cmd(&["join", link]).await.unwrap();
     assert_eq!(joined["group"], invite["group"]);
-    assert_eq!(joined["members"].as_array().unwrap().len(), 2);
+    assert_eq!(joined["members"].as_array().unwrap().len() + joined["offline"].as_u64().unwrap_or(0) as usize, 2);
     let event = alice.told(&["joined"]).await;
     assert_eq!((&event["member"], &event["by"]), (&json!(bob.fp), &json!("you")));
     (alice, bob, invite["group"].as_str().unwrap().to_owned())
@@ -237,9 +238,9 @@ fn messages_that_do_not_concern_a_session_wait_for_one_that_does() {
         bob.cmd(&["send", "--to", &alice.fp, "can you deploy?"]).await.unwrap();
         let first = alice.expect("message").await;
         let second = alice.expect("message").await;
-        assert_eq!((first["content"].as_str(), first.get("direct")), (Some("the build is green"), None));
-        assert_eq!((second["content"].as_str(), second["direct"].as_bool()), (Some("can you deploy?"), Some(true)));
-        assert_eq!(keys(&second), keys(&json!({ "type": 0, "group": 0, "id": 0, "seq": 0, "from": 0, "to": 0, "direct": 0, "content": 0, "sent_at": 0 })));
+        assert_eq!((first["content"].as_str(), first.get("to")), (Some("the build is green"), None));
+        assert_eq!((second["content"].as_str(), &second["to"]), (Some("can you deploy?"), &json!(["you"])));
+        assert_eq!(keys(&second), keys(&json!({ "type": 0, "group": 0, "id": 0, "seq": 0, "from": 0, "to": 0, "content": 0, "sent_at": 0 })));
         assert_eq!(second["seq"].as_u64(), first["seq"].as_u64().map(|s| s + 1), "in order");
         assert_eq!((second["group"].as_str(), second["id"].as_str().unwrap().len()), (Some(group.as_str()), crate::short::ID));
         assert_eq!(second["from"], bob.fp);
@@ -250,7 +251,7 @@ fn messages_that_do_not_concern_a_session_wait_for_one_that_does() {
         assert_eq!(reply["reply_to"], id);
         // Shown text is forgotten.
         let read = alice.cmd(&["read", id]).await.unwrap();
-        assert!(read["content"].is_null());
+        assert_eq!((&read["content"], &read["shown"]), (&Value::Null, &json!(true)));
     });
 }
 
@@ -277,19 +278,25 @@ fn send_answers_its_id_and_refuses_a_message_too_large() {
         let big = "x".repeat(16 << 20);
         let refused = alice.cmd(&["send", "--to", &bob.fp, &big]).await.unwrap_err().to_string();
         assert!(refused.contains("members take"), "{refused}");
+        let stopping = lmk_node::now();
         bob.stop().await;
         let before = lmk_node::now();
         let sent = alice.cmd(&["send", "--urgent", "anyone?"]).await.unwrap();
         assert!(sent["id"].is_string() && sent.get("pos").is_none(), "{sent}");
-        // Alice finds out that Bob's connection closed once his close reaches her.
-        let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["connected"].is_null()).await;
-        assert!(status["groups"][0]["connected"].is_null(), "{status}");
+        // Alice finds out that Bob's connection closed once his close reaches her: he was online until then.
+        let offline = |members: &Value| members["offline"] == 1;
+        let members = until(|| async { alice.cmd(&["members"]).await.unwrap() }, offline).await;
+        assert!(offline(&members), "{members}");
+        let all = alice.cmd(&["members", "--all"]).await.unwrap();
+        let last_seen = all["members"].as_array().unwrap().iter().find(|m| m["fp"] == bob.fp).unwrap()["last_seen"].clone();
+        assert!(last_seen.as_str().is_some_and(|at| crate::short::iso(stopping).as_str() <= at), "{all}");
         // Once Bob is back, he takes it.
         let mut bob = world.start("bob", HOUR).await;
         let message = bob.expect("message").await;
         assert_eq!((message["id"].as_str(), message["content"].as_str()), (sent["id"].as_str(), Some("anyone?")));
-        let sent_at = message["sent_at"].as_u64().unwrap();
-        assert!(before <= sent_at && sent_at < lmk_node::now(), "it tells when it was sent, not when it arrived");
+        let sent_at = message["sent_at"].as_str().unwrap();
+        let (sent, now) = (crate::short::iso(before), crate::short::iso(lmk_node::now()));
+        assert!(sent.as_str() <= sent_at && sent_at <= now.as_str(), "it tells when it was sent, not when it arrived");
     });
 }
 
@@ -322,7 +329,7 @@ fn membership_changes_are_told_and_a_removed_session_learns_it() {
     local(async {
         let world = world("remove").await;
         let (mut alice, mut bob, group) = pair(&world, HOUR).await;
-        let members = bob.cmd(&["members", "--group", &group[..6]]).await.unwrap();
+        let members = bob.cmd(&["members", "--all", "--group", &group[..6]]).await.unwrap();
         assert_eq!(members["members"][0]["fp"], alice.fp);
         assert_eq!(members["members"][1], json!({ "fp": bob.fp, "you": true }));
         let other = alice.cmd(&["invite"]).await.unwrap()["group"].as_str().unwrap().to_owned();
@@ -336,7 +343,7 @@ fn membership_changes_are_told_and_a_removed_session_learns_it() {
         assert_eq!(alice.told(&["left"]).await["member"], bob.fp);
         let removed = bob.told(&["removed"]).await;
         assert_eq!((&removed["group"], &removed["by"]), (&json!(group), &json!(alice.fp)));
-        assert_eq!(bob.cmd(&["groups"]).await.unwrap(), json!([]));
+        assert_eq!(bob.cmd(&["groups"]).await.unwrap(), json!({}), "no groups");
     });
 }
 
@@ -369,7 +376,7 @@ fn a_leaving_member_is_removed_by_another() {
         let world = world("leave").await;
         let (mut alice, mut bob, _) = pair(&world, HOUR).await;
         let left = bob.cmd(&["leave"]).await.unwrap();
-        assert_eq!(left["left"], true);
+        assert_eq!(left["pending"], true);
         assert_eq!(alice.told(&["left"]).await["member"], bob.fp);
         bob.told(&["removed"]).await;
     });
@@ -433,10 +440,9 @@ fn status_lists_sends_held_only_here() {
         let sent = alice.cmd(&["send", "anyone?"]).await.unwrap();
         let status = alice.cmd(&["status"]).await.unwrap();
         assert_eq!(status["groups"][0]["only_here"], json!([{ "what": "message", "id": sent["id"] }]));
-        assert!(status["warning"].is_string());
         let _bob = world.start("bob", HOUR).await;
         let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["only_here"].is_null()).await;
-        assert!(status["groups"][0]["only_here"].is_null() && status.get("warning").is_none(), "Bob holds it: {status}");
+        assert!(status["groups"][0]["only_here"].is_null(), "Bob holds it: {status}");
     });
 }
 
@@ -447,7 +453,7 @@ fn a_leave_is_pending_until_another_member_removes_the_session() {
         let (mut alice, mut bob, _) = pair(&world, HOUR).await;
         alice.stop().await;
         let left = bob.cmd(&["leave"]).await.unwrap();
-        assert_eq!((&left["left"], &left["pending"]), (&json!(true), &json!(true)), "{left}");
+        assert_eq!(left, json!({ "group": left["group"], "pending": true }));
         let _alice = world.start("alice", HOUR).await;
         assert_eq!(bob.told(&["removed"]).await["type"], "removed");
     });
@@ -531,7 +537,7 @@ fn a_restarted_session_takes_in_what_it_missed_in_delivery_order() {
         }
         assert_eq!(got, [first["id"].clone(), second["id"].clone()]);
         let groups = alice.cmd(&["groups"]).await.unwrap();
-        assert_eq!(groups[0]["group"], group);
+        assert_eq!(groups["groups"][0]["group"], group);
     });
 }
 
@@ -544,8 +550,8 @@ fn a_group_ended_for_everyone_keeps_no_member() {
         let ended = alice.cmd(&["leave", "--end"]).await.unwrap();
         assert_eq!((ended["ended"].as_bool(), ended.get("pending")), (Some(true), None), "{ended}");
         assert_eq!(bob.told(&["removed"]).await["by"], alice.fp);
-        assert_eq!(alice.cmd(&["groups"]).await.unwrap(), json!([]));
-        assert_eq!(bob.cmd(&["groups"]).await.unwrap(), json!([]));
+        assert_eq!(alice.cmd(&["groups"]).await.unwrap(), json!({}), "no groups");
+        assert_eq!(bob.cmd(&["groups"]).await.unwrap(), json!({}), "no groups");
     });
 }
 
@@ -610,10 +616,16 @@ fn sessions_lists_this_machines_sessions_running_or_stopped() {
         let invite = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap();
         desk.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
         let desk_fp = desk.fp.clone();
-        let listed = |desk: bool| json!({ "sessions": [
-            { "handle": "bob", "fp": bob.fp, "running": true, "groups": [group] },
-            { "handle": "desk", "fp": desk_fp, "running": desk, "groups": [group] },
-        ] });
+        let listed = |desk: bool| {
+            let mut listed = json!({ "sessions": [
+                { "handle": "bob", "fp": bob.fp, "running": true, "groups": [group] },
+                { "handle": "desk", "fp": desk_fp, "groups": [group] },
+            ] });
+            if desk {
+                listed["sessions"][1]["running"] = json!(true);
+            }
+            listed
+        };
         let running = until(|| async { crate::sessions(&bob.home).await.unwrap() }, |running| *running == listed(true)).await;
         assert_eq!(running, listed(true));
         desk.stop().await;
@@ -794,7 +806,7 @@ async fn lookups_during_a_fetch_do_not_start_another() {
 
 /// A group on a home's auto list is joined by each new session of the home as it starts: through a running session of
 /// the home in it, or else through a stopped one, whose node alone runs meanwhile, past one the group removed while it
-/// was stopped. A group no session of the home is in leaves the list.
+/// was stopped. A group no session of the home is in leaves the list, and the home's stopped sessions in no group go.
 #[test]
 fn a_new_session_joins_the_auto_groups_of_its_home() {
     local(async {
@@ -803,13 +815,13 @@ fn a_new_session_joins_the_auto_groups_of_its_home() {
         let mut alice = world.start_in("h", "alice", HOUR).await;
         let group = alice.cmd(&["invite"]).await.unwrap()["group"].as_str().unwrap().to_owned();
         let added = crate::change_auto(&home, false, Some(crate::cli::Auto::Add { group: group[..6].into() })).unwrap();
-        assert_eq!(added, json!({ "groups": [group] }));
+        assert_eq!(added, json!({ "auto": [group] }));
         assert!(crate::change_auto(&home, false, Some(crate::cli::Auto::Add { group: "nope".into() })).unwrap_err().to_string().contains("no session of this home is in nope"));
 
         let bob = world.start_in("h", "bob", HOUR).await;
         let joined = alice.told(&["joined"]).await;
         assert_eq!(joined["member"], json!(bob.fp));
-        assert_eq!(bob.cmd(&["groups"]).await.unwrap()[0]["group"], json!(group));
+        assert_eq!(bob.cmd(&["groups"]).await.unwrap()["groups"][0]["group"], json!(group));
 
         let mut bob = bob;
         alice.stop().await;
@@ -818,7 +830,7 @@ fn a_new_session_joins_the_auto_groups_of_its_home() {
         let carol = world.start_in("h", "carol", HOUR).await;
         let members = async {
             loop {
-                if let Ok(members) = carol.cmd(&["members"]).await {
+                if let Ok(members) = carol.cmd(&["members", "--all"]).await {
                     return members;
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -837,7 +849,10 @@ fn a_new_session_joins_the_auto_groups_of_its_home() {
         let mut dave = world.start_in("h", "dave", HOUR).await;
         let warning = dave.expect("warning").await;
         assert!(warning["text"].as_str().unwrap().contains("leaves the list"), "{warning}");
-        assert_eq!(crate::change_auto(&home, false, None).unwrap(), json!({ "groups": [] }));
+        for gone in ["alice", "bob"] {
+            assert!(!session_dir(&home, gone).unwrap().exists(), "{gone}, stopped in no group, is deleted as Dave starts");
+        }
+        assert_eq!(crate::change_auto(&home, false, None).unwrap(), json!({ "auto": [] }));
     });
 }
 
@@ -873,7 +888,7 @@ fn a_new_session_joins_an_auto_group_through_a_stopped_one_the_group_moved_past(
         let dave = world.start_in("h", "dave", HOUR).await;
         let members = async {
             loop {
-                if let Ok(members) = dave.cmd(&["members"]).await {
+                if let Ok(members) = dave.cmd(&["members", "--all"]).await {
                     return members;
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -899,8 +914,8 @@ fn one_session_of_a_home_at_a_time_represents_it_in_an_autorep_group() {
         dave.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
         crate::change_auto(&home, false, Some(crate::cli::Auto::Add { group: group.clone() })).unwrap();
         let added = crate::change_auto(&home, true, Some(crate::cli::Auto::Add { group: group.clone() })).unwrap();
-        assert_eq!(added, json!({ "groups": [group] }));
-        assert_eq!(crate::change_auto(&home, false, None).unwrap(), json!({ "groups": [] }), "a group added to one list leaves the other");
+        assert_eq!(added, json!({ "autorep": [group] }));
+        assert_eq!(crate::change_auto(&home, false, None).unwrap(), json!({ "auto": [] }), "a group added to one list leaves the other");
 
         // Bob, the first to start since, joins through Alice, who started before.
         let mut bob = world.start_in("h", "bob", HOUR).await;
@@ -918,8 +933,10 @@ fn one_session_of_a_home_at_a_time_represents_it_in_an_autorep_group() {
             let left = dave.told(&["left"]).await;
             assert_eq!((&left["member"], &left["by"]), (&json!(removed), &json!(carol.fp)));
         }
-        assert_eq!(dave.cmd(&["members"]).await.unwrap()["members"], json!([{ "fp": dave.fp, "you": true }, { "fp": carol.fp }]));
-        let out = |sessions: &Value| sessions["sessions"].as_array().unwrap().iter().all(|s| s["handle"] == "carol" || s["groups"] == json!([]));
+        let members = dave.cmd(&["members", "--all"]).await.unwrap();
+        let fps: Vec<&Value> = members["members"].as_array().unwrap().iter().map(|m| &m["fp"]).collect();
+        assert_eq!(fps, [&json!(dave.fp), &json!(carol.fp)]);
+        let out = |sessions: &Value| sessions["sessions"].as_array().unwrap().iter().all(|s| s["handle"] == "carol" || s["groups"].is_null());
         let sessions = until(|| async { crate::sessions(&home).await.unwrap() }, out).await;
         assert!(out(&sessions), "Alice's and Bob's groups no longer name the group: {sessions}");
     });
@@ -938,7 +955,7 @@ fn an_invite_for_a_member_admits_only_that_member() {
 
         assert!(alice.cmd(&["invite", "--for", "nope"]).await.unwrap_err().to_string().contains("no known member"));
         assert!(alice.cmd(&["invite", "--group", &group, "--for", &bob.fp[..8]]).await.unwrap_err().to_string().contains("is a member of"));
-        assert_eq!(alice.cmd(&["groups"]).await.unwrap().as_array().unwrap().len(), 1, "a failed invite creates no group");
+        assert_eq!(alice.cmd(&["groups"]).await.unwrap()["groups"].as_array().unwrap().len(), 1, "a failed invite creates no group");
 
         let breakout = alice.cmd(&["invite", "--for", &bob.fp[..8]]).await.unwrap();
         assert_eq!(breakout["for"], bob.fp);

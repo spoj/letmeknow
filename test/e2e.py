@@ -133,13 +133,13 @@ def main():
         invite = run("alice", "invite")
         check(invite["link"].startswith("https://letmeknow.dev/i#12."), "invite gives a link to a new chat")
         group = invite["group"]
-        check("serve" in run("alice", "groups")[0]["membership"], "its log is on the local letmeknow serve")
+        check("serve" in run("alice", "groups")["groups"][0]["membership"], "its log is on the local letmeknow serve")
         joined = run("bob", "join", invite["link"])
-        check(joined["group"] == group and len(joined["members"]) == 2, "bob joins through the link")
+        check(joined["group"] == group and len(joined["members"]) + joined.get("offline", 0) == 2, "bob joins through the link")
         event = alice.expect("joined")
         check(event["member"] == bob.ready["fp"], "alice sees bob join")
         check("unknown, used or expired" in run("carol", "join", invite["link"], ok=False), "an invite link works once")
-        check(bob.ready["fp"] in [m["fp"] for m in run("alice", "members")["members"]], "alice's members list bob by fingerprint")
+        check(bob.ready["fp"] in [m["fp"] for m in run("alice", "members", "--all")["members"]], "alice's members list bob by fingerprint")
 
         sent = run("alice", "send", "hello bob")
         check(sent.get("id") and "pos" not in sent, "send answers the message's id at once")
@@ -158,14 +158,14 @@ def main():
 
         # Carol joins through bob.
         joined = run("carol", "join", run("bob", "invite", f"--group={group}")["link"])
-        check(len(joined["members"]) == 3, "a member invites another")
+        check(len(joined["members"]) + joined.get("offline", 0) == 3, "a member invites another")
         alice.expect("joined", lambda e: e["member"] == carol.ready["fp"] and e["by"] == bob.ready["fp"])
 
         # A removal.
         run("alice", "remove", f"--group={group}", carol.ready["fp"])
         check(carol.expect("removed")["by"] == alice.ready["fp"], "carol is told alice removed her")
         alice.expect("left", lambda e: e["member"] == carol.ready["fp"])
-        check(run("carol", "groups") == [], "and is in no group")
+        check(run("carol", "groups") == {}, "and is in no group")
 
         # Any member that holds an invite admits by it: erin gets in while bob, who made her link, is stopped.
         link = run("bob", "invite", f"--group={group}")["link"]
@@ -178,7 +178,7 @@ def main():
         check(time.time() - stopping < 1.5, "a session in groups with peers online stops at once")
         listeners.remove(bob)
         joined = run("erin", "join", link)
-        check(joined["group"] == group and len(joined["members"]) == 3, "a joiner gets in while the inviter is stopped")
+        check(joined["group"] == group and len(joined["members"]) + joined.get("offline", 0) == 3, "a joiner gets in while the inviter is stopped")
         check(alice.expect("joined", lambda e: e["member"] == erin.ready["fp"])["by"] == "you", "alice, the member online, admits her")
         missed = run("alice", "send", f"--group={group}", "while you were away")
         check("id" in missed, "alice sends while bob is away")
@@ -186,7 +186,7 @@ def main():
         listeners.append(bob)
         got = bob.expect("message", lambda e: e["content"] == "while you were away", timeout=60)
         check(got["group"] == group and got["id"] == missed["id"], "a restarted session catches up on what it missed")
-        members = until(lambda: run("bob", "members")["members"], lambda ms: erin.ready["fp"] in [m["fp"] for m in ms])
+        members = until(lambda: run("bob", "members", "--all")["members"], lambda ms: erin.ready["fp"] in [m["fp"] for m in ms])
         check(erin.ready["fp"] in [m["fp"] for m in members], "and on the commit it missed: the member added while it was away")
         print("all ok")
         passed = True

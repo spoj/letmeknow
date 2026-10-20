@@ -36,6 +36,22 @@ pub fn compact(value: &mut Value) {
     }
 }
 
+/// A time in milliseconds since the Unix epoch as UTC to the second, as "2026-10-21T08:39:12Z".
+pub fn iso(ms: u64) -> String {
+    let (days, secs) = ((ms / 1000 / 86_400) as i64, ms / 1000 % 86_400);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", secs / 3600, secs / 60 % 60, secs % 60)
+}
+
 fn short(id: &mut String) {
     if id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
         id.truncate(ID);
@@ -76,7 +92,6 @@ mod tests {
             "seq": 7,
             "from": member("f1", false),
             "to": [member("f2", true), member("f3", false)],
-            "direct": false,
             "content": "hi \"there\"",
             "ids": ["b".repeat(64)],
             "carry": false,
@@ -91,5 +106,12 @@ mod tests {
                 "b".repeat(ID)
             )
         );
+    }
+
+    #[test]
+    fn times_show_as_utc_to_the_second() {
+        assert_eq!(iso(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso(951_782_400_000), "2000-02-29T00:00:00Z");
+        assert_eq!(iso(1_792_533_552_590), "2026-10-20T21:59:12Z");
     }
 }

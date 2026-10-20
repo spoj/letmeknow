@@ -245,6 +245,7 @@ pub async fn listen(
         Err(std::fs::TryLockError::WouldBlock) => bail!("session {} is already running", config.handle),
         Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
     }
+    delete_stopped_in_no_group(home)?;
     let (inbound, queue) = tokio::sync::mpsc::unbounded_channel();
     cli::open_channel(&config.dir.join("endpoint"), inbound).await?;
     let db = store::open(&config.dir.join("session.db"))?;
@@ -267,6 +268,24 @@ pub async fn listen(
     // A session that stops in no group leaves nothing behind.
     if serde_json::from_slice::<Vec<String>>(&std::fs::read(dir.join("groups.json"))?)?.is_empty() {
         std::fs::remove_dir_all(&dir)?;
+    }
+    Ok(())
+}
+
+/// Deletes the home's stopped sessions in no group, as each would have as it stopped: those that found, started to
+/// invite a new session, that they were removed while stopped, and those autorep removed.
+fn delete_stopped_in_no_group(home: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(home.join("sessions"))?.flatten() {
+        let dir = entry.path();
+        let Ok(groups) = std::fs::read(dir.join("groups.json")) else { continue };
+        if !serde_json::from_slice::<Vec<String>>(&groups)?.is_empty() {
+            continue;
+        }
+        let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("session.lock"))?;
+        if held.try_lock().is_ok() {
+            drop(held);
+            std::fs::remove_dir_all(&dir)?;
+        }
     }
     Ok(())
 }
@@ -321,10 +340,10 @@ pub fn change_auto(home: &Path, rep: bool, change: Option<cli::Auto>) -> Result<
             }
         }
         Some(cli::Auto::Remove { group }) => groups.retain(|g| *g != group && (group.is_empty() || !g.starts_with(&group))),
-        None => return Ok(json!({ "groups": groups })),
+        None => return Ok(json!({ if rep { "autorep" } else { "auto" }: groups })),
     }
     cli::private_file(&auto_file(home, rep), &serde_json::to_vec(&groups)?)?;
-    Ok(json!({ "groups": groups }))
+    Ok(json!({ if rep { "autorep" } else { "auto" }: groups }))
 }
 
 /// The sessions of a home but `me` that, as their `groups.json` says, are in `group`.
@@ -453,10 +472,16 @@ pub async fn sessions(home: &Path) -> Result<Value> {
     let mut sessions = Vec::new();
     for entry in std::fs::read_dir(home.join("sessions")).into_iter().flatten().flatten() {
         let (dir, handle) = (entry.path(), entry.file_name().to_string_lossy().into_owned());
-        let groups: Value = std::fs::read(dir.join("groups.json")).ok().and_then(|groups| serde_json::from_slice(&groups).ok()).unwrap_or(json!([]));
-        let mut session = json!({ "running": running.contains(&handle), "handle": handle, "groups": groups });
+        let groups: Vec<String> = std::fs::read(dir.join("groups.json")).ok().and_then(|groups| serde_json::from_slice(&groups).ok()).unwrap_or_default();
+        let mut session = json!({ "handle": handle });
         if let Ok(fp) = std::fs::read_to_string(dir.join("fp")) {
             session["fp"] = json!(fp);
+        }
+        if !groups.is_empty() {
+            session["groups"] = json!(groups);
+        }
+        if running.contains(&handle) {
+            session["running"] = json!(true);
         }
         sessions.push(session);
     }

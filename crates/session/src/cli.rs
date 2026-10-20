@@ -186,6 +186,10 @@ pub enum Request {
     Members {
         #[arg(long)]
         group: Option<String>,
+        /// Also the members offline, with when each was last seen online
+        #[arg(long)]
+        #[serde(default)]
+        all: bool,
     },
     /// List this session's groups
     #[command(display_order = 15)]
@@ -385,7 +389,7 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
             std::io::stdin().read_to_string(text)?;
         }
     }
-    let full = matches!(request, Request::Members { .. });
+    let full = matches!(request, Request::Members { .. } | Request::Join { .. });
     let channel = connect(&session_dir(home, session)?.join("endpoint"))
         .await
         .with_context(|| format!("session {session} is not running; start it with `letmeknow --session {session} listen`"))?;

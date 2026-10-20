@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// How many items that arrived while catching up are printed; older ones are counted as `omitted`.
+/// How many messages that arrived while catching up are printed; older ones are counted as `omitted`.
 const CATCH_UP: usize = 20;
 
 /// Messages addressed to this session, answering one of its messages, or urgent; `lost`; and `removed`. Membership
@@ -15,7 +15,8 @@ const CATCH_UP: usize = 20;
 pub fn wakes(item: &Value, mine: impl Fn(&str) -> bool) -> bool {
     match item["type"].as_str() {
         Some("message") => {
-            item["direct"] == true || item["urgent"] == true || item["reply_to"].as_str().is_some_and(mine)
+            let to_me = item["to"].as_array().is_some_and(|to| to.iter().any(|member| member["you"] == true));
+            to_me || item["urgent"] == true || item["reply_to"].as_str().is_some_and(mine)
         }
         Some("lost" | "removed") => true,
         _ => false,
@@ -36,14 +37,21 @@ impl Outbox {
         self.backlog.entry(group.to_owned()).or_default();
     }
 
-    /// Prints what arrived while a group caught up: the last CATCH_UP items, after an `omitted` count.
+    /// Prints what arrived while a group caught up: all but the messages before the last CATCH_UP, after an `omitted`
+    /// count of those.
     pub fn caught_up(&mut self) {
         for (group, items) in std::mem::take(&mut self.backlog) {
-            let omitted = items.len().saturating_sub(CATCH_UP);
+            let mut omitted = items.iter().filter(|item| item["type"] == "message").count().saturating_sub(CATCH_UP);
             if omitted > 0 {
                 self.out.push(serde_json::json!({ "type": "omitted", "group": group, "count": omitted }));
             }
-            self.out.extend(items.into_iter().skip(omitted));
+            for item in items {
+                if omitted > 0 && item["type"] == "message" {
+                    omitted -= 1;
+                } else {
+                    self.out.push(item);
+                }
+            }
         }
     }
 
@@ -88,12 +96,12 @@ mod tests {
     fn only_what_concerns_this_session_wakes_it() {
         let mine = |id: &str| id == "m1";
         let message = |extra: Value| {
-            let mut item = json!({ "type": "message", "group": "g", "direct": false });
+            let mut item = json!({ "type": "message", "group": "g", "to": [{ "fp": "a" }] });
             item.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
             item
         };
         assert!(!wakes(&message(json!({})), mine));
-        assert!(wakes(&message(json!({ "direct": true })), mine));
+        assert!(wakes(&message(json!({ "to": [{ "fp": "a" }, { "fp": "b", "you": true }] })), mine));
         assert!(wakes(&message(json!({ "urgent": true })), mine));
         assert!(wakes(&message(json!({ "reply_to": "m1" })), mine));
         assert!(!wakes(&message(json!({ "reply_to": "m2" })), mine));
@@ -119,19 +127,21 @@ mod tests {
     }
 
     #[test]
-    fn a_group_catching_up_prints_only_its_latest_items() {
+    fn a_group_catching_up_prints_only_its_latest_messages() {
         let mut outbox = Outbox::default();
         outbox.catch_up("g");
+        outbox.deliver(json!({ "type": "joined", "group": "g" }), false);
         for n in 0..25 {
-            outbox.deliver(json!({ "group": "g", "n": n }), n % 2 == 0);
+            outbox.deliver(json!({ "type": "message", "group": "g", "n": n }), n % 2 == 0);
         }
         outbox.deliver(json!({ "group": "h", "n": 99 }), true);
         assert_eq!(outbox.take().len(), 1);
         outbox.caught_up();
         let printed = outbox.take();
         assert_eq!(printed[0], json!({ "type": "omitted", "group": "g", "count": 5 }));
-        assert_eq!(printed[1]["n"], 5);
-        assert_eq!(printed.len(), 21);
+        assert_eq!(printed[1]["type"], "joined");
+        assert_eq!(printed[2]["n"], 5);
+        assert_eq!(printed.len(), 22);
     }
 
 }

@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use lmk_node::{Event, INVITE_VALID, Member, Message, Node, fp};
+use lmk_node::{Event, INVITE_VALID, Member, Message, Node, Seen, fp};
 use lmk_proto::Bytes;
 use lmk_proto::group::{Attachment, ChatMessage, PROTOCOL, Service, Settings, UPDATE};
 use lmk_proto::links::Invite;
@@ -20,7 +20,7 @@ use tokio::time::Instant;
 
 use crate::cli::{Request, private_file};
 use crate::policy::{Outbox, wakes};
-use crate::{message_id, shown, short};
+use crate::{message_id, short};
 
 /// How long after starting what arrives counts as catching up.
 const CATCH_UP_WINDOW: Duration = Duration::from_secs(3);
@@ -185,7 +185,7 @@ impl Session {
         let node = self.node.clone();
         let answer = match request {
             Request::Read { id } => self.read(&id),
-            Request::Members { group } => self.resolve(group).and_then(|gid| Ok(json!({ "group": b64(&gid.0), "members": described_members(&node, &gid)? }))),
+            Request::Members { group, all } => self.resolve(group).and_then(|gid| listed_members(&node, &gid, all)),
             Request::Groups => self.list_groups(),
             Request::Status { group } => self.status(group),
             Request::Send { group, to, reply_to, urgent, attach, attach_name, text } => {
@@ -211,8 +211,12 @@ impl Session {
                 };
                 let invite = async move {
                     let (gid, target) = gid?;
-                    let link = node.invite(&gid.0, INVITE_VALID, target.as_ref().map(|m| &m.key.0[..])).await?.link();
-                    Ok(json!({ "group": b64(&gid.0), "link": link, "expires_in": INVITE_VALID / 1000, "for": target.map(|m| fp(&m.key.0)) }))
+                    let expires = short::iso(lmk_proto::clock::corrected() + INVITE_VALID);
+                    let invite = node.invite(&gid.0, INVITE_VALID, target.as_ref().map(|m| &m.key.0[..])).await?;
+                    let (me, members) = (node.key(), node.members(&gid.0)?);
+                    let via: Vec<Value> =
+                        invite.members.iter().filter_map(|(key, _)| members.iter().find(|m| m.iroh.0 == key)).map(|m| describe(&me, m)).collect();
+                    Ok(json!({ "group": b64(&gid.0), "link": invite.link(), "expires": expires, "via": via, "for": target.map(|m| fp(&m.key.0)) }))
                 };
                 _ = self.running.spawn_local(async move { Answered(invite.await, Some(reply)) });
                 return;
@@ -228,7 +232,7 @@ impl Session {
                     let (member, gid) = found?;
                     ensure!(member.key != node.key(), "to leave a group, use `leave`");
                     node.remove(&gid.0, &member.key.0).await?;
-                    Ok(json!({ "group": b64(&gid.0), "members": described_members(&node, &gid)? }))
+                    Ok(json!({ "group": b64(&gid.0), "removed": fp(&member.key.0) }))
                 };
                 _ = self.running.spawn_local(async move { Answered(remove.await, Some(reply)) });
                 return;
@@ -242,7 +246,7 @@ impl Session {
                     }
                     let mut answer = match node.leave(&gid.0)? {
                         None => json!({ "group": b64(&gid.0), "left": true }),
-                        Some(_) => json!({ "group": b64(&gid.0), "left": true, "pending": true, "status": "a member removes this session once a cut keeps its leave" }),
+                        Some(_) => json!({ "group": b64(&gid.0), "pending": true }),
                     };
                     if end {
                         answer["ended"] = json!(true);
@@ -261,35 +265,26 @@ impl Session {
         for gid in self.node.groups() {
             let settings = self.node.settings(&gid.0)?;
             groups.push(json!({
-                "group": b64(&gid.0), "members": self.node.members(&gid.0)?.len(), "carry": settings.carry,
+                "group": b64(&gid.0), "size": self.node.members(&gid.0)?.len(), "carry": settings.carry,
                 "membership": settings.membership, "epoch": self.node.epoch(&gid.0)?,
             }));
         }
-        Ok(Value::Array(groups))
+        Ok(json!({ "groups": groups }))
     }
 
-    /// The members this session is connected to in each of its groups, or only `group`, and its chat messages no other
-    /// member holds yet.
+    /// The sends of this session that no other member holds yet, in each of its groups or only `group`.
     fn status(&self, group: Option<String>) -> Result<Value> {
         let gids = match group {
             Some(group) => vec![self.resolve(Some(group))?],
             None => self.node.groups(),
         };
-        let me = self.node.key();
         let mut groups = Vec::new();
-        let mut only_here_count = 0;
         for gid in gids {
-            let connected: Vec<Value> = self.node.connected(&gid.0)?.iter().map(|m| describe(&me, m)).collect();
             let only_here: Vec<Value> =
                 self.node.only_here(&gid.0)?.iter().map(|(id, payload)| json!({ "what": payload["type"], "id": hex::encode(&id.0) })).collect();
-            only_here_count += only_here.len();
-            groups.push(json!({ "group": b64(&gid.0), "connected": connected, "only_here": only_here }));
+            groups.push(json!({ "group": b64(&gid.0), "only_here": only_here }));
         }
-        let mut status = json!({ "groups": groups });
-        if only_here_count > 0 {
-            status["warning"] = json!(format!("{only_here_count} sends are held by no other member yet; keep this session running until they are"));
-        }
-        Ok(status)
+        Ok(json!({ "groups": groups }))
     }
 
     /// The group a request acts on: the one it names by id, or any unique beginning of it, or else the session's one group.
@@ -351,16 +346,18 @@ impl Session {
             Event::Message(_) => return Ok(()),
             Event::Lost(lost) => {
                 let members = self.node.members(&lost.group.0).unwrap_or_default();
-                let messages: Vec<Value> = lost.messages.iter().map(|of| json!({
-                    "from": describe(&me, &of.from), "seqs": of.seqs, "ids": of.ids.iter().map(|id| hex::encode(&id.0)).collect::<Vec<_>>(),
-                })).collect();
                 let member = describe_key(&me, &members, &lost.member.key);
-                let mut item = json!({ "type": "lost", "group": lost.group, "member": member, "messages": messages });
-                if member["you"] != true {
-                    let count: usize = lost.messages.iter().map(|lost| lost.seqs.len()).sum();
-                    item["text"] = json!(format!("{} could not read {count} of your messages; send again, with --reply-to <id>, any that still matters", shown(&member)));
+                if member["you"] == true {
+                    let messages: Vec<Value> = lost.messages.iter().map(|of| json!({ "from": describe(&me, &of.from), "seqs": of.seqs })).collect();
+                    json!({ "type": "lost", "group": lost.group, "member": member, "messages": messages })
+                } else {
+                    // The others' loss of this session's messages: only those it knows the ids of can be sent again.
+                    let ids: Vec<String> = lost.messages.iter().flat_map(|of| &of.ids).map(|id| hex::encode(&id.0)).collect();
+                    if ids.is_empty() {
+                        return Ok(());
+                    }
+                    json!({ "type": "lost", "group": lost.group, "member": member, "ids": ids })
                 }
-                item
             }
             Event::Warning { group, text } => {
                 self.outbox.print(json!({ "type": "warning", "group": group, "text": text }));
@@ -486,8 +483,10 @@ impl Session {
         let to: Vec<Bytes> = serde_json::from_value(payload.get("to").cloned().unwrap_or(json!([])))?;
         let to: Vec<String> = to.iter().map(|fp| hex::encode(&fp.0)).collect();
         let forgotten = self.node.shown(&gid.0, &message.id.0)?;
-        item["content"] = if forgotten { Value::Null } else { payload.get("content").cloned().unwrap_or(Value::Null) };
-        item["direct"] = json!(to.iter().any(|to| *to == fp(&me.0)));
+        match forgotten {
+            true => item["shown"] = json!(true),
+            false => item["content"] = payload.get("content").cloned().unwrap_or(Value::Null),
+        }
         if !to.is_empty() {
             let described: Vec<Value> = members.iter().map(|m| describe(&me, m)).collect();
             item["to"] = to.iter().map(|fp| described.iter().find(|m| m["fp"] == fp.as_str()).cloned().unwrap_or_else(|| json!(fp))).collect();
@@ -495,8 +494,8 @@ impl Session {
         if payload["urgent"] == true {
             item["urgent"] = json!(true);
         }
-        if let Some(sent_at) = payload.get("sent_at") {
-            item["sent_at"] = sent_at.clone();
+        if let Some(sent_at) = payload["sent_at"].as_u64() {
+            item["sent_at"] = json!(short::iso(sent_at));
         }
         // An attachment shows as the file another member's attached is saved in.
         if let Some(name) = payload["attachment"]["name"].as_str() {
@@ -570,8 +569,7 @@ async fn join(node: &Node, joining: &RefCell<HashSet<Vec<u8>>>, link: &str) -> R
     ensure!(joining.borrow_mut().insert(key.clone()), "this session is joining that already: wait for that join to end");
     let joined = node.join(&invite).await;
     joining.borrow_mut().remove(&key);
-    let gid = joined?.0;
-    Ok(json!({ "group": b64(&gid.0), "members": described_members(node, &gid)? }))
+    listed_members(node, &joined?.0, false)
 }
 
 /// Sends a chat message, a reply to `reply_to` if given, stamped with the time it is sent.
@@ -632,9 +630,28 @@ fn describe_key(me: &Bytes, members: &[Member], key: &Bytes) -> Value {
     }
 }
 
-fn described_members(node: &Node, gid: &Bytes) -> Result<Vec<Value>> {
+/// A group's members as `members` and `join` list them: this session, those online, and only a count of the others
+/// unless `all`.
+fn listed_members(node: &Node, gid: &Bytes, all: bool) -> Result<Value> {
     let me = node.key();
-    Ok(node.members(&gid.0)?.iter().map(|m| describe(&me, m)).collect())
+    let (mut members, mut offline) = (Vec::new(), 0);
+    for (member, seen) in node.presence(&gid.0)? {
+        let mut item = describe(&me, &member);
+        match seen {
+            Some(Seen { connected: true, .. }) => item["online"] = json!(true),
+            Some(Seen { at, .. }) => item["last_seen"] = json!(short::iso(at)),
+            None => {}
+        }
+        match all || item["you"] == true || item["online"] == true {
+            true => members.push(item),
+            false => offline += 1,
+        }
+    }
+    let mut listed = json!({ "group": b64(&gid.0), "members": members });
+    if offline > 0 {
+        listed["offline"] = json!(offline);
+    }
+    Ok(listed)
 }
 
 /// Runs a session until `shutdown` or a line it prints that cannot be written: prints `ready`, then handles what arrives and prints what concerns the agent, one JSON object per line.
@@ -649,7 +666,7 @@ pub async fn run(
     // Termux may run a program through Android's linker, which /proc/self/exe then names; it names the program in
     // TERMUX_EXEC__PROC_SELF_EXE.
     let bin = std::env::var_os("TERMUX_EXEC__PROC_SELF_EXE").map_or_else(std::env::current_exe, |exe| Ok(exe.into()))?;
-    let ready = json!({ "type": "ready", "session": session.config.handle, "fp": fp, "bin": bin, "membership": session.config.membership });
+    let ready = json!({ "type": "ready", "handle": session.config.handle, "fp": fp, "bin": bin, "membership": session.config.membership });
     let mut shutdown = std::pin::pin!(shutdown);
     if print(short::line(&ready)).is_ok() {
         loop {
@@ -689,6 +706,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shown;
 
     #[test]
     fn a_member_shows_by_its_fingerprint() {
