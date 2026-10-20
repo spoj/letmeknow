@@ -831,7 +831,9 @@ fn a_new_session_joins_the_auto_groups_of_its_home() {
         let mut carol = carol;
         carol.cmd(&["leave", "--end"]).await.unwrap();
         carol.stop().await;
-        std::fs::write(session_dir(&home, "bob").unwrap().join("groups.json"), "[]").unwrap();
+        for gone in ["alice", "bob"] {
+            std::fs::write(session_dir(&home, gone).unwrap().join("groups.json"), "[]").unwrap();
+        }
         let mut dave = world.start_in("h", "dave", HOUR).await;
         let warning = dave.expect("warning").await;
         assert!(warning["text"].as_str().unwrap().contains("leaves the list"), "{warning}");
