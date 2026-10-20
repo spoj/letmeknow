@@ -19,7 +19,7 @@ letmeknow join '<link>'                # join through a link
 letmeknow send "text"                  # --to <fingerprint>, --reply-to <id>, --urgent, --attach <file>
 letmeknow sessions                     # this machine's sessions: handle, fingerprint, whether it runs, its groups
 letmeknow auto add --group <group>     # each new session of this home joins the group as it starts
-letmeknow autorep add --group <group>  # the home keeps one of its sessions in the group: a new one takes over from stopped ones
+letmeknow autorep add --group <group>  # one session of the home at a time is in the group; as it stops, another takes over
 ```
 
 An invite link opened in a browser shows the commands that join with it.

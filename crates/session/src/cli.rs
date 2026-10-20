@@ -49,7 +49,7 @@ pub enum Command {
         #[command(subcommand)]
         change: Option<Auto>,
     },
-    /// The groups this home keeps one session in: a new session joins one as it starts while none of the home's sessions in it runs, and removes those
+    /// The groups one session of this home at a time is in: the first to start, and as it stops, one running then; it joins through a session of the home in it, and removes the home's stopped ones
     Autorep {
         #[command(subcommand)]
         change: Option<Auto>,
