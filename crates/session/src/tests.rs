@@ -847,10 +847,18 @@ fn a_new_session_joins_the_auto_groups_of_its_home() {
             std::fs::write(session_dir(&home, gone).unwrap().join("groups.json"), "[]").unwrap();
         }
         let mut dave = world.start_in("h", "dave", HOUR).await;
-        let warning = dave.expect("warning").await;
-        assert!(warning["text"].as_str().unwrap().contains("leaves the list"), "{warning}");
-        for gone in ["alice", "bob"] {
-            assert!(!session_dir(&home, gone).unwrap().exists(), "{gone}, stopped in no group, is deleted as Dave starts");
+        loop {
+            let warning = dave.expect("warning").await;
+            if warning["text"].as_str().unwrap().contains("leaves the list") {
+                break;
+            }
+        }
+        // Windows refuses to delete a file still open, as one of this process's other sessions may hold one of theirs:
+        // Dave then warns, and the next session tries again.
+        if !cfg!(windows) {
+            let gone = || ["alice", "bob"].iter().all(|gone| !session_dir(&home, gone).unwrap().exists());
+            until(|| async { json!(gone()) }, |gone| *gone == true).await;
+            assert!(gone(), "Alice and Bob, stopped in no group, are deleted as Dave starts");
         }
         assert_eq!(crate::change_auto(&home, false, None).unwrap(), json!({ "auto": [] }));
     });

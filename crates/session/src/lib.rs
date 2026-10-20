@@ -245,7 +245,6 @@ pub async fn listen(
         Err(std::fs::TryLockError::WouldBlock) => bail!("session {} is already running", config.handle),
         Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
     }
-    delete_stopped_in_no_group(home)?;
     let (inbound, queue) = tokio::sync::mpsc::unbounded_channel();
     cli::open_channel(&config.dir.join("endpoint"), inbound).await?;
     let db = store::open(&config.dir.join("session.db"))?;
@@ -256,6 +255,7 @@ pub async fn listen(
     let mut session = session::Session::open(config, db, node.clone(), held, membership).await?;
     let joined = node.groups();
     let missing: Vec<String> = auto(home, false)?.into_iter().filter(|group| !joined.iter().any(|gid| b64(&gid.0) == *group)).collect();
+    session.start(delete_stopped_in_no_group(home.to_owned()));
     if !missing.is_empty() {
         session.start(join_auto(home.to_owned(), handle.clone(), node_config.clone(), node.clone(), missing));
     }
@@ -273,21 +273,29 @@ pub async fn listen(
 }
 
 /// Deletes the home's stopped sessions in no group, as each would have as it stopped: those that found, started to
-/// invite a new session, that they were removed while stopped, and those autorep removed.
-fn delete_stopped_in_no_group(home: &Path) -> Result<()> {
+/// invite a new session, that they were removed while stopped, and those autorep removed. Answers what it warns of: one
+/// not deleted, as when Windows finds a file of it open, is tried again as the next session starts.
+async fn delete_stopped_in_no_group(home: PathBuf) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
     for entry in std::fs::read_dir(home.join("sessions"))?.flatten() {
         let dir = entry.path();
-        let Ok(groups) = std::fs::read(dir.join("groups.json")) else { continue };
-        if !serde_json::from_slice::<Vec<String>>(&groups)?.is_empty() {
-            continue;
-        }
-        let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("session.lock"))?;
-        if held.try_lock().is_ok() {
-            drop(held);
-            std::fs::remove_dir_all(&dir)?;
+        let deleted = || -> Result<()> {
+            let Ok(groups) = std::fs::read(dir.join("groups.json")) else { return Ok(()) };
+            if !serde_json::from_slice::<Vec<String>>(&groups)?.is_empty() {
+                return Ok(());
+            }
+            let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("session.lock"))?;
+            if held.try_lock().is_ok() {
+                drop(held);
+                std::fs::remove_dir_all(&dir)?;
+            }
+            Ok(())
+        };
+        if let Err(error) = deleted() {
+            warnings.push(format!("deleting the stopped session {}, in no group: {error:#}", entry.file_name().to_string_lossy()));
         }
     }
-    Ok(())
+    Ok(warnings)
 }
 
 fn b64(bytes: &[u8]) -> String {
