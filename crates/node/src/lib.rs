@@ -60,6 +60,13 @@ pub struct Config {
     pub ca: CaTlsConfig,
 }
 
+/// When a member was last known online, in milliseconds since the epoch, and whether this session is connected to it now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Seen {
+    pub at: u64,
+    pub connected: bool,
+}
+
 /// A group member, from its leaf.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {

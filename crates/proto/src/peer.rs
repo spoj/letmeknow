@@ -46,8 +46,8 @@ pub struct At {
     #[serde(with = "fixed32")]
     pub log: [u8; 32],
     pub head: Option<Head>,
-    /// Members the sender knows to be online, by iroh key, with how many milliseconds ago it last knew: 0 for those it
-    /// is connected to. Only sightings it has not told the receiver, or told it half an hour staler.
+    /// Members the sender ever knew to be online, by iroh key, with how many milliseconds ago it last knew: 0 for those
+    /// it is connected to. Only sightings it has not told the receiver, or told it half an hour staler.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub seen: BTreeMap<Bytes, u64>,
 }

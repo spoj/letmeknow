@@ -472,12 +472,20 @@ impl Peers {
         }
     }
 
-    /// The group's members this member knows to be online, with when it last knew: now for its neighbours.
+    /// When this member last knew each of the group's members it ever knew online to be: now for its neighbours.
     fn sightings(&self, group: &Bytes, now: u64) -> BTreeMap<Key, u64> {
-        let g = &self.groups[group];
-        let mut seen: BTreeMap<Key, u64> = g.seen.iter().filter(|(k, at)| self.alive(k, **at, now)).map(|(k, at)| (*k, *at)).collect();
+        let mut seen = self.groups[group].seen.clone();
         seen.extend(self.neighbours(group).into_iter().map(|k| (k, now)));
         seen
+    }
+
+    /// For each of the group's members this member ever knew online, when it last knew, and whether it is connected to
+    /// it now.
+    pub fn presence(&self, group: &Bytes, now: u64) -> BTreeMap<Key, (u64, bool)> {
+        let Some(g) = self.groups.get(group) else { return BTreeMap::new() };
+        let mut presence: BTreeMap<Key, (u64, bool)> = g.seen.iter().map(|(k, at)| (*k, (*at, false))).collect();
+        presence.extend(g.own.members.iter().filter(|(_, k)| self.conns.contains_key(k)).map(|(_, k)| (*k, (now, true))));
+        presence
     }
 
     /// The members the group targets: all members in a full mesh, else the best `K` by rank, the surest to be online

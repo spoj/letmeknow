@@ -284,6 +284,22 @@ fn sightings_count_of_members_from_neighbours_of_the_group_for_recent() {
     assert!(!p.targets(&id(), RECENT).contains(&far));
 }
 
+/// Sightings are told however old, so that a member come online learns when each member was last online.
+#[test]
+fn old_sightings_are_told_and_show_when_a_member_was_last_online() {
+    let mut p = peers();
+    p.group(id(), own(1, &(1..=19).collect::<Vec<_>>()), 0);
+    let r = ranked();
+    let (a, b, far) = (r[18], r[17], r[16]);
+    let now = 3 * RECENT;
+    p.connect(a, gs(), false, now);
+    p.frame(&a, &telling(&[(far, 2 * RECENT)]), now);
+    assert_eq!(p.presence(&id(), now)[&far], (RECENT, false));
+    assert_eq!(p.presence(&id(), now)[&a], (now, true));
+    p.connect(b, gs(), false, now);
+    assert_eq!(told(&p.poll(now))[&b].get(&Bytes(far.to_vec())), Some(&(2 * RECENT)));
+}
+
 /// A neighbour that disconnects was online until then.
 #[test]
 fn a_neighbour_that_disconnects_was_online_until_then() {

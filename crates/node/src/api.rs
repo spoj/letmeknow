@@ -10,7 +10,7 @@ use lmk_proto::group::Settings;
 use lmk_proto::Bytes;
 use serde_json::{Value, json};
 
-use crate::{G, Member, Message, Node, Rec, State, now};
+use crate::{G, Member, Message, Node, Rec, Seen, State, now};
 
 impl Node {
     /// Stops the peers and every task, and closes the provider.
@@ -51,6 +51,16 @@ impl Node {
 
     pub fn members(&self, gid: &[u8]) -> Result<Vec<Member>> {
         self.inner.lock().members(gid)
+    }
+
+    /// Each member, with when it was last known online: none for this session, and for a member no one it heard from
+    /// knew online.
+    pub fn presence(&self, gid: &[u8]) -> Result<Vec<(Member, Option<Seen>)>> {
+        let mut st = self.inner.lock();
+        let now = st.tick();
+        let presence = st.peers.presence(&Bytes(gid.to_vec()), now);
+        let seen = |m: &Member| <[u8; 32]>::try_from(m.iroh.0.as_slice()).ok().and_then(|key| presence.get(&key)).map(|&(at, connected)| Seen { at, connected });
+        Ok(st.members(gid)?.into_iter().map(|m| (m.clone(), seen(&m))).collect())
     }
 
     /// The members this session is connected to now: above seven members, only some of those online.
