@@ -791,8 +791,8 @@ async fn lookups_during_a_fetch_do_not_start_another() {
 }
 
 /// A group on a home's auto list is joined by each new session of the home as it starts: through a running session of
-/// the home in it, or else through a stopped one, whose node alone runs meanwhile. A group no session of the home is in
-/// leaves the list.
+/// the home in it, or else through a stopped one, whose node alone runs meanwhile, past one the group removed while it
+/// was stopped. A group no session of the home is in leaves the list.
 #[test]
 fn a_new_session_joins_the_auto_groups_of_its_home() {
     local(async {
@@ -811,6 +811,7 @@ fn a_new_session_joins_the_auto_groups_of_its_home() {
 
         let mut bob = bob;
         alice.stop().await;
+        bob.cmd(&["remove", &alice.fp]).await.unwrap();
         bob.stop().await;
         let carol = world.start_in("h", "carol", HOUR).await;
         let members = async {
@@ -822,15 +823,15 @@ fn a_new_session_joins_the_auto_groups_of_its_home() {
             }
         };
         let members = tokio::time::timeout(WAIT, members).await.expect("Carol joins through a stopped session");
-        assert_eq!(members["members"].as_array().unwrap().len(), 3);
+        assert_eq!(members["members"].as_array().unwrap().len(), 2);
+        let sessions = crate::sessions(&home).await.unwrap();
+        assert_eq!(sessions["sessions"][0]["groups"], json!([]), "Alice's node found out it was removed: {sessions}");
 
         // Once no session of the home is in it, the next session drops it from the list.
         let mut carol = carol;
         carol.cmd(&["leave", "--end"]).await.unwrap();
         carol.stop().await;
-        for gone in ["alice", "bob"] {
-            std::fs::write(session_dir(&home, gone).unwrap().join("groups.json"), "[]").unwrap();
-        }
+        std::fs::write(session_dir(&home, "bob").unwrap().join("groups.json"), "[]").unwrap();
         let mut dave = world.start_in("h", "dave", HOUR).await;
         let warning = dave.expect("warning").await;
         assert!(warning["text"].as_str().unwrap().contains("leaves the list"), "{warning}");

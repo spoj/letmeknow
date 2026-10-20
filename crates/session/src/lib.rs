@@ -381,6 +381,7 @@ async fn join_by_sibling(home: &Path, config: &lmk_node::Config, node: &Node, gr
         let link = answer["link"].as_str().context("an invite answers its link")?.to_owned();
         return Ok(node.join(&lmk_proto::links::Invite::parse(&link)?).await?.0);
     }
+    let mut failed = anyhow!("no session of this home in it could invite this one");
     for member in members.iter().filter(|member| !running.contains(member)) {
         let dir = cli::session_dir(home, member)?;
         let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("session.lock"))?;
@@ -388,16 +389,22 @@ async fn join_by_sibling(home: &Path, config: &lmk_node::Config, node: &Node, gr
             continue;
         }
         let (sibling, _events) = Node::start(SqliteProvider::open(&dir.join("session.db"))?, config.clone()).await?;
-        let gid = sibling.groups().into_iter().find(|gid| b64(&gid.0) == group);
         let joined = async {
-            let invite = sibling.invite(&gid.context("the session left the group")?.0, lmk_node::INVITE_VALID, None).await?;
+            let gid = sibling.groups().into_iter().find(|gid| b64(&gid.0) == group).context("the session left the group")?;
+            let invite = sibling.invite(&gid.0, lmk_node::INVITE_VALID, None).await?;
             node.join(&invite).await
         };
         let joined = joined.await;
+        // As the session itself would write them: its node may have found out meanwhile that the group removed it.
+        let groups: Vec<String> = sibling.groups().iter().map(|gid| b64(&gid.0)).collect();
         sibling.shutdown().await?;
-        return Ok(joined?.0);
+        cli::private_file(&dir.join("groups.json"), &serde_json::to_vec(&groups)?)?;
+        match joined {
+            Ok((gid, _)) => return Ok(gid),
+            Err(error) => failed = error.context(format!("through session {member}")),
+        }
     }
-    bail!("no session of this home in it could invite this one")
+    Err(failed)
 }
 
 /// This machine's sessions: each one's handle, its fingerprint, whether its process answers, and its groups as its
