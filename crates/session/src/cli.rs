@@ -49,6 +49,11 @@ pub enum Command {
         #[command(subcommand)]
         change: Option<Auto>,
     },
+    /// The groups this home keeps one session in: a new session joins one as it starts while none of the home's sessions in it runs, and removes those
+    Autorep {
+        #[command(subcommand)]
+        change: Option<Auto>,
+    },
     /// Print instructions for agents
     Skill,
     /// Run a membership service and an iroh relay
@@ -59,7 +64,7 @@ pub enum Command {
 
 #[derive(Subcommand)]
 pub enum Auto {
-    /// Add a group that a session of this home is in
+    /// Add a group that a session of this home is in; it leaves the other list (auto or autorep)
     Add {
         #[arg(long)]
         group: String,

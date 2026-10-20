@@ -800,9 +800,9 @@ fn a_new_session_joins_the_auto_groups_of_its_home() {
         let home = world.root.path().join("h");
         let mut alice = world.start_in("h", "alice", HOUR).await;
         let group = alice.cmd(&["invite"]).await.unwrap()["group"].as_str().unwrap().to_owned();
-        let added = crate::change_auto(&home, Some(crate::cli::Auto::Add { group: group[..6].into() })).unwrap();
+        let added = crate::change_auto(&home, false, Some(crate::cli::Auto::Add { group: group[..6].into() })).unwrap();
         assert_eq!(added, json!({ "groups": [group] }));
-        assert!(crate::change_auto(&home, Some(crate::cli::Auto::Add { group: "nope".into() })).unwrap_err().to_string().contains("no session of this home is in nope"));
+        assert!(crate::change_auto(&home, false, Some(crate::cli::Auto::Add { group: "nope".into() })).unwrap_err().to_string().contains("no session of this home is in nope"));
 
         let bob = world.start_in("h", "bob", HOUR).await;
         let joined = alice.told(&["joined"]).await;
@@ -834,7 +834,60 @@ fn a_new_session_joins_the_auto_groups_of_its_home() {
         let mut dave = world.start_in("h", "dave", HOUR).await;
         let warning = dave.expect("warning").await;
         assert!(warning["text"].as_str().unwrap().contains("leaves the list"), "{warning}");
-        assert_eq!(crate::change_auto(&home, None).unwrap(), json!({ "groups": [] }));
+        assert_eq!(crate::change_auto(&home, false, None).unwrap(), json!({ "groups": [] }));
+    });
+}
+
+/// A group on a home's autorep list is joined by a new session of the home as it starts only while none of the home's
+/// sessions in it runs: through a stopped one, which it then removes, so that the home keeps one session in the group.
+/// A group added to one list leaves the other.
+#[test]
+fn a_new_session_takes_an_autorep_group_over_from_the_stopped_sessions_of_its_home() {
+    local(async {
+        let world = world("autorep").await;
+        let home = world.root.path().join("h");
+        let mut alice = world.start_in("h", "alice", HOUR).await;
+        let invite = alice.cmd(&["invite"]).await.unwrap();
+        let busy = invite["group"].as_str().unwrap().to_owned();
+        let mut dave = world.start("dave", HOUR).await;
+        dave.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
+        let mut erin = world.start_in("h", "erin", HOUR).await;
+        let idle = erin.cmd(&["invite"]).await.unwrap()["group"].as_str().unwrap().to_owned();
+        erin.stop().await;
+        crate::change_auto(&home, false, Some(crate::cli::Auto::Add { group: busy.clone() })).unwrap();
+        for group in [&busy, &idle] {
+            crate::change_auto(&home, true, Some(crate::cli::Auto::Add { group: group.clone() })).unwrap();
+        }
+        assert_eq!(crate::change_auto(&home, true, None).unwrap(), json!({ "groups": [busy, idle] }));
+        assert_eq!(crate::change_auto(&home, false, None).unwrap(), json!({ "groups": [] }), "a group added to one list leaves the other");
+
+        // Bob passes Alice's group over, as she runs, and then takes Erin's over.
+        let bob = world.start_in("h", "bob", HOUR).await;
+        let taken = async {
+            loop {
+                let groups = bob.cmd(&["groups"]).await.unwrap();
+                if groups.as_array().unwrap().iter().any(|g| g["group"] == idle && g["members"] == 1) {
+                    return groups;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        };
+        let groups = tokio::time::timeout(WAIT, taken).await.expect("Bob takes Erin's group over");
+        assert_eq!(groups.as_array().unwrap().len(), 1, "{groups}");
+
+        // Once Alice stopped, Carol takes her group over.
+        alice.stop().await;
+        let carol = world.start_in("h", "carol", HOUR).await;
+        let joined = dave.told(&["joined"]).await;
+        assert_eq!((&joined["member"], &joined["by"]), (&json!(carol.fp), &json!(alice.fp)));
+        let left = dave.told(&["left"]).await;
+        assert_eq!((&left["member"], &left["by"]), (&json!(alice.fp), &json!(carol.fp)));
+        assert_eq!(dave.cmd(&["members"]).await.unwrap()["members"], json!([{ "fp": dave.fp, "you": true }, { "fp": carol.fp }]));
+        let sessions = crate::sessions(&home).await.unwrap();
+        for removed in ["alice", "erin"] {
+            let session = sessions["sessions"].as_array().unwrap().iter().find(|s| s["handle"] == removed).unwrap();
+            assert_eq!(session["groups"], json!([]), "{sessions}");
+        }
     });
 }
 

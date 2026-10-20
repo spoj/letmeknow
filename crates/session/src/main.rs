@@ -49,7 +49,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Command::Auto { change } => {
-            println!("{}", letmeknow::change_auto(&home, change)?);
+            println!("{}", letmeknow::change_auto(&home, false, change)?);
+            Ok(())
+        }
+        Command::Autorep { change } => {
+            println!("{}", letmeknow::change_auto(&home, true, change)?);
             Ok(())
         }
         Command::Skill => {

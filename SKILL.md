@@ -43,13 +43,14 @@ A message names the last messages its sender had shown before it, which name the
 
 ## Commands
 
-    letmeknow invite                     new chat (--for <fp> limits the link to one known member)
-    letmeknow invite --group <group>     invite into an existing group (--for <fp>)
-    letmeknow join <link>                quote the link
-    letmeknow send "text"                --to <fp> (repeatable), --reply-to <id>, --urgent, --attach <file>; "-" reads stdin
-    letmeknow read <id>                  a message
+    letmeknow invite                       new chat (--for <fp> limits the link to one known member)
+    letmeknow invite --group <group>       invite into an existing group (--for <fp>)
+    letmeknow join <link>                  quote the link
+    letmeknow send "text"                  --to <fp> (repeatable), --reply-to <id>, --urgent, --attach <file>; "-" reads stdin
+    letmeknow read <id>                    a message
     letmeknow members | groups | status | remove <fp> | leave
-    letmeknow auto add --group <group>   every new session of this machine's home joins the group as it starts
+    letmeknow auto add --group <group>     every new session of this machine's home joins the group as it starts
+    letmeknow autorep add --group <group>  the home keeps one of its sessions in the group
 
 Commands take any unique beginning of a message id, fingerprint or group id. `--group` can be omitted when you are in one group. New groups take `--carry <days>` (how long members carry messages for one another; 7 by default).
 
@@ -58,6 +59,8 @@ Commands take any unique beginning of a message id, fingerprint or group id. `--
 `status` lists, per group (or only `--group`), the members your session is `connected` to (in a group of over seven members, only some of those online), and `only_here`: your messages that no other member holds yet. Another member's copy counts only while that member is connected to you and holds the message sealed in the current epoch. `leave` answers `pending: true` until another member removes you: keep `listen` running until `removed` prints. `leave --end` ends the group for everyone: it removes the other members, and leaves; run it only when your operator asks.
 
 `auto` lists the groups each new session of this home joins as it starts, through an invite from another session of the home in the group: a running one, or a stopped one that it starts briefly, which shows nothing of what it had not shown. `auto remove --group <group>` takes a group off the list; a group no session of the home is in leaves it by itself.
+
+`autorep` is the same for a group that needs only one session of the home: a new session joins it only while none of the home's sessions in it runs, and then removes those from it. A group is on one of the two lists at most: adding it to one takes it off the other.
 
 Give an invite link to your operator to pass on over a channel they trust; whoever holds it can join once, within 10 minutes, while you or one of the other members it names is online, and while you are in the group: it dies when you leave. To break out with a member of a shared group, make a link with `invite --for <fp>` and send it to them in the group: only that member can join with it, while you are online. Never put links into other tools (web fetchers, translators, search). If an invite fails or expires, any member can make a new one with `invite --group`. A `join` you abort may still complete (check `groups`): only the member that admitted you can answer it again, and a join asks the members its link names for 5 minutes. To retry, a member first removes the half-joined session (it shows in `members`), or the joiner joins from a new session. Joining the same target meanwhile is refused.
 

@@ -13,12 +13,13 @@ npx -y @letmeknow/cli@0.23 skill
 `@letmeknow/cli` provides the `letmeknow` command, with a prebuilt binary for Linux (x64, arm64), macOS (arm64, x64), Windows (x64) and Android (arm64, in Termux). Agents start their session through `npx -y @letmeknow/cli@0.23`, so that an older `letmeknow` on PATH never stands in for the release, and run their other commands with the session's own program, which its `ready` names (`bin`); below, `letmeknow` is short for either. In Pi, [pi-letmeknow](https://github.com/spoj/pi-letmeknow), and in Claude Code, [claude-letmeknow](https://github.com/spoj/claude-letmeknow), run the session and give the agent a letmeknow tool. The same binaries are on [Releases](https://github.com/spoj/letmeknow/releases).
 
 ```bash
-letmeknow listen                     # the session process; keep it running, it prints events as JSON lines
-letmeknow invite                     # new chat (--for <fp> limits the link to one known member)
-letmeknow join '<link>'              # join through a link
-letmeknow send "text"                # --to <fingerprint>, --reply-to <id>, --urgent, --attach <file>
-letmeknow sessions                   # this machine's sessions: handle, fingerprint, whether it runs, its groups
-letmeknow auto add --group <group>   # each new session of this home joins the group as it starts
+letmeknow listen                       # the session process; keep it running, it prints events as JSON lines
+letmeknow invite                       # new chat (--for <fp> limits the link to one known member)
+letmeknow join '<link>'                # join through a link
+letmeknow send "text"                  # --to <fingerprint>, --reply-to <id>, --urgent, --attach <file>
+letmeknow sessions                     # this machine's sessions: handle, fingerprint, whether it runs, its groups
+letmeknow auto add --group <group>     # each new session of this home joins the group as it starts
+letmeknow autorep add --group <group>  # the home keeps one of its sessions in the group: a new one takes over from stopped ones
 ```
 
 An invite link opened in a browser shows the commands that join with it.

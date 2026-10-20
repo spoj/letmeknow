@@ -247,7 +247,11 @@ pub async fn listen(
     let (node, events) = Node::start(provider, node_config.clone()).await?;
     let handle = config.handle.clone();
     let mut session = session::Session::open(config, db, node.clone(), held, membership).await?;
-    let missing: Vec<String> = auto(home)?.into_iter().filter(|group| !node.groups().iter().any(|gid| b64(&gid.0) == *group)).collect();
+    let joined = node.groups();
+    let mut missing = Vec::new();
+    for rep in [false, true] {
+        missing.extend(auto(home, rep)?.into_iter().filter(|group| !joined.iter().any(|gid| b64(&gid.0) == *group)).map(|group| (group, rep)));
+    }
     if !missing.is_empty() {
         session.start(join_auto(home.to_owned(), handle, node_config, node, missing));
     }
@@ -258,20 +262,26 @@ fn b64(bytes: &[u8]) -> String {
     serde_json::to_value(Bytes(bytes.to_vec())).expect("JSON").as_str().expect("a string").to_owned()
 }
 
-/// The groups each new session of a home joins as it starts, by id: its `auto.json`.
-fn auto(home: &Path) -> Result<Vec<String>> {
-    match std::fs::read(home.join("auto.json")) {
+/// A home's auto list, or with `rep` its autorep list.
+fn auto_file(home: &Path, rep: bool) -> PathBuf {
+    home.join(if rep { "autorep.json" } else { "auto.json" })
+}
+
+/// The groups on a home's auto list, or with `rep` its autorep list, by id.
+fn auto(home: &Path, rep: bool) -> Result<Vec<String>> {
+    match std::fs::read(auto_file(home, rep)) {
         Ok(auto) => Ok(serde_json::from_slice(&auto)?),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(error.into()),
     }
 }
 
-/// Changes the auto groups as `change` says, and answers them.
-pub fn change_auto(home: &Path, change: Option<cli::Auto>) -> Result<Value> {
+/// Changes the groups on the auto list, or with `rep` the autorep list, as `change` says, and answers them. A group added
+/// to one list leaves the other.
+pub fn change_auto(home: &Path, rep: bool, change: Option<cli::Auto>) -> Result<Value> {
     let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(home.join("auto.lock"))?;
     lock.lock()?;
-    let mut groups = auto(home)?;
+    let mut groups = auto(home, rep)?;
     match change {
         Some(cli::Auto::Add { group }) => {
             let mut found = Vec::new();
@@ -288,6 +298,11 @@ pub fn change_auto(home: &Path, change: Option<cli::Auto>) -> Result<Value> {
                 0 => bail!("no session of this home is in {group}"),
                 _ => bail!("several groups have ids that begin {group}; give more of it"),
             };
+            let mut other = auto(home, !rep)?;
+            if other.contains(&group) {
+                other.retain(|g| *g != group);
+                cli::private_file(&auto_file(home, !rep), &serde_json::to_vec(&other)?)?;
+            }
             if !groups.contains(&group) {
                 groups.push(group);
             }
@@ -295,11 +310,11 @@ pub fn change_auto(home: &Path, change: Option<cli::Auto>) -> Result<Value> {
         Some(cli::Auto::Remove { group }) => groups.retain(|g| *g != group && (group.is_empty() || !g.starts_with(&group))),
         None => return Ok(json!({ "groups": groups })),
     }
-    cli::private_file(&home.join("auto.json"), &serde_json::to_vec(&groups)?)?;
+    cli::private_file(&auto_file(home, rep), &serde_json::to_vec(&groups)?)?;
     Ok(json!({ "groups": groups }))
 }
 
-/// The sessions of a home but `me` that, as they last wrote, are in `group`.
+/// The sessions of a home but `me` that, as their `groups.json` says, are in `group`.
 fn members_of(home: &Path, group: &str, me: &str) -> Vec<String> {
     let mut members = Vec::new();
     for entry in std::fs::read_dir(home.join("sessions")).into_iter().flatten().flatten() {
@@ -313,34 +328,58 @@ fn members_of(home: &Path, group: &str, me: &str) -> Vec<String> {
     members
 }
 
-/// Joins each auto group this session is not in, by an invite from a session of the home in it: a running one, or else
-/// a stopped one whose node alone runs here meanwhile, so that what it has not shown stays unshown. A group no session
-/// of the home is in any longer leaves the list. Answers what it warns of.
-async fn join_auto(home: PathBuf, me: String, config: lmk_node::Config, node: Node, groups: Vec<String>) -> Result<Vec<String>> {
+/// Joins each group of the home's lists that this session is not in, by an invite from a session of the home in it: a
+/// running one, or else a stopped one whose node alone runs here meanwhile, so that what it has not shown stays unshown.
+/// A group on the autorep list it joins only while none of the home's sessions in it runs, and then removes those from
+/// it. A group no session of the home is in any longer leaves its list. Answers what it warns of.
+async fn join_auto(home: PathBuf, me: String, config: lmk_node::Config, node: Node, groups: Vec<(String, bool)>) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
-    for group in groups {
+    for (group, rep) in groups {
+        let list = if rep { "autorep" } else { "auto" };
         let members = members_of(&home, &group, &me);
         if members.is_empty() {
-            change_auto(&home, Some(cli::Auto::Remove { group: group.clone() }))?;
-            warnings.push(format!("no session of this home is in the auto group {group} any longer: it leaves the list"));
+            change_auto(&home, rep, Some(cli::Auto::Remove { group: group.clone() }))?;
+            warnings.push(format!("no session of this home is in the {list} group {group} any longer: it leaves the list"));
             continue;
         }
-        if let Err(error) = join_by_sibling(&home, &config, &node, &group, &members).await {
-            warnings.push(format!("joining the auto group {group}: {error:#}"));
+        let running = cli::running(&home).await;
+        if rep && members.iter().any(|member| running.contains(member)) {
+            continue;
+        }
+        match join_by_sibling(&home, &config, &node, &group, &members, &running).await {
+            Err(error) => warnings.push(format!("joining the {list} group {group}: {error:#}")),
+            Ok(gid) if rep => {
+                for member in &members {
+                    let removed = async {
+                        let dir = cli::session_dir(&home, member)?;
+                        let fp = std::fs::read_to_string(dir.join("fp"))?;
+                        if let Some(sibling) = node.members(&gid.0)?.into_iter().find(|m| lmk_node::fp(&m.key.0) == fp) {
+                            node.remove(&gid.0, &sibling.key.0).await?;
+                        }
+                        // As the session itself writes once it learns of its removal.
+                        let file = dir.join("groups.json");
+                        let mut groups: Vec<String> = serde_json::from_slice(&std::fs::read(&file)?)?;
+                        groups.retain(|g| *g != group);
+                        cli::private_file(&file, &serde_json::to_vec(&groups)?)
+                    };
+                    if let Err(error) = removed.await {
+                        warnings.push(format!("removing session {member} from the autorep group {group}: {error:#}"));
+                    }
+                }
+            }
+            Ok(_) => {}
         }
     }
     Ok(warnings)
 }
 
-async fn join_by_sibling(home: &Path, config: &lmk_node::Config, node: &Node, group: &str, members: &[String]) -> Result<()> {
-    let running = cli::running(home).await;
+async fn join_by_sibling(home: &Path, config: &lmk_node::Config, node: &Node, group: &str, members: &[String], running: &[String]) -> Result<Bytes> {
     for member in members.iter().filter(|member| running.contains(member)) {
         let invite = cli::Request::Invite { group: Some(group.to_owned()), for_member: None, carry: 7 };
         // One that stopped meanwhile, or left the group, gives none.
         let Ok(answer) = cli::call(home, member, invite).await else { continue };
         let link = answer["link"].as_str().context("an invite answers its link")?.to_owned();
-        node.join(&lmk_proto::links::Invite::parse(&link)?).await?;
-        return Ok(());
+        return Ok(node.join(&lmk_proto::links::Invite::parse(&link)?).await?.0);
     }
     for member in members.iter().filter(|member| !running.contains(member)) {
         let dir = cli::session_dir(home, member)?;
@@ -356,14 +395,13 @@ async fn join_by_sibling(home: &Path, config: &lmk_node::Config, node: &Node, gr
         };
         let joined = joined.await;
         sibling.shutdown().await?;
-        joined?;
-        return Ok(());
+        return Ok(joined?.0);
     }
     bail!("no session of this home in it could invite this one")
 }
 
-/// This machine's sessions: each one's handle, its fingerprint, whether its process answers, and its groups as it last
-/// wrote them.
+/// This machine's sessions: each one's handle, its fingerprint, whether its process answers, and its groups as its
+/// `groups.json` says.
 pub async fn sessions(home: &Path) -> Result<Value> {
     let running = cli::running(home).await;
     let mut sessions = Vec::new();
