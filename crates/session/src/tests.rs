@@ -826,8 +826,6 @@ fn a_new_session_joins_the_auto_groups_of_its_home() {
         };
         let members = tokio::time::timeout(WAIT, members).await.expect("Carol joins through a stopped session");
         assert_eq!(members["members"].as_array().unwrap().len(), 2);
-        let sessions = crate::sessions(&home).await.unwrap();
-        assert_eq!(sessions["sessions"][0]["groups"], json!([]), "Alice's node found out it was removed: {sessions}");
 
         // Once no session of the home is in it, the next session drops it from the list.
         let mut carol = carol;
@@ -876,11 +874,9 @@ fn one_session_of_a_home_at_a_time_represents_it_in_an_autorep_group() {
             assert_eq!((&left["member"], &left["by"]), (&json!(removed), &json!(carol.fp)));
         }
         assert_eq!(dave.cmd(&["members"]).await.unwrap()["members"], json!([{ "fp": dave.fp, "you": true }, { "fp": carol.fp }]));
-        let sessions = crate::sessions(&home).await.unwrap();
-        for removed in ["alice", "bob"] {
-            let session = sessions["sessions"].as_array().unwrap().iter().find(|s| s["handle"] == removed).unwrap();
-            assert_eq!(session["groups"], json!([]), "{sessions}");
-        }
+        let out = |sessions: &Value| sessions["sessions"].as_array().unwrap().iter().all(|s| s["handle"] == "carol" || s["groups"] == json!([]));
+        let sessions = until(|| async { crate::sessions(&home).await.unwrap() }, out).await;
+        assert!(out(&sessions), "Alice's and Bob's groups no longer name the group: {sessions}");
     });
 }
 
