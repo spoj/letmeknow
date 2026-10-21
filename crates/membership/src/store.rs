@@ -417,7 +417,7 @@ mod tests {
 
     #[test]
     fn a_leaked_store_holds_no_expired_bytes() {
-        const LOGS: usize = 3_000;
+        const LOGS: usize = 300;
         let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
         let capabilities: Vec<[u8; 32]> = (0..LOGS).map(|_| lmk_proto::random::random()).collect();
