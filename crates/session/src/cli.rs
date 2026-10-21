@@ -21,7 +21,7 @@ use crate::session::Inbound;
 #[derive(Parser)]
 #[command(name = "letmeknow", version)]
 pub struct Cli {
-    /// Agent session, by handle or any unique beginning of its fingerprint; each session is its own group member [default: listen picks a new handle; other commands use the one running session]
+    /// Agent session, by any unique beginning of its fingerprint; each session is its own group member [default: listen starts a new session; other commands use the one running session]
     #[arg(long, env = "LETMEKNOW_SESSION", global = true)]
     pub session: Option<String>,
     /// Where sessions keep their state [default: the user's local data directory]
@@ -39,7 +39,7 @@ pub enum Command {
         #[arg(long, env = "LETMEKNOW_MEMBERSHIP", default_value = lmk_proto::links::DOMAIN)]
         membership: String,
     },
-    /// This machine's sessions: each one's handle, whether it runs, and its groups
+    /// This machine's sessions: each one's fingerprint, whether it runs, and its groups
     Sessions,
     /// Print instructions for agents
     Skill,
@@ -263,8 +263,8 @@ pub fn session_dir(home: &Path, session: &str) -> Result<PathBuf> {
     Ok(home.join("sessions").join(session))
 }
 
-/// The handle of the session `name` names: its handle, or else any unique beginning of its fingerprint; a name that is
-/// neither is a new handle.
+/// The directory name of the session `name` names: any unique beginning of its fingerprint, or its directory's name, which
+/// is its fingerprint but for sessions made before 0.23.10.
 pub fn session_named(home: &Path, name: String) -> Result<String> {
     if session_dir(home, &name)?.exists() {
         return Ok(name);
@@ -277,26 +277,16 @@ pub fn session_named(home: &Path, name: String) -> Result<String> {
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .collect();
     match found.len() {
-        0 => Ok(name),
+        0 => bail!("no session of this machine has a fingerprint that begins {name}; `letmeknow listen` with no --session starts a new one"),
         1 => Ok(found.remove(0)),
         _ => bail!("several sessions have fingerprints that begin {name} ({}); give more of it", found.join(", ")),
-    }
-}
-
-/// A handle of 8 hex digits not used by any existing session.
-pub fn new_handle(home: &Path) -> Result<String> {
-    loop {
-        let handle = format!("{:08x}", rand::random::<u32>());
-        if !session_dir(home, &handle)?.exists() {
-            return Ok(handle);
-        }
     }
 }
 
 /// How long finding the running session waits for each to answer: on Windows a refused connection takes seconds.
 const PROBE: Duration = Duration::from_millis(200);
 
-/// The handles of the sessions in `home` whose processes answer, in order.
+/// The directory names of the sessions in `home` whose processes answer, in order.
 pub async fn running(home: &Path) -> Vec<String> {
     let mut probes = tokio::task::JoinSet::new();
     for entry in std::fs::read_dir(home.join("sessions")).into_iter().flatten().flatten() {
@@ -315,7 +305,10 @@ pub async fn running_session(home: &Path) -> Result<String> {
     match running.as_slice() {
         [session] => Ok(session.clone()),
         [] => bail!("no session is running; start one with `letmeknow listen`"),
-        _ => bail!("several sessions are running ({}); pass --session", running.join(", ")),
+        _ => {
+            let fps: Vec<String> = running.iter().map(|dir| std::fs::read_to_string(home.join("sessions").join(dir).join("fp")).unwrap_or_else(|_| dir.clone())).collect();
+            bail!("several sessions are running ({}); pass --session", fps.join(", "))
+        }
     }
 }
 
@@ -436,7 +429,7 @@ mod tests {
     use super::{Command, Policy, Request, parse, session_named};
 
     #[test]
-    fn a_session_is_named_by_its_handle_or_a_unique_beginning_of_its_fingerprint() {
+    fn a_session_is_named_by_a_unique_beginning_of_its_fingerprint_or_its_directory() {
         let home = tempfile::tempdir().unwrap();
         for (handle, fp) in [("pi-1", "ab12000000000000"), ("pi-2", "ab34000000000000")] {
             std::fs::create_dir_all(home.path().join("sessions").join(handle)).unwrap();
@@ -445,7 +438,7 @@ mod tests {
         let named = |name: &str| session_named(home.path(), name.into());
         assert_eq!(named("pi-2").unwrap(), "pi-2");
         assert_eq!(named("ab34").unwrap(), "pi-2");
-        assert_eq!(named("new").unwrap(), "new");
+        assert!(named("new").unwrap_err().to_string().contains("no session"));
         assert!(named("ab").unwrap_err().to_string().contains("pi-1, pi-2") || named("ab").unwrap_err().to_string().contains("pi-2, pi-1"));
     }
 

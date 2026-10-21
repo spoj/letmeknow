@@ -1,4 +1,4 @@
-use letmeknow::cli::{Cli, Command, call, home_dir, new_handle, running_session, session_dir, session_named};
+use letmeknow::cli::{Cli, Command, call, home_dir, running_session, session_dir, session_named};
 use letmeknow::session::Config;
 use letmeknow::Network;
 use std::process::ExitCode;
@@ -25,15 +25,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Listen { membership } => {
             let network = Network::new(&home, letmeknow::ca()?)?;
-            let handle = match cli.session {
-                Some(session) => session_named(&home, session)?,
-                None => new_handle(&home)?,
+            let dir = match cli.session {
+                Some(session) => session_dir(&home, &session_named(&home, session)?)?,
+                None => letmeknow::new_session(&home, &membership)?,
             };
-            let config = Config {
-                dir: session_dir(&home, &handle)?,
-                handle,
-                membership,
-            };
+            let config = Config { dir, membership };
             let print = |line: String| {
                 use std::io::Write;
                 writeln!(std::io::stdout(), "{line}")

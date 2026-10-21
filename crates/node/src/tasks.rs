@@ -57,6 +57,12 @@ impl Node {
     }
 }
 
+/// Makes a new session in `provider`, living on the relay of `home`, which `Node::start` opens: answers its key.
+pub fn create(provider: &SqliteProvider, home: &str) -> Result<Bytes> {
+    let leaf = Leaf { key: Bytes(iroh_key(provider)?.public().as_bytes().to_vec()), revision: REVISION, home: home.into(), intro: None };
+    Ok(Bytes(Session::create(provider, leaf)?.key().to_vec()))
+}
+
 impl State {
     /// The session in `provider`, created on first use, with its leaf as `leaf`; its logs and groups.
     fn open(provider: SqliteProvider, leaf: Leaf) -> Result<Self> {

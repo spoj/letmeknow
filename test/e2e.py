@@ -33,9 +33,13 @@ def home(name):
     return os.path.join(TMP, name)
 
 
+# Each session's fingerprint, which names it once its `ready` gave it.
+FPS = {}
+
+
 def run(session, *args, ok=True, input=None, bin=BIN):
     env = {**ENV, "LETMEKNOW_HOME": home(session)}
-    result = subprocess.run([bin, "--session", session, *args], env=env, input=input, capture_output=True, text=True, encoding="utf-8", timeout=120)
+    result = subprocess.run([bin, "--session", FPS[session], *args], env=env, input=input, capture_output=True, text=True, encoding="utf-8", timeout=120)
     if ok and result.returncode:
         sys.exit(f"{session} {args}: {result.stderr}")
     return json.loads(result.stdout) if result.returncode == 0 else result.stderr
@@ -47,11 +51,12 @@ class Listener:
     def __init__(self, session, bin=BIN):
         self.session, self.lines = session, queue.Queue()
         env = {**ENV, "LETMEKNOW_HOME": home(session)}
-        args = [bin, "--session", session, "listen"]
+        args = [bin, *(["--session", FPS[session]] if session in FPS else []), "listen"]
         self.stderr = open(os.path.join(TMP, f"{session}.log"), "a")
         self.proc = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=self.stderr, text=True, encoding="utf-8")
         threading.Thread(target=self.read, daemon=True).start()
         self.ready = self.printed("ready")
+        FPS[session] = self.ready["fp"]
         self.told = set()
 
     def read(self):

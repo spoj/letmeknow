@@ -29,7 +29,6 @@ const FORGET: Duration = Duration::from_secs(3600);
 const KEEP: u64 = 7;
 
 pub struct Config {
-    pub handle: String,
     pub dir: PathBuf,
     /// The domain of the membership service for groups this session creates.
     pub membership: String,
@@ -701,7 +700,7 @@ pub async fn run(
     // Termux may run a program through Android's linker, which /proc/self/exe then names; it names the program in
     // TERMUX_EXEC__PROC_SELF_EXE.
     let bin = std::env::var_os("TERMUX_EXEC__PROC_SELF_EXE").map_or_else(std::env::current_exe, |exe| Ok(exe.into()))?;
-    let ready = json!({ "type": "ready", "handle": session.config.handle, "fp": fp, "bin": bin, "membership": session.config.membership, "log": session.log_path() });
+    let ready = json!({ "type": "ready", "fp": fp, "bin": bin, "membership": session.config.membership, "log": session.log_path() });
     let mut shutdown = std::pin::pin!(shutdown);
     let mut stopped = Ok(());
     if print(short::line(&ready)).is_ok() {

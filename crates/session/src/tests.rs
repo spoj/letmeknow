@@ -77,7 +77,8 @@ async fn service(root: &Path, name: &str, runtime: &tokio::runtime::Handle) -> (
 }
 
 struct Agent {
-    handle: String,
+    /// Its directory's name, which `--session` takes.
+    name: String,
     home: PathBuf,
     fp: String,
     events: mpsc::UnboundedReceiver<String>,
@@ -90,20 +91,19 @@ struct Agent {
 
 impl World {
     /// A session process in a home of its own.
-    async fn start(&self, handle: &str) -> Agent {
-        self.start_in(handle, handle).await
+    async fn start(&self, name: &str) -> Agent {
+        self.start_in(name, name).await
     }
 
     /// A session process in the home `home`.
-    async fn start_in(&self, home: &str, handle: &str) -> Agent {
-        self.launch(self.config(home, handle), usize::MAX).await
+    async fn start_in(&self, home: &str, name: &str) -> Agent {
+        self.launch(self.config(home, name), usize::MAX).await
     }
 
     /// A session's configuration, in the home `home`.
-    fn config(&self, home: &str, handle: &str) -> Config {
+    fn config(&self, home: &str, name: &str) -> Config {
         Config {
-            handle: handle.into(),
-            dir: session_dir(&self.root.path().join(home), handle).unwrap(),
+            dir: session_dir(&self.root.path().join(home), name).unwrap(),
             membership: self.domain.clone(),
         }
     }
@@ -111,7 +111,7 @@ impl World {
     /// A session process; writing the message after its first `messages` fails, as when its reader is gone.
     async fn launch(&self, config: Config, messages: usize) -> Agent {
         let home = config.dir.parent().unwrap().parent().unwrap().to_path_buf();
-        let handle = config.handle.clone();
+        let name = config.dir.file_name().unwrap().to_string_lossy().into_owned();
         let (out, events) = mpsc::unbounded_channel();
         let (stop, stopped) = oneshot::channel::<()>();
         let (network, at) = (self.network.clone(), home.clone());
@@ -129,9 +129,9 @@ impl World {
             };
             crate::listen(config, &at, network, print, async { drop(stopped.await) }).await.unwrap();
         });
-        let mut agent = Agent { handle, home, fp: String::new(), events, stop: Some(stop), done: Some(done), ready: Value::Null, told: BTreeSet::new() };
+        let mut agent = Agent { name, home, fp: String::new(), events, stop: Some(stop), done: Some(done), ready: Value::Null, told: BTreeSet::new() };
         let ready = agent.expect("ready").await;
-        assert!(keys(&ready).is_superset(&keys(&json!({ "type": 0, "handle": 0, "fp": 0, "bin": 0, "membership": 0 }))), "{ready}");
+        assert!(keys(&ready).is_superset(&keys(&json!({ "type": 0, "fp": 0, "bin": 0, "membership": 0 }))), "{ready}");
         agent.fp = ready["fp"].as_str().unwrap().into();
         agent.ready = ready;
         agent
@@ -141,10 +141,10 @@ impl World {
 impl Agent {
     async fn cmd(&self, args: &[&str]) -> Result<Value> {
         let home = self.home.to_str().unwrap();
-        let base = ["letmeknow", "--home", home, "--session", self.handle.as_str()];
+        let base = ["letmeknow", "--home", home, "--session", self.name.as_str()];
         let cli = crate::cli::parse(base.iter().chain(args))?;
         let Command::Request(request) = cli.command else { panic!("not a request") };
-        crate::cli::call(&self.home, &self.handle, request).await
+        crate::cli::call(&self.home, &self.name, request).await
     }
 
     /// The next event of `kind`, skipping others.
@@ -154,7 +154,7 @@ impl Agent {
 
     /// The session's log, line by line.
     fn log(&self) -> Vec<String> {
-        let log = std::fs::read_to_string(session_dir(&self.home, &self.handle).unwrap().join("log.jsonl")).unwrap_or_default();
+        let log = std::fs::read_to_string(session_dir(&self.home, &self.name).unwrap().join("log.jsonl")).unwrap_or_default();
         log.lines().map(str::to_owned).collect()
     }
 
@@ -168,7 +168,7 @@ impl Agent {
                     return event;
                 }
             }
-            assert!(start.elapsed() < WAIT, "{}: no {kinds:?} event", self.handle);
+            assert!(start.elapsed() < WAIT, "{}: no {kinds:?} event", self.name);
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
@@ -177,14 +177,14 @@ impl Agent {
     async fn expect_any(&mut self, kinds: &[&str]) -> Value {
         loop {
             let Ok(line) = tokio::time::timeout(WAIT, self.events.recv()).await else {
-                panic!("{}: no {kinds:?} event; status: {:?}", self.handle, self.cmd(&["groups"]).await);
+                panic!("{}: no {kinds:?} event; status: {:?}", self.name, self.cmd(&["groups"]).await);
             };
             let line = line.unwrap();
             let event: Value = serde_json::from_str(&line).unwrap();
             if kinds.iter().any(|kind| event["type"] == *kind) {
                 return event;
             }
-            eprintln!("{}: {event}", self.handle);
+            eprintln!("{}: {event}", self.name);
         }
     }
 
@@ -503,7 +503,7 @@ fn the_command_channel_needs_its_token_and_a_running_session() {
         let finding = std::time::Instant::now();
         assert_eq!(crate::cli::running_session(&alice.home).await.unwrap(), "alice");
         assert!(finding.elapsed() < Duration::from_secs(1), "{:?}", finding.elapsed());
-        let missing = Agent { handle: "nobody".into(), home: alice.home.clone(), fp: String::new(), events: mpsc::unbounded_channel().1, stop: None, done: None, ready: Value::Null, told: BTreeSet::new() };
+        let missing = Agent { name: "nobody".into(), home: alice.home.clone(), fp: String::new(), events: mpsc::unbounded_channel().1, stop: None, done: None, ready: Value::Null, told: BTreeSet::new() };
         let error = missing.cmd(&["groups"]).await.unwrap_err().to_string();
         assert!(error.contains("not running"), "{error}");
     });
@@ -608,14 +608,15 @@ fn sessions_lists_this_machines_sessions_running_or_stopped() {
         desk.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
         let desk_fp = desk.fp.clone();
         let listed = |desk: bool| {
-            let mut listed = json!({ "sessions": [
-                { "handle": "bob", "fp": bob.fp, "running": true, "groups": [group] },
-                { "handle": "desk", "fp": desk_fp, "groups": [group] },
-            ] });
+            let mut sessions = vec![
+                json!({ "fp": bob.fp, "running": true, "groups": [group] }),
+                json!({ "fp": desk_fp, "groups": [group] }),
+            ];
             if desk {
-                listed["sessions"][1]["running"] = json!(true);
+                sessions[1]["running"] = json!(true);
             }
-            listed
+            sessions.sort_by(|a, b| a["fp"].as_str().cmp(&b["fp"].as_str()));
+            json!({ "sessions": sessions })
         };
         let running = until(|| async { crate::sessions(&bob.home).await.unwrap() }, |running| *running == listed(true)).await;
         assert_eq!(running, listed(true));
@@ -635,7 +636,7 @@ fn a_session_runs_in_one_process() {
         std::fs::remove_file(world.config("alice", "alice").dir.join("endpoint")).unwrap();
         let again = crate::listen(world.config("alice", "alice"), &alice.home, world.network.clone(), |_| Ok(()), std::future::pending());
         let error = tokio::time::timeout(Duration::from_secs(10), again).await.expect("it fails at once").unwrap_err();
-        assert_eq!(error.to_string(), "session alice is already running");
+        assert_eq!(error.to_string(), "this session is already running");
     });
 }
 
@@ -648,9 +649,9 @@ fn a_session_goes_on_while_a_join_waits() {
         let link = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap().to_owned();
         let mut invite = lmk_proto::links::Invite::parse(&link).unwrap();
         invite.members[0].0 = *iroh::SecretKey::generate().public().as_bytes();
-        let (home, handle) = (bob.home.clone(), bob.handle.clone());
+        let (home, name) = (bob.home.clone(), bob.name.clone());
         let join = Request::Join { link: invite.link() };
-        let joining = tokio::task::spawn_local(async move { crate::cli::call(&home, &handle, join).await });
+        let joining = tokio::task::spawn_local(async move { crate::cli::call(&home, &name, join).await });
         tokio::time::sleep(Duration::from_millis(500)).await;
         let started = std::time::Instant::now();
         bob.cmd(&["groups"]).await.unwrap();

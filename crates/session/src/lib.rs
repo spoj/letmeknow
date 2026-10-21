@@ -219,25 +219,15 @@ pub async fn listen(
     print: impl FnMut(String) -> std::io::Result<()>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
-    let format = home.join("format");
-    let found = std::fs::read_to_string(&format).ok().map(|found| found.trim().to_owned());
-    match found.as_deref() {
-        Some("12") | None => {}
-        Some(newer) if newer.parse::<u32>().is_ok_and(|format| format > 12) => bail!(
-            "{home} holds state that a newer letmeknow wrote (format {newer}), which this one cannot read: run the newest release, `npx -y @letmeknow/cli@latest --home {home} listen`, or use another --home for this one",
-            home = home.display()
-        ),
-        _ => bail!("{} holds the state of an earlier letmeknow, which this one cannot read: move it away, or use another --home", home.display()),
-    }
+    own_format(home)?;
     cli::private_dir(&config.dir)?;
-    std::fs::write(&format, "12\n")?;
     let directory = own_directory(home, &network, &config.membership).await?;
     let membership = Service::Serve { key: Bytes(directory.key.to_vec()), domain: config.membership.clone(), rest: Default::default() };
     // One process runs a session, even when two start at once.
     let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(config.dir.join("session.lock"))?;
     match held.try_lock() {
         Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => bail!("session {} is already running", config.handle),
+        Err(std::fs::TryLockError::WouldBlock) => bail!("this session is already running"),
         Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
     }
     let (inbound, queue) = tokio::sync::mpsc::unbounded_channel();
@@ -255,6 +245,35 @@ pub async fn listen(
         std::fs::remove_dir_all(&dir)?;
     }
     Ok(())
+}
+
+/// Refuses a home that another format of letmeknow's state is in, and marks it as this one's.
+fn own_format(home: &Path) -> Result<()> {
+    let format = home.join("format");
+    let found = std::fs::read_to_string(&format).ok().map(|found| found.trim().to_owned());
+    match found.as_deref() {
+        Some("12") | None => {}
+        Some(newer) if newer.parse::<u32>().is_ok_and(|format| format > 12) => bail!(
+            "{home} holds state that a newer letmeknow wrote (format {newer}), which this one cannot read: run the newest release, `npx -y @letmeknow/cli@latest --home {home} listen`, or use another --home for this one",
+            home = home.display()
+        ),
+        _ => bail!("{} holds the state of an earlier letmeknow, which this one cannot read: move it away, or use another --home", home.display()),
+    }
+    cli::private_dir(home)?;
+    Ok(std::fs::write(&format, "12\n")?)
+}
+
+/// Makes a new session in `home`, living on the relay of `membership`, in a directory named by its fingerprint.
+pub fn new_session(home: &Path, membership: &str) -> Result<PathBuf> {
+    own_format(home)?;
+    let sessions = home.join("sessions");
+    cli::private_dir(&sessions)?;
+    let new = sessions.join(format!(".new-{:08x}", rand::random::<u32>()));
+    cli::private_dir(&new)?;
+    let key = lmk_node::create(&SqliteProvider::open(&new.join("session.db"))?, membership)?;
+    let dir = sessions.join(lmk_node::fp(&key.0));
+    std::fs::rename(&new, &dir)?;
+    Ok(dir)
 }
 
 /// Deletes the home's stopped sessions in no group, as each would have as it stopped: those that found, started again to
@@ -283,27 +302,25 @@ async fn delete_stopped_in_no_group(home: PathBuf) -> Result<Vec<String>> {
     Ok(warnings)
 }
 
-/// This machine's sessions: each one's handle, its fingerprint, whether its process answers, and its groups as its
-/// `groups.json` says.
+/// This machine's sessions: each one's fingerprint, whether its process answers, and its groups as its `groups.json`
+/// says.
 pub async fn sessions(home: &Path) -> Result<Value> {
     let running = cli::running(home).await;
     let mut sessions = Vec::new();
     for entry in std::fs::read_dir(home.join("sessions")).into_iter().flatten().flatten() {
-        let (dir, handle) = (entry.path(), entry.file_name().to_string_lossy().into_owned());
+        let dir = entry.path();
+        let Ok(fp) = std::fs::read_to_string(dir.join("fp")) else { continue };
         let groups: Vec<String> = std::fs::read(dir.join("groups.json")).ok().and_then(|groups| serde_json::from_slice(&groups).ok()).unwrap_or_default();
-        let mut session = json!({ "handle": handle });
-        if let Ok(fp) = std::fs::read_to_string(dir.join("fp")) {
-            session["fp"] = json!(fp);
-        }
+        let mut session = json!({ "fp": fp });
         if !groups.is_empty() {
             session["groups"] = json!(groups);
         }
-        if running.contains(&handle) {
+        if running.contains(&entry.file_name().to_string_lossy().into_owned()) {
             session["running"] = json!(true);
         }
         sessions.push(session);
     }
-    sessions.sort_by(|a, b| a["handle"].as_str().cmp(&b["handle"].as_str()));
+    sessions.sort_by(|a, b| a["fp"].as_str().cmp(&b["fp"].as_str()));
     Ok(json!({ "sessions": sessions }))
 }
 
