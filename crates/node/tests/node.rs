@@ -1322,7 +1322,10 @@ async fn back_with_no_holder(test: &str, missed: usize, wait_for_kept: bool) -> 
     drop(carol);
 
     for spare in &spares {
-        bob.node.send(&gid.0, &message("only Alice and Bob hold this"), None).await.unwrap();
+        // A loaded machine may not have read the last removal within a send's wait: the send asks to be made again.
+        while let Err(error) = bob.node.send(&gid.0, &message("only Alice and Bob hold this"), None).await {
+            assert!(matches!(error.downcast_ref::<SendError>(), Some(SendError::Behind)), "{error:#}");
+        }
         alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
         alice.node.remove(&gid.0, &spare.0).await.unwrap();
     }
@@ -2443,7 +2446,9 @@ async fn missed_commits(test: &str) -> (Vec<u64>, Vec<u64>) {
     // Alice's messages are 6 and 7, each held by Bob before the commit that keeps it.
     let mut sent = Vec::new();
     for (text, spare) in ["a1", "a2"].into_iter().zip(&spares) {
-        alice.node.send(&gid.0, &message(text), None).await.unwrap();
+        while let Err(error) = alice.node.send(&gid.0, &message(text), None).await {
+            assert!(matches!(error.downcast_ref::<SendError>(), Some(SendError::Behind)), "{error:#}");
+        }
         let seq = bob.until(|e| match e {
             Event::Message(message) => Some(message.seq),
             _ => None,
