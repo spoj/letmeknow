@@ -3,7 +3,8 @@
 Before pushing, run CI's Linux checks:
 
     cargo clippy --workspace --all-targets -- -D warnings
-    cargo test --workspace --no-fail-fast
+    cargo nextest run --workspace --no-fail-fast
+    cargo test --workspace --doc
     python3 -u test/deploy.py
     python3 -u test/pins.py
     python3 -u test/e2e.py
