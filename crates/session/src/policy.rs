@@ -1,89 +1,18 @@
-//! The delivery policy. Printing wakes the agent, so only what concerns this session prints at once; the rest waits,
-//! then prints in order just before the next thing that wakes it, after its next command, or once `--hold` runs out.
+//! What wakes the agent, and so prints at once. Everything goes to the session's log, which the agent reads at its pace.
 
 use serde_json::Value;
-use std::collections::HashMap;
-use std::time::Duration;
-use tokio::time::Instant;
 
-/// How many messages that arrived while catching up are printed; older ones are counted as `omitted`.
-const CATCH_UP: usize = 20;
-
-/// Messages addressed to this session, answering one of its messages, or urgent; `lost`; and `removed`. Membership
-/// changes wait, as other members' messages do: each wakes every agent of the
-/// group, and seldom needs one.
+/// Another member's message addressed to this session, answering one of its messages, or urgent; `removed`; and another
+/// member's `lost` of this session's messages, which it may send again.
 pub fn wakes(item: &Value, mine: impl Fn(&str) -> bool) -> bool {
     match item["type"].as_str() {
-        Some("message") => {
+        Some("message") if item["from"]["you"] != true => {
             let to_me = item["to"].as_array().is_some_and(|to| to.iter().any(|member| member["you"] == true));
             to_me || item["urgent"] == true || item["reply_to"].as_str().is_some_and(mine)
         }
-        Some("lost" | "removed") => true,
+        Some("lost") => item["member"]["you"] != true,
+        Some("removed" | "warning") => true,
         _ => false,
-    }
-}
-
-#[derive(Default)]
-pub struct Outbox {
-    held: Vec<Value>,
-    held_since: Option<Instant>,
-    /// Groups catching up, and what arrived for them meanwhile.
-    backlog: HashMap<String, Vec<Value>>,
-    out: Vec<Value>,
-}
-
-impl Outbox {
-    pub fn catch_up(&mut self, group: &str) {
-        self.backlog.entry(group.to_owned()).or_default();
-    }
-
-    /// Prints what arrived while a group caught up: all but the messages before the last CATCH_UP, after an `omitted`
-    /// count of those.
-    pub fn caught_up(&mut self) {
-        for (group, items) in std::mem::take(&mut self.backlog) {
-            let mut omitted = items.iter().filter(|item| item["type"] == "message").count().saturating_sub(CATCH_UP);
-            if omitted > 0 {
-                self.out.push(serde_json::json!({ "type": "omitted", "group": group, "count": omitted }));
-            }
-            for item in items {
-                if omitted > 0 && item["type"] == "message" {
-                    omitted -= 1;
-                } else {
-                    self.out.push(item);
-                }
-            }
-        }
-    }
-
-    pub fn deliver(&mut self, item: Value, wakes: bool) {
-        if let Some(backlog) = item["group"].as_str().and_then(|group| self.backlog.get_mut(group)) {
-            backlog.push(item);
-        } else if wakes {
-            self.flush_held();
-            self.out.push(item);
-        } else {
-            self.held_since.get_or_insert_with(Instant::now);
-            self.held.push(item);
-        }
-    }
-
-    /// Prints at once, ahead of anything held: answers to the agent's own commands and warnings.
-    pub fn print(&mut self, item: Value) {
-        self.out.push(item);
-    }
-
-    pub fn flush_held(&mut self) {
-        self.held_since = None;
-        self.out.append(&mut self.held);
-    }
-
-    /// When held items print anyway.
-    pub fn deadline(&self, hold: Duration) -> Option<Instant> {
-        self.held_since.map(|since| since + hold)
-    }
-
-    pub fn take(&mut self) -> Vec<Value> {
-        std::mem::take(&mut self.out)
     }
 }
 
@@ -96,52 +25,21 @@ mod tests {
     fn only_what_concerns_this_session_wakes_it() {
         let mine = |id: &str| id == "m1";
         let message = |extra: Value| {
-            let mut item = json!({ "type": "message", "group": "g", "to": [{ "fp": "a" }] });
+            let mut item = json!({ "type": "message", "group": "g", "from": { "fp": "c" }, "to": [{ "fp": "a" }] });
             item.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
             item
         };
         assert!(!wakes(&message(json!({})), mine));
         assert!(wakes(&message(json!({ "to": [{ "fp": "a" }, { "fp": "b", "you": true }] })), mine));
         assert!(wakes(&message(json!({ "urgent": true })), mine));
+        assert!(!wakes(&message(json!({ "urgent": true, "from": { "fp": "b", "you": true } })), mine), "its own");
         assert!(wakes(&message(json!({ "reply_to": "m1" })), mine));
         assert!(!wakes(&message(json!({ "reply_to": "m2" })), mine));
-        assert!(!wakes(&json!({ "type": "joined" }), mine));
+        assert!(!wakes(&json!({ "type": "joined", "by": { "fp": "b", "you": true } }), mine));
+        assert!(!wakes(&json!({ "type": "left" }), mine));
         assert!(wakes(&json!({ "type": "removed" }), mine));
-        assert!(wakes(&json!({ "type": "lost" }), mine));
+        assert!(wakes(&json!({ "type": "warning" }), mine));
+        assert!(wakes(&json!({ "type": "lost", "member": { "fp": "a" }, "ids": ["x"] }), mine));
+        assert!(!wakes(&json!({ "type": "lost", "member": { "fp": "b", "you": true } }), mine));
     }
-
-    #[test]
-    fn held_items_print_in_order_before_the_next_that_wakes() {
-        let mut outbox = Outbox::default();
-        outbox.deliver(json!({ "n": 1 }), false);
-        outbox.deliver(json!({ "n": 2 }), false);
-        assert!(outbox.take().is_empty());
-        assert!(outbox.deadline(Duration::from_secs(60)).is_some());
-        outbox.deliver(json!({ "n": 3 }), true);
-        let printed: Vec<Value> = outbox.take().iter().map(|item| item["n"].clone()).collect();
-        assert_eq!(printed, [1, 2, 3]);
-        assert_eq!(outbox.deadline(Duration::from_secs(60)), None);
-        outbox.deliver(json!({ "n": 4 }), false);
-        outbox.flush_held();
-        assert_eq!(outbox.take().len(), 1);
-    }
-
-    #[test]
-    fn a_group_catching_up_prints_only_its_latest_messages() {
-        let mut outbox = Outbox::default();
-        outbox.catch_up("g");
-        outbox.deliver(json!({ "type": "joined", "group": "g" }), false);
-        for n in 0..25 {
-            outbox.deliver(json!({ "type": "message", "group": "g", "n": n }), n % 2 == 0);
-        }
-        outbox.deliver(json!({ "group": "h", "n": 99 }), true);
-        assert_eq!(outbox.take().len(), 1);
-        outbox.caught_up();
-        let printed = outbox.take();
-        assert_eq!(printed[0], json!({ "type": "omitted", "group": "g", "count": 5 }));
-        assert_eq!(printed[1]["type"], "joined");
-        assert_eq!(printed[2]["n"], 5);
-        assert_eq!(printed.len(), 22);
-    }
-
 }

@@ -1,4 +1,5 @@
-//! The session process: this session's node, the requests it answers, and what concerns the agent, printed.
+//! The session process: this session's node, the requests it answers, and what it delivers: every event goes to its log,
+//! and what concerns the agent is printed too.
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
@@ -19,18 +20,17 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use crate::cli::{Request, private_file};
-use crate::policy::{Outbox, wakes};
+use crate::policy::wakes;
 use crate::{message_id, short};
 
-/// How long after starting what arrives counts as catching up.
-const CATCH_UP_WINDOW: Duration = Duration::from_secs(3);
 /// How often a session forgets the messages it took in more than H ago.
 const FORGET: Duration = Duration::from_secs(3600);
+/// How long the log keeps a line of no group the session is in, in days.
+const KEEP: u64 = 7;
 
 pub struct Config {
     pub handle: String,
     pub dir: PathBuf,
-    pub hold: Duration,
     /// The domain of the membership service for groups this session creates.
     pub membership: String,
 }
@@ -56,8 +56,8 @@ pub struct Session {
     /// The groups as last written to `groups.json`.
     groups: Vec<Bytes>,
     config: Config,
-    outbox: Outbox,
-    catching_up: Option<Instant>,
+    /// What waits to be logged, and whether it also prints.
+    out: Vec<(Value, bool)>,
     /// Work in flight: the loop takes each as it finishes, and never waits on one.
     running: JoinSet<Answered>,
 }
@@ -77,19 +77,14 @@ impl Session {
             _held: held,
             forget_at: Instant::now() + FORGET,
             config,
-            outbox: Outbox::default(),
-            catching_up: Some(Instant::now() + CATCH_UP_WINDOW),
+            out: Vec::new(),
             running: JoinSet::new(),
         };
         session.forget_old()?;
         session.write_groups();
         private_file(&session.config.dir.join("fp"), fp(&session.node.key().0).as_bytes())?;
-        let groups = session.node.groups();
-        for gid in &groups {
-            session.outbox.catch_up(&b64(&gid.0));
-        }
-        for gid in groups {
-            // What was delivered after the last message shown, as when the session stopped before printing it.
+        for gid in session.node.groups() {
+            // What was delivered after the last message logged, as when the session stopped before logging it.
             let (node, me) = (&session.node, session.node.key());
             let mut unshown = Vec::new();
             for message in node.messages(&gid.0)?.into_iter().rev() {
@@ -132,59 +127,91 @@ impl Session {
         }
     }
 
-    /// When something is next due without anything arriving.
-    pub fn next_due(&self) -> Instant {
-        let held = self.outbox.deadline(self.config.hold);
-        let later = Instant::now() + Duration::from_secs(3600);
-        held.into_iter().chain([self.forget_at]).chain(self.catching_up).fold(later, Instant::min)
-    }
-
-    pub async fn tick(&mut self) {
-        let now = Instant::now();
-        if self.forget_at <= now {
-            self.forget_at = now + FORGET;
-            if let Err(error) = self.forget_old() {
-                self.warn(format!("forgetting old messages: {error:#}"));
-            }
-        }
-        if self.outbox.deadline(self.config.hold).is_some_and(|at| at <= now) {
-            self.outbox.flush_held();
-        }
-        if self.catching_up.is_some_and(|at| at <= now) {
-            self.catching_up = None;
-            self.outbox.caught_up();
+    pub fn tick(&mut self) {
+        self.forget_at = Instant::now() + FORGET;
+        if let Err(error) = self.forget_old() {
+            self.warn(format!("forgetting old messages: {error:#}"));
         }
     }
 
-    /// Prints what is waiting. A message is seen once its line is written.
-    pub fn emit(&mut self, print: &mut impl FnMut(String) -> std::io::Result<()>) -> Result<()> {
-        for item in self.outbox.take() {
-            print(short::line(&self.compact(item.clone())))?;
+    fn log_path(&self) -> PathBuf {
+        self.config.dir.join("log.jsonl")
+    }
+
+    /// Logs what is waiting, made short and stamped with when, and prints what wakes the agent. A message is delivered,
+    /// and marked shown, once its line is synced to the log, whether or not it prints. Answers false once a line cannot
+    /// be printed.
+    pub fn emit(&mut self, print: &mut impl FnMut(String) -> std::io::Result<()>) -> Result<bool> {
+        let out = std::mem::take(&mut self.out);
+        if out.is_empty() {
+            return Ok(true);
+        }
+        let at = short::iso(lmk_proto::clock::now());
+        let lines: Vec<String> = out
+            .iter()
+            .map(|(item, _)| {
+                let mut item = item.clone();
+                item["at"] = json!(at);
+                short::compact(&mut item);
+                short::line(&item)
+            })
+            .collect();
+        append(&self.log_path(), lines.iter().map(|line| format!("{line}\n")).collect::<String>().as_bytes()).context("writing the log")?;
+        for (item, _) in &out {
             if item["type"] == "message" {
                 let shown = || -> Result<()> {
                     let gid: Bytes = serde_json::from_value(item["group"].clone())?;
                     self.show(&gid, &message_id(item["id"].as_str().context("a message has an id")?)?)
                 };
-                // Only a line that cannot be written stops the session.
                 if let Err(error) = shown() {
                     self.warn(format!("marking a message shown: {error:#}"));
                 }
             }
         }
-        Ok(())
+        for ((_, wake), line) in out.iter().zip(lines) {
+            if *wake && print(line).is_err() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
-    /// An item as the agent reads it: made short.
-    fn compact(&self, mut item: Value) -> Value {
-        short::compact(&mut item);
-        item
+    /// Rewrites the log without the lines of `gone` but its `removed`, and those older than their group's H, or than `KEEP` days where the
+    /// session is in no such group.
+    fn prune(&self, gone: Option<&Bytes>) -> Result<()> {
+        let path = self.log_path();
+        let log = match std::fs::read_to_string(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            log => log?,
+        };
+        let now = lmk_proto::clock::now();
+        let cutoff = |days: u64| short::iso(now.saturating_sub(days * 24 * 3600 * 1000));
+        let mut cutoffs = std::collections::HashMap::new();
+        for gid in self.node.groups() {
+            cutoffs.insert(b64(&gid.0), cutoff(self.node.settings(&gid.0)?.carry as u64));
+        }
+        let (gone, other) = (gone.map(|gid| b64(&gid.0)), cutoff(KEEP));
+        let mut kept = String::new();
+        for line in log.lines() {
+            let item: Value = serde_json::from_str(line)?;
+            let group = item["group"].as_str();
+            if group.is_some() && group == gone.as_deref() && item["type"] != "removed" {
+                continue;
+            }
+            if item["at"].as_str().unwrap_or_default() >= group.and_then(|group| cutoffs.get(group)).unwrap_or(&other).as_str() {
+                kept.push_str(line);
+                kept.push('\n');
+            }
+        }
+        let new = path.with_extension("new");
+        private_file(&new, kept.as_bytes())?;
+        Ok(std::fs::rename(&new, &path)?)
     }
 
     /// Takes a request: what may wait on the network goes on in `running`, and is answered once done.
     pub fn handle(&mut self, (request, reply): Inbound) {
         let node = self.node.clone();
         let answer = match request {
-            Request::Read { id } => self.read(&id),
             Request::Members { group, all } => self.resolve(group).and_then(|gid| listed_members(&node, &gid, all)),
             Request::Groups => self.list_groups(),
             Request::Status { group } => self.status(group),
@@ -311,7 +338,6 @@ impl Session {
         // Before the answer, so that `sessions` shows what the request changed.
         self.publish();
         let _ = reply.send(answer.unwrap_or_else(|e| json!({ "error": format!("{e:#}") })));
-        self.outbox.flush_held();
     }
 
     /// Runs work of the session's own, as requests run: what it warns of prints.
@@ -323,7 +349,7 @@ impl Session {
     pub fn event(&mut self, event: Event) {
         let group = event.group().cloned();
         if let Err(error) = self.on(event) {
-            self.outbox.print(json!({ "type": "warning", "group": group, "text": format!("{error:#}") }));
+            self.out.push((json!({ "type": "warning", "group": group, "text": format!("{error:#}") }), true));
         }
     }
 
@@ -359,19 +385,19 @@ impl Session {
                     json!({ "type": "lost", "group": lost.group, "member": member, "ids": ids })
                 }
             }
-            Event::Warning { group, text } => {
-                self.outbox.print(json!({ "type": "warning", "group": group, "text": text }));
-                return Ok(());
-            }
+            Event::Warning { group, text } => json!({ "type": "warning", "group": group, "text": text }),
         };
         let wake = wakes(&item, |id| self.mine(id));
-        self.outbox.deliver(item, wake);
+        self.out.push((item, wake));
         Ok(())
     }
 
-    /// Clears what the session kept of a group it is no longer in.
+    /// Clears what the session kept of a group it is no longer in, its lines in the log too.
     fn forget(&mut self, gid: &Bytes) -> Result<()> {
         self.db.execute("DELETE FROM taken WHERE gid = ?", [&gid.0])?;
+        let group = json!(gid);
+        self.out.retain(|(item, _)| item["group"] != group || item["type"] == "removed");
+        self.prune(Some(gid))?;
         let attachments = self.attachments_dir(gid);
         if attachments.exists() {
             std::fs::remove_dir_all(attachments)?;
@@ -396,7 +422,6 @@ impl Session {
             Some(id) => {
                 let target = self.find(&id)?;
                 ensure!(target.group == gid, "{id} is a message of another group");
-                self.show(&target.group, &target.id.0)?;
                 Some(target.id)
             }
             None => None,
@@ -429,13 +454,14 @@ impl Session {
             private_file(Path::new(path), &attachment.data.0)?;
         }
         let wakes = wakes(&item, |id| self.mine(id));
-        self.outbox.deliver(item, wakes);
+        self.out.push((item, wakes));
         Ok(())
     }
 
-    /// Forgets the messages taken in more than the group's H ago, with the copies of their attachments: no member can
-    /// send them again by then.
+    /// Forgets the messages taken in more than the group's H ago, with the copies of their attachments and their lines in
+    /// the log: no member can send them again by then.
     fn forget_old(&self) -> Result<()> {
+        self.prune(None)?;
         let node = &self.node;
         for gid in node.groups() {
             let before = lmk_proto::clock::now().saturating_sub(node.settings(&gid.0)?.carry as u64 * 24 * 3600 * 1000);
@@ -463,8 +489,7 @@ impl Session {
     }
 
     /// A chat message as the agent reads it: in delivery order, with what it needed and this session gave up on
-    /// (`missing`), and whether messages that needed those were delivered without them (`late`). Its text is left out
-    /// once shown.
+    /// (`missing`), and whether messages that needed those were delivered without them (`late`).
     fn message_item(&self, message: &Message) -> Result<Value> {
         let (gid, payload, me) = (&message.group, &message.payload, self.node.key());
         let members = self.node.members(&gid.0).unwrap_or_default();
@@ -482,11 +507,7 @@ impl Session {
         }
         let to: Vec<Bytes> = serde_json::from_value(payload.get("to").cloned().unwrap_or(json!([])))?;
         let to: Vec<String> = to.iter().map(|fp| hex::encode(&fp.0)).collect();
-        let forgotten = self.node.shown(&gid.0, &message.id.0)?;
-        match forgotten {
-            true => item["shown"] = json!(true),
-            false => item["content"] = payload.get("content").cloned().unwrap_or(Value::Null),
-        }
+        item["content"] = payload.get("content").cloned().unwrap_or(Value::Null);
         if !to.is_empty() {
             let described: Vec<Value> = members.iter().map(|m| describe(&me, m)).collect();
             item["to"] = to.iter().map(|fp| described.iter().find(|m| m["fp"] == fp.as_str()).cloned().unwrap_or_else(|| json!(fp))).collect();
@@ -508,7 +529,7 @@ impl Session {
         Ok(item)
     }
 
-    /// Marks a delivered message shown, as printed or replied to. Its text is then deleted, unless it is this session's
+    /// Marks a delivered message shown, as logged. Its text is then deleted from the node, unless it is this session's
     /// own, which it keeps to send again.
     fn show(&self, gid: &Bytes, id: &[u8]) -> Result<()> {
         let node = &self.node;
@@ -521,14 +542,6 @@ impl Session {
             node.redact(&gid.0, id, payload)?;
         }
         Ok(())
-    }
-
-    /// A chat message.
-    fn read(&self, id: &str) -> Result<Value> {
-        let message = self.find(id)?;
-        let item = self.message_item(&message)?;
-        self.show(&message.group, &message.id.0)?;
-        Ok(self.compact(item))
     }
 
     /// The message of this session's groups whose id begins with `id`.
@@ -552,7 +565,7 @@ impl Session {
     }
 
     fn warn(&mut self, text: String) {
-        self.outbox.print(json!({ "type": "warning", "text": text }));
+        self.out.push((json!({ "type": "warning", "text": text }), true));
     }
 
     pub async fn shutdown(&self) {
@@ -654,7 +667,20 @@ fn listed_members(node: &Node, gid: &Bytes, all: bool) -> Result<Value> {
     Ok(listed)
 }
 
-/// Runs a session until `shutdown` or a line it prints that cannot be written: prints `ready`, then handles what arrives and prints what concerns the agent, one JSON object per line.
+/// Appends `bytes` to a file only this user can read, and syncs it.
+fn append(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.append(true).create(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    Ok(file.sync_data()?)
+}
+
+/// Runs a session until `shutdown` or a line it prints that cannot be written: prints `ready`, then handles what arrives,
+/// logs it and prints what concerns the agent, one JSON object per line.
 pub async fn run(
     mut session: Session,
     mut inbound: mpsc::UnboundedReceiver<Inbound>,
@@ -666,15 +692,21 @@ pub async fn run(
     // Termux may run a program through Android's linker, which /proc/self/exe then names; it names the program in
     // TERMUX_EXEC__PROC_SELF_EXE.
     let bin = std::env::var_os("TERMUX_EXEC__PROC_SELF_EXE").map_or_else(std::env::current_exe, |exe| Ok(exe.into()))?;
-    let ready = json!({ "type": "ready", "handle": session.config.handle, "fp": fp, "bin": bin, "membership": session.config.membership });
+    let ready = json!({ "type": "ready", "handle": session.config.handle, "fp": fp, "bin": bin, "membership": session.config.membership, "log": session.log_path() });
     let mut shutdown = std::pin::pin!(shutdown);
+    let mut stopped = Ok(());
     if print(short::line(&ready)).is_ok() {
         loop {
             session.publish();
-            if session.emit(&mut print).is_err() {
-                break;
+            match session.emit(&mut print) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => {
+                    stopped = Err(error);
+                    break;
+                }
             }
-            let due = session.next_due();
+            let due = session.forget_at;
             tokio::select! {
                 Some(item) = inbound.recv() => session.handle(item),
                 Some(done) = session.running.join_next() => {
@@ -683,7 +715,7 @@ pub async fn run(
                         Answered(warnings, None) => {
                             session.publish();
                             match warnings {
-                                Ok(Value::Array(warnings)) => warnings.into_iter().for_each(|text| session.outbox.print(json!({ "type": "warning", "text": text }))),
+                                Ok(Value::Array(warnings)) => warnings.into_iter().for_each(|text| session.out.push((json!({ "type": "warning", "text": text }), true))),
                                 Ok(_) => {}
                                 Err(error) => session.warn(format!("{error:#}")),
                             }
@@ -691,7 +723,7 @@ pub async fn run(
                     }
                 }
                 Some(event) = events.recv() => session.event(event),
-                _ = tokio::time::sleep_until(due) => session.tick().await,
+                _ = tokio::time::sleep_until(due) => session.tick(),
                 _ = &mut shutdown => break,
             }
         }
@@ -700,7 +732,7 @@ pub async fn run(
     // Its groups as it stops, which `listen` reads.
     session.publish();
     session.shutdown().await;
-    Ok(())
+    stopped
 }
 
 #[cfg(test)]

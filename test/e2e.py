@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Native sessions use the real local membership service and iroh relay. LMK_E2E_BIN tests an already-built native
 artifact."""
-import json, os, queue, shutil, socket, subprocess, sys, tempfile, threading, time
+import io, json, os, queue, shutil, socket, subprocess, sys, tempfile, threading, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.environ.get("LMK_E2E_BIN") or os.path.join(ROOT, os.environ.get("CARGO_TARGET_DIR", "target"), "debug", "letmeknow" + (".exe" if os.name == "nt" else ""))
@@ -47,17 +47,19 @@ class Listener:
     def __init__(self, session, bin=BIN):
         self.session, self.lines = session, queue.Queue()
         env = {**ENV, "LETMEKNOW_HOME": home(session)}
-        args = [bin, "--session", session, "listen", "--hold", "0"]
-        self.log = open(os.path.join(TMP, f"{session}.log"), "a")
-        self.proc = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8")
+        args = [bin, "--session", session, "listen"]
+        self.stderr = open(os.path.join(TMP, f"{session}.log"), "a")
+        self.proc = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=self.stderr, text=True, encoding="utf-8")
         threading.Thread(target=self.read, daemon=True).start()
-        self.ready = self.expect("ready")
+        self.ready = self.printed("ready")
+        self.told = set()
 
     def read(self):
         for line in self.proc.stdout:
             self.lines.put(json.loads(line))
 
-    def expect(self, kind, predicate=lambda e: True, timeout=30):
+    def printed(self, kind, predicate=lambda e: True, timeout=30):
+        """The next printed event of `kind`, skipping others."""
         deadline, seen = time.time() + timeout, []
         while time.time() < deadline:
             try:
@@ -66,10 +68,23 @@ class Listener:
                 break
             if event["type"] == kind and predicate(event):
                 return event
-            if event["type"] == "warning":
-                sys.exit(f"{self.session} warning: {event}")
             seen.append(event)
-        sys.exit(f"{self.session}: no {kind} event, only {seen}")
+        sys.exit(f"{self.session}: no {kind} printed, only {seen}")
+
+    def expect(self, kind, predicate=lambda e: True, timeout=30):
+        """The first event of `kind` in the session's log that it did not return before; a warning there fails."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with open(self.ready["log"], encoding="utf-8") if os.path.exists(self.ready["log"]) else io.StringIO() as log:
+                for line in log:
+                    event = json.loads(line)
+                    if event["type"] == "warning":
+                        sys.exit(f"{self.session} warning: {event}")
+                    if event["type"] == kind and predicate(event) and line not in self.told:
+                        self.told.add(line)
+                        return event
+            time.sleep(0.2)
+        sys.exit(f"{self.session}: no {kind} event in its log")
 
     def stop(self):
         # SIGTERM where there are signals; on Windows, the process ends at once.
@@ -148,7 +163,7 @@ def main():
         reply = run("bob", "send", "--reply-to", got["id"], "hi alice")["id"]
         answer = alice.expect("message")
         check(answer["reply_to"] == got["id"] and "direct" not in answer, "a reply names what it answers")
-        check(run("alice", "read", reply)["reply_to"] == sent["id"], "read shows a message")
+        check(alice.printed("message")["id"] == reply, "a reply wakes its addressee: it prints")
 
         # An attachment.
         token = write("token.txt", "s3cret")

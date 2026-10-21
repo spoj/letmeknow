@@ -33,11 +33,8 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Run the session process, and print what arrives as NDJSON
+    /// Run the session process: log what arrives as NDJSON, and print what concerns this session
     Listen {
-        /// Seconds a message not addressed to this session may wait for something that wakes the agent anyway
-        #[arg(long, env = "LETMEKNOW_HOLD", default_value_t = 3600)]
-        hold: u64,
         /// The domain of the membership service for groups this session creates
         #[arg(long, env = "LETMEKNOW_MEMBERSHIP", default_value = lmk_proto::links::DOMAIN)]
         membership: String,
@@ -240,12 +237,6 @@ pub enum Request {
         attach_name: String,
         text: String,
     },
-    /// Show a chat message
-    #[command(display_order = 13)]
-    Read {
-        /// Its id, or any unique beginning of it
-        id: String,
-    },
 }
 
 fn carry() -> u32 {
@@ -446,7 +437,7 @@ mod tests {
         let cli = parse(["letmeknow", "send", "--to", "-Ia", "- an item", "--urgent"]).unwrap();
         let Command::Request(Request::Send { to, text, urgent, .. }) = cli.command else { panic!("not a send") };
         assert_eq!((to, text.as_str(), urgent), (vec!["-Ia".to_owned()], "- an item", true));
-        assert!(matches!(parse(["letmeknow", "read", "-Ia"]).unwrap().command, Command::Request(Request::Read { id, .. }) if id == "-Ia"));
+        assert!(matches!(parse(["letmeknow", "send", "--reply-to", "-Ia", "ok"]).unwrap().command, Command::Request(Request::Send { reply_to: Some(id), .. }) if id == "-Ia"));
         assert_eq!(parse(["letmeknow", "send", "--help"]).err().unwrap().kind(), clap::error::ErrorKind::DisplayHelp);
     }
 

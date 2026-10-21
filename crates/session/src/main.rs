@@ -2,7 +2,6 @@ use letmeknow::cli::{Cli, Command, call, home_dir, new_handle, running_session, 
 use letmeknow::session::Config;
 use letmeknow::Network;
 use std::process::ExitCode;
-use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -24,7 +23,7 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> anyhow::Result<()> {
     let home = home_dir(cli.home)?;
     match cli.command {
-        Command::Listen { hold, membership } => {
+        Command::Listen { membership } => {
             let network = Network::new(&home, letmeknow::ca()?)?;
             let handle = match cli.session {
                 Some(session) => session,
@@ -33,7 +32,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let config = Config {
                 dir: session_dir(&home, &handle)?,
                 handle,
-                hold: Duration::from_secs(hold),
                 membership,
             };
             let print = |line: String| {

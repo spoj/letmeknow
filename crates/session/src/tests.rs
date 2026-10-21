@@ -18,7 +18,6 @@ use tokio::sync::{mpsc, oneshot};
 use crate::cli::{Command, Request, session_dir};
 use crate::session::Config;
 
-const HOUR: Duration = Duration::from_secs(3600);
 /// How long a test waits for what a session prints: sessions start slowly on CI's Windows runners.
 const WAIT: Duration = Duration::from_secs(60);
 
@@ -85,17 +84,19 @@ struct Agent {
     stop: Option<oneshot::Sender<()>>,
     done: Option<tokio::task::JoinHandle<()>>,
     ready: Value,
+    /// The log's lines `told` returned.
+    told: BTreeSet<String>,
 }
 
 impl World {
     /// A session process in a home of its own.
-    async fn start(&self, handle: &str, hold: Duration) -> Agent {
-        self.start_in(handle, handle, hold).await
+    async fn start(&self, handle: &str) -> Agent {
+        self.start_in(handle, handle).await
     }
 
     /// A session process in the home `home`.
-    async fn start_in(&self, home: &str, handle: &str, hold: Duration) -> Agent {
-        self.launch(Config { hold, ..self.config(home, handle) }, usize::MAX).await
+    async fn start_in(&self, home: &str, handle: &str) -> Agent {
+        self.launch(self.config(home, handle), usize::MAX).await
     }
 
     /// A session's configuration, in the home `home`.
@@ -103,7 +104,6 @@ impl World {
         Config {
             handle: handle.into(),
             dir: session_dir(&self.root.path().join(home), handle).unwrap(),
-            hold: HOUR,
             membership: self.domain.clone(),
         }
     }
@@ -129,7 +129,7 @@ impl World {
             };
             crate::listen(config, &at, network, print, async { drop(stopped.await) }).await.unwrap();
         });
-        let mut agent = Agent { handle, home, fp: String::new(), events, stop: Some(stop), done: Some(done), ready: Value::Null };
+        let mut agent = Agent { handle, home, fp: String::new(), events, stop: Some(stop), done: Some(done), ready: Value::Null, told: BTreeSet::new() };
         let ready = agent.expect("ready").await;
         assert!(keys(&ready).is_superset(&keys(&json!({ "type": 0, "handle": 0, "fp": 0, "bin": 0, "membership": 0 }))), "{ready}");
         agent.fp = ready["fp"].as_str().unwrap().into();
@@ -152,20 +152,24 @@ impl Agent {
         self.expect_any(&[kind]).await
     }
 
-    /// The next event of any of `kinds`, which wait, as membership changes do, until the agent's next command: it runs
-    /// `status` until one prints, skipping other events.
+    /// The session's log, line by line.
+    fn log(&self) -> Vec<String> {
+        let log = std::fs::read_to_string(session_dir(&self.home, &self.handle).unwrap().join("log.jsonl")).unwrap_or_default();
+        log.lines().map(str::to_owned).collect()
+    }
+
+    /// The first event of any of `kinds` in the log that it did not return before, as it waits for one.
     async fn told(&mut self, kinds: &[&str]) -> Value {
         let start = std::time::Instant::now();
         loop {
-            // Once removed from its last group, the session has no status to give, but still prints what it was told.
-            let _ = self.cmd(&["status"]).await;
-            while let Ok(line) = tokio::time::timeout(Duration::from_millis(200), self.events.recv()).await {
-                let event: Value = serde_json::from_str(&line.unwrap()).unwrap();
-                if kinds.iter().any(|kind| event["type"] == *kind) {
+            for line in self.log() {
+                let event: Value = serde_json::from_str(&line).unwrap();
+                if kinds.iter().any(|kind| event["type"] == *kind) && self.told.insert(line) {
                     return event;
                 }
             }
             assert!(start.elapsed() < WAIT, "{}: no {kinds:?} event", self.handle);
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -211,9 +215,9 @@ fn local<F: std::future::Future>(test: F) -> F::Output {
 }
 
 /// Alice makes a group and invites Bob.
-async fn pair(world: &World, hold: Duration) -> (Agent, Agent, String) {
-    let mut alice = world.start("alice", hold).await;
-    let bob = world.start("bob", hold).await;
+async fn pair(world: &World) -> (Agent, Agent, String) {
+    let mut alice = world.start("alice").await;
+    let bob = world.start("bob").await;
     let invite = alice.cmd(&["invite"]).await.unwrap();
     assert_eq!(keys(&invite), keys(&json!({ "link": 0, "group": 0, "expires": 0, "via": 0 })));
     assert_eq!(invite["via"], json!(["you"]));
@@ -231,16 +235,17 @@ async fn pair(world: &World, hold: Duration) -> (Agent, Agent, String) {
 fn messages_that_do_not_concern_a_session_wait_for_one_that_does() {
     local(async {
         let world = world("steer").await;
-        let (mut alice, mut bob, group) = pair(&world, HOUR).await;
+        let (mut alice, mut bob, group) = pair(&world).await;
         let sent = bob.cmd(&["send", "the build is green"]).await.unwrap();
         assert!(sent["id"].is_string() && sent.get("pos").is_none(), "{sent}");
         assert!(alice.printed().await.iter().all(|e| e["type"] != "message"));
-        bob.cmd(&["send", "--to", &alice.fp, "can you deploy?"]).await.unwrap();
-        let first = alice.expect("message").await;
-        let second = alice.expect("message").await;
+        let first = alice.told(&["message"]).await;
         assert_eq!((first["content"].as_str(), first.get("to")), (Some("the build is green"), None));
+        bob.cmd(&["send", "--to", &alice.fp, "can you deploy?"]).await.unwrap();
+        let second = alice.expect("message").await;
         assert_eq!((second["content"].as_str(), &second["to"]), (Some("can you deploy?"), &json!(["you"])));
-        assert_eq!(keys(&second), keys(&json!({ "type": 0, "group": 0, "id": 0, "seq": 0, "from": 0, "to": 0, "content": 0, "sent_at": 0 })));
+        assert_eq!(keys(&second), keys(&json!({ "type": 0, "group": 0, "id": 0, "seq": 0, "from": 0, "to": 0, "content": 0, "sent_at": 0, "at": 0 })));
+        assert_eq!(alice.told(&["message"]).await, second, "the log holds what prints");
         assert_eq!(second["seq"].as_u64(), first["seq"].as_u64().map(|s| s + 1), "in order");
         assert_eq!((second["group"].as_str(), second["id"].as_str().unwrap().len()), (Some(group.as_str()), crate::short::ID));
         assert_eq!(second["from"], bob.fp);
@@ -249,24 +254,10 @@ fn messages_that_do_not_concern_a_session_wait_for_one_that_does() {
         alice.cmd(&["send", "--reply-to", id, "on it"]).await.unwrap();
         let reply = bob.expect("message").await;
         assert_eq!(reply["reply_to"], id);
-        // Shown text is forgotten.
-        let read = alice.cmd(&["read", id]).await.unwrap();
-        assert_eq!((&read["content"], &read["shown"]), (&Value::Null, &json!(true)));
-    });
-}
-
-#[test]
-fn held_messages_print_once_the_hold_runs_out() {
-    local(async {
-        let world = world("hold").await;
-        let hold = Duration::from_secs(2);
-        let (mut alice, bob, _) = pair(&world, hold).await;
-        // A command of Alice's prints what she holds, so that her hold starts at Bob's message.
-        alice.cmd(&["status"]).await.unwrap();
-        let sending = std::time::Instant::now();
-        bob.cmd(&["send", "fyi"]).await.unwrap();
-        assert_eq!(alice.expect("message").await["content"], "fyi");
-        assert!(sending.elapsed() >= hold, "printed after {:?}", sending.elapsed());
+        // Its own messages wake no one, urgent or not.
+        alice.cmd(&["send", "--urgent", "deploying"]).await.unwrap();
+        assert_eq!(bob.expect("message").await["content"], "deploying");
+        assert!(alice.printed().await.iter().all(|e| e["type"] != "message"));
     });
 }
 
@@ -274,7 +265,7 @@ fn held_messages_print_once_the_hold_runs_out() {
 fn send_answers_its_id_and_refuses_a_message_too_large() {
     local(async {
         let world = world("pending").await;
-        let (alice, mut bob, _) = pair(&world, HOUR).await;
+        let (alice, mut bob, _) = pair(&world).await;
         let big = "x".repeat(16 << 20);
         let refused = alice.cmd(&["send", "--to", &bob.fp, &big]).await.unwrap_err().to_string();
         assert!(refused.contains("members take"), "{refused}");
@@ -291,7 +282,7 @@ fn send_answers_its_id_and_refuses_a_message_too_large() {
         let last_seen = all["members"].as_array().unwrap().iter().find(|m| m["fp"] == bob.fp).unwrap()["last_seen"].clone();
         assert!(last_seen.as_str().is_some_and(|at| crate::short::iso(stopping).as_str() <= at), "{all}");
         // Once Bob is back, he takes it.
-        let mut bob = world.start("bob", HOUR).await;
+        let mut bob = world.start("bob").await;
         let message = bob.expect("message").await;
         assert_eq!((message["id"].as_str(), message["content"].as_str()), (sent["id"].as_str(), Some("anyone?")));
         let sent_at = message["sent_at"].as_str().unwrap();
@@ -304,7 +295,7 @@ fn send_answers_its_id_and_refuses_a_message_too_large() {
 fn an_attachment_arrives_as_a_private_file() {
     local(async {
         let world = world("attach").await;
-        let (mut alice, bob, _) = pair(&world, HOUR).await;
+        let (mut alice, bob, _) = pair(&world).await;
         let file = world.root.path().join("token.txt");
         std::fs::write(&file, "s3cret").unwrap();
         let sent = bob.cmd(&["send", "--to", &alice.fp, "--attach", file.to_str().unwrap(), "the token"]).await.unwrap();
@@ -318,9 +309,7 @@ fn an_attachment_arrives_as_a_private_file() {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
         }
-        let id = sent["id"].as_str().unwrap();
-        assert_eq!(alice.cmd(&["read", id]).await.unwrap()["attachment"], message["attachment"]);
-        assert_eq!(bob.cmd(&["read", id]).await.unwrap()["attachment"], json!({ "name": "token.txt" }), "the sender's own is not saved");
+        assert_eq!(message["id"], sent["id"]);
     });
 }
 
@@ -328,7 +317,7 @@ fn an_attachment_arrives_as_a_private_file() {
 fn membership_changes_are_told_and_a_removed_session_learns_it() {
     local(async {
         let world = world("remove").await;
-        let (mut alice, mut bob, group) = pair(&world, HOUR).await;
+        let (mut alice, mut bob, group) = pair(&world).await;
         let members = bob.cmd(&["members", "--all", "--group", &group[..6]]).await.unwrap();
         assert_eq!(members["members"][0]["fp"], alice.fp);
         assert_eq!(members["members"][1], json!({ "fp": bob.fp, "you": true }));
@@ -347,23 +336,24 @@ fn membership_changes_are_told_and_a_removed_session_learns_it() {
     });
 }
 
-/// The files of a session's database that hold `secret`. The `-shm` file holds only the WAL's index, and Windows locks
-/// parts of it.
+/// The files of a session's database, and its log, that hold `secret`. The `-shm` file holds only the WAL's index, and
+/// Windows locks parts of it.
 fn holding(dir: &Path, secret: &str) -> Vec<PathBuf> {
-    let files = ["session.db", "session.db-wal"].map(|name| dir.join(name));
+    let files = ["session.db", "session.db-wal", "log.jsonl"].map(|name| dir.join(name));
     files.into_iter().filter(|path| std::fs::read(path).unwrap_or_default().windows(secret.len()).any(|w| w == secret.as_bytes())).collect()
 }
 
 #[test]
-fn text_shown_or_left_behind_stays_in_no_file() {
+fn text_logged_stays_only_in_the_log_until_the_group_is_left() {
     local(async {
         let world = world("scrub").await;
-        let (mut alice, mut bob, _) = pair(&world, HOUR).await;
+        let (mut alice, mut bob, _) = pair(&world).await;
         let secret = "the vault code is 7-tangerine-42";
         bob.cmd(&["send", "--to", &alice.fp, secret]).await.unwrap();
         assert_eq!(alice.expect("message").await["content"].as_str().unwrap(), secret);
         alice.cmd(&["status"]).await.unwrap();
-        assert_eq!(holding(&session_dir(&alice.home, "alice").unwrap(), secret), Vec::<PathBuf>::new());
+        let dir = session_dir(&alice.home, "alice").unwrap();
+        assert_eq!(holding(&dir, secret), vec![dir.join("log.jsonl")]);
         alice.cmd(&["remove", &bob.fp]).await.unwrap();
         bob.told(&["removed"]).await;
         assert_eq!(holding(&session_dir(&bob.home, "bob").unwrap(), secret), Vec::<PathBuf>::new());
@@ -374,7 +364,7 @@ fn text_shown_or_left_behind_stays_in_no_file() {
 fn a_leaving_member_is_removed_by_another() {
     local(async {
         let world = world("leave").await;
-        let (mut alice, mut bob, _) = pair(&world, HOUR).await;
+        let (mut alice, mut bob, _) = pair(&world).await;
         let left = bob.cmd(&["leave"]).await.unwrap();
         assert_eq!(left["pending"], true);
         assert_eq!(alice.told(&["left"]).await["member"], bob.fp);
@@ -405,7 +395,7 @@ fn a_message_taken_in_is_forgotten_after_h_with_its_attachments_copy() {
     local(async {
         lmk_proto::clock::set(later);
         let world = world("forgotten").await;
-        let (mut alice, bob, _) = pair(&world, HOUR).await;
+        let (mut alice, bob, _) = pair(&world).await;
         let file = world.root.path().join("token.txt");
         std::fs::write(&file, "s3cret").unwrap();
         bob.cmd(&["send", "--to", &alice.fp, "--attach", file.to_str().unwrap(), "the token"]).await.unwrap();
@@ -417,7 +407,7 @@ fn a_message_taken_in_is_forgotten_after_h_with_its_attachments_copy() {
         assert_eq!(taken(), 1);
         alice.stop().await;
         LATER.store(8 * 24 * 3600 * 1000, Ordering::Relaxed);
-        let alice = world.start("alice", HOUR).await;
+        let alice = world.start("alice").await;
         alice.cmd(&["status"]).await.unwrap();
         assert_eq!(taken(), 0);
         assert!(!Path::new(path).exists());
@@ -430,7 +420,7 @@ fn a_message_taken_in_is_forgotten_after_h_with_its_attachments_copy() {
 fn status_lists_sends_held_only_here() {
     local(async {
         let world = world("only-here").await;
-        let (mut alice, mut bob, group) = pair(&world, HOUR).await;
+        let (mut alice, mut bob, group) = pair(&world).await;
         alice.cmd(&["send", "hello"]).await.unwrap();
         // Bob takes it, and the invite before it: once his summary tells Alice, her next commit keeps both.
         bob.told(&["message"]).await;
@@ -440,7 +430,7 @@ fn status_lists_sends_held_only_here() {
         let sent = alice.cmd(&["send", "anyone?"]).await.unwrap();
         let status = alice.cmd(&["status"]).await.unwrap();
         assert_eq!(status["groups"][0]["only_here"], json!([{ "what": "message", "id": sent["id"] }]));
-        let _bob = world.start("bob", HOUR).await;
+        let _bob = world.start("bob").await;
         let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["only_here"].is_null()).await;
         assert!(status["groups"][0]["only_here"].is_null(), "Bob holds it: {status}");
     });
@@ -450,18 +440,18 @@ fn status_lists_sends_held_only_here() {
 fn a_leave_is_pending_until_another_member_removes_the_session() {
     local(async {
         let world = world("leave-pending").await;
-        let (mut alice, mut bob, _) = pair(&world, HOUR).await;
+        let (mut alice, mut bob, _) = pair(&world).await;
         alice.stop().await;
         let left = bob.cmd(&["leave"]).await.unwrap();
         assert_eq!(left, json!({ "group": left["group"], "pending": true }));
-        let _alice = world.start("alice", HOUR).await;
+        let _alice = world.start("alice").await;
         assert_eq!(bob.told(&["removed"]).await["type"], "removed");
     });
 }
 
 /// Alice adds a session to the group and removes it again: two commits, after which the members are as they were.
 async fn add_and_remove(world: &World, alice: &mut Agent, group: &str) {
-    let mut carol = world.start("carol", HOUR).await;
+    let mut carol = world.start("carol").await;
     let link = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap();
     carol.cmd(&["join", link["link"].as_str().unwrap()]).await.unwrap();
     alice.told(&["joined"]).await;
@@ -476,13 +466,13 @@ async fn add_and_remove(world: &World, alice: &mut Agent, group: &str) {
 fn a_message_no_other_member_holds_is_not_lost() {
     local(async {
         let world = world("unkept").await;
-        let (mut alice, mut bob, group) = pair(&world, HOUR).await;
+        let (mut alice, mut bob, group) = pair(&world).await;
         bob.stop().await;
         alice.cmd(&["send", "while you were out"]).await.unwrap();
         add_and_remove(&world, &mut alice, &group).await;
         alice.stop().await;
-        let mut bob = world.start("bob", HOUR).await;
-        let _alice = world.start("alice", HOUR).await;
+        let mut bob = world.start("bob").await;
+        let _alice = world.start("alice").await;
         // Unless it comes while Bob catches up, the message, which does not wake him, waits for his next command.
         assert_eq!(bob.told(&["message"]).await["content"], "while you were out");
         assert!(bob.printed().await.iter().all(|e| e["type"] != "lost"));
@@ -493,7 +483,7 @@ fn a_message_no_other_member_holds_is_not_lost() {
 fn the_command_channel_needs_its_token_and_a_running_session() {
     local(async {
         let world = world("channel").await;
-        let alice = world.start("alice", HOUR).await;
+        let alice = world.start("alice").await;
         let endpoint: Value =
             serde_json::from_slice(&std::fs::read(session_dir(&alice.home, "alice").unwrap().join("endpoint")).unwrap()).unwrap();
         let port = endpoint["port"].as_u64().unwrap() as u16;
@@ -513,7 +503,7 @@ fn the_command_channel_needs_its_token_and_a_running_session() {
         let finding = std::time::Instant::now();
         assert_eq!(crate::cli::running_session(&alice.home).await.unwrap(), "alice");
         assert!(finding.elapsed() < Duration::from_secs(1), "{:?}", finding.elapsed());
-        let missing = Agent { handle: "nobody".into(), home: alice.home.clone(), fp: String::new(), events: mpsc::unbounded_channel().1, stop: None, done: None, ready: Value::Null };
+        let missing = Agent { handle: "nobody".into(), home: alice.home.clone(), fp: String::new(), events: mpsc::unbounded_channel().1, stop: None, done: None, ready: Value::Null, told: BTreeSet::new() };
         let error = missing.cmd(&["groups"]).await.unwrap_err().to_string();
         assert!(error.contains("not running"), "{error}");
     });
@@ -523,12 +513,12 @@ fn the_command_channel_needs_its_token_and_a_running_session() {
 fn a_restarted_session_takes_in_what_it_missed_in_delivery_order() {
     local(async {
         let world = world("causal").await;
-        let (mut alice, bob, group) = pair(&world, HOUR).await;
+        let (mut alice, bob, group) = pair(&world).await;
         alice.stop().await;
         let first = bob.cmd(&["send", "--urgent", "first"]).await.unwrap();
         assert!(first["id"].is_string(), "{first}");
         let second = bob.cmd(&["send", "--urgent", "second"]).await.unwrap();
-        let mut alice = world.start("alice", HOUR).await;
+        let mut alice = world.start("alice").await;
         let mut got = Vec::new();
         while got.len() < 2 {
             let message = alice.expect("message").await;
@@ -546,7 +536,7 @@ fn a_restarted_session_takes_in_what_it_missed_in_delivery_order() {
 fn a_group_ended_for_everyone_keeps_no_member() {
     local(async {
         let world = world("end").await;
-        let (alice, mut bob, _) = pair(&world, HOUR).await;
+        let (alice, mut bob, _) = pair(&world).await;
         let ended = alice.cmd(&["leave", "--end"]).await.unwrap();
         assert_eq!((ended["ended"].as_bool(), ended.get("pending")), (Some(true), None), "{ended}");
         assert_eq!(bob.told(&["removed"]).await["by"], alice.fp);
@@ -561,16 +551,16 @@ fn a_group_ended_for_everyone_keeps_no_member() {
 fn a_message_no_member_online_holds_does_not_hold_up_others() {
     local(async {
         let world = world("gap").await;
-        let (mut alice, mut bob, group) = pair(&world, HOUR).await;
-        let mut carol = world.start("carol", HOUR).await;
+        let (mut alice, mut bob, group) = pair(&world).await;
+        let mut carol = world.start("carol").await;
         carol.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
         bob.told(&["joined"]).await;
         alice.stop().await;
         carol.stop().await;
         bob.cmd(&["send", "while they are away"]).await.unwrap();
         bob.stop().await;
-        let alice = world.start("alice", HOUR).await;
-        let mut carol = world.start("carol", HOUR).await;
+        let alice = world.start("alice").await;
+        let mut carol = world.start("carol").await;
         alice.cmd(&["send", "--to", &carol.fp, "after the gap"]).await.unwrap();
         let got = carol.expect("message").await;
         assert_eq!(got["content"], "after the gap");
@@ -578,29 +568,30 @@ fn a_message_no_member_online_holds_does_not_hold_up_others() {
     });
 }
 
-/// A session whose reader is gone stops at the first line it cannot write; started again, it prints the messages after
-/// the last it printed, once.
+/// A session whose reader is gone stops at the first line it cannot write. What it logged is delivered: started again, it
+/// prints none of it again, and its log holds each message once.
 #[test]
-fn a_session_stops_once_it_cannot_print_and_prints_the_rest_when_started_again() {
+fn a_session_stops_once_it_cannot_print_and_logged_each_message_once() {
     local(async {
         let world = world("output").await;
-        let (mut alice, bob, _) = pair(&world, HOUR).await;
+        let (mut alice, bob, _) = pair(&world).await;
         alice.stop().await;
         let mut sent = Vec::new();
-        // Fewer than catching up prints, so none is omitted, however long catching up takes.
         for i in 0..10 {
             sent.push(bob.cmd(&["send", "--urgent", &format!("m{i}")]).await.unwrap()["id"].clone());
         }
         let mut alice = world.launch(world.config("alice", "alice"), 1).await;
-        assert_eq!(alice.expect("message").await["id"], sent[0]);
+        alice.expect("message").await;
         tokio::time::timeout(Duration::from_secs(30), alice.done.take().unwrap()).await.unwrap().unwrap();
-        let mut alice = world.start("alice", HOUR).await;
-        for id in &sent[1..] {
-            assert_eq!(alice.expect("message").await["id"], *id);
-        }
-        alice.stop().await;
-        let mut alice = world.start("alice", HOUR).await;
-        assert!(alice.printed().await.iter().all(|e| e["type"] != "message" && e["type"] != "omitted"));
+        let ids = |agent: &Agent| -> Vec<Value> {
+            let logged = agent.log().into_iter().map(|line| serde_json::from_str::<Value>(&line).unwrap()).filter(|e| e["type"] == "message");
+            logged.map(|e| e["id"].clone()).collect()
+        };
+        let before = ids(&alice);
+        let mut alice = world.start("alice").await;
+        let logged = until(|| async { json!(ids(&alice)) }, |logged| logged.as_array().unwrap().len() >= sent.len()).await;
+        assert_eq!(logged, json!(sent));
+        assert!(alice.printed().await.iter().all(|e| !before.contains(&e["id"])), "what was logged prints not again");
     });
 }
 
@@ -610,9 +601,9 @@ fn a_session_stops_once_it_cannot_print_and_prints_the_rest_when_started_again()
 fn sessions_lists_this_machines_sessions_running_or_stopped() {
     local(async {
         let world = world("sessions").await;
-        let (alice, mut bob, group) = pair(&world, HOUR).await;
-        world.start_in("bob", "lone", HOUR).await.stop().await;
-        let mut desk = world.start_in("bob", "desk", HOUR).await;
+        let (alice, mut bob, group) = pair(&world).await;
+        world.start_in("bob", "lone").await.stop().await;
+        let mut desk = world.start_in("bob", "desk").await;
         let invite = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap();
         desk.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
         let desk_fp = desk.fp.clone();
@@ -640,7 +631,7 @@ fn sessions_lists_this_machines_sessions_running_or_stopped() {
 fn a_session_runs_in_one_process() {
     local(async {
         let world = world("one-process").await;
-        let alice = world.start("alice", HOUR).await;
+        let alice = world.start("alice").await;
         std::fs::remove_file(world.config("alice", "alice").dir.join("endpoint")).unwrap();
         let again = crate::listen(world.config("alice", "alice"), &alice.home, world.network.clone(), |_| Ok(()), std::future::pending());
         let error = tokio::time::timeout(Duration::from_secs(10), again).await.expect("it fails at once").unwrap_err();
@@ -653,7 +644,7 @@ fn a_session_runs_in_one_process() {
 fn a_session_goes_on_while_a_join_waits() {
     local(async {
         let world = world("busy").await;
-        let (alice, mut bob, group) = pair(&world, HOUR).await;
+        let (alice, mut bob, group) = pair(&world).await;
         let link = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap().to_owned();
         let mut invite = lmk_proto::links::Invite::parse(&link).unwrap();
         invite.members[0].0 = *iroh::SecretKey::generate().public().as_bytes();
@@ -672,24 +663,22 @@ fn a_session_goes_on_while_a_join_waits() {
 
 /// A restarted session prints what was delivered after the last message it showed, and not what came before it.
 #[test]
-fn a_restarted_session_prints_what_came_after_the_last_it_showed() {
+fn messages_not_for_a_session_are_logged_in_order_and_print_not() {
     local(async {
-        let world = world("reprint").await;
-        let (mut alice, bob, _) = pair(&world, HOUR).await;
+        let world = world("logged").await;
+        let (mut alice, bob, group) = pair(&world).await;
         bob.cmd(&["send", "before"]).await.unwrap();
         bob.cmd(&["send", "--to", &alice.fp, "to alice"]).await.unwrap();
-        assert_eq!(alice.expect("message").await["content"], "before");
         assert_eq!(alice.expect("message").await["content"], "to alice");
-        bob.cmd(&["send", "after one"]).await.unwrap();
-        bob.cmd(&["send", "after two"]).await.unwrap();
-        // Alice holds both, as Bob's status shows, and, unaddressed, prints neither.
-        let status = until(|| async { bob.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["only_here"].is_null()).await;
-        assert!(status["groups"][0]["only_here"].is_null(), "{status}");
-        alice.stop().await;
-        let mut alice = world.start("alice", HOUR).await;
-        assert_eq!(alice.expect("message").await["content"], "after one");
-        assert_eq!(alice.expect("message").await["content"], "after two");
+        bob.cmd(&["send", "after"]).await.unwrap();
+        let contents: Vec<Value> = [alice.told(&["message"]).await, alice.told(&["message"]).await, alice.told(&["message"]).await].iter().map(|e| e["content"].clone()).collect();
+        assert_eq!(contents, ["before", "to alice", "after"]);
         assert!(alice.printed().await.iter().all(|e| e["type"] != "message"));
+        assert!(alice.ready["log"].as_str().unwrap().ends_with("log.jsonl"));
+        // Leaving takes its lines out of the log, but for the `removed`.
+        alice.cmd(&["leave", "--end"]).await.unwrap();
+        let log = until(|| async { json!(alice.log()) }, |log| log.as_array().unwrap().iter().all(|line| !line.as_str().unwrap().contains(r#""type":"message""#))).await;
+        assert!(log.as_array().unwrap().iter().all(|line| !line.as_str().unwrap().contains(&group) || line.as_str().unwrap().contains(r#""type":"removed""#)), "{log}");
     });
 }
 
@@ -812,13 +801,13 @@ fn a_new_session_joins_the_auto_groups_of_its_home() {
     local(async {
         let world = world("auto").await;
         let home = world.root.path().join("h");
-        let mut alice = world.start_in("h", "alice", HOUR).await;
+        let mut alice = world.start_in("h", "alice").await;
         let group = alice.cmd(&["invite"]).await.unwrap()["group"].as_str().unwrap().to_owned();
         let added = crate::change_auto(&home, false, Some(crate::cli::Auto::Add { group: group[..6].into() })).unwrap();
         assert_eq!(added, json!({ "auto": [group] }));
         assert!(crate::change_auto(&home, false, Some(crate::cli::Auto::Add { group: "nope".into() })).unwrap_err().to_string().contains("no session of this home is in nope"));
 
-        let bob = world.start_in("h", "bob", HOUR).await;
+        let bob = world.start_in("h", "bob").await;
         let joined = alice.told(&["joined"]).await;
         assert_eq!(joined["member"], json!(bob.fp));
         assert_eq!(bob.cmd(&["groups"]).await.unwrap()["groups"][0]["group"], json!(group));
@@ -827,7 +816,7 @@ fn a_new_session_joins_the_auto_groups_of_its_home() {
         alice.stop().await;
         bob.cmd(&["remove", &alice.fp]).await.unwrap();
         bob.stop().await;
-        let carol = world.start_in("h", "carol", HOUR).await;
+        let carol = world.start_in("h", "carol").await;
         let members = async {
             loop {
                 if let Ok(members) = carol.cmd(&["members", "--all"]).await {
@@ -846,7 +835,7 @@ fn a_new_session_joins_the_auto_groups_of_its_home() {
         for gone in ["alice", "bob"] {
             std::fs::write(session_dir(&home, gone).unwrap().join("groups.json"), "[]").unwrap();
         }
-        let mut dave = world.start_in("h", "dave", HOUR).await;
+        let mut dave = world.start_in("h", "dave").await;
         loop {
             let warning = dave.expect("warning").await;
             if warning["text"].as_str().unwrap().contains("leaves the list") {
@@ -871,13 +860,13 @@ fn a_new_session_joins_an_auto_group_through_a_stopped_one_the_group_moved_past(
     local(async {
         let mut world = world("auto-behind").await;
         let home = world.root.path().join("h");
-        let mut alice = world.start_in("h", "alice", HOUR).await;
+        let mut alice = world.start_in("h", "alice").await;
         let invite = alice.cmd(&["invite"]).await.unwrap();
         let group = invite["group"].as_str().unwrap().to_owned();
         crate::change_auto(&home, false, Some(crate::cli::Auto::Add { group: group.clone() })).unwrap();
-        let bob = world.start("bob", HOUR).await;
+        let bob = world.start("bob").await;
         bob.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
-        let mut carol = world.start("carol", HOUR).await;
+        let mut carol = world.start("carol").await;
         carol.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
         alice.stop().await;
         bob.cmd(&["remove", &carol.fp]).await.unwrap();
@@ -893,7 +882,7 @@ fn a_new_session_joins_an_auto_group_through_a_stopped_one_the_group_moved_past(
                 answer.await
             })
         });
-        let dave = world.start_in("h", "dave", HOUR).await;
+        let dave = world.start_in("h", "dave").await;
         let members = async {
             loop {
                 if let Ok(members) = dave.cmd(&["members", "--all"]).await {
@@ -915,10 +904,10 @@ fn one_session_of_a_home_at_a_time_represents_it_in_an_autorep_group() {
     local(async {
         let world = world("autorep").await;
         let home = world.root.path().join("h");
-        let mut alice = world.start_in("h", "alice", HOUR).await;
+        let mut alice = world.start_in("h", "alice").await;
         let invite = alice.cmd(&["invite"]).await.unwrap();
         let group = invite["group"].as_str().unwrap().to_owned();
-        let mut dave = world.start("dave", HOUR).await;
+        let mut dave = world.start("dave").await;
         dave.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
         crate::change_auto(&home, false, Some(crate::cli::Auto::Add { group: group.clone() })).unwrap();
         let added = crate::change_auto(&home, true, Some(crate::cli::Auto::Add { group: group.clone() })).unwrap();
@@ -926,12 +915,12 @@ fn one_session_of_a_home_at_a_time_represents_it_in_an_autorep_group() {
         assert_eq!(crate::change_auto(&home, false, None).unwrap(), json!({ "auto": [] }), "a group added to one list leaves the other");
 
         // Bob, the first to start since, joins through Alice, who started before.
-        let mut bob = world.start_in("h", "bob", HOUR).await;
+        let mut bob = world.start_in("h", "bob").await;
         let joined = dave.told(&["joined"]).await;
         assert_eq!((&joined["member"], &joined["by"]), (&json!(bob.fp), &json!(alice.fp)));
         alice.stop().await;
         // Carol, running as Bob stops, takes over: through a stopped session, Alice's, not Bob's while he ran.
-        let carol = world.start_in("h", "carol", HOUR).await;
+        let carol = world.start_in("h", "carol").await;
         // Long past her start, which would have joined through Bob.
         tokio::time::sleep(Duration::from_secs(1)).await;
         bob.stop().await;
@@ -956,8 +945,8 @@ fn one_session_of_a_home_at_a_time_represents_it_in_an_autorep_group() {
 fn an_invite_for_a_member_admits_only_that_member() {
     local(async {
         let world = world("for").await;
-        let (mut alice, bob, group) = pair(&world, HOUR).await;
-        let carol = world.start("carol", HOUR).await;
+        let (mut alice, bob, group) = pair(&world).await;
+        let carol = world.start("carol").await;
         carol.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
         alice.told(&["joined"]).await;
 
