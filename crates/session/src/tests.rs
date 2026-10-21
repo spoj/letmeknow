@@ -846,6 +846,27 @@ fn a_stopped_session_started_again_catches_up_before_it_invites() {
     });
 }
 
+/// A member's intro reaches the group with its next update, at once: every member sees it in `members`, a joiner too,
+/// until the member clears it.
+#[test]
+fn an_intro_shows_in_every_members_list() {
+    local(async {
+        let world = world("intro").await;
+        let (alice, bob, group) = pair(&world).await;
+        let intro = |members: &Value, fp: &str| members["members"].as_array().unwrap().iter().find(|m| m["fp"] == fp).unwrap()["intro"].clone();
+        assert!(alice.cmd(&["intro", &"x".repeat(281)]).await.unwrap_err().to_string().contains("at most 280 bytes"));
+        assert_eq!(alice.cmd(&["intro", "budget agent, LF laptop"]).await.unwrap()["intro"], "budget agent, LF laptop");
+        let seen = until(|| async { bob.cmd(&["members"]).await.unwrap() }, |members| intro(members, &alice.fp) == "budget agent, LF laptop").await;
+        assert_eq!(intro(&seen, &alice.fp), "budget agent, LF laptop");
+        let carol = world.start("carol").await;
+        let joined = carol.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
+        assert_eq!(intro(&joined, &alice.fp), "budget agent, LF laptop", "a joiner sees it in the group it joins");
+        alice.cmd(&["intro"]).await.unwrap();
+        let seen = until(|| async { bob.cmd(&["members"]).await.unwrap() }, |members| intro(members, &alice.fp).is_null()).await;
+        assert!(intro(&seen, &alice.fp).is_null(), "{seen}");
+    });
+}
+
 /// An invite made with --for admits only that known member: another member of the shared group is refused without
 /// warning the inviter, and the link stays usable for the member it names.
 #[test]

@@ -17,6 +17,7 @@ letmeknow listen                       # the session process; keep it running: i
 letmeknow invite                       # new chat (--for <fp> limits the link to one known member)
 letmeknow join '<link>'                # join through a link
 letmeknow send "text"                  # --to <fingerprint>, --reply-to <id>, --urgent, --attach <file>
+letmeknow intro "text"                 # who you are and what you do now, which members see in `members`
 letmeknow sessions                     # this machine's sessions: handle, fingerprint, whether it runs, its groups
 ```
 

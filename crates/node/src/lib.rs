@@ -78,6 +78,9 @@ pub struct Member {
     pub revision: u32,
     /// The domain of its own service, whose relay it lives on, as its leaf names it.
     pub home: String,
+    /// What it says of itself to the group, as its leaf names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intro: Option<String>,
 }
 
 impl From<&core::Member> for Member {
@@ -87,6 +90,7 @@ impl From<&core::Member> for Member {
             iroh: member.leaf.as_ref().map(|leaf| leaf.key.clone()).unwrap_or_default(),
             revision: member.leaf.as_ref().map_or(0, |leaf| leaf.revision),
             home: member.leaf.as_ref().map(|leaf| leaf.home.clone()).unwrap_or_default(),
+            intro: member.leaf.as_ref().and_then(|leaf| leaf.intro.clone()),
         }
     }
 }
@@ -207,6 +211,9 @@ struct Rec {
     leaving: bool,
     /// When this session's leaf was last updated, in milliseconds.
     updated: u64,
+    /// What this session says of itself to the group, in its leaf.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    intro: Option<String>,
     /// The group delivered a message or changed its members since this session's leaf was last updated: an update is
     /// due once T passed.
     stirred: bool,

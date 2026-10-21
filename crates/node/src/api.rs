@@ -10,7 +10,7 @@ use lmk_proto::group::Settings;
 use lmk_proto::Bytes;
 use serde_json::{Value, json};
 
-use crate::{G, Member, Message, Node, Rec, Seen, State, now};
+use crate::{G, Member, Message, Node, Rec, Seen, State, Work, now};
 
 impl Node {
     /// Stops the peers and every task, and closes the provider.
@@ -106,6 +106,15 @@ impl Node {
     /// Marks the group as one this session leaves, and sends its `leave`: the others remove it once a cut keeps the
     /// `leave`, and it is in the group until then. Forgets a group it is alone in. Returns the `leave`'s id; none once
     /// this session is out of the group.
+    /// Sets what this session says of itself to the group, which its next update, at once, puts in its leaf.
+    pub fn set_intro(&self, gid: &[u8], intro: Option<String>) -> Result<()> {
+        let mut st = self.inner.lock();
+        st.group_mut(gid)?.rec.intro = intro;
+        st.save(gid)?;
+        self.inner.work.send(Work::Duties(gid.to_vec())).ok();
+        Ok(())
+    }
+
     pub fn leave(&self, gid: &[u8]) -> Result<Option<Bytes>> {
         let mut st = self.inner.lock();
         st.group_mut(gid)?.rec.leaving = true;

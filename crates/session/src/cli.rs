@@ -172,6 +172,13 @@ pub enum Request {
         #[arg(long)]
         group: Option<String>,
     },
+    /// Tell a group's members, in `members`, who this session is and what it does now; with no text, nothing
+    #[command(display_order = 13)]
+    Intro {
+        #[arg(long)]
+        group: Option<String>,
+        text: Option<String>,
+    },
     /// Remove a member, by fingerprint, from a group
     #[command(display_order = 16)]
     Remove {

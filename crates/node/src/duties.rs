@@ -12,7 +12,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use lmk_core::group::{Change, MAX_CUT_STEP};
 use lmk_proto::Bytes;
-use lmk_proto::group::Control;
+use lmk_proto::group::{Control, Leaf};
 use lmk_proto::clock::corrected;
 use lmk_proto::held::Ref;
 use n0_future::time::{Duration, sleep};
@@ -150,9 +150,9 @@ fn due(st: &State, g: &G) -> Result<Option<Change>> {
     let kept = |m: &&lmk_core::group::Member| g.left(&m.key).is_some_and(|seq| cut.iter().any(|r| r.key.0 == m.key && r.seq >= seq));
     let remove: Vec<u32> = members.iter().filter(|m| m.key != me).filter(|m| kept(m) || g.left_behind(&m.key)).map(|m| m.index).collect();
     let Some(own) = members.iter().find(|m| m.index == g.mls.own_index()) else { return Ok(None) };
-    let leaf = &st.session.leaf;
-    let update = own.leaf.as_ref() != Some(leaf) || g.rec.stirred && now() >= next(g, me);
-    Ok((update || !remove.is_empty()).then(|| Change { remove, leaf: Some(leaf.clone()), cut, ..Change::default() }))
+    let leaf = Leaf { intro: g.rec.intro.clone(), ..st.session.leaf.clone() };
+    let update = own.leaf.as_ref() != Some(&leaf) || g.rec.stirred && now() >= next(g, me);
+    Ok((update || !remove.is_empty()).then(|| Change { remove, leaf: Some(leaf), cut, ..Change::default() }))
 }
 
 impl Inner {

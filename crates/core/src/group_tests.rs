@@ -17,7 +17,7 @@ pub(crate) fn settings() -> Settings {
 }
 
 pub(crate) fn leaf(name: &str) -> Leaf {
-    Leaf { key: Bytes(name.as_bytes().to_vec()), revision: REVISION, home: "lmk.example".into() }
+    Leaf { key: Bytes(name.as_bytes().to_vec()), revision: REVISION, home: "lmk.example".into(), intro: None }
 }
 
 const INVITE: [u8; 32] = [7; 32];

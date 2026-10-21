@@ -214,6 +214,12 @@ impl Session {
         let answer = match request {
             Request::Members { group, all } => self.resolve(group).and_then(|gid| listed_members(&node, &gid, all)),
             Request::Groups { group } => self.list_groups(group),
+            Request::Intro { group, text } => self.resolve(group).and_then(|gid| {
+                let intro = text.filter(|text| !text.is_empty());
+                ensure!(intro.as_ref().is_none_or(|text| text.len() <= INTRO), "an intro is at most {INTRO} bytes");
+                node.set_intro(&gid.0, intro.clone())?;
+                Ok(json!({ "group": b64(&gid.0), "intro": intro }))
+            }),
             Request::Send { group, to, reply_to, urgent, attach, attach_name, text } => {
                 match self.message(group, to, reply_to, urgent, attach.map(|data| (data, attach_name)), text) {
                     Ok((gid, payload, reply_to)) => {
@@ -640,6 +646,9 @@ fn describe_key(me: &Bytes, members: &[Member], key: &Bytes) -> Value {
     }
 }
 
+/// The longest intro, in bytes.
+const INTRO: usize = 280;
+
 /// A group's members as `members` and `join` list them: this session, those online, and only a count of the others
 /// unless `all`.
 fn listed_members(node: &Node, gid: &Bytes, all: bool) -> Result<Value> {
@@ -647,6 +656,9 @@ fn listed_members(node: &Node, gid: &Bytes, all: bool) -> Result<Value> {
     let (mut members, mut offline) = (Vec::new(), 0);
     for (member, seen) in node.presence(&gid.0)? {
         let mut item = describe(&me, &member);
+        if let Some(intro) = &member.intro {
+            item["intro"] = json!(intro);
+        }
         match seen {
             Some(Seen { connected: true, .. }) => item["online"] = json!(true),
             Some(Seen { at, .. }) => item["last_seen"] = json!(short::iso(at)),
@@ -739,7 +751,7 @@ mod tests {
 
     #[test]
     fn a_member_shows_by_its_fingerprint() {
-        let member = |key: u8| Member { key: Bytes(vec![key]), iroh: Bytes(vec![key]), revision: 1, home: "h.example".into() };
+        let member = |key: u8| Member { key: Bytes(vec![key]), iroh: Bytes(vec![key]), revision: 1, home: "h.example".into(), intro: None };
         let me = Bytes(vec![1]);
         assert_eq!(describe(&me, &member(1)), json!({ "fp": fp(&[1]), "you": true }));
         assert_eq!(describe(&me, &member(2)), json!({ "fp": fp(&[2]) }));

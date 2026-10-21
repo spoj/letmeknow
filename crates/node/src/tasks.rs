@@ -26,7 +26,7 @@ impl Node {
         let ca = std::mem::take(&mut config.ca);
         let relay: RelayUrl = relay_url(&config.home).parse()?;
         let endpoint = lmk_net::builder([relay]).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
-        let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), revision: REVISION, home: config.home.clone() };
+        let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), revision: REVISION, home: config.home.clone(), intro: None };
         let clients = logs::Clients::new(config.post.clone());
         let state = State::open(provider, leaf)?;
         let (events, events_rx) = mpsc::unbounded_channel();

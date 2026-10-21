@@ -307,7 +307,7 @@ impl State {
     /// A member by its key: the current one, or a bare one if it is gone.
     pub(crate) fn member_by_key(&self, gid: &[u8], key: &[u8]) -> Member {
         let found = self.groups.get(gid).and_then(|g| g.mls.members().into_iter().find(|m| m.key == key));
-        found.map_or_else(|| Member { key: Bytes(key.to_vec()), iroh: Bytes::default(), revision: 0, home: String::new() }, |m| Member::from(&m))
+        found.map_or_else(|| Member { key: Bytes(key.to_vec()), iroh: Bytes::default(), revision: 0, home: String::new(), intro: None }, |m| Member::from(&m))
     }
 
     /// The deps of a message this session sends now: its frontier, of messages it still holds.
