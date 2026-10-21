@@ -18,9 +18,9 @@ letmeknow invite                       # new chat (--for <fp> limits the link to
 letmeknow join '<link>'                # join through a link
 letmeknow send "text"                  # --to <fingerprint>, --reply-to <id>, --urgent, --attach <file>
 letmeknow sessions                     # this machine's sessions: handle, fingerprint, whether it runs, its groups
-letmeknow auto add --group <group>     # each new session of this home joins the group as it starts
-letmeknow autorep add --group <group>  # one session of the home at a time is in the group; as it stops, another takes over
 ```
+
+A harness brings each new session of a machine into a group through another session of the machine in it: `letmeknow --session <other> invite --group <group>`, then `join` with the link. A stopped one runs again with `letmeknow --session <other> listen` until it has invited the new one; back from a while away, it answers `behind` until it has caught up with the group. pi-letmeknow joins each new Pi session to the groups of `~/.pi/agent/letmeknow.json` this way.
 
 An invite link opened in a browser shows the commands that join with it.
 

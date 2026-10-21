@@ -58,9 +58,6 @@ pub struct Config {
     /// Posts to a membership service's routes, as the shell does over https.
     pub post: Post,
     pub ca: CaTlsConfig,
-    /// Whether reading waits, before a commit that deletes an epoch's keys, for the kept messages of it this session
-    /// lacks. A session started only to invite another, which needs the group's head and none of its messages, does not.
-    pub wait_for_kept: bool,
 }
 
 /// When a member was last known online, in milliseconds since the epoch, and whether this session is connected to it now.
@@ -433,7 +430,6 @@ pub(crate) struct Inner {
     clients: logs::Clients,
     /// The domain of this session's own service, whose relay it lives on.
     home: String,
-    wait_for_kept: bool,
     events: mpsc::UnboundedSender<Event>,
     work: mpsc::UnboundedSender<Work>,
     /// Peer output and client events from steps, in order.
@@ -611,7 +607,7 @@ mod tests {
     use lmk_testing::Relay;
 
     async fn node(relay: &Relay, post: Post) -> Node {
-        let config = Config { home: relay.domain.clone(), post, ca: relay.ca(), wait_for_kept: true };
+        let config = Config { home: relay.domain.clone(), post, ca: relay.ca() };
         Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0
     }
 

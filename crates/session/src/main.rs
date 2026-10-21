@@ -46,14 +46,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", letmeknow::sessions(&home).await?);
             Ok(())
         }
-        Command::Auto { change } => {
-            println!("{}", letmeknow::change_auto(&home, false, change)?);
-            Ok(())
-        }
-        Command::Autorep { change } => {
-            println!("{}", letmeknow::change_auto(&home, true, change)?);
-            Ok(())
-        }
         Command::Skill => {
             print!("{}", letmeknow::SKILL);
             Ok(())

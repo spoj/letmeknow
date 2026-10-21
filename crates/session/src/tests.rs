@@ -793,77 +793,17 @@ async fn lookups_during_a_fetch_do_not_start_another() {
     assert_eq!(calls.load(Ordering::Relaxed), 1);
 }
 
-/// A group on a home's auto list is joined by each new session of the home as it starts: through a running session of
-/// the home in it, or else through a stopped one, whose node alone runs meanwhile, past one the group removed while it
-/// was stopped. A group no session of the home is in leaves the list, and the home's stopped sessions in no group go.
+/// A stopped session that the group moved past while it was stopped, started again, catches up with the group before it
+/// invites, however longer than a send waits its reading takes: as a harness starts one again to bring a new session of
+/// its home into the group. A stopped session in no group that was not deleted as it stopped goes as the next one starts.
 #[test]
-fn a_new_session_joins_the_auto_groups_of_its_home() {
+fn a_stopped_session_started_again_catches_up_before_it_invites() {
     local(async {
-        let world = world("auto").await;
-        let home = world.root.path().join("h");
-        let mut alice = world.start_in("h", "alice").await;
-        let group = alice.cmd(&["invite"]).await.unwrap()["group"].as_str().unwrap().to_owned();
-        let added = crate::change_auto(&home, false, Some(crate::cli::Auto::Add { group: group[..6].into() })).unwrap();
-        assert_eq!(added, json!({ "auto": [group] }));
-        assert!(crate::change_auto(&home, false, Some(crate::cli::Auto::Add { group: "nope".into() })).unwrap_err().to_string().contains("no session of this home is in nope"));
-
-        let bob = world.start_in("h", "bob").await;
-        let joined = alice.told(&["joined"]).await;
-        assert_eq!(joined["member"], json!(bob.fp));
-        assert_eq!(bob.cmd(&["groups"]).await.unwrap()["groups"][0]["group"], json!(group));
-
-        let mut bob = bob;
-        alice.stop().await;
-        bob.cmd(&["remove", &alice.fp]).await.unwrap();
-        bob.stop().await;
-        let carol = world.start_in("h", "carol").await;
-        let members = async {
-            loop {
-                if let Ok(members) = carol.cmd(&["members", "--all"]).await {
-                    return members;
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        };
-        let members = tokio::time::timeout(WAIT, members).await.expect("Carol joins through a stopped session");
-        assert_eq!(members["members"].as_array().unwrap().len(), 2);
-
-        // Once no session of the home is in it, the next session drops it from the list.
-        let mut carol = carol;
-        carol.cmd(&["leave", "--end"]).await.unwrap();
-        carol.stop().await;
-        for gone in ["alice", "bob"] {
-            std::fs::write(session_dir(&home, gone).unwrap().join("groups.json"), "[]").unwrap();
-        }
-        let mut dave = world.start_in("h", "dave").await;
-        loop {
-            let warning = dave.expect("warning").await;
-            if warning["text"].as_str().unwrap().contains("leaves the list") {
-                break;
-            }
-        }
-        // Windows refuses to delete a file still open, as one of this process's other sessions may hold one of theirs:
-        // Dave then warns, and the next session tries again.
-        if !cfg!(windows) {
-            let gone = || ["alice", "bob"].iter().all(|gone| !session_dir(&home, gone).unwrap().exists());
-            until(|| async { json!(gone()) }, |gone| *gone == true).await;
-            assert!(gone(), "Alice and Bob, stopped in no group, are deleted as Dave starts");
-        }
-        assert_eq!(crate::change_auto(&home, false, None).unwrap(), json!({ "auto": [] }));
-    });
-}
-
-/// A stopped session of the home that the group moved past while it was stopped catches up with the group before it
-/// invites a new session, however longer than a send waits its reading takes.
-#[test]
-fn a_new_session_joins_an_auto_group_through_a_stopped_one_the_group_moved_past() {
-    local(async {
-        let mut world = world("auto-behind").await;
+        let mut world = world("revive").await;
         let home = world.root.path().join("h");
         let mut alice = world.start_in("h", "alice").await;
         let invite = alice.cmd(&["invite"]).await.unwrap();
         let group = invite["group"].as_str().unwrap().to_owned();
-        crate::change_auto(&home, false, Some(crate::cli::Auto::Add { group: group.clone() })).unwrap();
         let bob = world.start("bob").await;
         bob.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
         let mut carol = world.start("carol").await;
@@ -882,60 +822,27 @@ fn a_new_session_joins_an_auto_group_through_a_stopped_one_the_group_moved_past(
                 answer.await
             })
         });
-        let dave = world.start_in("h", "dave").await;
-        let members = async {
-            loop {
-                if let Ok(members) = dave.cmd(&["members", "--all"]).await {
-                    return members;
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut stale = world.start_in("h", "stale").await;
+        stale.stop().await;
+        crate::cli::private_dir(&session_dir(&home, "stale").unwrap()).unwrap();
+        std::fs::write(session_dir(&home, "stale").unwrap().join("groups.json"), "[]").unwrap();
+        let alice = world.start_in("h", "alice").await;
+        // Its reading takes longer than an invite waits: it answers `behind` until it has caught up.
+        let link = loop {
+            match alice.cmd(&["invite", &format!("--group={group}")]).await {
+                Ok(invite) => break invite["link"].as_str().unwrap().to_owned(),
+                Err(error) => assert!(error.to_string().starts_with("behind"), "{error:#}"),
             }
         };
-        let members = tokio::time::timeout(2 * WAIT, members).await.expect("Dave joins through Alice, stopped");
-        assert_eq!(members["members"].as_array().unwrap().len(), 3);
-    });
-}
-
-/// One session of a home at a time represents it in a group of its autorep list: the first to start, and as that one
-/// stops, one of those running then. It joins the group through a session of the home in it, and removes the home's
-/// stopped sessions from it. A group added to one list leaves the other.
-#[test]
-fn one_session_of_a_home_at_a_time_represents_it_in_an_autorep_group() {
-    local(async {
-        let world = world("autorep").await;
-        let home = world.root.path().join("h");
-        let mut alice = world.start_in("h", "alice").await;
-        let invite = alice.cmd(&["invite"]).await.unwrap();
-        let group = invite["group"].as_str().unwrap().to_owned();
-        let mut dave = world.start("dave").await;
-        dave.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
-        crate::change_auto(&home, false, Some(crate::cli::Auto::Add { group: group.clone() })).unwrap();
-        let added = crate::change_auto(&home, true, Some(crate::cli::Auto::Add { group: group.clone() })).unwrap();
-        assert_eq!(added, json!({ "autorep": [group] }));
-        assert_eq!(crate::change_auto(&home, false, None).unwrap(), json!({ "auto": [] }), "a group added to one list leaves the other");
-
-        // Bob, the first to start since, joins through Alice, who started before.
-        let mut bob = world.start_in("h", "bob").await;
-        let joined = dave.told(&["joined"]).await;
-        assert_eq!((&joined["member"], &joined["by"]), (&json!(bob.fp), &json!(alice.fp)));
-        alice.stop().await;
-        // Carol, running as Bob stops, takes over: through a stopped session, Alice's, not Bob's while he ran.
-        let carol = world.start_in("h", "carol").await;
-        // Long past her start, which would have joined through Bob.
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        bob.stop().await;
-        let joined = dave.told(&["joined"]).await;
-        assert_eq!((&joined["member"], &joined["by"]), (&json!(carol.fp), &json!(alice.fp)));
-        for removed in [&alice.fp, &bob.fp] {
-            let left = dave.told(&["left"]).await;
-            assert_eq!((&left["member"], &left["by"]), (&json!(removed), &json!(carol.fp)));
+        let dave = world.start_in("h", "dave").await;
+        dave.cmd(&["join", &link]).await.unwrap();
+        assert_eq!(dave.cmd(&["members", "--all"]).await.unwrap()["members"].as_array().unwrap().len(), 3);
+        // Windows refuses to delete a file still open, as one of this process's other sessions may hold one of theirs.
+        if !cfg!(windows) {
+            let gone = || !session_dir(&home, "stale").unwrap().exists();
+            until(|| async { json!(gone()) }, |gone| *gone == true).await;
+            assert!(gone(), "the stopped session in no group is deleted as the next session starts");
         }
-        let members = dave.cmd(&["members", "--all"]).await.unwrap();
-        let fps: Vec<&Value> = members["members"].as_array().unwrap().iter().map(|m| &m["fp"]).collect();
-        assert_eq!(fps, [&json!(dave.fp), &json!(carol.fp)]);
-        let out = |sessions: &Value| sessions["sessions"].as_array().unwrap().iter().all(|s| s["handle"] == "carol" || s["groups"].is_null());
-        let sessions = until(|| async { crate::sessions(&home).await.unwrap() }, out).await;
-        assert!(out(&sessions), "Alice's and Bob's groups no longer name the group: {sessions}");
     });
 }
 

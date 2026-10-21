@@ -81,7 +81,7 @@ impl Inner {
         let g = st.group(gid)?;
         let carried = time + days(g.mls.settings().carry) >= corrected();
         let lacking = if carried { g.lacking() } else { Vec::new() };
-        let waiting = self.wait_for_kept && st.peers.wait(&Bytes(gid.to_vec()), &lacking, read, now);
+        let waiting = st.peers.wait(&Bytes(gid.to_vec()), &lacking, read, now);
         if waiting {
             tracing::debug!("waiting at position {position} for {} memberships' kept messages", lacking.len());
         }
