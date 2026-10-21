@@ -1,7 +1,9 @@
 //! Reading a group's logs of commits strictly in order, each epoch's from the commit that moved the group to it, its
 //! entries after that epoch's first valid commit passed over. A commit deletes the keys of the epoch before the current
 //! one, whose messages the last commit kept: before it applies, this session waits for those it lacks as
-//! `Peers::wait` decides, unless the commit was made more than H ago, and what it still lacks then is lost to it.
+//! `Peers::wait` decides, unless the commit was made more than H ago, and what it still lacks then is lost to it. The
+//! commits made before a wait began, which it missed while away, share that wait; a session started only to invite
+//! another does not wait.
 //! Applying a commit moves the cuts: what they kept, and the memberships that ended and began.
 
 use anyhow::{Context, Result};
@@ -69,11 +71,8 @@ impl Inner {
         let now = st.tick();
         let g = st.group_mut(gid)?;
         let read = match g.reading {
-            Some((at, read)) if at == position => read,
-            _ => {
-                g.reading = Some((position, now));
-                now
-            }
+            Some(read) if time < read => read,
+            _ => *g.reading.insert(now),
         };
         g.waiting = true;
         let prior = g.mls.epoch().saturating_sub(1);
@@ -82,7 +81,7 @@ impl Inner {
         let g = st.group(gid)?;
         let carried = time + days(g.mls.settings().carry) >= corrected();
         let lacking = if carried { g.lacking() } else { Vec::new() };
-        let waiting = st.peers.wait(&Bytes(gid.to_vec()), &lacking, read, now);
+        let waiting = self.wait_for_kept && st.peers.wait(&Bytes(gid.to_vec()), &lacking, read, now);
         if waiting {
             tracing::debug!("waiting at position {position} for {} memberships' kept messages", lacking.len());
         }
@@ -106,7 +105,7 @@ impl Inner {
         let ended = Epoch { epoch: ending, capability: g.mls.capability(&st.provider)?, service: g.mls.settings().membership };
         let mut applied = g.mls.apply(&st.provider, entry)?;
         let current = g.mls.epoch();
-        (g.reading, g.fetch) = (None, None);
+        g.fetch = None;
         g.changed = true;
         let members = g.mls.members();
         let by = members.iter().find(|m| m.index == applied.by).cloned();

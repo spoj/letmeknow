@@ -37,6 +37,7 @@ impl Node {
             net: OnceLock::new(),
             clients,
             home: config.home.clone(),
+            wait_for_kept: config.wait_for_kept,
             events,
             work,
             outbox,

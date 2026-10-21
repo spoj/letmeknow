@@ -48,7 +48,7 @@ async fn session_trusting(relays: &[&Relay]) -> Session {
 }
 
 fn config(relay: &Relay) -> Config {
-    Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca() }
+    Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), wait_for_kept: true }
 }
 
 impl Session {
@@ -1297,6 +1297,69 @@ async fn catching_up() {
     assert!(started.elapsed() < Duration::from_millis(lmk_net::peers::HEAR), "took {:?}", started.elapsed());
     assert_eq!((lost.messages[0].from.key.clone(), lost.messages[0].seqs.clone()), (bob_key, vec![1]));
     carol.node.shutdown().await.unwrap();
+}
+
+/// Carol stops; Bob sends a message before each of `missed` commits, which Alice keeps; Alice and Bob stop, and Carol
+/// comes back with no holder online. Answers how long Carol, waiting or not as `wait_for_kept` says, took to catch up,
+/// and the seqs she lost: all but the last message's, whose keys no commit after it deletes.
+async fn back_with_no_holder(test: &str, missed: usize, wait_for_kept: bool) -> (Duration, Vec<u64>) {
+    let relay = relay().await;
+    let dir = folder(test);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = |name: &str| dir.join(format!("{name}.db"));
+    let mut alice = stored(&relay, &db("alice")).await;
+    let bob = stored(&relay, &db("bob")).await;
+    let carol = stored(&relay, &db("carol")).await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    let spares = strangers(&mut alice, &gid, &relay, missed).await;
+    for joiner in [&bob, &carol] {
+        joiner.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    }
+    let size = missed + 3;
+    eventually("Bob and Carol have both Adds", || [&bob, &carol].iter().all(|s| s.node.members(&gid.0).unwrap().len() == size)).await;
+    carol.node.shutdown().await.unwrap();
+    drop(carol);
+
+    for spare in &spares {
+        bob.node.send(&gid.0, &message("only Alice and Bob hold this"), None).await.unwrap();
+        alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
+        alice.node.remove(&gid.0, &spare.0).await.unwrap();
+    }
+    bob.node.shutdown().await.unwrap();
+    alice.node.shutdown().await.unwrap();
+
+    let started = std::time::Instant::now();
+    let (node, events) = Node::start(SqliteProvider::open(&db("carol")).unwrap(), Config { wait_for_kept, ..config(&relay) }).await.unwrap();
+    let mut carol = Session { node, events };
+    carol.node.caught_up(&gid.0).await.unwrap();
+    let took = started.elapsed();
+    let mut lost = Vec::new();
+    while lost.len() < missed - 1 {
+        lost.extend(carol.until(|e| match e {
+            Event::Lost(lost) => Some(lost.messages.into_iter().flat_map(|m| m.seqs).collect::<Vec<_>>()),
+            _ => None,
+        }).await);
+    }
+    carol.node.shutdown().await.unwrap();
+    (took, lost)
+}
+
+/// A member back from a while away waits `HEAR` once for the kept messages it lacks, not once for each commit it missed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_catching_up_waits_once_for_all_the_commits_it_missed() {
+    let (took, lost) = back_with_no_holder("wait-once", 4, true).await;
+    assert_eq!(lost, vec![1, 2, 3]);
+    let hear = Duration::from_millis(lmk_net::peers::HEAR);
+    assert!(took >= hear && took < 2 * hear, "took {took:?}");
+}
+
+/// A session that does not wait for kept messages, as one started only to invite another, catches up at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_not_waiting_for_kept_messages_catches_up_at_once() {
+    let (took, lost) = back_with_no_holder("no-wait", 4, false).await;
+    assert_eq!(lost, vec![1, 2, 3]);
+    assert!(took < Duration::from_millis(lmk_net::peers::HEAR), "took {took:?}");
 }
 
 /// `remove_others` removes every other member in one commit: the group is then its committer's alone.

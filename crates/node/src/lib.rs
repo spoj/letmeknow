@@ -58,6 +58,9 @@ pub struct Config {
     /// Posts to a membership service's routes, as the shell does over https.
     pub post: Post,
     pub ca: CaTlsConfig,
+    /// Whether reading waits, before a commit that deletes an epoch's keys, for the kept messages of it this session
+    /// lacks. A session started only to invite another, which needs the group's head and none of its messages, does not.
+    pub wait_for_kept: bool,
 }
 
 /// When a member was last known online, in milliseconds since the epoch, and whether this session is connected to it now.
@@ -283,8 +286,9 @@ pub(crate) struct G {
     seen: VecDeque<[u8; 32]>,
     /// Seqs that came to be known lately, and when: not asked for until `HOLD_OFF` passed.
     fresh: Vec<(Bytes, u64, lmk_proto::ranges::Ranges, u64)>,
-    /// The position of the commit reading waits at, and when it was read.
-    reading: Option<(u64, u64)>,
+    /// When reading began its last wait before a commit. The commits made before then, which this session missed while
+    /// away, share that wait: it waits once for them all, not once for each epoch it missed.
+    reading: Option<u64>,
     /// Reading waits before a commit that deletes the keys of an epoch whose kept messages this session lacks.
     waiting: bool,
     /// The seqs an update waits to fetch before it commits, and when it first waited, in this epoch.
@@ -429,6 +433,7 @@ pub(crate) struct Inner {
     clients: logs::Clients,
     /// The domain of this session's own service, whose relay it lives on.
     home: String,
+    wait_for_kept: bool,
     events: mpsc::UnboundedSender<Event>,
     work: mpsc::UnboundedSender<Work>,
     /// Peer output and client events from steps, in order.
@@ -606,7 +611,7 @@ mod tests {
     use lmk_testing::Relay;
 
     async fn node(relay: &Relay, post: Post) -> Node {
-        let config = Config { home: relay.domain.clone(), post, ca: relay.ca() };
+        let config = Config { home: relay.domain.clone(), post, ca: relay.ca(), wait_for_kept: true };
         Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0
     }
 

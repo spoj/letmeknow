@@ -249,7 +249,7 @@ pub async fn listen(
     cli::open_channel(&config.dir.join("endpoint"), inbound).await?;
     let db = store::open(&config.dir.join("session.db"))?;
     let provider = SqliteProvider::open(&config.dir.join("session.db"))?;
-    let node_config = lmk_node::Config { home: config.membership.clone(), post: network.post.clone(), ca: network.ca.clone() };
+    let node_config = lmk_node::Config { home: config.membership.clone(), post: network.post.clone(), ca: network.ca.clone(), wait_for_kept: true };
     let (node, events) = Node::start(provider, node_config.clone()).await?;
     let (handle, dir) = (config.handle.clone(), config.dir.clone());
     let mut session = session::Session::open(config, db, node.clone(), held, membership).await?;
@@ -453,7 +453,8 @@ async fn join_by_sibling(home: &Path, config: &lmk_node::Config, node: &Node, gr
         if held.try_lock().is_err() {
             continue;
         }
-        let (sibling, _events) = Node::start(SqliteProvider::open(&dir.join("session.db"))?, config.clone()).await?;
+        let config = lmk_node::Config { wait_for_kept: false, ..config.clone() };
+        let (sibling, _events) = Node::start(SqliteProvider::open(&dir.join("session.db"))?, config).await?;
         let joined = async {
             let gid = sibling.groups().into_iter().find(|gid| b64(&gid.0) == group).context("the session left the group")?;
             tokio::time::timeout(CATCH_UP, sibling.caught_up(&gid.0)).await.context("the session did not catch up with the group")??;
