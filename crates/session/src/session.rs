@@ -348,6 +348,10 @@ impl Session {
     /// Takes an event of the node.
     pub fn event(&mut self, event: Event) {
         let group = event.group().cloned();
+        // The node may tell of a group after the session let go of it, its log lines too: only its `removed` is logged.
+        if group.as_ref().is_some_and(|gid| !self.node.groups().contains(gid)) && !matches!(event, Event::Removed { .. }) {
+            return;
+        }
         if let Err(error) = self.on(event) {
             self.out.push((json!({ "type": "warning", "group": group, "text": format!("{error:#}") }), true));
         }
