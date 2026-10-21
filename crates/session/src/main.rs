@@ -1,4 +1,4 @@
-use letmeknow::cli::{Cli, Command, call, home_dir, new_handle, running_session, session_dir};
+use letmeknow::cli::{Cli, Command, call, home_dir, new_handle, running_session, session_dir, session_named};
 use letmeknow::session::Config;
 use letmeknow::Network;
 use std::process::ExitCode;
@@ -26,7 +26,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Listen { membership } => {
             let network = Network::new(&home, letmeknow::ca()?)?;
             let handle = match cli.session {
-                Some(session) => session,
+                Some(session) => session_named(&home, session)?,
                 None => new_handle(&home)?,
             };
             let config = Config {
@@ -53,7 +53,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Serve(serve) => letmeknow::serve(serve).await,
         Command::Request(request) => {
             let session = match cli.session {
-                Some(session) => session,
+                Some(session) => session_named(&home, session)?,
                 None => running_session(&home).await?,
             };
             let answer = call(&home, &session, request).await?;

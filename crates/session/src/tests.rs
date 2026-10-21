@@ -177,7 +177,7 @@ impl Agent {
     async fn expect_any(&mut self, kinds: &[&str]) -> Value {
         loop {
             let Ok(line) = tokio::time::timeout(WAIT, self.events.recv()).await else {
-                panic!("{}: no {kinds:?} event; status: {:?}", self.handle, self.cmd(&["status"]).await);
+                panic!("{}: no {kinds:?} event; status: {:?}", self.handle, self.cmd(&["groups"]).await);
             };
             let line = line.unwrap();
             let event: Value = serde_json::from_str(&line).unwrap();
@@ -322,10 +322,10 @@ fn membership_changes_are_told_and_a_removed_session_learns_it() {
         assert_eq!(members["members"][0]["fp"], alice.fp);
         assert_eq!(members["members"][1], json!({ "fp": bob.fp, "you": true }));
         let other = alice.cmd(&["invite"]).await.unwrap()["group"].as_str().unwrap().to_owned();
-        assert_eq!(alice.cmd(&["status"]).await.unwrap()["groups"].as_array().unwrap().len(), 2);
-        let status = alice.cmd(&["status", &format!("--group={}", &group[..8])]).await.unwrap();
+        assert_eq!(alice.cmd(&["groups"]).await.unwrap()["groups"].as_array().unwrap().len(), 2);
+        let status = alice.cmd(&["groups", &format!("--group={}", &group[..8])]).await.unwrap();
         assert_eq!(status["groups"].as_array().unwrap().iter().map(|g| &g["group"]).collect::<Vec<_>>(), [group.as_str()]);
-        assert!(alice.cmd(&["status", "--group", "nope"]).await.unwrap_err().to_string().contains("unknown group nope"));
+        assert!(alice.cmd(&["groups", "--group", "nope"]).await.unwrap_err().to_string().contains("unknown group nope"));
         alice.cmd(&["leave", &format!("--group={}", &other[..8])]).await.unwrap();
         assert!(alice.cmd(&["remove", "Carol"]).await.is_err());
         alice.cmd(&["remove", &bob.fp[..8]]).await.unwrap();
@@ -351,7 +351,7 @@ fn text_logged_stays_only_in_the_log_until_the_group_is_left() {
         let secret = "the vault code is 7-tangerine-42";
         bob.cmd(&["send", "--to", &alice.fp, secret]).await.unwrap();
         assert_eq!(alice.expect("message").await["content"].as_str().unwrap(), secret);
-        alice.cmd(&["status"]).await.unwrap();
+        alice.cmd(&["groups"]).await.unwrap();
         let dir = session_dir(&alice.home, "alice").unwrap();
         assert_eq!(holding(&dir, secret), vec![dir.join("log.jsonl")]);
         alice.cmd(&["remove", &bob.fp]).await.unwrap();
@@ -408,7 +408,7 @@ fn a_message_taken_in_is_forgotten_after_h_with_its_attachments_copy() {
         alice.stop().await;
         LATER.store(8 * 24 * 3600 * 1000, Ordering::Relaxed);
         let alice = world.start("alice").await;
-        alice.cmd(&["status"]).await.unwrap();
+        alice.cmd(&["groups"]).await.unwrap();
         assert_eq!(taken(), 0);
         assert!(!Path::new(path).exists());
     });
@@ -424,14 +424,14 @@ fn status_lists_sends_held_only_here() {
         alice.cmd(&["send", "hello"]).await.unwrap();
         // Bob takes it, and the invite before it: once his summary tells Alice, her next commit keeps both.
         bob.told(&["message"]).await;
-        until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["only_here"].is_null()).await;
+        until(|| async { alice.cmd(&["groups"]).await.unwrap() }, |status| status["groups"][0]["only_here"].is_null()).await;
         add_and_remove(&world, &mut alice, &group).await;
         bob.stop().await;
         let sent = alice.cmd(&["send", "anyone?"]).await.unwrap();
-        let status = alice.cmd(&["status"]).await.unwrap();
+        let status = alice.cmd(&["groups"]).await.unwrap();
         assert_eq!(status["groups"][0]["only_here"], json!([{ "what": "message", "id": sent["id"] }]));
         let _bob = world.start("bob").await;
-        let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["only_here"].is_null()).await;
+        let status = until(|| async { alice.cmd(&["groups"]).await.unwrap() }, |status| status["groups"][0]["only_here"].is_null()).await;
         assert!(status["groups"][0]["only_here"].is_null(), "Bob holds it: {status}");
     });
 }
@@ -649,11 +649,11 @@ fn a_session_goes_on_while_a_join_waits() {
         let mut invite = lmk_proto::links::Invite::parse(&link).unwrap();
         invite.members[0].0 = *iroh::SecretKey::generate().public().as_bytes();
         let (home, handle) = (bob.home.clone(), bob.handle.clone());
-        let join = Request::Join { target: invite.link() };
+        let join = Request::Join { link: invite.link() };
         let joining = tokio::task::spawn_local(async move { crate::cli::call(&home, &handle, join).await });
         tokio::time::sleep(Duration::from_millis(500)).await;
         let started = std::time::Instant::now();
-        bob.cmd(&["status"]).await.unwrap();
+        bob.cmd(&["groups"]).await.unwrap();
         alice.cmd(&["send", "--to", &bob.fp, "still there?"]).await.unwrap();
         assert_eq!(bob.expect("message").await["content"], "still there?");
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());

@@ -213,8 +213,7 @@ impl Session {
         let node = self.node.clone();
         let answer = match request {
             Request::Members { group, all } => self.resolve(group).and_then(|gid| listed_members(&node, &gid, all)),
-            Request::Groups => self.list_groups(),
-            Request::Status { group } => self.status(group),
+            Request::Groups { group } => self.list_groups(group),
             Request::Send { group, to, reply_to, urgent, attach, attach_name, text } => {
                 match self.message(group, to, reply_to, urgent, attach.map(|data| (data, attach_name)), text) {
                     Ok((gid, payload, reply_to)) => {
@@ -248,9 +247,9 @@ impl Session {
                 _ = self.running.spawn_local(async move { Answered(invite.await, Some(reply)) });
                 return;
             }
-            Request::Join { target } => {
+            Request::Join { link } => {
                 let joining = self.joining.clone();
-                _ = self.running.spawn_local(async move { Answered(join(&node, &joining, &target).await, Some(reply)) });
+                _ = self.running.spawn_local(async move { Answered(join(&node, &joining, &link).await, Some(reply)) });
                 return;
             }
             Request::Remove { group, member } => {
@@ -287,29 +286,23 @@ impl Session {
         self.answer(answer, reply);
     }
 
-    fn list_groups(&self) -> Result<Value> {
-        let mut groups = Vec::new();
-        for gid in self.node.groups() {
-            let settings = self.node.settings(&gid.0)?;
-            groups.push(json!({
-                "group": b64(&gid.0), "size": self.node.members(&gid.0)?.len(), "carry": settings.carry,
-                "membership": settings.membership, "epoch": self.node.epoch(&gid.0)?,
-            }));
-        }
-        Ok(json!({ "groups": groups }))
-    }
-
-    /// The sends of this session that no other member holds yet, in each of its groups or only `group`.
-    fn status(&self, group: Option<String>) -> Result<Value> {
+    /// This session's groups, or only `group`: each one's settings, size, the members online, and the sends of this
+    /// session that no other member holds yet.
+    fn list_groups(&self, group: Option<String>) -> Result<Value> {
         let gids = match group {
             Some(group) => vec![self.resolve(Some(group))?],
             None => self.node.groups(),
         };
         let mut groups = Vec::new();
         for gid in gids {
+            let settings = self.node.settings(&gid.0)?;
+            let presence = self.node.presence(&gid.0)?;
             let only_here: Vec<Value> =
                 self.node.only_here(&gid.0)?.iter().map(|(id, payload)| json!({ "what": payload["type"], "id": hex::encode(&id.0) })).collect();
-            groups.push(json!({ "group": b64(&gid.0), "only_here": only_here }));
+            groups.push(json!({
+                "group": b64(&gid.0), "size": presence.len(), "online": 1 + presence.iter().filter(|(_, seen)| seen.as_ref().is_some_and(|seen| seen.connected)).count(),
+                "carry": settings.carry, "membership": settings.membership, "epoch": self.node.epoch(&gid.0)?, "only_here": only_here,
+            }));
         }
         Ok(json!({ "groups": groups }))
     }

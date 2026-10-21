@@ -21,7 +21,7 @@ use crate::session::Inbound;
 #[derive(Parser)]
 #[command(name = "letmeknow", version)]
 pub struct Cli {
-    /// Agent session; each session is its own group member [default: listen picks a new handle; other commands use the one running session]
+    /// Agent session, by handle or any unique beginning of its fingerprint; each session is its own group member [default: listen picks a new handle; other commands use the one running session]
     #[arg(long, env = "LETMEKNOW_SESSION", global = true)]
     pub session: Option<String>,
     /// Where sessions keep their state [default: the user's local data directory]
@@ -148,13 +148,13 @@ pub enum Request {
         #[serde(rename = "for", default, skip_serializing_if = "Option::is_none")]
         for_member: Option<String>,
         /// Days members carry a new group's messages for one another
-        #[arg(long, default_value_t = 7, conflicts_with = "group")]
+        #[arg(long, default_value_t = CARRY, conflicts_with = "group")]
         #[serde(default = "carry")]
         carry: u32,
     },
     /// Join a group through an invite link
     #[command(display_order = 11)]
-    Join { target: String },
+    Join { link: String },
     /// List members of a group
     #[command(display_order = 14)]
     Members {
@@ -165,9 +165,13 @@ pub enum Request {
         #[serde(default)]
         all: bool,
     },
-    /// List this session's groups
+    /// This session's groups: each one's size, the members online, and the sends no other member holds yet (only_here)
     #[command(display_order = 15)]
-    Groups,
+    Groups {
+        /// Only this group
+        #[arg(long)]
+        group: Option<String>,
+    },
     /// Remove a member, by fingerprint, from a group
     #[command(display_order = 16)]
     Remove {
@@ -183,13 +187,6 @@ pub enum Request {
         #[arg(long)]
         #[serde(default)]
         end: bool,
-    },
-    /// The members this session is connected to in each group, and what only this session holds
-    #[command(display_order = 21)]
-    Status {
-        /// Only this group
-        #[arg(long)]
-        group: Option<String>,
     },
     /// Send a message in a chat ("-" reads the text from stdin)
     #[command(display_order = 12)]
@@ -216,8 +213,10 @@ pub enum Request {
     },
 }
 
+const CARRY: u32 = 7;
+
 fn carry() -> u32 {
-    7
+    CARRY
 }
 
 /// Where a running session process accepts requests: a localhost port guarded by a token.
@@ -255,6 +254,26 @@ pub fn session_dir(home: &Path, session: &str) -> Result<PathBuf> {
         bail!("session names may contain only letters, digits, '.', '_' and '-'");
     }
     Ok(home.join("sessions").join(session))
+}
+
+/// The handle of the session `name` names: its handle, or else any unique beginning of its fingerprint; a name that is
+/// neither is a new handle.
+pub fn session_named(home: &Path, name: String) -> Result<String> {
+    if session_dir(home, &name)?.exists() {
+        return Ok(name);
+    }
+    let mut found: Vec<String> = std::fs::read_dir(home.join("sessions"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| std::fs::read_to_string(entry.path().join("fp")).is_ok_and(|fp| fp.starts_with(&name)))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    match found.len() {
+        0 => Ok(name),
+        1 => Ok(found.remove(0)),
+        _ => bail!("several sessions have fingerprints that begin {name} ({}); give more of it", found.join(", ")),
+    }
 }
 
 /// A handle of 8 hex digits not used by any existing session.
@@ -407,7 +426,21 @@ pub fn private_file(path: &Path, contents: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, Policy, Request, parse};
+    use super::{Command, Policy, Request, parse, session_named};
+
+    #[test]
+    fn a_session_is_named_by_its_handle_or_a_unique_beginning_of_its_fingerprint() {
+        let home = tempfile::tempdir().unwrap();
+        for (handle, fp) in [("pi-1", "ab12000000000000"), ("pi-2", "ab34000000000000")] {
+            std::fs::create_dir_all(home.path().join("sessions").join(handle)).unwrap();
+            std::fs::write(home.path().join("sessions").join(handle).join("fp"), fp).unwrap();
+        }
+        let named = |name: &str| session_named(home.path(), name.into());
+        assert_eq!(named("pi-2").unwrap(), "pi-2");
+        assert_eq!(named("ab34").unwrap(), "pi-2");
+        assert_eq!(named("new").unwrap(), "new");
+        assert!(named("ab").unwrap_err().to_string().contains("pi-1, pi-2") || named("ab").unwrap_err().to_string().contains("pi-2, pi-1"));
+    }
 
     #[test]
     fn a_value_may_start_with_a_hyphen() {
