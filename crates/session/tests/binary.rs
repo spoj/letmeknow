@@ -25,8 +25,8 @@ fn the_binary_prints_the_skill_and_needs_a_session_for_requests() {
     let groups = letmeknow(&home, &["groups"]);
     assert!(!groups.status.success());
     assert!(String::from_utf8(groups.stderr).unwrap().contains("no session is running"));
-    let send = letmeknow(&home, &["--session", "swift-koala", "send", "hi"]);
-    assert!(String::from_utf8(send.stderr).unwrap().contains("swift-koala is not running"));
+    let send = letmeknow(&home, &["--session", "0123abcd", "send", "hi"]);
+    assert!(String::from_utf8(send.stderr).unwrap().contains("no session of this machine has a fingerprint that begins 0123abcd"));
     let bad = letmeknow(&home, &["invite", "--no-such-flag"]);
     assert!(!bad.status.success());
 }
