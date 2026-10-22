@@ -69,6 +69,9 @@ pub struct Own {
     /// Seqs the node holds sealed in an ended epoch, which it wants sealed again: offered only to holders whose summary
     /// of this epoch lists them sealed.
     pub stale: Vec<Seqs>,
+    /// The signed intros of the current memberships, own included, with their versions: each goes to every neighbour
+    /// not told it.
+    pub intros: BTreeMap<Membership, (u64, Signed)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,6 +145,8 @@ struct Conn {
     theirs: BTreeMap<[u8; 32], u64>,
     /// Per group, the latest sighting of each member the peer told or was told.
     told: BTreeMap<Bytes, BTreeMap<Key, u64>>,
+    /// Per group, the latest version of each membership's intro the peer told or was told.
+    introduced: BTreeMap<Bytes, BTreeMap<Membership, u64>>,
     /// Per group, the held messages the peer announced it holds.
     has: BTreeMap<Bytes, Set>,
 }
@@ -178,7 +183,7 @@ impl Peers {
                 }
                 g.heard.retain(|m, _| *m == own.me || own.members.iter().any(|(n, _)| n == m));
                 g.seen.retain(|k, _| own.members.iter().any(|(_, n)| n == k));
-                let changed = (g.own.epoch, g.own.log, &g.own.head) != (own.epoch, own.log, &own.head);
+                let changed = (g.own.epoch, g.own.log, &g.own.head, &g.own.intros) != (own.epoch, own.log, &own.head, &own.intros);
                 let members = g.own.members != own.members;
                 g.own = own;
                 (changed, members)
@@ -210,6 +215,7 @@ impl Peers {
             c.opened.remove(id);
             c.sent.remove(id);
             c.told.remove(id);
+            c.introduced.remove(id);
             c.has.remove(id);
         }
     }
@@ -225,7 +231,7 @@ impl Peers {
             self.changed.get_or_insert(now);
         }
         self.backoff.remove(&peer);
-        let conn = Conn { dialed, served_at: now, active: now, hello: true, opened: served.clone(), served, sent: BTreeMap::new(), theirs: BTreeMap::new(), told: BTreeMap::new(), has: BTreeMap::new() };
+        let conn = Conn { dialed, served_at: now, active: now, hello: true, opened: served.clone(), served, sent: BTreeMap::new(), theirs: BTreeMap::new(), told: BTreeMap::new(), introduced: BTreeMap::new(), has: BTreeMap::new() };
         self.conns.insert(peer, conn);
     }
 
@@ -254,6 +260,7 @@ impl Peers {
         }
         c.sent.retain(|id, _| served.contains(id));
         c.told.retain(|id, _| served.contains(id));
+        c.introduced.retain(|id, _| served.contains(id));
         c.has.retain(|id, _| served.contains(id));
         c.served = served;
         for (id, g) in &mut self.groups {
@@ -305,7 +312,8 @@ impl Peers {
         }
     }
 
-    /// A frame from a connected peer, after the node's own checks. A `summary` goes to `summary`.
+    /// A frame from a connected peer, after the node's own checks: a `hello`'s intros after the node took them into
+    /// `Own`. A `summary` goes to `summary`.
     pub fn frame(&mut self, peer: &Key, frame: &Frame, now: u64) {
         let Some(c) = self.conns.get_mut(peer) else { return };
         match frame {
@@ -317,6 +325,12 @@ impl Peers {
                 let served: Vec<&At> = groups.iter().filter(|at| c.served.contains(&at.group)).collect();
                 for at in served {
                     self.saw(peer, &at.group, &at.seen, now);
+                    let Some(g) = self.groups.get(&at.group) else { continue };
+                    let c = self.conns.get_mut(peer).expect("a connected peer");
+                    let introduced = c.introduced.entry(at.group.clone()).or_default();
+                    for (m, (version, _)) in g.own.intros.iter().filter(|(_, (_, signed))| at.intros.contains(signed)) {
+                        introduced.insert(m.clone(), *version);
+                    }
                 }
             }
             Frame::Held { group, items, answers: Some(answers) } => {
@@ -546,7 +560,7 @@ impl Peers {
     }
 
     /// `entries` to peers that lack them, and `hello`s: each tells the peer the sightings it was not told, or was told
-    /// `RETELL` staler.
+    /// `RETELL` staler, and the intros it was not told.
     fn hellos(&mut self, now: u64) -> Vec<Out> {
         let due = self.changed.is_some_and(|since| now - since >= DEBOUNCE);
         let sightings: BTreeMap<Bytes, BTreeMap<Key, u64>> = match due || self.conns.values().any(|c| c.hello) {
@@ -576,7 +590,15 @@ impl Peers {
                             let untold: BTreeMap<Key, u64> = sightings[*id].iter().filter(|(k, at)| *k != key && told.get(*k).is_none_or(|t| **at > t + RETELL)).map(|(k, at)| (*k, *at)).collect();
                             told.extend(&untold);
                             let seen = untold.iter().map(|(k, at)| (Bytes(k.to_vec()), now - at)).collect();
-                            At { group: (*id).clone(), log: g.own.log, head: g.own.head.clone(), seen }
+                            let introduced = c.introduced.entry((*id).clone()).or_default();
+                            let mut intros = Vec::new();
+                            for (m, (version, signed)) in &g.own.intros {
+                                if introduced.get(m).is_none_or(|told| told < version) {
+                                    introduced.insert(m.clone(), *version);
+                                    intros.push(signed.clone());
+                                }
+                            }
+                            At { group: (*id).clone(), log: g.own.log, head: g.own.head.clone(), seen, intros }
                         })
                         .collect();
                     out.push(Out::Frame(*key, Frame::Hello { groups }));

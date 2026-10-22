@@ -11,6 +11,8 @@ use crate::{Bytes, head::Head, leading, membership::fixed32, ranges::Ranges};
 
 /// What a summary's signature covers, before its body.
 pub const SUMMARY: &[u8] = b"letmeknow summary v1\0";
+/// What an intro's signature covers, before its body.
+pub const INTRO: &[u8] = b"letmeknow intro v1\0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,6 +52,9 @@ pub struct At {
     /// it is connected to. Only sightings it has not told the receiver, or told it half an hour staler.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub seen: BTreeMap<Bytes, u64>,
+    /// Members' signed intros the sender holds and has not told the receiver, each as its member signed it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intros: Vec<Signed>,
 }
 
 /// A membership's seqs, carried as `[key, joined, seqs]`.
@@ -95,7 +100,20 @@ pub struct Summary {
     pub sealed: Vec<Seqs>,
 }
 
-/// A signed summary: `body` a `Summary`'s JSON, `sig` its member's signature over `SUMMARY ‖ body`.
+/// What a member says of itself to a group, as it signs it: any member passes it on, and the highest version wins.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Intro {
+    pub group: Bytes,
+    /// Its membership: its leaf signature key, and the epoch it joined in.
+    pub member: Bytes,
+    pub joined: u64,
+    pub version: u64,
+    /// None once the member cleared it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// A signed summary or intro: `body` its JSON, `sig` its member's signature over `SUMMARY ‖ body` or `INTRO ‖ body`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signed {
     pub body: Bytes,
@@ -140,7 +158,7 @@ mod tests {
         let summary = r#"{"group":"AQ","member":"Ag","joined":0,"version":1,"time":2,"epoch":3}"#;
         let parsed: Summary = serde_json::from_str(summary).unwrap();
         assert_eq!(serde_json::to_string(&parsed).unwrap(), summary);
-        let at = At { group: Bytes(vec![1]), log: [0; 32], head: None, seen: BTreeMap::from([(Bytes(vec![2]), 5)]) };
+        let at = At { group: Bytes(vec![1]), log: [0; 32], head: None, seen: BTreeMap::from([(Bytes(vec![2]), 5)]), intros: vec![] };
         let text = serde_json::to_string(&at).unwrap();
         assert!(text.ends_with(r#""head":null,"seen":{"Ag":5}}"#), "{text}");
         assert_eq!(serde_json::from_str::<At>(&text).unwrap(), at);

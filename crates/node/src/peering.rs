@@ -14,7 +14,7 @@ use lmk_net::peers::{self, Own};
 use lmk_proto::Bytes;
 use lmk_proto::directory::relay_url;
 use lmk_proto::head::Head;
-use lmk_proto::peer::{At, Frame, SUMMARY, Seqs, Signed, Summary};
+use lmk_proto::peer::{At, Frame, INTRO, Intro, SUMMARY, Seqs, Signed, Summary};
 use n0_future::time::{Duration, timeout};
 use serde::{Deserialize, Serialize};
 
@@ -53,6 +53,21 @@ fn group_of(frame: &Frame) -> Option<&Bytes> {
     }
 }
 
+impl G {
+    /// The group's intros, each with its body.
+    pub(crate) fn intros(&self) -> impl Iterator<Item = (Intro, &Signed)> {
+        self.rec.intros.iter().map(|signed| (serde_json::from_slice(&signed.body.0).expect("an intro checked as it came"), signed))
+    }
+
+    /// Keeps a membership's intro in place of its member's earlier ones.
+    fn keep_intro(&mut self, intro: &Intro, signed: Signed) {
+        let member = intro.member.clone();
+        let others: Vec<Signed> = self.intros().filter(|(held, _)| held.member != member).map(|(_, signed)| signed.clone()).collect();
+        self.rec.intros = others;
+        self.rec.intros.push(signed);
+    }
+}
+
 /// How long a member waits after signing a summary of a group before it signs the next: longer in larger groups.
 fn gap(g: &G) -> u64 {
     (g.mls.members().len() as u64 * 250).max(1000)
@@ -79,6 +94,7 @@ impl State {
         let me = self.me().to_vec();
         let g = self.groups.get_mut(gid).unwrap();
         let (wanted, stale) = g.wanted(now, &me);
+        let intros = g.intros().map(|(intro, signed)| ((intro.member, intro.joined), (intro.version, signed.clone()))).collect();
         let members = g.mls.members().into_iter().filter(|m| m.key != me).filter_map(|m| {
             let iroh = m.leaf.as_ref()?.key.0.as_slice().try_into().ok()?;
             Some(((Bytes(m.key.clone()), g.mls.joined(&m.key)?), iroh))
@@ -92,6 +108,7 @@ impl State {
             members: members.collect(),
             wanted,
             stale,
+            intros,
         }
     }
 
@@ -272,13 +289,51 @@ impl State {
         self.save(gid)
     }
 
-    /// Takes again the summaries kept until a commit made their memberships known.
+    /// Takes again the summaries and intros kept until a commit made their memberships known.
     pub(crate) fn reverify(&mut self, gid: &[u8]) -> Result<()> {
         let unverified = std::mem::take(&mut self.group_mut(gid)?.unverified);
         for (peer, signed) in unverified {
             self.summary(gid, peer, signed)?;
         }
+        for signed in std::mem::take(&mut self.group_mut(gid)?.early_intros) {
+            self.intro(gid, signed)?;
+        }
         Ok(())
+    }
+
+    /// Takes an intro any neighbour passed on: checked against its membership and its member's signature, and kept if
+    /// newer. One of a membership this session does not know yet is kept a while.
+    pub(crate) fn intro(&mut self, gid: &[u8], signed: Signed) -> Result<()> {
+        let Ok(intro) = serde_json::from_slice::<Intro>(&signed.body.0) else { return Ok(()) };
+        let g = self.group_mut(gid)?;
+        if intro.group.0 != gid {
+            return Ok(());
+        }
+        if g.mls.joined(&intro.member.0) != Some(intro.joined) {
+            if intro.joined > g.mls.epoch() && g.early_intros.len() < UNVERIFIED {
+                g.early_intros.push(signed);
+            }
+            return Ok(());
+        }
+        let newer = g.intros().all(|(held, _)| held.member != intro.member || held.joined != intro.joined || held.version < intro.version);
+        if !newer || !lmk_core::group::verify(&intro.member.0, INTRO, &signed.body.0, &signed.sig.0) {
+            return Ok(());
+        }
+        g.keep_intro(&intro, signed);
+        self.save(gid)
+    }
+
+    /// Signs what this session says of itself to the group, for its neighbours to pass on.
+    pub(crate) fn introduce(&mut self, gid: &[u8], text: Option<String>) -> Result<()> {
+        let (me, now) = (self.me().to_vec(), self.tick());
+        let g = self.group(gid)?;
+        let last = g.intros().find(|(intro, _)| intro.member.0 == me).map_or(0, |(intro, _)| intro.version);
+        let joined = g.mls.joined(&me).context("a member of its group")?;
+        let intro = Intro { group: Bytes(gid.to_vec()), member: Bytes(me), joined, version: (last + 1).max(now), text };
+        let body = serde_json::to_vec(&intro)?;
+        let sig = self.session.sign(&[INTRO, &body].concat());
+        self.group_mut(gid)?.keep_intro(&intro, Signed { body: Bytes(body), sig: Bytes(sig) });
+        self.save(gid)
     }
 
     /// Hands `Peers` a group's saved summaries, as the node starts.
@@ -292,9 +347,11 @@ impl State {
         Ok(())
     }
 
-    /// Deletes a member's summary of a group, as its Remove applies.
+    /// Deletes a member's summary and intro of a group, as its Remove applies.
     pub(crate) fn unhear(&mut self, gid: &[u8], key: &[u8]) -> Result<()> {
         let g = self.group_mut(gid)?;
+        let others: Vec<Signed> = g.intros().filter(|(intro, _)| intro.member.0 != key).map(|(_, signed)| signed.clone()).collect();
+        g.rec.intros = others;
         let gone: Vec<(Bytes, u64)> = g.rec.heard.iter().filter(|(k, _)| k.0 == key).cloned().collect();
         g.rec.heard.retain(|(k, _)| k.0 != key);
         for (key, joined) in gone {
@@ -431,6 +488,15 @@ impl Inner {
             let shown = |at: &At| at.head.as_ref().is_none_or(|head| head.log_ref == at.log && (!st.logs.contains_key(at.log.as_slice()) || self.vouched(st, head, &peer)));
             let (held, early): (Vec<At>, Vec<At>) = groups.into_iter().partition(|at| st.groups.contains_key(&at.group.0));
             let groups: Vec<At> = held.into_iter().filter(|at| shown(at)).collect();
+            for at in &groups {
+                if !st.admitted(&at.group.0, &peer) {
+                    continue;
+                }
+                for signed in at.intros.clone() {
+                    st.intro(&at.group.0, signed)?;
+                }
+                st.refresh(&at.group.0);
+            }
             st.peers.frame(&key, &Frame::Hello { groups }, now);
             // A joiner's admitter says where it is as it applies the Add, which may be before the Welcome adds the group here.
             st.early_hellos.extend(early.into_iter().map(|at| (peer, at)));

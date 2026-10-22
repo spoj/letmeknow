@@ -52,9 +52,6 @@ pub struct Leaf {
     pub revision: u32,
     /// The domain of the session's own membership service, whose relay it lives on.
     pub home: String,
-    /// What the member says of itself to the group, as `intro` set it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub intro: Option<String>,
 }
 
 /// The core's own payloads. The plaintext of an MLS application message is JSON with a `type`; every type but these

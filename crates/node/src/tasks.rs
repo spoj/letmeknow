@@ -26,7 +26,7 @@ impl Node {
         let ca = std::mem::take(&mut config.ca);
         let relay: RelayUrl = relay_url(&config.home).parse()?;
         let endpoint = lmk_net::builder([relay]).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
-        let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), revision: REVISION, home: config.home.clone(), intro: None };
+        let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), revision: REVISION, home: config.home.clone() };
         let clients = logs::Clients::new(config.post.clone());
         let state = State::open(provider, leaf)?;
         let (events, events_rx) = mpsc::unbounded_channel();
@@ -59,7 +59,7 @@ impl Node {
 
 /// Makes a new session in `provider`, living on the relay of `home`, which `Node::start` opens: answers its key.
 pub fn create(provider: &SqliteProvider, home: &str) -> Result<Bytes> {
-    let leaf = Leaf { key: Bytes(iroh_key(provider)?.public().as_bytes().to_vec()), revision: REVISION, home: home.into(), intro: None };
+    let leaf = Leaf { key: Bytes(iroh_key(provider)?.public().as_bytes().to_vec()), revision: REVISION, home: home.into() };
     Ok(Bytes(Session::create(provider, leaf)?.key().to_vec()))
 }
 

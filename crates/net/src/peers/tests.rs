@@ -31,6 +31,7 @@ fn own(epoch: u64, members: &[u8]) -> Own {
         members: members.iter().map(|&n| (member(n), key(n))).collect(),
         wanted: vec![],
         stale: vec![],
+        intros: BTreeMap::new(),
     }
 }
 
@@ -74,7 +75,7 @@ fn summaries_to(out: &[Out]) -> Vec<Key> {
 /// A `hello` of the group at no position, telling these sightings, each `ago` milliseconds old.
 fn telling(seen: &[(Key, u64)]) -> Frame {
     let seen = seen.iter().map(|(k, ago)| (Bytes(k.to_vec()), *ago)).collect();
-    Frame::Hello { groups: vec![At { group: id(), log: [7; 32], head: None, seen }] }
+    Frame::Hello { groups: vec![At { group: id(), log: [7; 32], head: None, seen, intros: vec![] }] }
 }
 
 /// The sightings each `hello` in `out` tells, by peer.
@@ -267,6 +268,37 @@ fn a_sighting_is_told_again_only_once_it_is_retell_fresher() {
     assert_eq!(to_1(p.poll(RETELL + DEBOUNCE)), sighted);
 }
 
+/// A `hello` tells a neighbour each intro version once, as soon as it is held, and none the neighbour told.
+#[test]
+fn an_intro_is_told_once_to_each_neighbour_that_did_not_tell_it() {
+    let mut p = peers();
+    let members: Vec<u8> = (1..=3).collect();
+    p.group(id(), own(1, &members), 0);
+    p.connect(key(1), gs(), false, 0);
+    p.connect(key(2), gs(), false, 0);
+    p.poll(0);
+    let intro = |version: u64| Signed { body: Bytes(vec![3, version as u8]), sig: Bytes(vec![]) };
+    let with = |version| Own { intros: BTreeMap::from([(member(3), (version, intro(version)))]), ..own(1, &members) };
+    let intros = |out: &[Out]| -> BTreeMap<Key, Vec<Signed>> {
+        out.iter().filter_map(|o| match o {
+            Out::Frame(k, Frame::Hello { groups }) => Some((*k, groups[0].intros.clone())),
+            _ => None,
+        }).collect()
+    };
+    p.group(id(), with(1), 10);
+    let hello = Frame::Hello { groups: vec![At { group: id(), log: [7; 32], head: None, seen: BTreeMap::new(), intros: vec![intro(1)] }] };
+    p.frame(&key(1), &hello, 10);
+    let out = intros(&p.poll(10 + DEBOUNCE));
+    assert_eq!(out[&key(2)], vec![intro(1)]);
+    assert_eq!(out[&key(1)], vec![], "not back to the neighbour that told it");
+    p.group(id(), with(2), 2_000);
+    let out = intros(&p.poll(2_000 + DEBOUNCE));
+    assert_eq!((&out[&key(1)], &out[&key(2)]), (&vec![intro(2)], &vec![intro(2)]));
+    p.group(id(), own(1, &[1, 2]), 4_000);
+    p.connect(key(1), gs(), false, 4_000);
+    assert_eq!(intros(&p.poll(4_000))[&key(1)], vec![], "a removed member's intro goes no further");
+}
+
 /// Sightings count only of current members, from neighbours the group is served to, and for `RECENT`.
 #[test]
 fn sightings_count_of_members_from_neighbours_of_the_group_for_recent() {
@@ -369,7 +401,7 @@ fn hello_on_connect_carries_the_served_groups_positions() {
     let head = Head { log_ref: [7; 32], length: 3, hash: [0; 32], time: 0, sig: Bytes::default() };
     p.group(id(), Own { head: Some(head.clone()), ..own(1, &[1]) }, 0);
     p.connect(key(1), gs(), false, 0);
-    let groups = vec![At { group: id(), log: [7; 32], head: Some(head), seen: BTreeMap::new() }];
+    let groups = vec![At { group: id(), log: [7; 32], head: Some(head), seen: BTreeMap::new(), intros: vec![] }];
     assert!(p.poll(0).contains(&Out::Frame(key(1), Frame::Hello { groups })));
 }
 
@@ -835,7 +867,7 @@ fn twelve_members_converge_through_loss_and_reconnection() {
     let mut sim = Sim { now: 0, chaos: true, rng: Rng(0x9e37_79b9_7f4a_7c15), peers: Vec::new(), versions: vec![0; N], links: BTreeSet::new(), queue: BTreeMap::new(), sent: 0, offline: BTreeSet::new(), offline_dials: vec![0; N] };
     for i in 0..N {
         let members = (0..N).filter(|&j| j != i).map(|j| ((Bytes(vec![j as u8]), 0), key(j as u8))).collect();
-        let own = Own { me: (Bytes(vec![i as u8]), 0), epoch: 1, log: [1; 32], head: None, earlier: vec![], members, wanted: vec![], stale: vec![] };
+        let own = Own { me: (Bytes(vec![i as u8]), 0), epoch: 1, log: [1; 32], head: None, earlier: vec![], members, wanted: vec![], stale: vec![], intros: BTreeMap::new() };
         sim.peers.push(Peers::new(0, key(i as u8)));
         sim.peers[i].group(id(), own, 0);
     }
@@ -913,7 +945,7 @@ fn members_online_in_a_mostly_offline_group_find_each_other() {
     let mut sim = Sim { now: 0, chaos: false, rng: Rng(0x2545_f491_4f6c_dd1d), peers: Vec::new(), versions: vec![0; MEMBERS], links: BTreeSet::new(), queue: BTreeMap::new(), sent: 0, offline, offline_dials: vec![0; MEMBERS] };
     for i in 0..MEMBERS {
         let members = (0..MEMBERS).filter(|&j| j != i).map(|j| ((Bytes(vec![j as u8]), 0), key(j as u8))).collect();
-        let own = Own { me: (Bytes(vec![i as u8]), 0), epoch: 1, log: [1; 32], head: None, earlier: vec![], members, wanted: vec![], stale: vec![] };
+        let own = Own { me: (Bytes(vec![i as u8]), 0), epoch: 1, log: [1; 32], head: None, earlier: vec![], members, wanted: vec![], stale: vec![], intros: BTreeMap::new() };
         sim.peers.push(Peers::new(0, key(i as u8)));
         sim.peers[i].group(id(), own, 0);
     }

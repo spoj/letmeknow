@@ -653,9 +653,10 @@ const INTRO: usize = 280;
 fn listed_members(node: &Node, gid: &Bytes, all: bool) -> Result<Value> {
     let me = node.key();
     let (mut members, mut offline) = (Vec::new(), 0);
+    let intros = node.intros(&gid.0)?;
     for (member, seen) in node.presence(&gid.0)? {
         let mut item = describe(&me, &member);
-        if let Some(intro) = &member.intro {
+        if let Some(intro) = intros.get(&member.key) {
             item["intro"] = json!(intro);
         }
         match seen {
@@ -750,7 +751,7 @@ mod tests {
 
     #[test]
     fn a_member_shows_by_its_fingerprint() {
-        let member = |key: u8| Member { key: Bytes(vec![key]), iroh: Bytes(vec![key]), revision: 1, home: "h.example".into(), intro: None };
+        let member = |key: u8| Member { key: Bytes(vec![key]), iroh: Bytes(vec![key]), revision: 1, home: "h.example".into() };
         let me = Bytes(vec![1]);
         assert_eq!(describe(&me, &member(1)), json!({ "fp": fp(&[1]), "you": true }));
         assert_eq!(describe(&me, &member(2)), json!({ "fp": fp(&[2]) }));

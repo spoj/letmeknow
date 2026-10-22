@@ -79,9 +79,6 @@ pub struct Member {
     pub revision: u32,
     /// The domain of its own service, whose relay it lives on, as its leaf names it.
     pub home: String,
-    /// What it says of itself to the group, as its leaf names it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub intro: Option<String>,
 }
 
 impl From<&core::Member> for Member {
@@ -91,7 +88,6 @@ impl From<&core::Member> for Member {
             iroh: member.leaf.as_ref().map(|leaf| leaf.key.clone()).unwrap_or_default(),
             revision: member.leaf.as_ref().map_or(0, |leaf| leaf.revision),
             home: member.leaf.as_ref().map(|leaf| leaf.home.clone()).unwrap_or_default(),
-            intro: member.leaf.as_ref().and_then(|leaf| leaf.intro.clone()),
         }
     }
 }
@@ -212,9 +208,9 @@ struct Rec {
     leaving: bool,
     /// When this session's leaf was last updated, in milliseconds.
     updated: u64,
-    /// What this session says of itself to the group, in its leaf.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    intro: Option<String>,
+    /// The signed intros of the current memberships, this session's own included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    intros: Vec<Signed>,
     /// The group delivered a message or changed its members since this session's leaf was last updated: an update is
     /// due once T passed.
     stirred: bool,
@@ -300,6 +296,8 @@ pub(crate) struct G {
     fetch: Option<(Vec<Seqs>, u64)>,
     /// Summaries of memberships this session does not know yet, as a joiner's before its Add applies here.
     unverified: Vec<(EndpointId, Signed)>,
+    /// Intros of memberships this session does not know yet.
+    early_intros: Vec<Signed>,
     /// This session's summary changed since it was signed.
     changed: bool,
     /// Epochs behind this session's whose logs their services let go, as the check before its last commit found.
@@ -321,6 +319,7 @@ impl G {
             waiting: false,
             fetch: None,
             unverified: Vec::new(),
+            early_intros: Vec::new(),
             changed: true,
             lapsed: Vec::new(),
         }
@@ -551,6 +550,10 @@ impl State {
         let now = self.tick();
         let (early, others) = std::mem::take(&mut self.early_hellos).into_iter().partition(|(_, at)| at.group.0 == gid);
         self.early_hellos = others;
+        for signed in early.iter().flat_map(|(_, at)| at.intros.clone()) {
+            self.intro(&gid, signed)?;
+        }
+        self.refresh(&gid);
         for (peer, at) in early {
             self.peers.frame(peer.as_bytes(), &Frame::Hello { groups: vec![at] }, now);
         }
