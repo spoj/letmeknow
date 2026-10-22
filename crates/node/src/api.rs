@@ -1,6 +1,5 @@
 //! The node's public API, but for admission (`admission`) and the peers' summaries (`peering`).
 
-
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, ensure};

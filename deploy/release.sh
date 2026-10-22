@@ -7,7 +7,8 @@ version=$1 notes=$2
 printf '%s\n' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || { echo 'expected X.Y.Z version' >&2; exit 1; }
 cd "$(dirname "$0")/.."
 [ "$(git branch --show-current)" = main ] || { echo "release from main" >&2; exit 1; }
-[ -z "$(git status --porcelain)" ] || { echo "commit or stash your changes first" >&2; exit 1; }
+dirty=$(git status --porcelain)
+[ -z "$dirty" ] || { printf 'commit or stash your changes first:\n%s\n' "$dirty" >&2; exit 1; }
 [ -f "$notes" ] || { echo "no notes file $notes" >&2; exit 1; }
 sed -i "0,/^version = \".*\"/s//version = \"$version\"/" Cargo.toml
 minor=${version%.*}
