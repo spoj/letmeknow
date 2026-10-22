@@ -579,7 +579,8 @@ impl Inner {
                     rec.invites.push(Rule { hash, expires, by: h.author.clone(), to: None });
                 }
             }
-            // Each author is told of its own seqs lost, of those it knows it sent.
+            // Each author is told of its own seqs lost, of those it knows it sent, with the ids of the chat messages among
+            // them: a control message is not its client's to send again.
             Control::Lost { lost } if h.author.0 != me => {
                 let mut messages = Vec::new();
                 for lost in lost.iter().filter(|lost| lost.key.0 == me) {
@@ -587,7 +588,10 @@ impl Inner {
                     let seqs: Vec<u64> = lost.seqs.intersection(&Ranges::range(1, last)).iter().collect();
                     let mut ids = Vec::new();
                     for &seq in &seqs {
-                        ids.extend(st.id_at(gid, &me, lost.joined, seq)?);
+                        let Some(id) = st.id_at(gid, &me, lost.joined, seq)? else { continue };
+                        if !st.record(gid, &id.0)?.is_some_and(|record| Control::TYPES.contains(&type_of(&record.header.payload))) {
+                            ids.push(id);
+                        }
                     }
                     if !seqs.is_empty() {
                         messages.push(LostOf { from: st.member_by_key(gid, &me), joined: lost.joined, seqs, ids });

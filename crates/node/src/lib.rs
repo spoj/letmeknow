@@ -124,7 +124,7 @@ pub struct Lost {
     pub messages: Vec<LostOf>,
 }
 
-/// Seqs of one author's membership lost, with the ids this session knows: only of its own messages, told by others.
+/// Seqs of one author's membership lost, with the ids this session knows: only of its own chat messages, told by others.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LostOf {
     pub from: Member,

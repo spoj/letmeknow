@@ -2538,7 +2538,7 @@ async fn a_removed_members_send_past_its_final_cut_reaches_no_one() {
 }
 
 /// A member's summary tells what another holds and showed, and survives a restart. A loss a member reports is told to
-/// the author once, and not again after it restarts.
+/// the author once, and not again after it restarts, with the ids of its chat messages only: not of its invite.
 #[tokio::test(flavor = "multi_thread")]
 async fn lost_seqs_are_told_once_across_restarts() {
     let relay = relay().await;
@@ -2558,23 +2558,24 @@ async fn lost_seqs_are_told_once_across_restarts() {
     let (bob_key, carol_key) = (bob.node.key(), carol.node.key());
     carol.node.shutdown().await.unwrap();
     drop(carol);
+    bob.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
     let sent = bob.node.send(&gid.0, &message("only Alice and Bob hold this"), None).await.unwrap();
     alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
-    eventually("Alice hears that Bob holds it", || alice.node.heard(&gid.0).unwrap().iter().any(|h| h.member.key == bob_key && h.held.iter().any(|s| s.key == bob_key && s.seqs.contains(1)))).await;
+    eventually("Alice hears that Bob holds it", || alice.node.heard(&gid.0).unwrap().iter().any(|h| h.member.key == bob_key && h.held.iter().any(|s| s.key == bob_key && s.seqs.contains(2)))).await;
     for spare in &spares {
         alice.node.remove(&gid.0, &spare.0).await.unwrap();
     }
     bob.node.shutdown().await.unwrap();
     alice.node.shutdown().await.unwrap();
 
-    // Carol, back with no holder online, loses Bob's message and says so in its summary.
+    // Carol, back with no holder online, loses Bob's invite and message and says so in its summary.
     let mut carol = stored(&relay, &db("carol")).await;
     carol.node.read_group(&gid.0).await.unwrap();
     let lost = carol.until(|e| match e {
         Event::Lost(lost) => Some(lost),
         _ => None,
     }).await;
-    assert_eq!((lost.messages[0].from.key.clone(), lost.messages[0].seqs.clone()), (bob_key.clone(), vec![1]));
+    assert_eq!((lost.messages[0].from.key.clone(), lost.messages[0].seqs.clone()), (bob_key.clone(), vec![1, 2]));
 
     // Bob comes back and hears Carol's summary: he is told once, as its author. Carol's summary survives his restart.
     let mut bob = stored(&relay, &db("bob")).await;
@@ -2583,7 +2584,7 @@ async fn lost_seqs_are_told_once_across_restarts() {
         _ => None,
     }).await;
     let of = &told.messages[0];
-    assert_eq!((told.member.key.clone(), &of.from.key, of.seqs.clone(), of.ids.clone()), (carol_key.clone(), &bob_key, vec![1], vec![sent.clone()]));
+    assert_eq!((told.member.key.clone(), &of.from.key, of.seqs.clone(), of.ids.clone()), (carol_key.clone(), &bob_key, vec![1, 2], vec![sent.clone()]));
     bob.node.shutdown().await.unwrap();
     let mut bob = stored(&relay, &db("bob")).await;
     assert!(bob.node.heard(&gid.0).unwrap().iter().any(|h| h.member.key == carol_key), "Carol's summary survives the restart");
