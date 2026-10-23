@@ -1,7 +1,7 @@
 //! The `letmeknow` command line: `listen` runs a session process; most other commands are requests to it, over a
-//! localhost port guarded by a token.
+//! localhost port guarded by a token, and `attach` reads what it prints there.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use lmk_membership::service::Policy;
@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
@@ -38,7 +38,12 @@ pub enum Command {
         /// The domain of the membership service for groups this session creates
         #[arg(long, env = "LETMEKNOW_MEMBERSHIP", default_value = lmk_proto::links::DOMAIN)]
         membership: String,
+        /// Print only `ready`, and run on without a reader: what concerns this session waits for the one that attaches
+        #[arg(long)]
+        detached: bool,
     },
+    /// Be the reader of a session that runs detached, one at a time: print its `ready`, what concerned it since its last reader, and what comes
+    Attach,
     /// This machine's sessions: each one's fingerprint, whether it runs, and its groups
     Sessions,
     /// Print instructions for agents
@@ -236,8 +241,20 @@ struct Endpoint {
 #[derive(Serialize, Deserialize)]
 struct Call {
     token: String,
-    request: Request,
+    #[serde(flatten)]
+    ask: Ask,
 }
+
+/// What a call asks of a session process: to answer a request, or to print to it as its reader.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Ask {
+    Request(Request),
+    Attach {},
+}
+
+/// How often `attach` looks for its session again, once that stopped.
+const AGAIN: Duration = Duration::from_secs(1);
 
 /// Parses a command line.
 pub fn parse<T: Into<OsString> + Clone>(args: impl IntoIterator<Item = T>) -> Result<Cli, clap::Error> {
@@ -336,17 +353,33 @@ pub async fn open_channel(endpoint_path: &Path, inbound: mpsc::UnboundedSender<I
 
 async fn answer(stream: TcpStream, token: String, inbound: mpsc::UnboundedSender<Inbound>) {
     let (read, mut write) = stream.into_split();
+    let mut read = BufReader::new(read);
     let mut line = String::new();
-    if BufReader::new(read).read_line(&mut line).await.is_err() {
+    if read.read_line(&mut line).await.is_err() {
         return;
     }
     let response = match serde_json::from_str::<Call>(&line) {
-        Ok(call) if call.token == token => {
+        Ok(call) if call.token != token => json!({ "error": "bad token" }),
+        Ok(Call { ask: Ask::Request(request), .. }) => {
             let (reply, answer) = oneshot::channel();
-            let _ = inbound.send((call.request, reply));
+            let _ = inbound.send(Inbound::Request(request, reply));
             answer.await.unwrap_or_else(|_| json!({ "error": "session process stopped" }))
         }
-        Ok(_) => json!({ "error": "bad token" }),
+        Ok(Call { ask: Ask::Attach {}, .. }) => {
+            let (reader, mut lines) = mpsc::unbounded_channel();
+            let _ = inbound.send(Inbound::Attach(reader));
+            // A reader sends nothing more: it is gone once its end closes.
+            let mut gone = [0; 1];
+            loop {
+                tokio::select! {
+                    line = lines.recv() => match line {
+                        Some(line) if write.write_all(format!("{line}\n").as_bytes()).await.is_ok() => {}
+                        _ => return,
+                    },
+                    _ = read.read(&mut gone) => return,
+                }
+            }
+        }
         Err(error) => json!({ "error": format!("bad request: {error}") }),
     };
     let _ = write.write_all(format!("{response}\n").as_bytes()).await;
@@ -387,10 +420,47 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
     Ok(answer)
 }
 
+/// Prints with `print`, as the reader of the detached session `session`, what it prints: its `ready`, what concerned it
+/// since its last reader, and what comes, until a line cannot be printed. Once the session stops, waits for it to run
+/// again, and attaches again.
+pub async fn attach(home: &Path, session: &str, mut print: impl FnMut(String) -> std::io::Result<()>) -> Result<()> {
+    let dir = session_dir(home, session)?;
+    let mut attached = false;
+    loop {
+        let (stream, token) = match connect(&dir.join("endpoint")).await {
+            Ok(channel) => channel,
+            Err(_) if attached && dir.exists() => {
+                tokio::time::sleep(AGAIN).await;
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("session {session} is not running; start it with `letmeknow --session {session} listen --detached`"));
+            }
+        };
+        // Its write half stays open while it reads: the session takes it closing for the reader gone.
+        let (read, mut write) = stream.into_split();
+        write.write_all(format!("{}\n", serde_json::to_string(&Call { token, ask: Ask::Attach {} })?).as_bytes()).await?;
+        let mut lines = BufReader::new(read).lines();
+        let mut first = true;
+        while let Some(line) = lines.next_line().await.ok().flatten() {
+            if first && let Some(error) = serde_json::from_str::<Value>(&line)?.get("error").and_then(Value::as_str) {
+                bail!("{error}");
+            }
+            (first, attached) = (false, true);
+            if print(line).is_err() {
+                return Ok(());
+            }
+        }
+        ensure!(attached, "session {session} stopped");
+        drop(write);
+        tokio::time::sleep(AGAIN).await;
+    }
+}
+
 /// Sends a request over a command channel and returns its answer.
 pub async fn exchange((stream, token): (TcpStream, String), request: Request) -> Result<Value> {
     let (read, mut write) = stream.into_split();
-    write.write_all(format!("{}\n", serde_json::to_string(&Call { token, request })?).as_bytes()).await?;
+    write.write_all(format!("{}\n", serde_json::to_string(&Call { token, ask: Ask::Request(request) })?).as_bytes()).await?;
     let mut line = String::new();
     BufReader::new(read).read_line(&mut line).await?;
     let response: Value = serde_json::from_str(&line).context("session process closed the connection")?;

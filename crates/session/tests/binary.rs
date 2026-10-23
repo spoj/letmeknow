@@ -84,3 +84,32 @@ fn the_binary_leaves_an_earlier_home_as_it_is() {
     assert_eq!(std::fs::read_to_string(home.join("format")).unwrap(), "4\n");
     assert!(!home.join("sessions").exists());
 }
+
+/// A session run with `listen --detached` prints `ready`, and runs on once its reader is gone; `attach` prints its `ready`
+/// as its reader, and another `attach` meanwhile fails.
+#[test]
+fn the_binary_attaches_one_reader_to_a_detached_session() {
+    use std::io::BufRead;
+    let dir = tempfile::tempdir().unwrap();
+    let home = seeded_home(dir.path());
+    let spawn = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_letmeknow"));
+        command.arg("--home").arg(&home).args(args).env_remove("LETMEKNOW_SESSION").env("LETMEKNOW_REGISTRY", "http://127.0.0.1:1");
+        command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap()
+    };
+    let ready = |child: &mut std::process::Child| {
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()
+    };
+    let mut listen = spawn(&["listen", "--detached", "--membership", "localhost:1"]);
+    let fp = ready(&mut listen)["fp"].as_str().unwrap().to_owned();
+    let mut reader = spawn(&["--session", &fp, "attach"]);
+    assert_eq!(ready(&mut reader)["fp"], fp.as_str());
+    let again = letmeknow(&home, &["--session", &fp, "attach"]);
+    assert!(String::from_utf8(again.stderr).unwrap().contains("has a reader attached already"));
+    for child in [&mut reader, &mut listen] {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}

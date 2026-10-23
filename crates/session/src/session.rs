@@ -1,5 +1,5 @@
 //! The session process: this session's node, the requests it answers, and what it delivers: every event goes to its log,
-//! and what concerns the agent is printed too.
+//! and what concerns the agent is printed too, or, detached, goes to the reader attached, or waits for the next one.
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
@@ -32,10 +32,16 @@ pub struct Config {
     pub dir: PathBuf,
     /// The domain of the membership service for groups this session creates.
     pub membership: String,
+    /// Whether it runs without a reader of its own: what concerns the agent goes to the reader attached, or waits for one.
+    pub detached: bool,
 }
 
-/// A request on a command channel, and where its answer goes.
-pub type Inbound = (Request, oneshot::Sender<Value>);
+/// What arrives on a command channel: a request, and where its answer goes; or a reader attaching, and where the lines it
+/// prints go.
+pub enum Inbound {
+    Request(Request, oneshot::Sender<Value>),
+    Attach(mpsc::UnboundedSender<String>),
+}
 
 /// What work the session loop started gave: a request's answer, and where it goes; or, with no request, warnings to
 /// print.
@@ -57,6 +63,8 @@ pub struct Session {
     config: Config,
     /// What waits to be logged, and whether it also prints.
     out: Vec<(Value, bool)>,
+    /// The reader attached to this detached session, while one is.
+    reader: Option<mpsc::UnboundedSender<String>>,
     /// Work in flight: the loop takes each as it finishes, and never waits on one.
     running: JoinSet<Answered>,
 }
@@ -77,6 +85,7 @@ impl Session {
             forget_at: Instant::now() + FORGET,
             config,
             out: Vec::new(),
+            reader: None,
             running: JoinSet::new(),
         };
         session.forget_old()?;
@@ -137,9 +146,18 @@ impl Session {
         self.config.dir.join("log.jsonl")
     }
 
-    /// Logs what is waiting, made short and stamped with when, and prints what wakes the agent. A message is delivered,
-    /// and marked shown, once its line is synced to the log, whether or not it prints. Answers false once a line cannot
-    /// be printed.
+    /// `ready`: the session's fingerprint, its program, which runs the agent's other commands, the domain of its membership
+    /// service, and its log.
+    fn ready(&self) -> Result<Value> {
+        // Termux may run a program through Android's linker, which /proc/self/exe then names; it names the program in
+        // TERMUX_EXEC__PROC_SELF_EXE.
+        let bin = std::env::var_os("TERMUX_EXEC__PROC_SELF_EXE").map_or_else(std::env::current_exe, |exe| Ok(exe.into()))?;
+        Ok(json!({ "type": "ready", "fp": fp(&self.node.key().0), "bin": bin, "membership": self.config.membership, "log": self.log_path() }))
+    }
+
+    /// Logs what is waiting, made short and stamped with when, and prints what wakes the agent: detached, to its reader, or
+    /// held for the next one. A message is delivered, and marked shown, once its line is synced to the log, whether or not
+    /// it prints. Answers false once a line cannot be printed.
     pub fn emit(&mut self, print: &mut impl FnMut(String) -> std::io::Result<()>) -> Result<bool> {
         let out = std::mem::take(&mut self.out);
         if out.is_empty() {
@@ -168,15 +186,59 @@ impl Session {
             }
         }
         for ((_, wake), line) in out.iter().zip(lines) {
-            if *wake && print(line).is_err() {
+            if !*wake {
+                continue;
+            }
+            if self.config.detached {
+                self.hand(line).context("holding a line for a reader")?;
+            } else if print(line).is_err() {
                 return Ok(false);
             }
         }
         Ok(true)
     }
 
+    /// Gives a line that wakes the agent to the reader attached, or else holds it for the next one.
+    fn hand(&mut self, line: String) -> Result<()> {
+        let line = match &self.reader {
+            Some(reader) => match reader.send(line) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::error::SendError(line)) => line,
+            },
+            None => line,
+        };
+        self.reader = None;
+        self.db.execute("INSERT INTO held (line) VALUES (?)", [line])?;
+        Ok(())
+    }
+
+    /// Makes `reader` the reader of this detached session, unless it has one: it gets `ready`, then the lines held for it,
+    /// then those that come.
+    fn attach(&mut self, reader: mpsc::UnboundedSender<String>) -> Result<()> {
+        let fp = fp(&self.node.key().0);
+        let refused = if !self.config.detached {
+            Some(format!("session {fp} prints to the program that started it; one started with `listen --detached` takes a reader"))
+        } else if self.reader.as_ref().is_some_and(|reader| !reader.is_closed()) {
+            Some(format!("session {fp} has a reader attached already"))
+        } else {
+            None
+        };
+        if let Some(error) = refused {
+            _ = reader.send(json!({ "error": error }).to_string());
+            return Ok(());
+        }
+        _ = reader.send(short::line(&self.ready()?));
+        let held: Vec<String> = self.db.prepare("SELECT line FROM held ORDER BY seq")?.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+        for line in held {
+            _ = reader.send(line);
+        }
+        self.db.execute("DELETE FROM held", [])?;
+        self.reader = Some(reader);
+        Ok(())
+    }
+
     /// Rewrites the log without the lines of `gone` but its `removed`, and those older than their group's H, or than `KEEP` days where the
-    /// session is in no such group.
+    /// session is in no such group; the lines held for a reader go as theirs in the log go.
     fn prune(&self, gone: Option<&Bytes>) -> Result<()> {
         let path = self.log_path();
         let log = match std::fs::read_to_string(&path) {
@@ -190,25 +252,45 @@ impl Session {
             cutoffs.insert(b64(&gid.0), cutoff(self.node.settings(&gid.0)?.carry as u64));
         }
         let (gone, other) = (gone.map(|gid| b64(&gid.0)), cutoff(KEEP));
-        let mut kept = String::new();
-        for line in log.lines() {
+        let keeps = |line: &str| -> Result<bool> {
             let item: Value = serde_json::from_str(line)?;
             let group = item["group"].as_str();
             if group.is_some() && group == gone.as_deref() && item["type"] != "removed" {
-                continue;
+                return Ok(false);
             }
-            if item["at"].as_str().unwrap_or_default() >= group.and_then(|group| cutoffs.get(group)).unwrap_or(&other).as_str() {
+            Ok(item["at"].as_str().unwrap_or_default() >= group.and_then(|group| cutoffs.get(group)).unwrap_or(&other).as_str())
+        };
+        let mut kept = String::new();
+        for line in log.lines() {
+            if keeps(line)? {
                 kept.push_str(line);
                 kept.push('\n');
             }
         }
         let new = path.with_extension("new");
         private_file(&new, kept.as_bytes())?;
-        Ok(std::fs::rename(&new, &path)?)
+        std::fs::rename(&new, &path)?;
+        let held: Vec<(i64, String)> =
+            self.db.prepare("SELECT seq, line FROM held")?.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        for (seq, line) in held {
+            if !keeps(&line)? {
+                self.db.execute("DELETE FROM held WHERE seq = ?", [seq])?;
+            }
+        }
+        Ok(())
     }
 
-    /// Takes a request: what may wait on the network goes on in `running`, and is answered once done.
-    pub fn handle(&mut self, (request, reply): Inbound) {
+    /// Takes a reader attaching, or a request: what may wait on the network goes on in `running`, and is answered once done.
+    pub fn handle(&mut self, inbound: Inbound) {
+        let (request, reply) = match inbound {
+            Inbound::Request(request, reply) => (request, reply),
+            Inbound::Attach(reader) => {
+                if let Err(error) = self.attach(reader) {
+                    self.warn(format!("attaching a reader: {error:#}"));
+                }
+                return;
+            }
+        };
         let node = self.node.clone();
         let answer = match request {
             Request::Members { group, all } => self.resolve(group).and_then(|gid| listed_members(&node, &gid, all)),
@@ -697,11 +779,7 @@ pub async fn run(
     mut print: impl FnMut(String) -> std::io::Result<()>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
-    let fp = fp(&session.node.key().0);
-    // Termux may run a program through Android's linker, which /proc/self/exe then names; it names the program in
-    // TERMUX_EXEC__PROC_SELF_EXE.
-    let bin = std::env::var_os("TERMUX_EXEC__PROC_SELF_EXE").map_or_else(std::env::current_exe, |exe| Ok(exe.into()))?;
-    let ready = json!({ "type": "ready", "fp": fp, "bin": bin, "membership": session.config.membership, "log": session.log_path() });
+    let ready = session.ready()?;
     let mut shutdown = std::pin::pin!(shutdown);
     let mut stopped = Ok(());
     if print(short::line(&ready)).is_ok() {

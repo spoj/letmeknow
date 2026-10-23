@@ -105,6 +105,7 @@ impl World {
         Config {
             dir: session_dir(&self.root.path().join(home), name).unwrap(),
             membership: self.domain.clone(),
+            detached: false,
         }
     }
 
@@ -897,3 +898,67 @@ fn an_invite_for_a_member_admits_only_that_member() {
     });
 }
 
+
+/// A reader `attach` makes of the session `agent`: what it prints, and its task.
+fn attached(agent: &Agent) -> (mpsc::UnboundedReceiver<Value>, tokio::task::JoinHandle<Result<()>>) {
+    let (out, printed) = mpsc::unbounded_channel();
+    let (home, name) = (agent.home.clone(), agent.name.clone());
+    let reading = tokio::task::spawn_local(async move {
+        crate::cli::attach(&home, &name, |line| {
+            drop(out.send(serde_json::from_str(&line).unwrap()));
+            Ok(())
+        })
+        .await
+    });
+    (printed, reading)
+}
+
+async fn read(printed: &mut mpsc::UnboundedReceiver<Value>) -> Value {
+    tokio::time::timeout(WAIT, printed.recv()).await.expect("a line").expect("the reader runs")
+}
+
+/// A detached session prints only `ready`, and holds what concerns it for the reader that attaches, one at a time: the
+/// reader gets `ready`, what waited, and what comes, and follows the session as it runs again. What is held goes as its
+/// line in the log goes.
+#[test]
+fn a_detached_session_holds_what_concerns_it_for_one_reader_at_a_time() {
+    local(async {
+        let world = world("detached").await;
+        let (mut alice, bob, _) = pair(&world).await;
+        let detached = || Config { detached: true, ..world.config("alice", "alice") };
+        alice.stop().await;
+        let mut alice = world.launch(detached(), usize::MAX).await;
+        bob.cmd(&["send", "--to", &alice.fp, "one"]).await.unwrap();
+        assert_eq!(alice.told(&["message"]).await["content"], "one");
+        assert!(alice.printed().await.is_empty(), "only `ready` prints");
+        let refused = crate::cli::attach(&bob.home, &bob.name, |_| Ok(())).await.unwrap_err().to_string();
+        assert!(refused.contains("prints to the program that started it"), "{refused}");
+
+        let (mut printed, reading) = attached(&alice);
+        let ready = read(&mut printed).await;
+        assert_eq!((ready["type"].as_str(), ready["fp"].as_str()), (Some("ready"), Some(alice.fp.as_str())));
+        assert_eq!(read(&mut printed).await["content"], "one", "what waited for a reader");
+        let refused = crate::cli::attach(&alice.home, &alice.name, |_| Ok(())).await.unwrap_err().to_string();
+        assert!(refused.contains("has a reader attached already"), "{refused}");
+        bob.cmd(&["send", "--to", &alice.fp, "two"]).await.unwrap();
+        assert_eq!(read(&mut printed).await["content"], "two");
+
+        alice.stop().await;
+        let mut alice = world.launch(detached(), usize::MAX).await;
+        assert_eq!(read(&mut printed).await["type"], "ready", "the reader follows the session as it runs again");
+        bob.cmd(&["send", "--to", &alice.fp, "three"]).await.unwrap();
+        assert_eq!(read(&mut printed).await["content"], "three");
+
+        // With no reader, a line is held; the lines of a group the session is no longer in go, but its `removed`.
+        reading.abort();
+        alice.stop().await;
+        let mut alice = world.launch(detached(), usize::MAX).await;
+        bob.cmd(&["send", "--to", &alice.fp, "four"]).await.unwrap();
+        until(|| async { json!(alice.log().iter().any(|line| line.contains("four"))) }, |logged| *logged == json!(true)).await;
+        bob.cmd(&["remove", &alice.fp]).await.unwrap();
+        alice.told(&["removed"]).await;
+        let (mut printed, _reading) = attached(&alice);
+        assert_eq!(read(&mut printed).await["type"], "ready");
+        assert_eq!(read(&mut printed).await["type"], "removed");
+    });
+}

@@ -23,13 +23,13 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> anyhow::Result<()> {
     let home = home_dir(cli.home)?;
     match cli.command {
-        Command::Listen { membership } => {
+        Command::Listen { membership, detached } => {
             let network = Network::new(&home, letmeknow::ca()?)?;
             let dir = match cli.session {
                 Some(session) => session_dir(&home, &session_named(&home, session)?)?,
                 None => letmeknow::new_session(&home, &membership)?,
             };
-            let config = Config { dir, membership };
+            let config = Config { dir, membership, detached };
             let print = |line: String| {
                 use std::io::Write;
                 writeln!(std::io::stdout(), "{line}")
@@ -37,6 +37,17 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             // Work in flight runs on the loop's thread, a step at a time.
             let listen = letmeknow::listen(config, &home, network, print, letmeknow::shutdown());
             tokio::task::LocalSet::new().run_until(listen).await
+        }
+        Command::Attach => {
+            let session = match cli.session {
+                Some(session) => session_named(&home, session)?,
+                None => running_session(&home).await?,
+            };
+            let print = |line: String| {
+                use std::io::Write;
+                writeln!(std::io::stdout(), "{line}")
+            };
+            letmeknow::cli::attach(&home, &session, print).await
         }
         Command::Sessions => {
             println!("{}", letmeknow::sessions(&home).await?);

@@ -14,6 +14,8 @@ npx -y @letmeknow/cli@0.23 skill
 
 ```bash
 letmeknow listen                       # the session process; keep it running: it logs events as JSON lines, and prints those for you
+letmeknow listen --detached            # a session that runs on with no reader, as a service: it holds what concerns it
+letmeknow attach                       # be a detached session's reader, while no other is: it prints what listen would
 letmeknow invite                       # new chat (--for <fp> limits the link to one known member)
 letmeknow join '<link>'                # join through a link
 letmeknow send "text"                  # --to <fingerprint>, --reply-to <id>, --urgent, --attach <file>
