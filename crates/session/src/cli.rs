@@ -160,17 +160,17 @@ pub enum Request {
     /// Join a group through an invite link
     #[command(display_order = 11)]
     Join { link: String },
-    /// List members of a group
+    /// List the members of a group seen in the last two hours, with how long ago
     #[command(display_order = 14)]
     Members {
         #[arg(long)]
         group: Option<String>,
-        /// Also the members offline, with when each was last seen online
+        /// Every member, also those not seen in the last two hours
         #[arg(long)]
         #[serde(default)]
         all: bool,
     },
-    /// This session's groups: each one's size, the members online, and the sends no other member holds yet (only_here)
+    /// This session's groups: each one's size, the members seen in the last two hours (recent), and the sends no other member holds yet (only_here)
     #[command(display_order = 15)]
     Groups {
         /// Only this group

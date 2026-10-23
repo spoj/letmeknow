@@ -270,18 +270,17 @@ fn send_answers_its_id_and_refuses_a_message_too_large() {
         let big = "x".repeat(16 << 20);
         let refused = alice.cmd(&["send", "--to", &bob.fp, &big]).await.unwrap_err().to_string();
         assert!(refused.contains("members take"), "{refused}");
-        let stopping = lmk_node::now();
+        let bob_fp = bob.fp.clone();
+        let last_seen = |members: &Value| members["members"].as_array().unwrap().iter().find(|m| m["fp"] == bob_fp).unwrap()["last_seen"].clone();
+        assert_eq!(last_seen(&alice.cmd(&["members"]).await.unwrap()), "now");
         bob.stop().await;
         let before = lmk_node::now();
         let sent = alice.cmd(&["send", "--urgent", "anyone?"]).await.unwrap();
         assert!(sent["id"].is_string() && sent.get("pos").is_none(), "{sent}");
-        // Alice finds out that Bob's connection closed once his close reaches her: he was online until then.
-        let offline = |members: &Value| members["offline"] == 1;
-        let members = until(|| async { alice.cmd(&["members"]).await.unwrap() }, offline).await;
-        assert!(offline(&members), "{members}");
-        let all = alice.cmd(&["members", "--all"]).await.unwrap();
-        let last_seen = all["members"].as_array().unwrap().iter().find(|m| m["fp"] == bob.fp).unwrap()["last_seen"].clone();
-        assert!(last_seen.as_str().is_some_and(|at| crate::short::iso(stopping).as_str() <= at), "{all}");
+        // Alice finds out that Bob's connection closed once his close reaches her: he was seen until then, and is listed
+        // for two hours.
+        let members = until(|| async { alice.cmd(&["members"]).await.unwrap() }, |members| last_seen(members) == "0m").await;
+        assert_eq!((last_seen(&members), members.get("offline")), (json!("0m"), None), "{members}");
         // Once Bob is back, he takes it.
         let mut bob = world.start("bob").await;
         let message = bob.expect("message").await;
@@ -320,7 +319,7 @@ fn membership_changes_are_told_and_a_removed_session_learns_it() {
         let world = world("remove").await;
         let (mut alice, mut bob, group) = pair(&world).await;
         let members = bob.cmd(&["members", "--all", "--group", &group[..6]]).await.unwrap();
-        assert_eq!(members["members"][0]["fp"], alice.fp);
+        assert_eq!((&members["members"][0]["fp"], &members["members"][0]["last_seen"]), (&json!(alice.fp), &json!("now")));
         assert_eq!(members["members"][1], json!({ "fp": bob.fp, "you": true }));
         let other = alice.cmd(&["invite"]).await.unwrap()["group"].as_str().unwrap().to_owned();
         assert_eq!(alice.cmd(&["groups"]).await.unwrap()["groups"].as_array().unwrap().len(), 2);

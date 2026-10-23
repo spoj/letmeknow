@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use lmk_node::{Event, INVITE_VALID, Member, Message, Node, Seen, fp};
+use lmk_node::{Event, INVITE_VALID, Member, Message, Node, RECENT, Seen, fp};
 use lmk_proto::Bytes;
 use lmk_proto::group::{Attachment, ChatMessage, PROTOCOL, Service, Settings, UPDATE};
 use lmk_proto::links::Invite;
@@ -373,9 +373,10 @@ impl Session {
         self.answer(answer, reply);
     }
 
-    /// This session's groups, or only `group`: each one's settings, size, the members online, and the sends of this
-    /// session that no other member holds yet.
+    /// This session's groups, or only `group`: each one's settings, size, the members seen in the last `RECENT`, and the
+    /// sends of this session that no other member holds yet.
     fn list_groups(&self, group: Option<String>) -> Result<Value> {
+        let now = lmk_node::now();
         let gids = match group {
             Some(group) => vec![self.resolve(Some(group))?],
             None => self.node.groups(),
@@ -387,7 +388,7 @@ impl Session {
             let only_here: Vec<Value> =
                 self.node.only_here(&gid.0)?.iter().map(|(id, payload)| json!({ "what": payload["type"], "id": hex::encode(&id.0) })).collect();
             groups.push(json!({
-                "group": b64(&gid.0), "size": presence.len(), "online": 1 + presence.iter().filter(|(_, seen)| seen.as_ref().is_some_and(|seen| seen.connected)).count(),
+                "group": b64(&gid.0), "size": presence.len(), "recent": 1 + presence.iter().filter(|(_, seen)| seen.is_some_and(|seen| now.saturating_sub(seen.at) < RECENT)).count(),
                 "carry": settings.carry, "membership": settings.membership, "epoch": self.node.epoch(&gid.0)?, "only_here": only_here,
             }));
         }
@@ -730,10 +731,10 @@ fn describe_key(me: &Bytes, members: &[Member], key: &Bytes) -> Value {
 /// The longest intro, in bytes.
 const INTRO: usize = 280;
 
-/// A group's members as `members` and `join` list them: this session, those online, and only a count of the others
-/// unless `all`.
+/// A group's members as `members` and `join` list them: this session, and those seen in the last `RECENT`, with how long
+/// ago; only a count of the others, unless `all`.
 fn listed_members(node: &Node, gid: &Bytes, all: bool) -> Result<Value> {
-    let me = node.key();
+    let (me, now) = (node.key(), lmk_node::now());
     let (mut members, mut offline) = (Vec::new(), 0);
     let intros = node.intros(&gid.0)?;
     for (member, seen) in node.presence(&gid.0)? {
@@ -741,12 +742,16 @@ fn listed_members(node: &Node, gid: &Bytes, all: bool) -> Result<Value> {
         if let Some(intro) = intros.get(&member.key) {
             item["intro"] = json!(intro);
         }
-        match seen {
-            Some(Seen { connected: true, .. }) => item["online"] = json!(true),
-            Some(Seen { at, .. }) => item["last_seen"] = json!(short::iso(at)),
-            None => {}
+        if let Some(Seen { at, connected }) = seen {
+            let minutes = now.saturating_sub(at) / 60_000;
+            item["last_seen"] = json!(match minutes {
+                _ if connected => "now".to_owned(),
+                0..60 => format!("{minutes}m"),
+                60..1440 => format!("{}h", minutes / 60),
+                _ => format!("{}d", minutes / 1440),
+            });
         }
-        match all || item["you"] == true || item["online"] == true {
+        match all || item["you"] == true || seen.is_some_and(|seen| now.saturating_sub(seen.at) < RECENT) {
             true => members.push(item),
             false => offline += 1,
         }
