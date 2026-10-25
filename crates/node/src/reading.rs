@@ -2,8 +2,7 @@
 //! entries after that epoch's first valid commit passed over. A commit deletes the keys of the epoch before the current
 //! one, whose messages the last commit kept: before it applies, this session waits for those it lacks as
 //! `Peers::wait` decides, unless the commit was made more than H ago, and what it still lacks then is lost to it. The
-//! commits made before a wait began, which it missed while away, share that wait; a session started only to invite
-//! another does not wait.
+//! commits made before a wait began, which it missed while away, share that wait.
 //! Applying a commit moves the cuts: what they kept, and the memberships that ended and began.
 
 use anyhow::{Context, Result};

@@ -797,8 +797,8 @@ async fn lookups_during_a_fetch_do_not_start_another() {
 }
 
 /// A stopped session that the group moved past while it was stopped, started again, catches up with the group before it
-/// invites, however longer than a send waits its reading takes: as a harness starts one again to bring a new session of
-/// its home into the group. A stopped session in no group that was not deleted as it stopped goes as the next one starts.
+/// invites, however long its reading takes: as a harness starts one again to bring a new session of its home into the
+/// group. A stopped session in no group that was not deleted as it stopped goes as the next one starts.
 #[test]
 fn a_stopped_session_started_again_catches_up_before_it_invites() {
     local(async {
@@ -830,13 +830,7 @@ fn a_stopped_session_started_again_catches_up_before_it_invites() {
         crate::cli::private_dir(&session_dir(&home, "stale").unwrap()).unwrap();
         std::fs::write(session_dir(&home, "stale").unwrap().join("groups.json"), "[]").unwrap();
         let alice = world.start_in("h", "alice").await;
-        // Its reading takes longer than an invite waits: it answers `behind` until it has caught up.
-        let link = loop {
-            match alice.cmd(&["invite", &format!("--group={group}")]).await {
-                Ok(invite) => break invite["link"].as_str().unwrap().to_owned(),
-                Err(error) => assert!(error.to_string().starts_with("behind"), "{error:#}"),
-            }
-        };
+        let link = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap().to_owned();
         let dave = world.start_in("h", "dave").await;
         dave.cmd(&["join", &link]).await.unwrap();
         assert_eq!(dave.cmd(&["members", "--all"]).await.unwrap()["members"].as_array().unwrap().len(), 3);

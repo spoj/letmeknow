@@ -2704,10 +2704,10 @@ async fn entering_an_epoch_asks_the_service_nothing() {
     bob.node.shutdown().await.unwrap();
 }
 
-/// A send whose service answers that its group's log moved is refused as behind when the session does not catch up
-/// within `CATCH_UP_WAIT`: nothing is sealed in an epoch the service shows over. Reads of the log wait until then.
+/// A send whose service answers that its group's log moved waits until the session caught up with it: nothing is sealed
+/// in an epoch the service shows over. Reads of the log wait until the test lets them through.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_send_that_does_not_catch_up_with_its_moved_log_is_refused() {
+async fn a_send_whose_log_moved_waits_until_the_session_caught_up() {
     let relay = relay().await;
     let dir = folder("behind");
     std::fs::create_dir_all(&dir).unwrap();
@@ -2735,12 +2735,15 @@ async fn a_send_that_does_not_catch_up_with_its_moved_log_is_refused() {
     });
     let bob = stored_with(&relay, &dir.join("bob.db"), slow).await;
     let epoch = bob.node.epoch(&gid.0).unwrap();
-    let refused = bob.node.send(&gid.0, &message("hello"), None).await.unwrap_err();
-    assert!(matches!(refused.downcast_ref::<SendError>(), Some(SendError::Behind)), "{refused:#}");
-    assert!(bob.node.messages(&gid.0).unwrap().iter().all(|m| m.payload != message("hello")));
+    let hello = message("hello");
+    let send = bob.node.send(&gid.0, &hello, None);
+    tokio::pin!(send);
+    // Past the 5 s a send waits for its service's answer.
+    assert!(tokio::time::timeout(Duration::from_secs(6), &mut send).await.is_err(), "the send waits while the log is read");
+    assert!(bob.node.messages(&gid.0).unwrap().iter().all(|m| m.payload != hello));
     open.send(true).unwrap();
-    eventually("Bob catches up", || bob.node.epoch(&gid.0).unwrap() > epoch).await;
-    bob.node.send(&gid.0, &message("hello"), None).await.unwrap();
+    send.await.unwrap();
+    assert!(bob.node.epoch(&gid.0).unwrap() > epoch, "sent once Bob caught up");
     bob.node.shutdown().await.unwrap();
 }
 

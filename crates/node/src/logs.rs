@@ -19,7 +19,6 @@ use lmk_proto::membership::{Known, STALE};
 use lmk_proto::clock::corrected;
 use n0_future::time::{Duration, timeout};
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
 
 use crate::{Epoch, Inner, SendError, State, Work, get, hex, put};
 
@@ -27,9 +26,6 @@ pub(crate) const NOT_FOLLOWED: &str = "this session does not follow that log";
 
 /// How long a send waits for the service: chat works while it is down.
 const SEND_WAIT: Duration = Duration::from_secs(5);
-
-/// How long a send waits to catch up with a log the service answered moved.
-const CATCH_UP_WAIT: Duration = Duration::from_secs(30);
 
 /// One membership client per service, sharing the session's post.
 pub(crate) struct Clients {
@@ -233,10 +229,9 @@ impl State {
 }
 
 impl Inner {
-    /// Before a send: asks the service about the group's current log, and reads the group's logs on through each epoch a
-    /// commit moves it to. Fails when the log counts as let go, or the service answered that it moved and this session
-    /// did not catch up within `CATCH_UP_WAIT`, as it goes on doing. A service that does not answer within `SEND_WAIT`
-    /// holds nothing back: chat goes on while it is down.
+    /// Before a send: asks the service about the group's current log, and if it moved, waits until this session caught up
+    /// with it, through each epoch a commit moves it to. Fails when the log counts as let go. A service that does not
+    /// answer within `SEND_WAIT` holds nothing back: chat goes on while it is down.
     pub(crate) async fn refresh(self: &Arc<Self>, gid: &[u8]) -> Result<()> {
         let (id, service, known) = {
             let mut st = self.lock();
@@ -258,28 +253,7 @@ impl Inner {
         };
         match answer.into_iter().next() {
             Some(Err(_)) => self.lapse(&mut self.lock(), &id).and(Err(SendError::LetGo.into())),
-            Some(Ok(_)) => {
-                let (read, reading) = oneshot::channel();
-                let (inner, group) = (self.clone(), gid.to_vec());
-                self.spawn(async move {
-                    read.send(inner.read_group(&group).await).ok();
-                });
-                let caught_up = async {
-                    reading.await??;
-                    loop {
-                        let advanced = self.advanced.notified();
-                        {
-                            let st = self.lock();
-                            ensure!(st.group(gid)?.mls.active(), "this session was removed from the group");
-                            if st.at_head(gid) {
-                                return anyhow::Ok(());
-                            }
-                        }
-                        advanced.await;
-                    }
-                };
-                timeout(CATCH_UP_WAIT, caught_up).await.map_err(|_| SendError::Behind)?
-            }
+            Some(Ok(_)) => self.caught_up(gid).await,
             None => self.lock().read_as_of(&id, sent),
         }
     }

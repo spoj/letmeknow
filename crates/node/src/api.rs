@@ -135,10 +135,11 @@ impl Node {
     }
 
     /// Sends a held payload, a reply to the delivered message `reply_to` if given. The node first asks the membership
-    /// service about the group's log, waiting at most 5 seconds for its answer, and catches up if it moved, waiting at most
-    /// 30 seconds; then it seals the payload to the members as of then, keeps it, delivers it to this session and pushes
-    /// it to the members online, and seals it again in each epoch until a cut keeps it. Answers its id. Fails with `SendError` when this session sends faster
-    /// than members take, the message is too large, the service let the log go, or the session did not catch up.
+    /// service about the group's log, waiting at most 5 seconds for its answer, and if it moved, waits until this session
+    /// caught up with it: back from a while away, until the members online brought what it missed, or its wait for them
+    /// gave up. Then it seals the payload to the members as of then, keeps it, delivers it to this session and pushes it to
+    /// the members online, and seals it again in each epoch until a cut keeps it. Answers its id. Fails with `SendError`
+    /// when this session sends faster than members take, the message is too large, or the service let the log go.
     pub async fn send(&self, gid: &[u8], payload: &Value, reply_to: Option<&[u8]>) -> Result<Bytes> {
         self.inner.refresh(gid).await?;
         self.inner.send(&mut self.inner.lock(), gid, payload, reply_to)

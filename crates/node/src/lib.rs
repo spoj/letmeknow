@@ -144,8 +144,6 @@ pub enum SendError {
     Size(String),
     #[error("let go: the membership service let the group's log go; this session leaves the group unless a member online brings what it missed")]
     LetGo,
-    #[error("behind: the group moved on, and this session has not caught up yet; send again")]
-    Behind,
 }
 
 #[derive(Debug)]
