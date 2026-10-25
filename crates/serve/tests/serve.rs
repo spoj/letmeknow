@@ -1,4 +1,4 @@
-use std::{net::Ipv4Addr, path::Path, sync::Arc, time::Duration};
+use std::{net::{Ipv4Addr, Ipv6Addr}, path::Path, sync::Arc, time::Duration};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use iroh::tls::CaTlsConfig;
@@ -14,11 +14,12 @@ use tokio::{
 };
 
 /// A port free for TCP and UDP, below the ephemeral range: a port `bind(0)` returned could be taken by another test's relay
-/// or endpoint before the service binds it.
+/// or endpoint before the service binds it. It is tried on `[::]`, as the service binds it: on macOS and Windows, 127.0.0.1
+/// binds beside another test process's service there, whose port this one's would then fail to take.
 fn free_port() -> u16 {
     loop {
         let port = rand::random_range(1024..32768);
-        if std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() && std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+        if std::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)).is_ok() && std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, port)).is_ok() {
             return port;
         }
     }
