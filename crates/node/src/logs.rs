@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use lmk_core::provider::SqliteProvider;
 use lmk_membership::client::{Post, ServeClient};
 use lmk_membership::{Contradiction, Expired, Frontier, Unsupported, WrongDirectory};
@@ -17,7 +17,7 @@ use lmk_proto::group::Service;
 use lmk_proto::head::{self, Head};
 use lmk_proto::membership::{Known, STALE};
 use lmk_proto::clock::corrected;
-use n0_future::time::{Duration, Instant, timeout};
+use n0_future::time::{Duration, timeout};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -27,6 +27,9 @@ pub(crate) const NOT_FOLLOWED: &str = "this session does not follow that log";
 
 /// How long a send waits for the service: chat works while it is down.
 const SEND_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a send waits to catch up with a log the service answered moved.
+const CATCH_UP_WAIT: Duration = Duration::from_secs(30);
 
 /// One membership client per service, sharing the session's post.
 pub(crate) struct Clients {
@@ -232,10 +235,9 @@ impl State {
 impl Inner {
     /// Before a send: asks the service about the group's current log, and reads the group's logs on through each epoch a
     /// commit moves it to. Fails when the log counts as let go, or the service answered that it moved and this session
-    /// did not catch up within `SEND_WAIT`, as it goes on doing. A service that does not answer within it holds nothing
-    /// back: chat goes on while it is down.
+    /// did not catch up within `CATCH_UP_WAIT`, as it goes on doing. A service that does not answer within `SEND_WAIT`
+    /// holds nothing back: chat goes on while it is down.
     pub(crate) async fn refresh(self: &Arc<Self>, gid: &[u8]) -> Result<()> {
-        let started = Instant::now();
         let (id, service, known) = {
             let mut st = self.lock();
             let id = st.group(gid)?.rec.log.0.clone();
@@ -262,12 +264,21 @@ impl Inner {
                 self.spawn(async move {
                     read.send(inner.read_group(&group).await).ok();
                 });
-                match timeout(SEND_WAIT.saturating_sub(started.elapsed()), reading).await {
-                    Ok(Ok(read)) => read?,
-                    _ => bail!(SendError::Behind),
-                }
-                ensure!(self.lock().at_head(gid), SendError::Behind);
-                Ok(())
+                let caught_up = async {
+                    reading.await??;
+                    loop {
+                        let advanced = self.advanced.notified();
+                        {
+                            let st = self.lock();
+                            ensure!(st.group(gid)?.mls.active(), "this session was removed from the group");
+                            if st.at_head(gid) {
+                                return anyhow::Ok(());
+                            }
+                        }
+                        advanced.await;
+                    }
+                };
+                timeout(CATCH_UP_WAIT, caught_up).await.map_err(|_| SendError::Behind)?
             }
             None => self.lock().read_as_of(&id, sent),
         }

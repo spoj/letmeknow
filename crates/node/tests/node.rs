@@ -121,14 +121,7 @@ async fn strangers(member: &mut Session, gid: &Bytes, relay: &Relay, n: usize) -
     for _ in 0..n {
         let joiner = session(relay).await;
         keys.push(joiner.node.key());
-        // A loaded machine may read the last joiner's update past the invite's 5 s: the invite asks to be made again.
-        let link = loop {
-            match member.node.invite(&gid.0, INVITE_VALID, None).await {
-                Err(error) if matches!(error.downcast_ref::<SendError>(), Some(SendError::Behind)) => continue,
-                link => break link.unwrap(),
-            }
-        };
-        joiner.node.join(&link).await.unwrap();
+        joiner.node.join(&member.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
         member.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
         joiner.node.shutdown().await.unwrap();
     }
@@ -761,13 +754,7 @@ async fn a_log_let_go_is_no_removal_while_a_peer_brings_the_commits() {
     let spares = strangers(&mut alice, &gid, &relay, 2).await;
     bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-    // A joiner's update that its join could not land lands meanwhile: a send then asks to be sent again.
-    let held = loop {
-        match bob.node.send(&gid.0, &message("held before refusal"), None).await {
-            Err(error) if matches!(error.downcast_ref::<SendError>(), Some(SendError::Behind)) => continue,
-            sent => break sent.unwrap(),
-        }
-    };
+    let held = bob.node.send(&gid.0, &message("held before refusal"), None).await.unwrap();
     let members = bob.node.members(&gid.0).unwrap();
     let epoch = bob.node.epoch(&gid.0).unwrap();
     let log_ref: [u8; 32] = bob.node.log(&gid.0).unwrap().0.try_into().unwrap();
@@ -1321,10 +1308,7 @@ async fn back_with_no_holder(test: &str, missed: usize) -> (Duration, Vec<u64>) 
     drop(carol);
 
     for spare in &spares {
-        // A loaded machine may not have read the last removal within a send's wait: the send asks to be made again.
-        while let Err(error) = bob.node.send(&gid.0, &message("only Alice and Bob hold this"), None).await {
-            assert!(matches!(error.downcast_ref::<SendError>(), Some(SendError::Behind)), "{error:#}");
-        }
+        bob.node.send(&gid.0, &message("only Alice and Bob hold this"), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
         alice.node.remove(&gid.0, &spare.0).await.unwrap();
     }
@@ -2437,9 +2421,7 @@ async fn missed_commits(test: &str) -> (Vec<u64>, Vec<u64>) {
     // Alice's messages are 6 and 7, each held by Bob before the commit that keeps it.
     let mut sent = Vec::new();
     for (text, spare) in ["a1", "a2"].into_iter().zip(&spares) {
-        while let Err(error) = alice.node.send(&gid.0, &message(text), None).await {
-            assert!(matches!(error.downcast_ref::<SendError>(), Some(SendError::Behind)), "{error:#}");
-        }
+        alice.node.send(&gid.0, &message(text), None).await.unwrap();
         let seq = bob.until(|e| match e {
             Event::Message(message) => Some(message.seq),
             _ => None,
@@ -2723,7 +2705,7 @@ async fn entering_an_epoch_asks_the_service_nothing() {
 }
 
 /// A send whose service answers that its group's log moved is refused as behind when the session does not catch up
-/// within `SEND_WAIT`: nothing is sealed in an epoch the service shows over.
+/// within `CATCH_UP_WAIT`: nothing is sealed in an epoch the service shows over. Reads of the log wait until then.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_send_that_does_not_catch_up_with_its_moved_log_is_refused() {
     let relay = relay().await;
@@ -2741,11 +2723,12 @@ async fn a_send_that_does_not_catch_up_with_its_moved_log_is_refused() {
     alice.node.shutdown().await.unwrap();
 
     let inner = relay.post();
+    let (open, opened) = tokio::sync::watch::channel(false);
     let slow: Post = Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
-        let answer = inner(domain, route, body);
+        let (answer, mut opened) = (inner(domain, route, body), opened.clone());
         Box::pin(async move {
             if route == "/membership/5/read" {
-                tokio::time::sleep(Duration::from_secs(6)).await;
+                opened.wait_for(|open| *open).await.unwrap();
             }
             answer.await
         })
@@ -2755,6 +2738,7 @@ async fn a_send_that_does_not_catch_up_with_its_moved_log_is_refused() {
     let refused = bob.node.send(&gid.0, &message("hello"), None).await.unwrap_err();
     assert!(matches!(refused.downcast_ref::<SendError>(), Some(SendError::Behind)), "{refused:#}");
     assert!(bob.node.messages(&gid.0).unwrap().iter().all(|m| m.payload != message("hello")));
+    open.send(true).unwrap();
     eventually("Bob catches up", || bob.node.epoch(&gid.0).unwrap() > epoch).await;
     bob.node.send(&gid.0, &message("hello"), None).await.unwrap();
     bob.node.shutdown().await.unwrap();
