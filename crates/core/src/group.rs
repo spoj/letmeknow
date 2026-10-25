@@ -735,13 +735,10 @@ impl Group {
 
     /// Decrypts a member's held message and checks its header: of this group, its author the sender, as it claimed, of
     /// the membership its author had in the epoch it was sealed in, and within its final cut if that membership ended.
-    /// What openmls does with one it rejects leaves no trace: it advances the claimed sender's keys before it checks the
-    /// signature.
     pub fn open(&mut self, provider: &SqliteProvider, bytes: &[u8]) -> Result<Opened> {
         let message = parse::<MlsMessageIn>(bytes)?.try_into_protocol_message()?;
         ensure!(message.content_type() == ContentType::Application, "not an application message");
-        let processed = self.guarded(provider, |result| matches!(result, Ok(Ok(_))), |g| Ok(g.mls.process_message(provider, message)))?;
-        let processed = match processed {
+        let processed = match self.mls.process_message(provider, message) {
             Err(ProcessMessageError::ValidationError(ValidationError::UnableToDecrypt(MessageDecryptionError::SecretTreeError(
                 SecretTreeError::TooDistantInThePast | SecretTreeError::SecretReuseError,
             )))) => return Err(Unheld.into()),

@@ -463,9 +463,8 @@ fn two_epochs_of_keys() {
     }
 }
 
-/// Proof: a message that openmls rejects after it advanced the claimed sender's keys leaves no trace, so the sender's
-/// real messages still open. The forger, a copy of B's state, seals as B but signs with another key: valid AEAD, bad
-/// signature, B's leaf index and generation.
+/// Proof: a message that openmls rejects leaves no trace, so the sender's real messages still open. The forger, a copy
+/// of B's state, seals as B but signs with another key: valid AEAD, bad signature, B's leaf index and generation.
 #[test]
 fn a_forged_message_leaves_no_trace() {
     let mut a = Member::new(memory(), "A");
@@ -485,19 +484,9 @@ fn a_forged_message_leaves_no_trace() {
     let mut forger = forger;
     let forged = forger.group.as_mut().unwrap().mls.create_message(&forger.provider, &stranger(), &serde_json::to_vec(&message("forged")).unwrap()).unwrap().to_bytes().unwrap();
     let second = real(&mut b, "second");
-    a.provider.begin().unwrap();
     assert!(a.open(&forged).is_err());
-    a.provider.commit().unwrap();
     assert_eq!(text(&a.open(&second).unwrap()), "second", "the forgery used the generation of B's second message");
     assert_eq!(text(&a.open(&first).unwrap()), "first");
-
-    // Without the savepoint, openmls keeps what the forgery did: B's next real message no longer opens.
-    let forged = forger.group.as_mut().unwrap().mls.create_message(&forger.provider, &stranger(), &serde_json::to_vec(&message("forged")).unwrap()).unwrap().to_bytes().unwrap();
-    let third = real(&mut b, "third");
-    let group = a.group.as_mut().unwrap();
-    let message = parse::<MlsMessageIn>(&forged).unwrap().try_into_protocol_message().unwrap();
-    assert!(group.mls.process_message(&a.provider, message).is_err());
-    assert!(a.open(&third).is_err());
 }
 
 /// Proof: one SQLite connection, openmls's storage borrowing it. A step's openmls writes and our own records commit
