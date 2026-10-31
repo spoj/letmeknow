@@ -14,11 +14,11 @@ use lmk_net::peers::{self, Own};
 use lmk_proto::Bytes;
 use lmk_proto::directory::relay_url;
 use lmk_proto::head::Head;
-use lmk_proto::peer::{At, Frame, INTRO, Intro, SUMMARY, Seqs, Signed, Summary};
+use lmk_proto::peer::{At, Frame, INTRO, Intro, SUMMARY, Seqs, Shown, Signed, Summary};
 use n0_future::time::{Duration, timeout};
 use serde::{Deserialize, Serialize};
 
-use crate::{G, Inner, Member, Node, Out, State, get, now, put};
+use crate::{Epoch, G, Inner, Member, Node, Out, State, get, now, put};
 
 /// How many summaries of memberships not known yet a group keeps.
 const UNVERIFIED: usize = 32;
@@ -302,7 +302,8 @@ impl State {
     }
 
     /// Takes an intro any neighbour passed on: checked against its membership and its member's signature, and kept if
-    /// newer. One of a membership this session does not know yet is kept a while.
+    /// newer, with the epoch it names as where its member is, if later than this session knew. One of a membership this
+    /// session does not know yet is kept a while.
     pub(crate) fn intro(&mut self, gid: &[u8], signed: Signed) -> Result<()> {
         let Ok(intro) = serde_json::from_slice::<Intro>(&signed.body.0) else { return Ok(()) };
         let g = self.group_mut(gid)?;
@@ -320,16 +321,37 @@ impl State {
             return Ok(());
         }
         g.keep_intro(&intro, signed);
+        if let Some(Shown { epoch, capability }) = intro.shown {
+            self.at(gid, &intro.member.0, epoch)?;
+            let g = self.group_mut(gid)?;
+            if epoch < g.mls.epoch() && g.at_epoch(&intro.member.0) == epoch && g.rec.epochs.iter().all(|e| e.epoch != epoch) {
+                g.rec.epochs.push(Epoch { epoch, capability, service: g.mls.settings().membership });
+            }
+        }
         self.save(gid)
     }
 
-    /// Signs what this session says of itself to the group, for its neighbours to pass on.
+    /// Records that this session's own commit or message showed it in the group's current epoch, and signs its intro
+    /// again if that names an earlier one.
+    pub(crate) fn present(&mut self, gid: &[u8]) -> Result<()> {
+        let me = self.me().to_vec();
+        let g = self.group_mut(gid)?;
+        g.rec.present = g.mls.epoch();
+        let own = g.intros().find(|(intro, _)| intro.member.0 == me).map(|(intro, _)| intro);
+        if own.as_ref().and_then(|intro| intro.shown.as_ref()).is_some_and(|shown| shown.epoch == g.rec.present) {
+            return Ok(());
+        }
+        self.introduce(gid, own.and_then(|intro| intro.text))
+    }
+
+    /// Signs what this session says of itself to the group, and the epoch it is in, for its neighbours to pass on.
     pub(crate) fn introduce(&mut self, gid: &[u8], text: Option<String>) -> Result<()> {
         let (me, now) = (self.me().to_vec(), self.tick());
         let g = self.group(gid)?;
         let last = g.intros().find(|(intro, _)| intro.member.0 == me).map_or(0, |(intro, _)| intro.version);
         let joined = g.mls.joined(&me).context("a member of its group")?;
-        let intro = Intro { group: Bytes(gid.to_vec()), member: Bytes(me), joined, version: (last + 1).max(now), text };
+        let shown = Shown { epoch: g.mls.epoch(), capability: g.mls.capability(&self.provider)? };
+        let intro = Intro { group: Bytes(gid.to_vec()), member: Bytes(me), joined, version: (last + 1).max(now), shown: Some(shown), text };
         let body = serde_json::to_vec(&intro)?;
         let sig = self.session.sign(&[INTRO, &body].concat());
         self.group_mut(gid)?.keep_intro(&intro, Signed { body: Bytes(body), sig: Bytes(sig) });

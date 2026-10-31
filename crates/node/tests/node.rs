@@ -899,6 +899,49 @@ fn a_member_in_an_epoch_the_service_let_go_is_removed_by_the_others() {
     });
 }
 
+/// A member that joined after another stopped takes, from the intro the others pass on, the epoch the stopped one was
+/// last in, and removes it once that epoch's log is let go: before the log of the epoch it joined in goes.
+#[test]
+fn a_joiner_removes_a_member_away_since_before_it_joined_by_its_intro() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let dir = folder("intro-epoch");
+        let mut alice = stored(&relay, &dir.join("alice.db")).await;
+        let bob = session(&relay).await;
+        let bob_key = bob.node.key();
+        let gid = alice.node.create(settings(&relay)).unwrap();
+        let spares = strangers(&mut alice, &gid, &relay, 1).await;
+        bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        bob.node.set_intro(&gid.0, Some("bob".into())).unwrap();
+        eventually("Alice holds Bob's intro", || alice.node.intros(&gid.0).unwrap().contains_key(&bob_key)).await;
+        bob.node.shutdown().await.unwrap();
+        alice.node.remove(&gid.0, &spares[0].0).await.unwrap();
+        alice.node.shutdown().await.unwrap();
+        drop(alice);
+
+        SHIFT.store(4 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        let alice = stored(&relay, &dir.join("alice.db")).await;
+        let carol = stored(&relay, &dir.join("carol.db")).await;
+        carol.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        eventually("Carol holds Bob's intro", || carol.node.intros(&gid.0).unwrap().contains_key(&bob_key)).await;
+        for session in [alice, carol] {
+            session.node.shutdown().await.unwrap();
+        }
+
+        SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        while relay.membership.expire().await {}
+        let mut carol = stored(&relay, &dir.join("carol.db")).await;
+        carol.node.send(&gid.0, &message("stir"), None).await.unwrap();
+        carol.until(|e| matches!(e, Event::Left { member, .. } if member.key == bob_key).then_some(())).await;
+        assert_eq!(carol.node.members(&gid.0).unwrap().len(), 2, "Alice, there four days ago, stays");
+        carol.node.shutdown().await.unwrap();
+    });
+}
+
 /// The types of the payloads of a group's messages a stopped stored member holds, by its author's key.
 fn payload_types(db: &Path, gid: &Bytes) -> Vec<(Bytes, String)> {
     let db = rusqlite::Connection::open(db).unwrap();

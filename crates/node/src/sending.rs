@@ -141,7 +141,6 @@ impl Inner {
         }
         let ciphertext = g.mls.seal(&st.provider, &st.session, &plaintext)?;
         let epoch = g.mls.epoch();
-        g.rec.present = epoch;
         let author = g.author_mut(&me, joined).unwrap();
         author.held.insert(seq);
         author.known = author.known.max(seq);
@@ -151,6 +150,7 @@ impl Inner {
         let id = Bytes(held::id(&plaintext).to_vec());
         let record = Record { id: id.clone(), header, plaintext: Some(Bytes(plaintext)), sealing: Some((epoch, Bytes(ciphertext.clone()))), opened: now, released: false, delivered: None };
         st.store(gid, &record)?;
+        st.present(gid)?;
         self.control(st, gid, &record.header)?;
         self.deliver(st, gid, record)?;
         let group = Bytes(gid.to_vec());
@@ -189,7 +189,7 @@ impl Inner {
         g.rec.resealed = epoch;
         g.changed |= !items.is_empty();
         if !items.is_empty() {
-            g.rec.present = epoch;
+            st.present(gid)?;
         }
         for peer in st.peers.neighbours(&Bytes(gid.to_vec())) {
             let peer = EndpointId::from_bytes(&peer)?;

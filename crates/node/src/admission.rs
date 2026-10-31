@@ -266,7 +266,7 @@ impl Inner {
         let epoch = {
             let st = self.lock();
             let g = st.group(gid)?;
-            let at = g.rec.members.iter().find(|(member, _)| member.0 == key).map(|(_, at)| *at);
+            let at = g.mls.members().iter().any(|m| m.key == key).then(|| g.at_epoch(key));
             at.and_then(|at| g.rec.epochs.iter().find(|epoch| epoch.epoch == at).cloned())
         };
         let Some(epoch) = epoch else { return Ok(()) };

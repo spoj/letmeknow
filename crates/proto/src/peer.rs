@@ -108,9 +108,21 @@ pub struct Intro {
     pub member: Bytes,
     pub joined: u64,
     pub version: u64,
+    /// None in intros of releases before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shown: Option<Shown>,
     /// None once the member cleared it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+}
+
+/// The epoch a member was in as it signed its intro, and the capability of that epoch's log: a member that joined since
+/// asks the service by it whether the log was let go, and removes the member once it was.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Shown {
+    pub epoch: u64,
+    #[serde(with = "fixed32")]
+    pub capability: [u8; 32],
 }
 
 /// A signed summary or intro: `body` its JSON, `sig` its member's signature over `SUMMARY ‖ body` or `INTRO ‖ body`.

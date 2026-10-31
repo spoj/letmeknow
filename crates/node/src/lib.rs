@@ -240,8 +240,13 @@ struct Rec {
     commits: Vec<(u64, u64)>,
     /// The epoch this session's messages past its cut were last sealed again in.
     resealed: u64,
-    /// The epoch each other member is surely at: its join epoch, its latest commit's, or a summary's in the current epoch.
+    /// The latest epoch each other member showed itself in, as far as this session knows: by its Add or latest commit, a
+    /// message, a summary in the current epoch, or the epoch its intro names. One it knows none of is taken to be at
+    /// `since`.
     members: Vec<(Bytes, u64)>,
+    /// The epoch this session joined in.
+    #[serde(default)]
+    since: u64,
     /// The epochs behind the current one that members are at, each with its log's capability and service.
     epochs: Vec<Epoch>,
 }
@@ -324,9 +329,14 @@ impl G {
         }
     }
 
+    /// The epoch the other member with key `key` is in, as far as this session knows (`Rec::members`).
+    fn at_epoch(&self, key: &[u8]) -> u64 {
+        self.rec.members.iter().find(|(member, _)| member.0 == key).map_or(self.rec.since, |(_, epoch)| *epoch)
+    }
+
     /// Whether the member with key `key` is in an epoch whose log its service let go.
     fn left_behind(&self, key: &[u8]) -> bool {
-        self.rec.members.iter().any(|(member, epoch)| member.0 == key && self.lapsed.contains(epoch))
+        self.lapsed.contains(&self.at_epoch(key))
     }
 
     /// The seq of the `leave` of the current membership of the member with key `key`, if it asked to leave.
@@ -535,12 +545,11 @@ impl State {
     fn add_group(&mut self, mls: Group, mut rec: Rec) -> Result<Vec<u8>> {
         let gid = mls.id().to_vec();
         let base = rec.position;
-        (rec.resealed, rec.present) = (mls.epoch(), mls.epoch());
-        let own = mls.own_index();
-        rec.members = mls.members().into_iter().filter(|m| m.index != own).map(|m| (Bytes(m.key), mls.epoch())).collect();
+        (rec.resealed, rec.since) = (mls.epoch(), mls.epoch());
         rec.authors = mls.cut().iter().map(|r| Author::new(r.key.clone(), r.joined, r.seq)).collect();
         self.groups.insert(gid.clone(), G::new(mls, rec));
         self.next_log(&gid, base)?;
+        self.present(&gid)?;
         self.save_groups()?;
         self.gate = true;
         self.refresh(&gid);

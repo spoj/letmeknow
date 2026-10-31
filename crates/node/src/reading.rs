@@ -112,7 +112,7 @@ impl Inner {
             g.rec.stirred = true;
         }
         if applied.own {
-            (g.rec.committed, g.rec.present) = (current, current);
+            g.rec.committed = current;
             if applied.updated {
                 (g.rec.updated, g.rec.stirred) = (now, false);
             }
@@ -125,6 +125,9 @@ impl Inner {
         }
         self.cuts(st, gid, &applied, ending)?;
         st.moved(gid, &applied, ended)?;
+        if applied.own {
+            st.present(gid)?;
+        }
         st.scrub = true;
         st.gate = true;
         let core::Applied { added, removed, gone, .. } = applied;
@@ -258,8 +261,9 @@ impl State {
         Ok(())
     }
 
-    /// Moves what this session knows of its members' epochs as a commit applied: the epoch it ended keeps its log while a
-    /// member is still in it; the committer and the members it added are in the epoch it began; the removed are forgotten.
+    /// Moves what this session knows of its members' epochs as a commit applied: the committer and the members it added
+    /// are in the epoch it began; the removed are forgotten; the epoch it ended, like each earlier one, keeps its log's
+    /// capability while a member is in it.
     fn moved(&mut self, gid: &[u8], applied: &core::Applied, ended: Epoch) -> Result<()> {
         let me = self.me().to_vec();
         let current = self.group(gid)?.mls.epoch();
@@ -271,7 +275,8 @@ impl State {
         let g = self.group_mut(gid)?;
         g.rec.members.retain(|(key, _)| members.iter().any(|m| m.key == key.0));
         g.rec.epochs.push(ended);
-        g.rec.epochs.retain(|e| g.rec.members.iter().any(|(_, at)| *at == e.epoch));
+        let at: Vec<u64> = members.iter().filter(|m| m.key != me).map(|m| g.at_epoch(&m.key)).collect();
+        g.rec.epochs.retain(|e| at.contains(&e.epoch));
         Ok(())
     }
 }
