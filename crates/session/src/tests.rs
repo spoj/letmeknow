@@ -102,6 +102,12 @@ impl World {
         self.launch(self.config(home, name), usize::MAX).await
     }
 
+    /// A new session process in the home `home`, in a directory named by its fingerprint, as `listen` makes one.
+    async fn start_new(&self, home: &str) -> Agent {
+        let dir = crate::new_session(&self.root.path().join(home), &self.domain).unwrap();
+        self.start_in(home, &dir.file_name().unwrap().to_string_lossy()).await
+    }
+
     /// The device of the home `home`, as `members` shows it.
     fn device(&self, home: &str) -> Value {
         let (key, name) = crate::device(&self.root.path().join(home)).unwrap();
@@ -610,9 +616,13 @@ fn a_session_stops_once_it_cannot_print_and_logged_each_message_once() {
 fn sessions_lists_this_machines_sessions_running_or_stopped() {
     local(async {
         let world = world("sessions").await;
-        let (alice, mut bob, group) = pair(&world).await;
-        world.start_in("bob", "lone").await.stop().await;
-        let mut desk = world.start_in("bob", "desk").await;
+        let alice = world.start("alice").await;
+        let mut bob = world.start_new("bob").await;
+        let invite = alice.cmd(&["invite"]).await.unwrap();
+        let group = invite["group"].as_str().unwrap().to_owned();
+        bob.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
+        world.start_new("bob").await.stop().await;
+        let mut desk = world.start_new("bob").await;
         let invite = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap();
         desk.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
         let desk_fp = desk.fp.clone();
@@ -814,7 +824,8 @@ fn a_stopped_session_started_again_catches_up_before_it_invites() {
         let mut alice = world.start_in("h", "alice").await;
         let invite = alice.cmd(&["invite"]).await.unwrap();
         let group = invite["group"].as_str().unwrap().to_owned();
-        let bob = world.start("bob").await;
+        // On Alice's device, an admin, as she is.
+        let bob = world.start_in("h", "bob").await;
         bob.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
         let mut carol = world.start("carol").await;
         carol.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
@@ -896,6 +907,52 @@ fn members_show_their_devices_and_remove_device_removes_a_devices_members() {
         assert_eq!(removed, BTreeSet::from([bob.fp.as_str(), desk.fp.as_str()]));
         assert_eq!(bob.told(&["removed"]).await["by"], alice.fp);
         assert_eq!(desk.told(&["removed"]).await["by"], alice.fp);
+    });
+}
+
+/// A group's founder and its device are its admins: `members` marks them, and `admins` and `groups` list them, with the
+/// admitted devices. A member that is no admin is told so as it removes, ends or changes them; it admits a session of an
+/// admitted device, not of another; an admin makes it an admin, and the group keeps one.
+#[test]
+fn admins_and_admitted_devices_decide_who_adds_and_removes() {
+    local(async {
+        let world = world("admins").await;
+        let (mut alice, mut bob, group) = pair(&world).await;
+        let (alices, bobs) = (world.device("alice"), world.device("bob"));
+        let listed = alice.cmd(&["admins"]).await.unwrap();
+        assert_eq!(listed, json!({ "group": group, "admins": [{ "fp": alice.fp, "you": true }, alices], "admitted": [] }));
+        let members = bob.cmd(&["members"]).await.unwrap();
+        let marked: Vec<&Value> = members["members"].as_array().unwrap().iter().filter(|m| m["admin"] == true).map(|m| &m["fp"]).collect();
+        assert_eq!(marked, [&json!(alice.fp)]);
+        assert_eq!(bob.cmd(&["groups"]).await.unwrap()["groups"][0]["admins"], json!([alice.fp, alices["fp"]]));
+        let bobs_fp = &bobs["fp"].as_str().unwrap()[..8];
+        for refused in [bob.cmd(&["remove", &alice.fp]).await, bob.cmd(&["leave", "--end"]).await, bob.cmd(&["admitted", "add", bobs_fp]).await] {
+            let refused = refused.unwrap_err().to_string();
+            assert!(refused.contains("no admin"), "{refused}");
+        }
+
+        assert_eq!(alice.cmd(&["admitted", "add", bobs_fp]).await.unwrap()["admitted"], json!([bobs]));
+        until(|| async { bob.cmd(&["admins"]).await.unwrap() }, |listed| listed["admitted"] == json!([bobs])).await;
+        alice.stop().await;
+        let invite = bob.cmd(&["invite", &format!("--group={group}"), "--valid", "60"]).await.unwrap();
+        assert!(invite["expires"].as_str().unwrap() > crate::short::iso(lmk_proto::clock::now() + 50 * 60_000).as_str(), "{invite}");
+        let link = invite["link"].as_str().unwrap();
+        let refused = world.start("carol").await.cmd(&["join", link]).await.unwrap_err().to_string();
+        assert!(refused.contains("neither admitted nor an admin"), "{refused}");
+        let desk = world.start_in("bob", "desk").await;
+        desk.cmd(&["join", link]).await.unwrap();
+        assert_eq!(bob.told(&["joined"]).await["by"], "you");
+
+        let mut alice = world.start("alice").await;
+        let made = alice.cmd(&["admins", "add", &bob.fp[..8]]).await.unwrap();
+        assert_eq!(made["admins"], json!([{ "fp": alice.fp, "you": true }, alices, { "fp": bob.fp }]));
+        until(|| async { bob.cmd(&["admins"]).await.unwrap() }, |listed| listed["admins"].as_array().unwrap().contains(&json!({ "fp": bob.fp, "you": true }))).await;
+        bob.cmd(&["remove", &desk.fp]).await.unwrap();
+        let emptied = bob.cmd(&["admins", "remove", &alice.fp, alices["fp"].as_str().unwrap(), &bob.fp]).await.unwrap_err().to_string();
+        assert!(emptied.contains("no admin"), "{emptied}");
+        let unknown = alice.cmd(&["admitted", "remove", "ffff"]).await.unwrap_err().to_string();
+        assert!(unknown.contains("no key this can take"), "{unknown}");
+        alice.stop().await;
     });
 }
 
@@ -984,7 +1041,8 @@ fn a_detached_session_holds_what_concerns_it_for_one_reader_at_a_time() {
         let mut alice = world.launch(detached(), usize::MAX).await;
         bob.cmd(&["send", "--to", &alice.fp, "four"]).await.unwrap();
         until(|| async { json!(alice.log().iter().any(|line| line.contains("four"))) }, |logged| *logged == json!(true)).await;
-        bob.cmd(&["remove", &alice.fp]).await.unwrap();
+        // Bob, no admin, removes Alice by the leave her `leave` carries.
+        alice.cmd(&["leave"]).await.unwrap();
         alice.told(&["removed"]).await;
         let (mut printed, _reading) = attached(&alice);
         assert_eq!(read(&mut printed).await["type"], "ready");

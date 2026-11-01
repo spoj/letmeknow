@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use lmk_node::{Event, INVITE_VALID, Member, Message, Node, RECENT, Seen, fp};
+use lmk_node::{Event, Member, Message, Node, RECENT, Seen, fp};
 use lmk_proto::Bytes;
 use lmk_proto::group::{Attachment, ChatMessage, PROTOCOL, Service, Settings, UPDATE};
 use lmk_proto::links::Invite;
@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use crate::cli::{Request, private_file};
+use crate::cli::{Action, Request, private_file};
 use crate::policy::wakes;
 use crate::{message_id, short};
 
@@ -92,7 +92,6 @@ impl Session {
         };
         session.forget_old()?;
         session.write_groups();
-        private_file(&session.config.dir.join("fp"), fp(&session.node.key().0).as_bytes())?;
         for gid in session.node.groups() {
             // What was delivered after the last message logged, as when the session stopped before logging it.
             let (node, me) = (&session.node, session.node.key());
@@ -312,7 +311,7 @@ impl Session {
                     Err(error) => Err(error),
                 }
             }
-            Request::Invite { group, for_member, carry } => {
+            Request::Invite { group, for_member, carry, valid } => {
                 let target = for_member.map(|fp| known_member(&node, &fp)).transpose();
                 let gid = match (target, group) {
                     (Err(error), _) => Err(error),
@@ -326,8 +325,9 @@ impl Session {
                 };
                 let invite = async move {
                     let (gid, target) = gid?;
-                    let expires = short::iso(lmk_proto::clock::corrected() + INVITE_VALID);
-                    let invite = node.invite(&gid.0, INVITE_VALID, target.as_ref().map(|m| &m.key.0[..])).await?;
+                    let valid = valid * 60_000;
+                    let expires = short::iso(lmk_proto::clock::corrected() + valid);
+                    let invite = node.invite(&gid.0, valid, target.as_ref().map(|m| &m.key.0[..])).await?;
                     let (me, members) = (node.key(), node.members(&gid.0)?);
                     let via: Vec<Value> =
                         invite.members.iter().filter_map(|(key, _)| members.iter().find(|m| m.iroh.0 == key)).map(|m| describe(&me, m)).collect();
@@ -358,6 +358,8 @@ impl Session {
                 _ = self.running.spawn_local(async move { Answered(remove.await, Some(reply)) });
                 return;
             }
+            Request::Admins { group, action, keys } => return self.lists(group, false, action, keys, reply),
+            Request::Admitted { group, action, keys } => return self.lists(group, true, action, keys, reply),
             Request::Leave { group, end } => {
                 let gid = self.resolve(group);
                 let leave = async move {
@@ -381,8 +383,37 @@ impl Session {
         self.answer(answer, reply);
     }
 
-    /// This session's groups, or only `group`: each one's settings, size, the members seen in the last `RECENT`, and the
-    /// sends of this session that no other member holds yet.
+    /// Answers with the group's admins and admitted devices, after it changes, with `action`, its admins, or its admitted
+    /// devices, as it says, in one commit: by `keys`, each a whole key in hex, or a unique beginning of the fingerprint of a
+    /// member or its device to add (a device's only, to the admitted devices), or of a key to remove.
+    fn lists(&mut self, group: Option<String>, admitted: bool, action: Option<Action>, keys: Vec<String>, reply: oneshot::Sender<Value>) {
+        let (node, gid) = (self.node.clone(), self.resolve(group));
+        let lists = async move {
+            let gid = gid?;
+            if let Some(action) = action {
+                let (settings, members) = (node.settings(&gid.0)?, node.members(&gid.0)?);
+                let devices = members.iter().filter_map(|m| Some(m.device.as_ref()?.key.clone()));
+                let known: Vec<Bytes> = match (action, admitted) {
+                    (Action::Add, false) => members.iter().map(|m| m.key.clone()).chain(devices).collect(),
+                    (Action::Add, true) => devices.collect(),
+                    (Action::Remove, false) => settings.admins,
+                    (Action::Remove, true) => settings.admitted,
+                };
+                let named = keys_named(&keys, &known)?;
+                node.change_settings(&gid.0, |settings| {
+                    let list = if admitted { &mut settings.admitted } else { &mut settings.admins };
+                    list.retain(|key| action == Action::Add || !named.contains(key));
+                    list.extend(named.iter().filter(|key| action == Action::Add && !list.contains(key)).cloned().collect::<Vec<_>>());
+                })
+                .await?;
+            }
+            listed_lists(&node, &gid)
+        };
+        _ = self.running.spawn_local(async move { Answered(lists.await, Some(reply)) });
+    }
+
+    /// This session's groups, or only `group`: each one's settings, size, the members seen in the last `RECENT`, its
+    /// admins and admitted devices, and the sends of this session that no other member holds yet.
     fn list_groups(&self, group: Option<String>) -> Result<Value> {
         let now = lmk_node::now();
         let gids = match group {
@@ -395,9 +426,11 @@ impl Session {
             let presence = self.node.presence(&gid.0)?;
             let only_here: Vec<Value> =
                 self.node.only_here(&gid.0)?.iter().map(|(id, payload)| json!({ "what": payload["type"], "id": hex::encode(&id.0) })).collect();
+            let lists = listed_lists(&self.node, &gid)?;
             groups.push(json!({
                 "group": b64(&gid.0), "size": presence.len(), "recent": 1 + presence.iter().filter(|(_, seen)| seen.is_some_and(|seen| now.saturating_sub(seen.at) < RECENT)).count(),
                 "carry": settings.carry, "membership": settings.membership, "epoch": self.node.epoch(&gid.0)?, "only_here": only_here,
+                "admins": lists["admins"], "admitted": lists["admitted"],
             }));
         }
         Ok(json!({ "groups": groups }))
@@ -712,6 +745,41 @@ fn on_device(node: &Node, gid: &Bytes, fp: &str) -> Result<Vec<Bytes>> {
     Ok(on)
 }
 
+/// The keys `args` name: each a whole key in hex, or a unique beginning of the fingerprint of one of `known`.
+fn keys_named(args: &[String], known: &[Bytes]) -> Result<Vec<Bytes>> {
+    args.iter()
+        .map(|arg| {
+            if arg.len() > 16 {
+                return Ok(Bytes(hex::decode(arg).with_context(|| format!("{arg} is neither a fingerprint nor a key in hex"))?));
+            }
+            let mut found: Vec<&Bytes> = known.iter().filter(|key| !arg.is_empty() && fp(&key.0).starts_with(arg.as_str())).collect::<BTreeSet<_>>().into_iter().collect();
+            match found.len() {
+                1 => Ok(found.remove(0).clone()),
+                0 => bail!("no key this can take has a fingerprint that begins {arg}: give a member's or its device's, or a device's whole key in hex"),
+                _ => bail!("several keys have fingerprints that begin {arg}; give more of it"),
+            }
+        })
+        .collect()
+}
+
+/// A group's admins and admitted devices, each key by its fingerprint, as this session, or with the name of the device it
+/// is where a member's leaf names it.
+fn listed_lists(node: &Node, gid: &Bytes) -> Result<Value> {
+    let (settings, members, me) = (node.settings(&gid.0)?, node.members(&gid.0)?, node.key());
+    let describe = |key: &Bytes| {
+        let mut item = json!({ "fp": fp(&key.0) });
+        if *key == me {
+            item["you"] = json!(true);
+        }
+        if let Some(device) = members.iter().filter_map(|m| m.device.as_ref()).find(|device| device.key == *key) {
+            item["name"] = json!(device.name);
+        }
+        item
+    };
+    let (admins, admitted): (Vec<Value>, Vec<Value>) = (settings.admins.iter().map(describe).collect(), settings.admitted.iter().map(describe).collect());
+    Ok(json!({ "group": b64(&gid.0), "admins": admins, "admitted": admitted }))
+}
+
 /// The member of any of this session's groups, other than this session, whose fingerprint begins with `fp`.
 fn known_member(node: &Node, fp: &str) -> Result<Member> {
     let me = node.key();
@@ -752,7 +820,7 @@ fn describe_key(me: &Bytes, members: &[Member], key: &Bytes) -> Value {
 const INTRO: usize = 280;
 
 /// A group's members as `members` and `join` list them: this session, and those seen in the last `RECENT`, with how long
-/// ago, each with its intro and device; only a count of the others, unless `all`.
+/// ago, each with its intro and device, and whether it is an admin; only a count of the others, unless `all`.
 fn listed_members(node: &Node, gid: &Bytes, all: bool) -> Result<Value> {
     let (me, now) = (node.key(), lmk_node::now());
     let (mut members, mut offline) = (Vec::new(), 0);
@@ -764,6 +832,9 @@ fn listed_members(node: &Node, gid: &Bytes, all: bool) -> Result<Value> {
         }
         if let Some(device) = &member.device {
             item["device"] = json!({ "fp": fp(&device.key.0), "name": device.name });
+        }
+        if node.admin(&gid.0, &member.key.0)? {
+            item["admin"] = json!(true);
         }
         if let Some(Seen { at, connected }) = seen {
             let minutes = now.saturating_sub(at) / 60_000;

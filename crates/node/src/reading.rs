@@ -148,7 +148,7 @@ impl Inner {
                 st.out.push(Out::Frame { peer, frame: frame.clone() });
             }
         }
-        self.work.send(Work::Applied { group: gid.to_vec(), by, added, removed, gone }).ok();
+        self.work.send(Work::Applied { group: gid.to_vec(), by: by.map(Box::new), added, removed, gone }).ok();
         st.group_mut(gid)?.rec.position = position;
         if gone {
             return Ok(false);

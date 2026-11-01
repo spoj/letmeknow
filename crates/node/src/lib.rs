@@ -429,7 +429,7 @@ impl Drop for Step<'_> {
 pub(crate) enum Work {
     Applied {
         group: Vec<u8>,
-        by: Option<core::Member>,
+        by: Option<Box<core::Member>>,
         added: Vec<core::Member>,
         removed: Vec<core::Member>,
         gone: bool,

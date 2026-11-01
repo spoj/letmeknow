@@ -180,7 +180,7 @@ impl Inner {
     async fn drive(self: Arc<Self>, mut work: mpsc::UnboundedReceiver<Work>) {
         while let Some(item) = work.recv().await {
             match item {
-                Work::Applied { group, by, added, removed, gone } => self.applied(&group, by, added, removed, gone).await,
+                Work::Applied { group, by, added, removed, gone } => self.applied(&group, by.map(|by| *by), added, removed, gone).await,
                 Work::Duties(gid) => self.duties(&gid),
                 Work::Lapsed(log) => {
                     let node = self.clone();

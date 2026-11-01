@@ -46,7 +46,7 @@ pub enum Command {
     Attach,
     /// This machine's sessions: each one's fingerprint, whether it runs, and its groups
     Sessions,
-    /// This machine's device, which certifies its sessions to their groups' members: its fingerprint and name
+    /// This machine's device, which certifies its sessions to their groups' members: its fingerprint, name and key
     Device,
     /// Print instructions for agents
     Skill,
@@ -145,7 +145,7 @@ impl Serve {
 #[derive(Subcommand, Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
-    /// Make a one-time invite link, valid for 10 minutes, into a chat: a new one unless --group is given
+    /// Make a one-time invite link into a chat: a new one unless --group is given
     #[command(display_order = 10)]
     Invite {
         #[arg(long)]
@@ -158,6 +158,10 @@ pub enum Request {
         #[arg(long, default_value_t = CARRY, conflicts_with = "group")]
         #[serde(default = "carry")]
         carry: u32,
+        /// Minutes the link is valid for
+        #[arg(long, value_name = "MINUTES", default_value_t = VALID)]
+        #[serde(default = "valid")]
+        valid: u64,
     },
     /// Join a group through an invite link
     #[command(display_order = 11)]
@@ -198,6 +202,30 @@ pub enum Request {
         #[arg(required_unless_present = "device")]
         members: Vec<String>,
     },
+    /// List a group's admins and admitted devices; `admins add|remove <fp|key>...` changes its admins, sessions or devices, in one commit
+    #[command(display_order = 18)]
+    Admins {
+        #[arg(long)]
+        group: Option<String>,
+        #[arg(requires = "keys")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<Action>,
+        /// A unique beginning of a fingerprint, or a device's whole key in hex
+        #[serde(default)]
+        keys: Vec<String>,
+    },
+    /// List a group's admins and admitted devices; `admitted add|remove <fp|key>...` changes the devices whose sessions any member may add, in one commit
+    #[command(display_order = 19)]
+    Admitted {
+        #[arg(long)]
+        group: Option<String>,
+        #[arg(requires = "keys")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<Action>,
+        /// A unique beginning of a device's fingerprint, or its whole key in hex
+        #[serde(default)]
+        keys: Vec<String>,
+    },
     /// Leave a group; with --end, end it for everyone: remove the other members, and leave
     #[command(display_order = 17)]
     Leave {
@@ -232,10 +260,23 @@ pub enum Request {
     },
 }
 
+/// A change to a list of a group's settings.
+#[derive(clap::ValueEnum, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Action {
+    Add,
+    Remove,
+}
+
 const CARRY: u32 = 7;
+const VALID: u64 = lmk_node::INVITE_VALID / 60_000;
 
 fn carry() -> u32 {
     CARRY
+}
+
+fn valid() -> u64 {
+    VALID
 }
 
 /// Where a running session process accepts requests: a localhost port guarded by a token.
@@ -298,18 +339,15 @@ pub fn session_dir(home: &Path, session: &str) -> Result<PathBuf> {
     Ok(home.join("sessions").join(session))
 }
 
-/// The directory name of the session `name` names: any unique beginning of its fingerprint, or its directory's name, which
-/// is its fingerprint but for sessions made before 0.23.10.
+/// The directory name of the session `name` names, its fingerprint: `name` is any unique beginning of it.
 pub fn session_named(home: &Path, name: String) -> Result<String> {
-    if session_dir(home, &name)?.exists() {
-        return Ok(name);
-    }
+    session_dir(home, &name)?;
     let mut found: Vec<String> = std::fs::read_dir(home.join("sessions"))
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|entry| std::fs::read_to_string(entry.path().join("fp")).is_ok_and(|fp| fp.starts_with(&name)))
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|dir| dir.starts_with(&name))
         .collect();
     match found.len() {
         0 => bail!("no session of this machine has a fingerprint that begins {name}; `letmeknow listen` with no --session starts a new one"),
@@ -340,10 +378,7 @@ pub async fn running_session(home: &Path) -> Result<String> {
     match running.as_slice() {
         [session] => Ok(session.clone()),
         [] => bail!("no session is running; start one with `letmeknow listen`"),
-        _ => {
-            let fps: Vec<String> = running.iter().map(|dir| std::fs::read_to_string(home.join("sessions").join(dir).join("fp")).unwrap_or_else(|_| dir.clone())).collect();
-            bail!("several sessions are running ({}); pass --session", fps.join(", "))
-        }
+        _ => bail!("several sessions are running ({}); pass --session", running.join(", ")),
     }
 }
 
@@ -427,7 +462,7 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
             std::io::stdin().read_to_string(text)?;
         }
     }
-    let full = matches!(request, Request::Members { .. } | Request::Join { .. });
+    let full = matches!(request, Request::Members { .. } | Request::Join { .. } | Request::Admins { .. } | Request::Admitted { .. });
     let channel = connect(&session_dir(home, session)?.join("endpoint"))
         .await
         .with_context(|| format!("session {session} is not running; start it with `letmeknow --session {session} listen`"))?;
@@ -517,17 +552,29 @@ mod tests {
     use super::{Command, Policy, Request, parse, session_named};
 
     #[test]
-    fn a_session_is_named_by_a_unique_beginning_of_its_fingerprint_or_its_directory() {
+    fn a_session_is_named_by_a_unique_beginning_of_its_fingerprint() {
         let home = tempfile::tempdir().unwrap();
-        for (handle, fp) in [("pi-1", "ab12000000000000"), ("pi-2", "ab34000000000000")] {
-            std::fs::create_dir_all(home.path().join("sessions").join(handle)).unwrap();
-            std::fs::write(home.path().join("sessions").join(handle).join("fp"), fp).unwrap();
+        for fp in ["ab12000000000000", "ab34000000000000"] {
+            std::fs::create_dir_all(home.path().join("sessions").join(fp)).unwrap();
         }
         let named = |name: &str| session_named(home.path(), name.into());
-        assert_eq!(named("pi-2").unwrap(), "pi-2");
-        assert_eq!(named("ab34").unwrap(), "pi-2");
-        assert!(named("new").unwrap_err().to_string().contains("no session"));
-        assert!(named("ab").unwrap_err().to_string().contains("pi-1, pi-2") || named("ab").unwrap_err().to_string().contains("pi-2, pi-1"));
+        assert_eq!(named("ab34").unwrap(), "ab34000000000000");
+        assert_eq!(named("ab12000000000000").unwrap(), "ab12000000000000");
+        assert!(named("cd").unwrap_err().to_string().contains("no session"));
+        let several = named("ab").unwrap_err().to_string();
+        assert!(several.contains("ab12000000000000") && several.contains("ab34000000000000"), "{several}");
+        assert!(named("../x").is_err());
+    }
+
+    #[test]
+    fn admins_and_admitted_list_or_add_or_remove_keys() {
+        use super::Action;
+        let Command::Request(Request::Admins { action: None, keys, .. }) = parse(["letmeknow", "admins"]).unwrap().command else { panic!("not admins") };
+        assert!(keys.is_empty());
+        let Command::Request(Request::Admitted { group, action, keys }) = parse(["letmeknow", "admitted", "add", "ab12", "cd", "--group", "-G"]).unwrap().command else { panic!("not admitted") };
+        assert_eq!((group.as_deref(), action, keys), (Some("-G"), Some(Action::Add), vec!["ab12".to_owned(), "cd".to_owned()]));
+        assert!(parse(["letmeknow", "admins", "remove"]).is_err(), "a change names keys");
+        assert!(parse(["letmeknow", "admins", "ab12"]).is_err(), "keys come with a change");
     }
 
     #[test]

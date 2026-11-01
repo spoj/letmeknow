@@ -341,14 +341,17 @@ pub async fn sessions(home: &Path) -> Result<Value> {
     let running = cli::running(home).await;
     let mut sessions = Vec::new();
     for entry in std::fs::read_dir(home.join("sessions")).into_iter().flatten().flatten() {
-        let dir = entry.path();
-        let Ok(fp) = std::fs::read_to_string(dir.join("fp")) else { continue };
+        let (dir, fp) = (entry.path(), entry.file_name().to_string_lossy().into_owned());
+        // One being made.
+        if fp.starts_with('.') {
+            continue;
+        }
         let groups: Vec<String> = std::fs::read(dir.join("groups.json")).ok().and_then(|groups| serde_json::from_slice(&groups).ok()).unwrap_or_default();
         let mut session = json!({ "fp": fp });
         if !groups.is_empty() {
             session["groups"] = json!(groups);
         }
-        if running.contains(&entry.file_name().to_string_lossy().into_owned()) {
+        if running.contains(&fp) {
             session["running"] = json!(true);
         }
         sessions.push(session);
