@@ -232,7 +232,7 @@ async fn pair(world: &World) -> (Agent, Agent, String) {
     assert_eq!(keys(&invite), keys(&json!({ "link": 0, "group": 0, "expires": 0, "via": 0 })));
     assert_eq!(invite["via"], json!(["you"]));
     let link = invite["link"].as_str().unwrap();
-    assert!(link.starts_with("https://letmeknow.dev/i#12."));
+    assert!(link.starts_with("https://letmeknow.dev/i#13."));
     let joined = bob.cmd(&["join", link]).await.unwrap();
     assert_eq!(joined["group"], invite["group"]);
     assert_eq!(joined["members"].as_array().unwrap().len() + joined["offline"].as_u64().unwrap_or(0) as usize, 2);
@@ -697,7 +697,7 @@ fn messages_not_for_a_session_are_logged_in_order_and_print_not() {
 fn a_home_of_another_format_is_refused() {
     local(async {
         let world = world("format").await;
-        for (format, names) in [("11", "an earlier letmeknow"), ("13", "a newer letmeknow")] {
+        for (format, names) in [("12", "an earlier letmeknow"), ("14", "a newer letmeknow")] {
             let home = world.root.path().join(format!("format-{format}"));
             std::fs::create_dir_all(&home).unwrap();
             std::fs::write(home.join("format"), format!("{format}\n")).unwrap();
@@ -826,7 +826,7 @@ fn a_stopped_session_started_again_catches_up_before_it_invites() {
         world.network.post = Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| -> BoxFuture<Result<Vec<u8>>> {
             let answer = fast(domain, route, body);
             Box::pin(async move {
-                if route == "/membership/5/read" {
+                if route == "/membership/6/read" {
                     tokio::time::sleep(Duration::from_secs(6)).await;
                 }
                 answer.await
