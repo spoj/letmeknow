@@ -339,13 +339,14 @@ impl Session {
                 _ = self.running.spawn_local(async move { Answered(join(&node, &joining, &link).await, Some(reply)) });
                 return;
             }
-            Request::Remove { group, member } => {
-                let found = self.resolve(group).and_then(|gid| Ok((member_by_fp(&node, &gid, &member)?, gid)));
+            Request::Remove { group, members } => {
+                let found = self.resolve(group).and_then(|gid| Ok((members.iter().map(|m| member_by_fp(&node, &gid, m)).collect::<Result<Vec<_>>>()?, gid)));
                 let remove = async move {
-                    let (member, gid) = found?;
-                    ensure!(member.key != node.key(), "to leave a group, use `leave`");
-                    node.remove(&gid.0, &member.key.0).await?;
-                    Ok(json!({ "group": b64(&gid.0), "removed": fp(&member.key.0) }))
+                    let (members, gid) = found?;
+                    let keys: Vec<Bytes> = members.into_iter().map(|m| m.key).collect();
+                    ensure!(!keys.contains(&node.key()), "to leave a group, use `leave`");
+                    node.remove(&gid.0, &keys).await?;
+                    Ok(json!({ "group": b64(&gid.0), "removed": keys.iter().map(|key| fp(&key.0)).collect::<Vec<_>>() }))
                 };
                 _ = self.running.spawn_local(async move { Answered(remove.await, Some(reply)) });
                 return;

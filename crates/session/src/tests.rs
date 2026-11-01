@@ -330,7 +330,7 @@ fn membership_changes_are_told_and_a_removed_session_learns_it() {
         assert!(alice.cmd(&["groups", "--group", "nope"]).await.unwrap_err().to_string().contains("unknown group nope"));
         alice.cmd(&["leave", &format!("--group={}", &other[..8])]).await.unwrap();
         assert!(alice.cmd(&["remove", "Carol"]).await.is_err());
-        alice.cmd(&["remove", &bob.fp[..8]]).await.unwrap();
+        assert_eq!(alice.cmd(&["remove", &bob.fp[..8]]).await.unwrap()["removed"], json!([bob.fp]));
         assert_eq!(alice.told(&["left"]).await["member"], bob.fp);
         let removed = bob.told(&["removed"]).await;
         assert_eq!((&removed["group"], &removed["by"]), (&json!(group), &json!(alice.fp)));

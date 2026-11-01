@@ -53,7 +53,7 @@ A message names the last messages its sender had logged before it, which name th
     letmeknow intro "text"                 tell the group who you are and what you do now; no text clears it
     letmeknow members                      the members seen in the last two hours, with their intros (--all: every member)
     letmeknow groups                       per group: size, members seen in the last two hours (recent), only_here (--group: only that one)
-    letmeknow remove <fp> | leave
+    letmeknow remove <fp>... | leave
 
 Commands take any unique beginning of a message id, fingerprint or group id. `--group` can be omitted when you are in one group. New groups take `--carry <days>` (how long members carry messages for one another; 7 by default).
 

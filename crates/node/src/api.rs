@@ -82,10 +82,15 @@ impl Node {
         Ok(Bytes(gid))
     }
 
-    /// Removes a member. Returns whether this session's commit removed it, which it need not once another's did.
-    pub async fn remove(&self, gid: &[u8], key: &[u8]) -> Result<bool> {
-        ensure!(self.inner.lock().group(gid)?.mls.members().iter().any(|m| m.key == key), "not a member");
-        let remove = |_: &State, g: &G| Ok(g.mls.members().into_iter().find(|m| m.key == key).map(|member| Change { remove: vec![member.index], ..Change::default() }));
+    /// Removes members, in one commit. Returns whether this session's commit removed any, which it need not once others'
+    /// removed them all.
+    pub async fn remove(&self, gid: &[u8], keys: &[Bytes]) -> Result<bool> {
+        let members = self.inner.lock().group(gid)?.mls.members();
+        ensure!(keys.iter().all(|key| members.iter().any(|m| m.key == key.0)), "not a member");
+        let remove = |_: &State, g: &G| {
+            let remove: Vec<u32> = g.mls.members().into_iter().filter(|m| keys.iter().any(|key| key.0 == m.key)).map(|m| m.index).collect();
+            Ok((!remove.is_empty()).then(|| Change { remove, ..Change::default() }))
+        };
         Ok(self.inner.commit(gid, remove).await?.is_some())
     }
 

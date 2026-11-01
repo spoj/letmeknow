@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand};
 use lmk_membership::service::Policy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -184,12 +184,13 @@ pub enum Request {
         group: Option<String>,
         text: Option<String>,
     },
-    /// Remove a member, by fingerprint, from a group
+    /// Remove members, by fingerprint, from a group, in one commit
     #[command(display_order = 16)]
     Remove {
         #[arg(long)]
         group: Option<String>,
-        member: String,
+        #[arg(required = true)]
+        members: Vec<String>,
     },
     /// Leave a group; with --end, end it for everyone: remove the other members, and leave
     #[command(display_order = 17)]
@@ -261,9 +262,11 @@ pub fn parse<T: Into<OsString> + Clone>(args: impl IntoIterator<Item = T>) -> Re
     Cli::from_arg_matches_mut(&mut hyphens(Cli::command()).try_get_matches_from(args)?)
 }
 
-/// Lets every value start with '-', as ids and fingerprints in base64url do, and text may. Known flags stay flags.
+/// Lets every value start with '-', as ids in base64url do, and text may. Known flags stay flags. A positional that takes
+/// several values, as `remove`'s fingerprints, which are hex, takes none: it would take the flags after it.
 fn hyphens(command: clap::Command) -> clap::Command {
-    command.mut_args(|arg| if arg.get_action().takes_values() { arg.allow_hyphen_values(true) } else { arg }).mut_subcommands(hyphens)
+    let hyphenated = |arg: &clap::Arg| arg.get_action().takes_values() && !(arg.is_positional() && matches!(arg.get_action(), ArgAction::Append));
+    command.mut_args(|arg| if hyphenated(&arg) { arg.allow_hyphen_values(true) } else { arg }).mut_subcommands(hyphens)
 }
 
 pub fn home_dir(home: Option<PathBuf>) -> Result<PathBuf> {
@@ -519,6 +522,13 @@ mod tests {
         assert_eq!((to, text.as_str(), urgent), (vec!["-Ia".to_owned()], "- an item", true));
         assert!(matches!(parse(["letmeknow", "send", "--reply-to", "-Ia", "ok"]).unwrap().command, Command::Request(Request::Send { reply_to: Some(id), .. }) if id == "-Ia"));
         assert_eq!(parse(["letmeknow", "send", "--help"]).err().unwrap().kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn remove_takes_several_members_and_flags_after_them() {
+        let Command::Request(Request::Remove { group, members }) = parse(["letmeknow", "remove", "ab", "cd", "--group", "-G"]).unwrap().command else { panic!("not a remove") };
+        assert_eq!((group.as_deref(), members), (Some("-G"), vec!["ab".to_owned(), "cd".to_owned()]));
+        assert!(parse(["letmeknow", "remove"]).is_err());
     }
 
     #[test]

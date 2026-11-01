@@ -1,6 +1,7 @@
 //! Sessions over a local relay with a self-signed certificate, their logs on a membership service served through it.
 
 use std::path::Path;
+use std::slice::from_ref;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -261,7 +262,7 @@ async fn chat_and_removal() {
     assert!(matches!(refused.downcast_ref(), Some(lmk_node::SendError::Size(_))), "{refused:#}");
 
     let bob_key = bob.node.key();
-    alice.node.remove(&gid.0, &bob_key.0).await.unwrap();
+    alice.node.remove(&gid.0, from_ref(&bob_key)).await.unwrap();
     bob.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
     eventually("Bob forgot the group", || bob.node.groups().is_empty()).await;
 }
@@ -356,7 +357,7 @@ async fn an_invite_dies_when_its_inviter_leaves() {
     let invites = || alice.node.messages(&gid.0).unwrap().iter().filter(|m| m.payload["type"] == "invite").count();
     eventually("Alice holds both invites", || invites() == 4).await;
 
-    alice.node.remove(&gid.0, &bob.node.key().0).await.unwrap();
+    alice.node.remove(&gid.0, &[bob.node.key()]).await.unwrap();
     carol.node.leave(&gid.0).unwrap();
     eventually("Bob and Carol are out", || alice.node.members(&gid.0).unwrap().len() == 1).await;
     let dave = session(&relay).await;
@@ -598,7 +599,7 @@ fn an_idle_member_commits_nothing_until_it_sends() {
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
         bob.node.shutdown().await.unwrap();
         drop(bob);
-        alice.node.remove(&gid.0, &spares[0].0).await.unwrap();
+        alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
         let epoch = alice.node.epoch(&gid.0).unwrap();
         alice.node.shutdown().await.unwrap();
 
@@ -637,7 +638,7 @@ async fn each_commit_moves_the_group_to_its_new_epochs_log() {
         eventually("Alice reads the joiner's update", || alice.node.log(&gid.0).unwrap() == log).await;
         logs.push(log);
     }
-    alice.node.remove(&gid.0, &carol.node.key().0).await.unwrap();
+    alice.node.remove(&gid.0, &[carol.node.key()]).await.unwrap();
     carol.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
     assert!(!logs.contains(&alice.node.log(&gid.0).unwrap()), "the Remove moved the group to a log Carol cannot name");
     let after = alice.node.send(&gid.0, &message("after Carol"), None).await.unwrap();
@@ -714,7 +715,7 @@ async fn a_removal_made_moot_commits_nothing() {
     let carol_key = carol.node.key();
     let remove = |node: &Node| {
         let (node, gid, key) = (node.clone(), gid.clone(), carol_key.clone());
-        tokio::spawn(async move { node.remove(&gid.0, &key.0).await })
+        tokio::spawn(async move { node.remove(&gid.0, &[key]).await })
     };
     // One commits the removal; the other finds it moot, or, if it starts once the removal applied, not a member.
     let (a, b) = (remove(&alice.node), remove(&bob.node));
@@ -727,7 +728,7 @@ async fn a_removal_made_moot_commits_nothing() {
     let epochs = (alice.node.epoch(&gid.0).unwrap(), bob.node.epoch(&gid.0).unwrap());
     assert!(epochs.0.max(epochs.1) == epoch + 1, "one removal committed: {epochs:?} after {epoch}");
     bob.until(|e| matches!(e, Event::Left { .. }).then_some(())).await;
-    let again = alice.node.remove(&gid.0, &carol_key.0).await.unwrap_err();
+    let again = alice.node.remove(&gid.0, from_ref(&carol_key)).await.unwrap_err();
     assert!(format!("{again:#}").contains("not a member"), "removing a non-member fails at once: {again:#}");
 }
 
@@ -762,7 +763,7 @@ async fn a_log_let_go_is_no_removal_while_a_peer_brings_the_commits() {
     drop(bob);
 
     for spare in &spares {
-        alice.node.remove(&gid.0, &spare.0).await.unwrap();
+        alice.node.remove(&gid.0, from_ref(spare)).await.unwrap();
     }
     let missed = alice.node.send(&gid.0, &message("recover from the peer"), None).await.unwrap();
     let moved = alice.node.epoch(&gid.0).unwrap();
@@ -780,7 +781,7 @@ async fn a_log_let_go_is_no_removal_while_a_peer_brings_the_commits() {
     // group that was queued before it.
     let barrier = bob.node.create(settings(&relay)).unwrap();
     let barrier_spare = strangers(&mut bob, &barrier, &relay, 1).await;
-    bob.node.remove(&barrier.0, &barrier_spare[0].0).await.unwrap();
+    bob.node.remove(&barrier.0, &barrier_spare[..1]).await.unwrap();
     bob.until(|e| {
         assert!(!matches!(&e, Event::Removed { group, .. } if group == &gid), "refusal removed the group");
         matches!(e, Event::Left { group, .. } if group == barrier).then_some(())
@@ -842,7 +843,7 @@ fn a_group_forgets_the_adds_of_members_gone_past_h() {
             joiner.node.shutdown().await.unwrap();
         }
         for key in [&keys[0], &keys[2]] {
-            assert!(alice.node.remove(&gid.0, &key.0).await.unwrap());
+            assert!(alice.node.remove(&gid.0, from_ref(key)).await.unwrap());
         }
         alice.node.shutdown().await.unwrap();
         drop(alice);
@@ -883,7 +884,7 @@ fn a_member_in_an_epoch_the_service_let_go_is_removed_by_the_others() {
         bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
         bob.node.shutdown().await.unwrap();
-        alice.node.remove(&gid.0, &spares[0].0).await.unwrap();
+        alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
         alice.node.ask_behind(&gid.0).await.unwrap();
         assert_eq!(alice.node.members(&gid.0).unwrap().len(), 2, "the log Bob is in is not gone yet");
         alice.node.shutdown().await.unwrap();
@@ -919,7 +920,7 @@ fn a_joiner_removes_a_member_away_since_before_it_joined_by_its_intro() {
         bob.node.set_intro(&gid.0, Some("bob".into())).unwrap();
         eventually("Alice holds Bob's intro", || alice.node.intros(&gid.0).unwrap().contains_key(&bob_key)).await;
         bob.node.shutdown().await.unwrap();
-        alice.node.remove(&gid.0, &spares[0].0).await.unwrap();
+        alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
         alice.node.shutdown().await.unwrap();
         drop(alice);
 
@@ -976,7 +977,7 @@ fn an_idle_member_shows_itself_present_before_its_epochs_log_goes() {
         bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
         let epoch = bob.node.epoch(&gid.0).unwrap();
         eventually("Alice has Bob's update", || alice.node.epoch(&gid.0).unwrap() == epoch).await;
-        alice.node.remove(&gid.0, &spares[0].0).await.unwrap();
+        alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
         eventually("Bob has the removal", || bob.node.epoch(&gid.0).unwrap() == epoch + 1).await;
         let bob_key = bob.node.key();
         for session in [alice, bob] {
@@ -1022,7 +1023,7 @@ fn a_member_away_six_days_resumes() {
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
         bob.node.shutdown().await.unwrap();
         drop(bob);
-        alice.node.remove(&gid.0, &spares[0].0).await.unwrap();
+        alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
         let alice_epoch = alice.node.epoch(&gid.0).unwrap();
 
         SHIFT.store(6 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
@@ -1054,7 +1055,7 @@ fn a_member_whose_log_the_service_let_go_leaves_when_no_peer_brings_it_within_wa
         bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
         bob.node.shutdown().await.unwrap();
-        alice.node.remove(&gid.0, &spares[0].0).await.unwrap();
+        alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
         alice.node.shutdown().await.unwrap();
 
         SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
@@ -1166,7 +1167,7 @@ fn a_joiner_whose_key_is_in_the_tree_of_a_lapsed_member_is_removed_before_its_ad
         bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
         bob.node.shutdown().await.unwrap();
-        alice.node.remove(&gid.0, &spares[0].0).await.unwrap();
+        alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
         alice.node.shutdown().await.unwrap();
         drop(alice);
 
@@ -1256,7 +1257,7 @@ async fn an_announced_loss_reaches_every_member() {
     let sent = bob.node.send(&gid.0, &message("only Alice and Bob hold this"), None).await.unwrap();
     alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
     for spare in &spares {
-        alice.node.remove(&gid.0, &spare.0).await.unwrap();
+        alice.node.remove(&gid.0, from_ref(spare)).await.unwrap();
     }
     bob.node.shutdown().await.unwrap();
     alice.node.shutdown().await.unwrap();
@@ -1311,7 +1312,7 @@ async fn catching_up() {
     bob.node.send(&gid.0, &message("only Alice and Bob hold this"), None).await.unwrap();
     alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
     for spare in &spares {
-        alice.node.remove(&gid.0, &spare.0).await.unwrap();
+        alice.node.remove(&gid.0, from_ref(spare)).await.unwrap();
     }
     bob.node.shutdown().await.unwrap();
     alice.node.shutdown().await.unwrap();
@@ -1353,7 +1354,7 @@ async fn back_with_no_holder(test: &str, missed: usize) -> (Duration, Vec<u64>) 
     for spare in &spares {
         bob.node.send(&gid.0, &message("only Alice and Bob hold this"), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
-        alice.node.remove(&gid.0, &spare.0).await.unwrap();
+        alice.node.remove(&gid.0, from_ref(spare)).await.unwrap();
     }
     bob.node.shutdown().await.unwrap();
     alice.node.shutdown().await.unwrap();
@@ -1403,6 +1404,20 @@ async fn remove_others_removes_every_other_member_in_one_commit() {
     assert_eq!((alice.node.epoch(&gid.0).unwrap(), alice.node.members(&gid.0).unwrap().len()), (epoch + 1, 1));
     bob.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
     carol.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
+}
+
+/// `remove` removes the members it names in one commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn remove_removes_the_members_it_names_in_one_commit() {
+    let relay = relay().await;
+    let mut alice = session(&relay).await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    let spares = strangers(&mut alice, &gid, &relay, 3).await;
+    alice.node.caught_up(&gid.0).await.unwrap();
+    let epoch = alice.node.epoch(&gid.0).unwrap();
+    assert!(alice.node.remove(&gid.0, &spares[..2]).await.unwrap());
+    let members: Vec<Bytes> = alice.node.members(&gid.0).unwrap().into_iter().map(|m| m.key).collect();
+    assert_eq!((alice.node.epoch(&gid.0).unwrap(), members), (epoch + 1, vec![alice.node.key(), spares[2].clone()]));
 }
 
 /// A `leave` stirs its sender's update. A leaver that updates while the others are away reseals its `leave` in the epoch
@@ -1548,12 +1563,12 @@ async fn a_member_waits_for_the_kept_message_its_only_holder_gives() {
     let sam_key = sam.node.key();
     let held = |node: &Node| node.heard(&gid.0).unwrap().iter().any(|h| h.held.iter().any(|s| s.key == sam_key && s.seqs.contains(got.seq)));
     eventually("Sam hears that Quinn holds it", || held(&sam.node)).await;
-    sam.node.remove(&gid.0, &spares[0].0).await.unwrap();
+    sam.node.remove(&gid.0, &spares[..1]).await.unwrap();
 
     // Rita comes back online and hears that Quinn holds the message before Sam's second commit needs it.
     let mut rita = stored(&relay, &dbs[2]).await;
     eventually("Rita hears that Quinn holds it", || held(&rita.node)).await;
-    sam.node.remove(&gid.0, &spares[1].0).await.unwrap();
+    sam.node.remove(&gid.0, &spares[1..2]).await.unwrap();
     let epoch = sam.node.epoch(&gid.0).unwrap();
     let got_by_rita = rita.until(|e| match e {
         Event::Message(message) => Some(message),
@@ -1787,9 +1802,9 @@ async fn a_commit_waiting_in_one_group_holds_up_no_other() {
     // A removal in `a` waits for its log, which the gate holds shut.
     gate.set(false);
     let (node, group, spare) = (alice.node.clone(), a.clone(), spare_a[0].clone());
-    let waiting = tokio::spawn(async move { node.remove(&group.0, &spare.0).await });
+    let waiting = tokio::spawn(async move { node.remove(&group.0, &[spare]).await });
     assert_eq!(tokio::time::timeout(WAIT, reaching.recv()).await.unwrap().unwrap(), "Alice");
-    tokio::time::timeout(Duration::from_secs(20), alice.node.remove(&b.0, &spare_b[0].0)).await.expect("B commits").unwrap();
+    tokio::time::timeout(Duration::from_secs(20), alice.node.remove(&b.0, &spare_b[..1])).await.expect("B commits").unwrap();
     let (joined, _) = tokio::time::timeout(Duration::from_secs(20), bob.node.join(&link)).await.expect("the ask again is answered").unwrap();
     assert_eq!(joined, a);
     assert!(!waiting.is_finished());
@@ -2031,7 +2046,7 @@ async fn a_message_whose_dep_is_withheld_is_delivered_with_missing_and_the_dep_c
     }).await;
     sam.node.mark_shown(&gid.0, std::slice::from_ref(&m1)).unwrap();
     eventually("Bob hears that Sam holds m1", || bob.node.heard(&gid.0).unwrap().iter().any(|h| h.member.key == sam.node.key() && h.held.iter().any(|s| s.key == bob_key && s.seqs.contains(m1_seq)))).await;
-    bob.node.remove(&gid.0, &spares[0].0).await.unwrap();
+    bob.node.remove(&gid.0, &spares[..1]).await.unwrap();
     let m2 = sam.node.send(&gid.0, &message("m2 replies to m1"), None).await.unwrap();
     bob.node.shutdown().await.unwrap();
     sam.node.shutdown().await.unwrap();
@@ -2130,7 +2145,7 @@ async fn a_commit_keeps_what_an_online_member_holds() {
     let held = |node: &Node| node.only_here(&gid.0).unwrap().into_iter().map(|(id, _)| id).collect::<Vec<_>>();
     eventually("Alice hears that Bob holds both", || held(&alice.node).is_empty()).await;
 
-    assert!(alice.node.remove(&gid.0, &dave_key.0).await.unwrap());
+    assert!(alice.node.remove(&gid.0, from_ref(&dave_key)).await.unwrap());
     assert!(held(&alice.node).is_empty(), "the commit kept both, which Bob held");
 
     bob.node.shutdown().await.unwrap();
@@ -2175,7 +2190,7 @@ async fn a_message_held_in_an_ended_epoch_is_only_here_until_its_holder_takes_th
     bob.node.shutdown().await.unwrap();
     drop(bob);
 
-    alice.node.remove(&gid.0, &spares[0].0).await.unwrap();
+    alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
     assert!(alice.node.only_here(&gid.0).unwrap().iter().any(|(id, _)| *id == m), "the commit kept nothing: Bob was away");
 
     let (iroh, mls) = member_of(&db);
@@ -2205,7 +2220,7 @@ async fn a_message_an_online_member_holds_is_kept_by_the_next_commit() {
     eventually("Alice hears that Bob holds it", || alice.node.only_here(&gid.0).unwrap().is_empty()).await;
     // The commit is a removal of a stranger admitted now, while Bob is online to hold its invite.
     let spares = strangers(&mut alice, &gid, &relay, 1).await;
-    alice.node.remove(&gid.0, &spares[0].0).await.unwrap();
+    alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
     bob.node.shutdown().await.unwrap();
     eventually("Alice sees Bob go", || alice.node.connected(&gid.0).unwrap().is_empty()).await;
     assert!(alice.node.only_here(&gid.0).unwrap().is_empty(), "the commit kept it");
@@ -2294,7 +2309,7 @@ async fn a_removal_and_an_add_do_not_wait_for_holders() {
     };
 
     let listed_at = block().await;
-    alice.node.remove(&gid.0, &tablet_key.0).await.unwrap();
+    alice.node.remove(&gid.0, from_ref(&tablet_key)).await.unwrap();
     assert!(listed_at.elapsed() < Duration::from_millis(lmk_net::peers::HEAR), "the removal waited");
 
     let listed_at = block().await;
@@ -2368,7 +2383,7 @@ async fn a_removed_member_is_told_which_of_its_messages_no_cut_kept() {
     drop(dave);
 
     let alice = stored(&relay, &db("alice")).await;
-    assert!(alice.node.remove(&gid.0, &dave_key.0).await.unwrap());
+    assert!(alice.node.remove(&gid.0, from_ref(&dave_key)).await.unwrap());
     alice.node.shutdown().await.unwrap();
     let mut dave = stored(&relay, &db("dave")).await;
     dave.node.send(&gid.0, &message("three"), None).await.unwrap_err();
@@ -2405,7 +2420,7 @@ async fn a_holder_keeps_the_removed_members_last_kept_message() {
     eventually("Alice hears that Bob holds it", || alice.node.heard(&gid.0).unwrap().iter().any(|h| h.member.key == bob_key && h.held.iter().any(|s| s.key == dave_key && s.seqs.contains(1)))).await;
     dave.node.shutdown().await.unwrap();
 
-    assert!(alice.node.remove(&gid.0, &dave_key.0).await.unwrap());
+    assert!(alice.node.remove(&gid.0, from_ref(&dave_key)).await.unwrap());
     assert!(alice.node.message(&gid.0, &last.0).unwrap().is_some(), "Alice kept it");
     bob.until(|e| matches!(e, Event::Left { member, .. } if member.key == dave_key).then_some(())).await;
     assert!(bob.node.message(&gid.0, &last.0).unwrap().is_some(), "Bob keeps it");
@@ -2433,7 +2448,7 @@ async fn what_a_member_sends_alone_needs_no_holder_and_reaches_no_joiner() {
         _ => None,
     }).await;
     assert_eq!((got.id, got.seq, got.missing.is_empty()), (after, 4, true));
-    alice.node.remove(&gid.0, &spares[0].0).await.unwrap();
+    alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
     assert!(bob.node.messages(&gid.0).unwrap().iter().all(|m| m.payload != message("before Bob")));
     alice.node.shutdown().await.unwrap();
     bob.node.shutdown().await.unwrap();
@@ -2471,9 +2486,9 @@ async fn missed_commits(test: &str) -> (Vec<u64>, Vec<u64>) {
         }).await;
         sent.push(seq);
         eventually("Alice hears that Bob holds her messages up to it", || alice.node.heard(&gid.0).unwrap().iter().any(|h| h.member.key == bob.node.key() && (5..=seq).all(|q| h.held.iter().any(|s| s.key == alice_key && s.seqs.contains(q))))).await;
-        alice.node.remove(&gid.0, &spare.0).await.unwrap();
+        alice.node.remove(&gid.0, from_ref(spare)).await.unwrap();
     }
-    alice.node.remove(&gid.0, &spares[2].0).await.unwrap();
+    alice.node.remove(&gid.0, &spares[2..3]).await.unwrap();
     let epoch = alice.node.epoch(&gid.0).unwrap();
     assert_eq!(sent, [6, 7]);
 
@@ -2540,7 +2555,7 @@ async fn a_removed_members_send_past_its_final_cut_reaches_no_one() {
     drop(dave);
     gate.set(false);
 
-    assert!(alice.node.remove(&gid.0, &dave_key.0).await.unwrap());
+    assert!(alice.node.remove(&gid.0, from_ref(&dave_key)).await.unwrap());
     let epoch = alice.node.epoch(&gid.0).unwrap();
     eventually("Bob applies the removal", || bob.node.epoch(&gid.0).unwrap() == epoch).await;
     let dave = stored_with(&relay, &dir.join("dave.db"), gate.post("Dave", relay.post())).await;
@@ -2588,7 +2603,7 @@ async fn lost_seqs_are_told_once_across_restarts() {
     alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
     eventually("Alice hears that Bob holds it", || alice.node.heard(&gid.0).unwrap().iter().any(|h| h.member.key == bob_key && h.held.iter().any(|s| s.key == bob_key && s.seqs.contains(2)))).await;
     for spare in &spares {
-        alice.node.remove(&gid.0, &spare.0).await.unwrap();
+        alice.node.remove(&gid.0, from_ref(spare)).await.unwrap();
     }
     bob.node.shutdown().await.unwrap();
     alice.node.shutdown().await.unwrap();
@@ -2738,7 +2753,7 @@ async fn entering_an_epoch_asks_the_service_nothing() {
     eventually("Alice has Bob", || alice.node.members(&gid.0).unwrap().len() == 3).await;
     quiet(&requests).await;
     let before = requests.lock().unwrap().len();
-    alice.node.remove(&gid.0, &spares[0].0).await.unwrap();
+    alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
     let epoch = alice.node.epoch(&gid.0).unwrap();
     eventually("Bob applied the commit", || bob.node.epoch(&gid.0).unwrap() == epoch).await;
     quiet(&requests).await;
@@ -2762,7 +2777,7 @@ async fn a_send_whose_log_moved_waits_until_the_session_caught_up() {
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     bob.node.shutdown().await.unwrap();
     drop(bob);
-    alice.node.remove(&gid.0, &spares[0].0).await.unwrap();
+    alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
     alice.node.shutdown().await.unwrap();
 
     let inner = relay.post();
@@ -2809,8 +2824,8 @@ async fn each_send_reads_the_group_first() {
     eventually("Carol holds the four members", || carol.node.members(&gid.0).unwrap().len() == 4).await;
 
     bob.node.shutdown().await.unwrap();
-    alice.node.remove(&gid.0, &spares[0].0).await.unwrap();
-    alice.node.remove(&gid.0, &bob.node.key().0).await.unwrap();
+    alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
+    alice.node.remove(&gid.0, &[bob.node.key()]).await.unwrap();
     let before = asked.load(std::sync::atomic::Ordering::Relaxed);
     carol.node.send(&gid.0, &message("after"), None).await.unwrap();
     assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), before + 1, "the send asked about the group's log");
