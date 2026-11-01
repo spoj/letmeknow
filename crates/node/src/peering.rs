@@ -323,12 +323,11 @@ impl State {
             return Ok(());
         }
         g.keep_intro(&intro, signed);
-        if let Some(Shown { epoch, capability }) = intro.shown {
-            self.at(gid, &intro.member.0, epoch)?;
-            let g = self.group_mut(gid)?;
-            if epoch < g.mls.epoch() && g.at_epoch(&intro.member.0) == epoch && g.rec.epochs.iter().all(|e| e.epoch != epoch) {
-                g.rec.epochs.push(Epoch { epoch, capability, service: g.mls.settings().membership, expired: None });
-            }
+        let Shown { epoch, capability } = intro.shown;
+        self.at(gid, &intro.member.0, epoch)?;
+        let g = self.group_mut(gid)?;
+        if epoch < g.mls.epoch() && g.at_epoch(&intro.member.0) == epoch && g.rec.epochs.iter().all(|e| e.epoch != epoch) {
+            g.rec.epochs.push(Epoch { epoch, capability, service: g.mls.settings().membership, expired: None });
         }
         self.save(gid)
     }
@@ -340,21 +339,20 @@ impl State {
         let g = self.group_mut(gid)?;
         g.rec.present = g.mls.epoch();
         let own = g.intros().find(|(intro, _)| intro.member.0 == me).map(|(intro, _)| intro);
-        if own.as_ref().and_then(|intro| intro.shown.as_ref()).is_some_and(|shown| shown.epoch == g.rec.present) {
+        if own.as_ref().is_some_and(|intro| intro.shown.epoch == g.rec.present) {
             return Ok(());
         }
         self.introduce(gid, own.and_then(|intro| intro.text))
     }
 
-    /// Signs what this session says of itself to the group, the epoch it is in and its device, for its neighbours to pass
-    /// on.
+    /// Signs what this session says of itself to the group, and the epoch it is in, for its neighbours to pass on.
     pub(crate) fn introduce(&mut self, gid: &[u8], text: Option<String>) -> Result<()> {
         let (me, now) = (self.me().to_vec(), self.tick());
         let g = self.group(gid)?;
         let last = g.intros().find(|(intro, _)| intro.member.0 == me).map_or(0, |(intro, _)| intro.version);
         let joined = g.mls.joined(&me).context("a member of its group")?;
         let shown = Shown { epoch: g.mls.epoch(), capability: g.mls.capability(&self.provider)? };
-        let intro = Intro { group: Bytes(gid.to_vec()), member: Bytes(me), joined, version: (last + 1).max(now), shown: Some(shown), text, device: self.device.clone() };
+        let intro = Intro { group: Bytes(gid.to_vec()), member: Bytes(me), joined, version: (last + 1).max(now), shown, text };
         let body = serde_json::to_vec(&intro)?;
         let sig = self.session.sign(&[INTRO, &body].concat());
         self.group_mut(gid)?.keep_intro(&intro, Signed { body: Bytes(body), sig: Bytes(sig) });

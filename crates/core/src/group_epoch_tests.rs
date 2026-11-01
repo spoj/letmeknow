@@ -219,14 +219,14 @@ fn staged_oversize_and_malformed_builds_restore_everything() {
     let mut w = World::new(&["A", "B"]);
     w.found(0, &[1]);
     let a = &mut w.m[0];
-    let padded = |n: usize| Leaf { key: Bytes(vec![b'x'; n]), revision: REVISION, home: "lmk.example".into() };
+    let padded = |n: usize| Leaf { key: Bytes(vec![b'x'; n]), home: "lmk.example".into(), device: None };
     let cut = a.cut();
     let top = a.commit(Change { cut, leaf: Some(padded(700_000)), ..Change::default() });
     assert_eq!(top.entry.len(), 1 << 20);
     a.cancel();
     let group = a.group.as_mut().unwrap();
     group.mls.set_aad(b"transient AAD before a failed build".to_vec());
-    group.state.aad = Aad { invite: Some([3; 32].into()), moved: vec![], time: 1 };
+    group.state.aad = Aad { invite: Some([3; 32].into()), time: 1, ..Aad::default() };
     group.save(&a.provider).unwrap();
     let before = a.provider.rows();
     let before_state = serde_json::to_vec(&group.state).unwrap();

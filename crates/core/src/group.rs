@@ -7,7 +7,7 @@ use chacha20poly1305::{XChaCha20Poly1305, aead::{Aead, KeyInit, Payload}};
 use lmk_proto::Bytes;
 use lmk_proto::clock::{corrected, now};
 use lmk_proto::entry::{Entry, signed, welcome_signed};
-use lmk_proto::group::{LEAF_EXTENSION, Leaf, PROTOCOL, SETTINGS_EXTENSION, Service, Settings};
+use lmk_proto::group::{Device, LEAF_EXTENSION, LEAVE, Leaf, PROTOCOL, SETTINGS_EXTENSION, Service, Settings};
 use lmk_proto::held::{self, Claim, Header, Ref};
 use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
 use openmls::prelude::*;
@@ -153,9 +153,11 @@ impl Session {
     }
 }
 
-/// Validates a KeyPackage as it arrives at a member that admits it, and returns its session key.
-pub fn key_package_key(provider: &SqliteProvider, key_package: &[u8]) -> Result<Vec<u8>> {
-    Ok(key_package_in(provider, key_package)?.leaf_node().signature_key().as_slice().to_vec())
+/// Validates a KeyPackage as it arrives at a member that admits it, and returns its session key and leaf data.
+pub fn key_package_leaf(provider: &SqliteProvider, key_package: &[u8]) -> Result<(Vec<u8>, Option<Leaf>)> {
+    let key_package = key_package_in(provider, key_package)?;
+    let leaf = key_package.leaf_node();
+    Ok((leaf.signature_key().as_slice().to_vec(), leaf_of(leaf.extensions())))
 }
 
 pub fn key_package_reference(provider: &SqliteProvider, key_package: &[u8]) -> Result<[u8; 32]> {
@@ -178,18 +180,25 @@ pub struct Change {
     pub invite: Option<Bytes>,
     /// Leaf indices.
     pub remove: Vec<u32>,
+    /// The leaves of members it removes (`Group::leave`), carried in its authenticated data: with them a member that is
+    /// no admin may remove them.
+    pub left: Vec<Bytes>,
     pub leaf: Option<Leaf>,
+    /// New settings, which only an admin commits: its admins and admitted devices changed.
+    pub settings: Option<Settings>,
     /// The cut of the epoch the commit ends: for each member, by key, the seq up to which the committer holds every
     /// held message, sealed in this epoch, and the id there (see `Group::cut`). The commit carries the entries that moved.
     pub cut: Vec<Ref>,
 }
 
-/// A commit's authenticated data, inside its sealed entry: the invite the member it adds came in by, the entries of the
-/// cut state it moves, and when it was made, by the committer's corrected clock.
+/// A commit's authenticated data, inside its sealed entry: the invite the member it adds came in by, the leaves of
+/// members it removes, the entries of the cut state it moves, and when it was made, by the committer's corrected clock.
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Aad {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     invite: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    left: Vec<Bytes>,
     #[serde(default)]
     moved: Vec<Ref>,
     #[serde(default)]
@@ -238,10 +247,34 @@ impl Member {
         let leaf = group.public_group().leaf(index)?;
         Some(Member { index: index.u32(), key: member.signature_key, leaf: leaf_of(leaf.extensions()) })
     }
+
+    /// The device that certified it, as its leaf names it.
+    pub fn device(&self) -> Option<&Device> {
+        self.leaf.as_ref()?.device_of(&self.key)
+    }
 }
 
 fn leaf_of(extensions: &Extensions<LeafNode>) -> Option<Leaf> {
     serde_json::from_slice(&extensions.unknown(LEAF_EXTENSION)?.0).ok()
+}
+
+/// Whether a session, by its key and its leaf data, is one of the settings' admins: by its key, or by the device that
+/// certified it.
+fn admin(settings: &Settings, key: &[u8], leaf: Option<&Leaf>) -> bool {
+    let device = leaf.and_then(|leaf| leaf.device_of(key));
+    settings.admins.iter().any(|admin| admin.0 == key) || device.is_some_and(|device| settings.admins.contains(&device.key))
+}
+
+/// Whether the settings let any member add a session, by its key and its leaf data: the device that certified it is
+/// admitted, or an admin.
+fn admits(settings: &Settings, key: &[u8], leaf: Option<&Leaf>) -> bool {
+    let device = leaf.and_then(|leaf| leaf.device_of(key));
+    device.is_some_and(|device| settings.admitted.contains(&device.key) || settings.admins.contains(&device.key))
+}
+
+/// Whether `sig` is the leave of the member with key `key` of the group `group`, whose cut state `cut` names it.
+fn left(group: &[u8], cut: &[Ref], key: &[u8], sig: &[u8]) -> bool {
+    cut.iter().find(|r| r.key.0 == key).is_some_and(|r| verify(key, LEAVE, &[group, &r.joined.to_be_bytes()].concat(), sig))
 }
 
 /// A log entry as judged in the current epoch, before anything of it is applied.
@@ -337,13 +370,18 @@ fn creator_lifetime() -> Lifetime {
 }
 
 impl Group {
+    /// A new group, of this session alone, whose admins are this session and the device that certified it, whatever
+    /// `settings` name.
     pub fn create(provider: &SqliteProvider, session: &Session, settings: &Settings) -> Result<Self> {
         ensure!(settings.protocol == PROTOCOL, "settings name protocol {}", settings.protocol);
         service_key(settings)?;
+        let device = session.leaf.device_of(session.key()).map(|device| device.key.clone());
+        let admins = [Bytes(session.key().to_vec())].into_iter().chain(device).collect();
+        let settings = Settings { admins, ..settings.clone() };
         let config = MlsGroupCreateConfig::builder()
             .ciphersuite(CIPHERSUITE)
             .capabilities(capabilities())
-            .with_group_context_extensions(context_extensions(settings)?)
+            .with_group_context_extensions(context_extensions(&settings)?)
             .with_leaf_node_extensions(leaf_extensions(&session.leaf)?)?
             .use_ratchet_tree_extension(true)
             .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
@@ -450,6 +488,29 @@ impl Group {
 
     pub fn settings(&self) -> Settings {
         settings_of(self.mls.extensions()).expect("every epoch's settings were checked")
+    }
+
+    /// Whether the member with key `key` is an admin: by its key, or by the device its leaf names.
+    pub fn admin(&self, key: &[u8]) -> bool {
+        let leaf = self.members().into_iter().find(|m| m.key == key).and_then(|m| m.leaf);
+        admin(&self.settings(), key, leaf.as_ref())
+    }
+
+    /// Whether any member may add the session with key `key` and leaf data `leaf`: its device is admitted, or an admin.
+    pub fn admits(&self, key: &[u8], leaf: Option<&Leaf>) -> bool {
+        admits(&self.settings(), key, leaf)
+    }
+
+    /// This session's leave of its membership, for its `leave` to carry: a commit that removes it may carry the leave in
+    /// its authenticated data, so that any member may commit it.
+    pub fn leave(&self, session: &Session) -> Result<Bytes> {
+        let joined = self.joined(session.key()).context("a member of its group")?;
+        Ok(Bytes(session.sign(&[LEAVE, self.id(), &joined.to_be_bytes()].concat())))
+    }
+
+    /// Whether `sig` is the leave of the current membership of the member with key `key`.
+    pub fn left(&self, key: &[u8], sig: &[u8]) -> bool {
+        left(self.id(), &self.state.cut, key, sig)
     }
 
     pub fn active(&self) -> bool {
@@ -582,20 +643,23 @@ impl Group {
             g.mls.clear_pending_commit(provider.storage())?;
             let adds = change.add.iter().map(|bytes| key_package_in(provider, bytes)).collect::<Result<Vec<_>>>()?;
             let moved = change.cut.iter().filter(|r| !g.state.cut.contains(r)).cloned().collect();
-            let aad = Aad { invite: change.invite, moved, time: corrected() };
+            let aad = Aad { invite: change.invite, left: change.left, moved, time: corrected() };
             g.mls.set_aad(serde_json::to_vec(&aad)?);
             let mut parameters = LeafNodeParameters::builder();
             if let Some(leaf) = &change.leaf {
                 parameters = parameters.with_extensions(leaf_extensions(leaf)?);
             }
-            let builder = g
+            let mut builder = g
                 .mls
                 .commit_builder()
                 .consume_proposal_store(false)
                 .force_self_update(change.add.is_empty() || change.leaf.is_some())
                 .propose_adds(adds)
-                .propose_removals(change.remove.into_iter().map(LeafNodeIndex::new))
-                .leaf_node_parameters(parameters.build());
+                .propose_removals(change.remove.into_iter().map(LeafNodeIndex::new));
+            if let Some(settings) = &change.settings {
+                builder = builder.propose_group_context_extensions(context_extensions(settings)?)?;
+            }
+            let builder = builder.leaf_node_parameters(parameters.build());
             let bundle = builder
                 .load_psks(provider.storage())?
                 .build(provider.rand(), provider.crypto(), &session.signer, |_| true)?
@@ -829,21 +893,40 @@ fn well_formed(r: &Ref) -> bool {
     r.id.0.len() == if r.seq == 0 { 0 } else { 32 }
 }
 
-/// The app's rules on a commit, from MLS state alone, binding the committer too: changes inline only, of the kinds we
-/// make: Adds, which name the invite they came in by, and none of a key it removes, and Removes; the committer's key
-/// unchanged; and cut entries that each name a member of the cut state `cut` once, by key, in order, at its membership,
-/// past its entry there by at most `MAX_CUT_STEP`.
+/// The app's rules on a commit, from MLS state alone and the commit, binding the committer too: changes inline only, of
+/// the kinds we make: Adds, which name the invite they came in by, and none of a key it removes, of sessions whose
+/// device is admitted or an admin unless the committer is an admin; Removes, of members that signed their leave unless
+/// the committer is an admin; and settings, by an admin, that change only the admins and admitted devices and leave an
+/// admin; the committer's key unchanged; and cut entries that each name a member of the cut state `cut` once, by key, in
+/// order, at its membership, past its entry there by at most `MAX_CUT_STEP`.
 fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad, cut: &[Ref]) -> Result<()> {
+    let settings = settings_of(group.extensions())?;
+    let committer = Member::of(group, by).context("not a member")?;
+    let admin = admin(&settings, &committer.key, committer.leaf.as_ref());
     let removed: Vec<Vec<u8>> = staged.remove_proposals().filter_map(|r| group.member_at(r.remove_proposal().removed())).map(|m| m.signature_key).collect();
     for proposal in staged.queued_proposals() {
         ensure!(proposal.proposal_or_ref_type() == ProposalOrRefType::Proposal, "a proposal by reference");
         match proposal.proposal() {
             Proposal::Add(add) => {
                 let leaf = add.key_package().leaf_node();
-                ensure!(names_its_key(leaf.credential(), leaf.signature_key().as_slice()), "a credential that names another key");
-                ensure!(!removed.iter().any(|key| key == leaf.signature_key().as_slice()), "a commit that adds a key it removes");
+                let key = leaf.signature_key().as_slice();
+                ensure!(names_its_key(leaf.credential(), key), "a credential that names another key");
+                ensure!(!removed.iter().any(|removed| removed == key), "a commit that adds a key it removes");
+                ensure!(admin || admits(&settings, key, leaf_of(leaf.extensions()).as_ref()), "an Add by a member that is no admin, of a session whose device is neither admitted nor an admin");
             }
-            Proposal::Remove(_) => {}
+            Proposal::Remove(remove) => {
+                let key = group.member_at(remove.removed()).context("a Remove of no member")?.signature_key;
+                let signed = aad.left.iter().any(|sig| left(group.group_id().as_slice(), cut, &key, &sig.0));
+                ensure!(admin || signed, "a Remove by a member that is no admin, of a member that did not sign its leave");
+            }
+            Proposal::GroupContextExtensions(_) => {
+                ensure!(admin, "a settings change by a member that is no admin");
+                let new = settings_of(staged.group_context().extensions())?;
+                ensure!(*staged.group_context().extensions() == context_extensions(&new)?, "a settings change with other context extensions");
+                let fixed = |s: &Settings| (s.protocol, s.carry, s.update, s.membership.clone());
+                ensure!(fixed(&new) == fixed(&settings), "a settings change of more than the admins and admitted devices");
+                ensure!(!new.admins.is_empty(), "a settings change that leaves the group no admin");
+            }
             other => bail!("a {:?} proposal", other.proposal_type()),
         }
     }

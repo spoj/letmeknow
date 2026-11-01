@@ -2,8 +2,8 @@
 //! advance, at start, and at this session's next update, and one whose commit failed again after `RETRY`. It drops what
 //! the group kept past H, and commits at most once, with every Remove due (members whose `leave` the cut it builds
 //! keeps, and members left behind in an epoch whose log was let go, as the service answered, asked at most daily, or a
-//! neighbour passed on its answer) and
-//! this session's update if due: T after the last, at an offset of its own, once the group delivered a message or
+//! neighbour passed on its answer; of a session that is no admin, only those leavers whose `leave` carries their
+//! leave) and this session's update if due: T after the last, at an offset of its own, once the group delivered a message or
 //! changed its members since. The update first fetches for at most `HEAR` what the last commit kept and connected
 //! members hold past the cut. T grows with the group, so that its members update about hourly between them, up to three
 //! days: an online member's update shows it is there well within the services' retention.
@@ -143,18 +143,29 @@ impl State {
     }
 }
 
-/// What a pass commits on the group as it stands, if anything: the Removes due and this session's update.
+/// What a pass commits on the group as it stands, if anything: the Removes due, which a session that is no admin may
+/// commit, and this session's update.
 fn due(st: &State, g: &G) -> Result<Option<Change>> {
     let gid = g.mls.id();
     let me = st.me();
-    let cut = st.cut_for(gid)?;
+    let admin = g.mls.admin(me);
+    let mut change = Change { cut: st.cut_for(gid)?, ..Change::default() };
     let members = g.mls.members();
-    let kept = |m: &&lmk_core::group::Member| g.left(&m.key).is_some_and(|seq| cut.iter().any(|r| r.key.0 == m.key && r.seq >= seq));
-    let remove: Vec<u32> = members.iter().filter(|m| m.key != me).filter(|m| kept(m) || g.left_behind(&m.key)).map(|m| m.index).collect();
+    for m in members.iter().filter(|m| m.key != me) {
+        let kept = |seq: &u64| change.cut.iter().any(|r| r.key.0 == m.key && r.seq >= *seq);
+        match g.left(&m.key).filter(|(seq, _)| kept(seq)) {
+            Some((_, sig)) if admin || g.mls.left(&m.key, &sig.0) => {
+                change.remove.push(m.index);
+                change.left.push(sig.clone());
+            }
+            _ if admin && g.left_behind(&m.key) => change.remove.push(m.index),
+            _ => {}
+        }
+    }
     let Some(own) = members.iter().find(|m| m.index == g.mls.own_index()) else { return Ok(None) };
     let leaf = st.session.leaf.clone();
     let update = own.leaf.as_ref() != Some(&leaf) || g.rec.stirred && now() >= next(g, me);
-    Ok((update || !remove.is_empty()).then(|| Change { remove, leaf: Some(leaf), cut, ..Change::default() }))
+    Ok((update || !change.remove.is_empty()).then(|| Change { leaf: Some(leaf), ..change }))
 }
 
 impl Inner {

@@ -15,7 +15,6 @@ use lmk_proto::Bytes;
 use lmk_proto::directory::{Directory, MAX_BYTES, check_domain};
 use lmk_proto::group::Service;
 use lmk_proto::links::{DOMAIN, MEMBERSHIP_KEY};
-use lmk_proto::peer::Device;
 use n0_future::boxed::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -225,7 +224,7 @@ pub async fn listen(
 ) -> Result<()> {
     own_format(home)?;
     cli::private_dir(&config.dir)?;
-    let (device_key, device_name) = device(&config.device)?;
+    let device = device(&config.device)?;
     let directory = own_directory(home, &network, &config.membership).await?;
     let membership = Service::Serve { key: Bytes(directory.key.to_vec()), domain: config.membership.clone(), rest: Default::default() };
     // One process runs a session, even when two start at once.
@@ -239,9 +238,8 @@ pub async fn listen(
     cli::open_channel(&config.dir.join("endpoint"), inbound).await?;
     let db = store::open(&config.dir.join("session.db"))?;
     let provider = SqliteProvider::open(&config.dir.join("session.db"))?;
-    let node_config = lmk_node::Config { home: config.membership.clone(), post: network.post.clone(), ca: network.ca.clone() };
+    let node_config = lmk_node::Config { home: config.membership.clone(), post: network.post.clone(), ca: network.ca.clone(), device };
     let (node, events) = Node::start(provider, node_config).await?;
-    node.set_device(Device::sign(&device_key, &node.key().0, &device_name))?;
     let dir = config.dir.clone();
     let mut session = session::Session::open(config, db, node, held, membership).await?;
     session.start(delete_stopped_in_no_group(home.to_owned()));

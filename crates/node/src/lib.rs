@@ -29,9 +29,9 @@ use lmk_core::provider::SqliteProvider;
 use lmk_membership::client::Post;
 use lmk_net::peers::Peers;
 use lmk_net::Net;
-use lmk_proto::group::Service;
+use lmk_proto::group::{Device, Service};
 use lmk_proto::membership::Expiry;
-use lmk_proto::peer::{At, Device, Frame, Seqs, Signed};
+use lmk_proto::peer::{At, Frame, Seqs, Signed};
 use lmk_proto::Bytes;
 use n0_future::task::{JoinHandle, spawn};
 use n0_future::time::Duration;
@@ -61,6 +61,8 @@ pub struct Config {
     /// Posts to a membership service's routes, as the shell does over https.
     pub post: Post,
     pub ca: CaTlsConfig,
+    /// The key of the device it runs on, and the device's name: its leaf carries the device's certificate of it.
+    pub device: (ed25519_dalek::SigningKey, String),
 }
 
 /// When a member was last known online, in milliseconds since the epoch, and whether this session is connected to it now.
@@ -77,10 +79,10 @@ pub struct Member {
     pub key: Bytes,
     /// The iroh key its leaf names.
     pub iroh: Bytes,
-    /// The protocol revision its leaf names.
-    pub revision: u32,
     /// The domain of its own service, whose relay it lives on, as its leaf names it.
     pub home: String,
+    /// The device that certified it, as its leaf names it.
+    pub device: Option<Device>,
 }
 
 impl From<&core::Member> for Member {
@@ -88,8 +90,8 @@ impl From<&core::Member> for Member {
         Member {
             key: Bytes(member.key.clone()),
             iroh: member.leaf.as_ref().map(|leaf| leaf.key.clone()).unwrap_or_default(),
-            revision: member.leaf.as_ref().map_or(0, |leaf| leaf.revision),
             home: member.leaf.as_ref().map(|leaf| leaf.home.clone()).unwrap_or_default(),
+            device: member.device().cloned(),
         }
     }
 }
@@ -202,8 +204,8 @@ struct Rec {
     committed: u64,
     /// The invites shared with the group, kept for H after they expire.
     invites: Vec<Rule>,
-    /// The `leave`s opened: each one's membership, and its seq.
-    leaves: Vec<(Bytes, u64, u64)>,
+    /// The `leave`s opened: each one's membership, its seq, and the member's leave it carries (`Group::leave`).
+    leaves: Vec<(Bytes, u64, u64, Bytes)>,
     /// This session asked to leave: it is in the group until a member removes it.
     leaving: bool,
     /// When this session's leaf was last updated, in milliseconds.
@@ -246,7 +248,6 @@ struct Rec {
     /// `since`.
     members: Vec<(Bytes, u64)>,
     /// The epoch this session joined in.
-    #[serde(default)]
     since: u64,
     /// The epochs behind the current one that members are at, each with its log's capability and service.
     epochs: Vec<Epoch>,
@@ -342,10 +343,11 @@ impl G {
         self.rec.epochs.iter().any(|epoch| epoch.epoch == at && epoch.expired.is_some())
     }
 
-    /// The seq of the `leave` of the current membership of the member with key `key`, if it asked to leave.
-    fn left(&self, key: &[u8]) -> Option<u64> {
+    /// The seq of the `leave` of the current membership of the member with key `key`, if it asked to leave, and the leave
+    /// it carries.
+    fn left(&self, key: &[u8]) -> Option<(u64, &Bytes)> {
         let joined = self.mls.joined(key)?;
-        self.rec.leaves.iter().find(|(by, at, _)| by.0 == key && *at == joined).map(|(_, _, seq)| *seq)
+        self.rec.leaves.iter().find(|(by, at, _, _)| by.0 == key && *at == joined).map(|(_, _, seq, sig)| (*seq, sig))
     }
 }
 
@@ -358,8 +360,6 @@ pub(crate) struct State {
     /// What the current step tells the session, sent once it commits.
     events: Vec<Event>,
     session: Session,
-    /// The certificate of this session by the device it runs on, which its intros carry.
-    device: Option<Device>,
     groups: BTreeMap<Vec<u8>, G>,
     /// The logs this session follows, by id.
     logs: BTreeMap<Vec<u8>, logs::Log>,
@@ -634,7 +634,8 @@ mod tests {
     use lmk_testing::Relay;
 
     async fn node(relay: &Relay, post: Post) -> Node {
-        let config = Config { home: relay.domain.clone(), post, ca: relay.ca() };
+        let device = (ed25519_dalek::SigningKey::from_bytes(&[9; 32]), "test".into());
+        let config = Config { home: relay.domain.clone(), post, ca: relay.ca(), device };
         Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0
     }
 
@@ -644,7 +645,7 @@ mod tests {
     async fn a_joiners_summary_right_after_its_add_is_kept() {
         let relay = lmk_testing::relay().await;
         let (alice, bob, carol) = (node(&relay, relay.post()).await, node(&relay, relay.post()).await, node(&relay, relay.post()).await);
-        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone() };
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
         let gid = bob.create(settings.clone()).unwrap();
         alice.join(&bob.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
         // Alice no longer polls.
@@ -673,7 +674,7 @@ mod tests {
     async fn an_idle_session_polls_for_nothing() {
         let relay = lmk_testing::relay().await;
         let (alice, bob) = (node(&relay, relay.post()).await, node(&relay, relay.post()).await);
-        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone() };
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
         let gid = alice.create(settings).unwrap();
         bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
         let text = serde_json::json!({ "type": "message", "content": "hi" });

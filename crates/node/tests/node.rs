@@ -17,7 +17,7 @@ use lmk_proto::group::{ChatMessage, PROTOCOL, Service, Settings};
 use lmk_proto::Bytes;
 use lmk_proto::frame::{self, ALPN};
 use lmk_proto::head::Head;
-use lmk_proto::peer::{Device, Frame, SUMMARY, Seqs, Signed, Summary};
+use lmk_proto::peer::{Frame, SUMMARY, Seqs, Signed, Summary};
 use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -49,8 +49,17 @@ async fn session_trusting(relays: &[&Relay]) -> Session {
     Session { node, events }
 }
 
+/// A session's configuration: every session a test starts so is on one device, `test`, which founds its groups, so that
+/// each is an admin.
 fn config(relay: &Relay) -> Config {
-    Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca() }
+    Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: (SigningKey::from_bytes(&[9; 32]), "test".into()) }
+}
+
+/// A session on the device named `name`, whose key's seed is `seed`'s bytes.
+async fn session_on(relay: &Relay, seed: u8, name: &str) -> Session {
+    let device = (SigningKey::from_bytes(&[seed; 32]), name.into());
+    let (node, events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), Config { device, ..config(relay) }).await.unwrap();
+    Session { node, events }
 }
 
 impl Session {
@@ -109,6 +118,8 @@ fn settings(relay: &Relay) -> Settings {
         carry: 7,
         update: lmk_proto::group::UPDATE,
         membership: relay.service.clone(),
+        admins: vec![],
+        admitted: vec![],
     }
 }
 
@@ -424,12 +435,12 @@ impl Gate {
     }
 }
 
-/// A session whose leaf names an older revision writes its own as it starts.
+/// A session whose leaf names no device writes its own as it starts.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_session_updates_an_older_leaf_as_it_starts() {
+async fn a_session_updates_its_leaf_as_it_starts() {
     use lmk_core::group::{Change, Group, Session as Mls};
     let relay = relay().await;
-    let dir = folder("revision");
+    let dir = folder("leaf");
     std::fs::create_dir_all(&dir).unwrap();
     let bob_db = dir.join("bob.db");
     let start = || async { Node::start(SqliteProvider::open(&bob_db).unwrap(), config(&relay)).await.unwrap().0 };
@@ -438,32 +449,34 @@ async fn a_session_updates_an_older_leaf_as_it_starts() {
     let bob = start().await;
     let bob_key = bob.key();
     bob.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
-    let revision = |wanted: u32| {
+    let device = |wanted: Option<&'static str>| {
         let (node, gid, bob_key) = (&alice.node, &gid, &bob_key);
+        let named = move || node.members(&gid.0).unwrap().into_iter().any(|m| m.key == *bob_key && m.device.map(|d| d.name).as_deref() == wanted);
         tokio::time::timeout(WAIT, async move {
-            while !node.members(&gid.0).unwrap().iter().any(|m| m.key == *bob_key && m.revision == wanted) {
+            while !named() {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         })
     };
-    revision(lmk_proto::group::REVISION).await.expect("a joiner's leaf names this revision");
+    device(Some("test")).await.expect("a joiner's leaf names its device");
     bob.shutdown().await.unwrap();
     drop(bob);
 
-    // Bob's leaf goes back to revision 0 while he is stopped.
+    // Bob's leaf names no device while he is stopped.
     let provider = SqliteProvider::open(&bob_db).unwrap();
     let mls = Mls::load(&provider).unwrap();
-    let old = lmk_proto::group::Leaf { revision: 0, ..mls.leaf.clone() };
+    let old = lmk_proto::group::Leaf { device: None, ..mls.leaf.clone() };
     let mut group = Group::load(&provider, &gid.0).unwrap();
     let capability = group.capability(&provider).unwrap();
     let cut = group.cut().to_vec();
     let commit = group.commit(&provider, &mls, Change { leaf: Some(old), cut, ..Change::default() }).unwrap();
     ServeClient::for_service(relay.post(), &relay.service).unwrap().append(&capability, &[commit.entry]).await.unwrap();
     drop(provider);
-    revision(0).await.expect("Alice sees Bob's leaf of revision 0");
+    alice.node.read_group(&gid.0).await.unwrap();
+    device(None).await.expect("Alice sees Bob's leaf name no device");
 
     let bob = start().await;
-    revision(lmk_proto::group::REVISION).await.expect("Bob's leaf names this revision once he starts");
+    device(Some("test")).await.expect("Bob's leaf names his device once he starts");
     bob.shutdown().await.unwrap();
     alice.node.shutdown().await.unwrap();
 }
@@ -944,33 +957,18 @@ fn a_joiner_removes_a_member_away_since_before_it_joined_by_its_intro() {
     });
 }
 
-/// A session names its device in its intro, signed again with no commit as the device is set: the members, and a joiner,
-/// see it, and a certificate of another session's shows no device.
+/// Each member's leaf names the device that certified it, which its members and joiners see.
 #[tokio::test(flavor = "multi_thread")]
-async fn members_see_the_devices_their_intros_certify() {
+async fn members_see_the_devices_their_leaves_name() {
     let relay = relay().await;
-    let (alice, bob) = (session(&relay).await, session(&relay).await);
-    let (alice_key, bob_key) = (alice.node.key(), bob.node.key());
+    let alice = session_on(&relay, 1, "laptop").await;
     let gid = alice.node.create(settings(&relay)).unwrap();
+    let bob = session(&relay).await;
     bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
-    let epoch = bob.node.epoch(&gid.0).unwrap();
-    eventually("Alice reads Bob's update", || alice.node.epoch(&gid.0).unwrap() == epoch).await;
-
-    let laptop = SigningKey::from_bytes(&[7; 32]);
-    alice.node.set_device(Device::sign(&laptop, &alice_key.0, "laptop")).unwrap();
-    bob.node.set_device(Device::sign(&laptop, &alice_key.0, "laptop")).unwrap();
-    bob.node.set_intro(&gid.0, Some("bob".into())).unwrap();
-    let named = |node: &Node, key: &Bytes| node.devices(&gid.0).unwrap().get(key).map(|device| device.name.clone());
-    eventually("Bob sees Alice's device", || named(&bob.node, &alice_key).as_deref() == Some("laptop")).await;
-    eventually("Alice holds Bob's intro", || alice.node.intros(&gid.0).unwrap().contains_key(&bob_key)).await;
-    assert_eq!(named(&alice.node, &bob_key), None, "Bob's certificate is of Alice's session");
-    assert_eq!(named(&alice.node, &alice_key).as_deref(), Some("laptop"));
-    assert_eq!((alice.node.epoch(&gid.0).unwrap(), bob.node.epoch(&gid.0).unwrap()), (epoch, epoch), "no commit");
-
-    let carol = session(&relay).await;
-    carol.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
-    eventually("Carol sees Alice's device", || named(&carol.node, &alice_key).as_deref() == Some("laptop")).await;
-    for session in [alice, bob, carol] {
+    let named = |node: &Node, key: &Bytes| node.members(&gid.0).unwrap().into_iter().find(|m| m.key == *key).and_then(|m| Some(m.device?.name));
+    assert_eq!(named(&bob.node, &alice.node.key()).as_deref(), Some("laptop"));
+    eventually("Alice sees Bob's device", || named(&alice.node, &bob.node.key()).as_deref() == Some("test")).await;
+    for session in [alice, bob] {
         session.node.shutdown().await.unwrap();
     }
 }
@@ -994,11 +992,11 @@ fn expired_epochs(db: &Path, gid: &Bytes) -> Vec<u64> {
     rec["epochs"].as_array().unwrap().iter().filter(|epoch| epoch.get("expired").is_some()).map(|epoch| epoch["epoch"].as_u64().unwrap()).collect()
 }
 
-/// A joiner takes from its admitter the devices and the expiries it holds. Alice, which asked the service, asks it no
-/// more of that log, and can append nothing past Carol's Add; Carol, which can ask it nothing, keeps the expiry, and
-/// started again removes Bob, whose epoch's log was let go.
+/// A joiner takes from its admitter the expiries it holds. Alice, which asked the service, asks it no more of that log,
+/// and can append nothing past Carol's Add; Carol, which can ask it nothing, keeps the expiry, and started again removes
+/// Bob, whose epoch's log was let go.
 #[test]
-fn a_joiner_takes_the_devices_and_expiries_its_admitter_holds() {
+fn a_joiner_takes_the_expiries_its_admitter_holds() {
     static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     fn shifted() -> u64 {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
@@ -1029,8 +1027,6 @@ fn a_joiner_takes_the_devices_and_expiries_its_admitter_holds() {
         SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         while relay.membership.expire().await {}
         let alice = stored_with(&relay, &alice_db, alice_post).await;
-        let alice_key = alice.node.key();
-        alice.node.set_device(Device::sign(&SigningKey::from_bytes(&[7; 32]), &alice_key.0, "laptop")).unwrap();
         // Alice's commit updates her leaf, so that the invite's message stirs no update; she knows of no log let go yet.
         alice.node.remove(&gid.0, &spares[1..]).await.unwrap();
         let link = alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
@@ -1044,8 +1040,6 @@ fn a_joiner_takes_the_devices_and_expiries_its_admitter_holds() {
         appends.store(1, SeqCst);
         let carol = stored_with(&relay, &carol_db, failing(relay.post(), |route| !route.ends_with("/read"))).await;
         carol.node.join(&link).await.unwrap();
-        let named = |node: &Node| node.devices(&gid.0).unwrap().get(&alice_key).map(|device| device.name.clone());
-        eventually("Carol sees Alice's device", || named(&carol.node).as_deref() == Some("laptop")).await;
         eventually("Carol takes the expiry Alice holds", || expired_epochs(&carol_db, &gid) == [behind]).await;
         assert!(carol.node.members(&gid.0).unwrap().iter().any(|m| m.key == bob_key), "no one could commit since the Add");
         for session in [alice, carol] {
@@ -2955,4 +2949,93 @@ async fn each_send_reads_the_group_first() {
     assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), read + 1, "the next send asks again");
     alice.node.shutdown().await.unwrap();
     carol.node.shutdown().await.unwrap();
+}
+
+/// The key of the device a member's leaf names.
+fn device_of(node: &Node, gid: &Bytes, key: &Bytes) -> Bytes {
+    node.members(&gid.0).unwrap().into_iter().find(|m| m.key == *key).and_then(|m| m.device).unwrap().key
+}
+
+/// A member that is no admin removes no one, at once, and refuses a joiner whose device is neither admitted nor an admin;
+/// an admin the link names too admits it, and removes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_an_admin_removes_or_admits_sessions_of_other_devices() {
+    use lmk_proto::links::Invite;
+    let relay = relay().await;
+    let mut alice = session_on(&relay, 1, "alice").await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    let bob = session_on(&relay, 2, "bob").await;
+    bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    assert!(alice.node.admin(&gid.0, &alice.node.key().0).unwrap() && !alice.node.admin(&gid.0, &bob.node.key().0).unwrap());
+
+    let carol = session_on(&relay, 3, "carol").await;
+    let link = bob.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
+    assert_eq!(link.members.len(), 2, "the link names Bob and Alice");
+    let refused = carol.node.join(&Invite { members: link.members[..1].to_vec(), ..link.clone() }).await.unwrap_err();
+    assert!(format!("{refused:#}").contains("neither admitted nor an admin"), "{refused:#}");
+    let (_, by) = carol.node.join(&link).await.unwrap();
+    assert_eq!(by, alice.node.address().0, "Alice admits Carol");
+    eventually("Bob holds Carol's Add", || bob.node.members(&gid.0).unwrap().len() == 3).await;
+
+    for refused in [bob.node.remove(&gid.0, &[carol.node.key()]).await.unwrap_err(), bob.node.remove_others(&gid.0).await.unwrap_err()] {
+        assert!(refused.to_string().contains("no admin"), "{refused:#}");
+    }
+    let changed = bob.node.change_settings(&gid.0, |s| s.admins.clear()).await.unwrap_err();
+    assert!(changed.to_string().contains("no admin"), "{changed:#}");
+    alice.node.remove(&gid.0, &[carol.node.key()]).await.unwrap();
+    eventually("Bob applies the removal", || bob.node.members(&gid.0).unwrap().len() == 2).await;
+    for session in [alice, bob, carol] {
+        session.node.shutdown().await.unwrap();
+    }
+}
+
+/// An admin admits a device; then a session of it joins through another, which is no admin, with no admin online, as a
+/// new session of a machine joins through another of it. A group keeps an admin.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_of_an_admitted_device_joins_through_a_member_that_is_no_admin() {
+    let relay = relay().await;
+    let alice = session_on(&relay, 1, "alice").await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    let laptop = session_on(&relay, 2, "laptop").await;
+    laptop.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    let device = device_of(&alice.node, &gid, &laptop.node.key());
+    let emptied = alice.node.change_settings(&gid.0, |s| s.admins.clear()).await.unwrap_err();
+    assert!(emptied.to_string().contains("no admin"), "{emptied:#}");
+    assert!(alice.node.change_settings(&gid.0, |s| s.admitted.push(device.clone())).await.unwrap());
+    assert!(!alice.node.change_settings(&gid.0, |s| s.admitted.dedup()).await.unwrap(), "no change, no commit");
+    eventually("the laptop applies the change", || laptop.node.settings(&gid.0).unwrap().admitted == [device.clone()]).await;
+    alice.node.shutdown().await.unwrap();
+
+    let second = session_on(&relay, 2, "laptop").await;
+    let (joined, by) = second.node.join(&laptop.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    assert_eq!((joined, by), (gid.clone(), laptop.node.address().0));
+    for session in [laptop, second] {
+        session.node.shutdown().await.unwrap();
+    }
+}
+
+/// A leaver's `leave` carries its leave, with which a member that is no admin removes it, with no admin online.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_that_is_no_admin_removes_a_leaver_by_its_leave() {
+    let relay = relay().await;
+    let mut alice = session_on(&relay, 1, "alice").await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    let (mut bob, carol) = (session_on(&relay, 2, "bob").await, session_on(&relay, 3, "carol").await);
+    for joiner in [&bob, &carol] {
+        joiner.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    }
+    eventually("Bob holds Carol's Add", || bob.node.members(&gid.0).unwrap().len() == 3).await;
+    alice.node.shutdown().await.unwrap();
+    let carol_key = carol.node.key();
+    carol.node.leave(&gid.0).unwrap().unwrap();
+    let by = bob.until(|e| match e {
+        Event::Left { member, by, .. } if member.key == carol_key => Some(by),
+        _ => None,
+    }).await;
+    assert_eq!(by.key, bob.node.key(), "Bob removed Carol");
+    for session in [bob, carol] {
+        session.node.shutdown().await.unwrap();
+    }
 }

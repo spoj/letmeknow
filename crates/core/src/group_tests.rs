@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::provider::SqliteProvider;
-use lmk_proto::group::{ChatMessage, REVISION, Service};
+use lmk_proto::group::{ChatMessage, Service};
 use std::path::Path;
 use sha2::{Digest, Sha256};
 
@@ -13,11 +13,21 @@ pub(crate) fn service(domain: &str) -> Service {
 }
 
 pub(crate) fn settings() -> Settings {
-    Settings { protocol: PROTOCOL, carry: 7, update: lmk_proto::group::UPDATE, membership: service("lmk.example") }
+    Settings { protocol: PROTOCOL, carry: 7, update: lmk_proto::group::UPDATE, membership: service("lmk.example"), admins: vec![], admitted: vec![] }
 }
 
+/// A leaf naming no device.
 pub(crate) fn leaf(name: &str) -> Leaf {
-    Leaf { key: Bytes(name.as_bytes().to_vec()), revision: REVISION, home: "lmk.example".into() }
+    Leaf { key: Bytes(name.as_bytes().to_vec()), home: "lmk.example".into(), device: None }
+}
+
+/// A device key, by a byte of its seed: the 0th is every test member's, unless it moves (`Member::on`).
+pub(crate) fn device(seed: u8) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+}
+
+fn key_of(device: &ed25519_dalek::SigningKey) -> Bytes {
+    Bytes(device.verifying_key().to_bytes().to_vec())
 }
 
 const INVITE: [u8; 32] = [7; 32];
@@ -37,9 +47,20 @@ pub(crate) struct Member {
 }
 
 impl Member {
+    /// A member on device 0, as all are by default: the founder's device makes them all admins.
     pub fn new(provider: SqliteProvider, name: &str) -> Self {
         let session = Session::create(&provider, leaf(name)).unwrap();
-        Member { provider, session, group: None, pos: 0, sent: Vec::new() }
+        let mut member = Member { provider, session, group: None, pos: 0, sent: Vec::new() };
+        member.on(Some(&device(0)));
+        member
+    }
+
+    /// Puts this member's session on `device`, or on none, before it is in a group: its leaf names the device's
+    /// certificate of it.
+    pub fn on(&mut self, device: Option<&ed25519_dalek::SigningKey>) {
+        let certified = device.map(|device| Device::sign(device, self.session.key(), "laptop"));
+        let leaf = Leaf { device: certified, ..self.session.leaf.clone() };
+        self.session.set_leaf(&self.provider, leaf).unwrap();
     }
 
     pub fn g(&mut self) -> &mut Group {
@@ -165,16 +186,12 @@ fn cut_aad(moved: &[Ref]) -> Vec<u8> {
     serde_json::to_vec(&Aad { moved: moved.to_vec(), ..Aad::default() }).unwrap()
 }
 
-/// A commit built past `Group::commit`'s rules: a key update moving `moved`, proposing `settings` if given. It is kept
-/// as `m`'s pending commit, as `Group::commit` keeps one.
-fn unruled(m: &mut Member, moved: Vec<Ref>, settings: Option<Settings>) -> Vec<u8> {
+/// A commit built past `Group::commit`'s rules, with the authenticated data `aad`: a key update, with what `propose`
+/// proposes. It is kept as `m`'s pending commit, as `Group::commit` keeps one.
+fn unruled(m: &mut Member, aad: Aad, propose: impl for<'a> FnOnce(CommitBuilder<'a, Initial>) -> CommitBuilder<'a, Initial>) -> Vec<u8> {
     let group = m.group.as_mut().unwrap();
-    let aad = Aad { moved, ..Aad::default() };
     group.mls.set_aad(serde_json::to_vec(&aad).unwrap());
-    let mut builder = group.mls.commit_builder().consume_proposal_store(false).force_self_update(true);
-    if let Some(settings) = &settings {
-        builder = builder.propose_group_context_extensions(context_extensions(settings).unwrap()).unwrap();
-    }
+    let builder = propose(group.mls.commit_builder().consume_proposal_store(false).force_self_update(true));
     let bundle = builder
         .load_psks(m.provider.storage())
         .unwrap()
@@ -587,7 +604,8 @@ fn settings_in_the_welcome() {
     let pos = w.post(commit.entry);
     w.read(&[0, 1, 2]);
     w.m[3].join(&inner, &admission, pos, &kp);
-    assert_eq!(w.m[3].g().settings(), settings());
+    let admins = vec![Bytes(w.m[0].session.key().to_vec()), key_of(&device(0))];
+    assert_eq!(w.m[3].g().settings(), Settings { admins, ..settings() });
     w.agree(&[0, 1, 2, 3]);
 }
 
@@ -596,9 +614,9 @@ fn leaf_data() {
     let mut w = World::new(&["A", "B", "C"]);
     w.found(0, &[1, 2]);
     let leaves: Vec<_> = w.m[0].g().members().into_iter().map(|m| m.leaf.unwrap()).collect();
-    assert_eq!(leaves, [leaf("A"), leaf("B"), leaf("C")]);
+    assert_eq!(leaves, [0, 1, 2].map(|i| w.m[i].session.leaf.clone()));
     let b = w.m[2].index_of("B");
-    let moved = Leaf { key: Bytes(b"moved".to_vec()), ..leaf("B") };
+    let moved = Leaf { key: Bytes(b"moved".to_vec()), ..w.m[1].session.leaf.clone() };
     let cut = w.m[1].cut();
     let commit = w.m[1].commit(Change { cut, leaf: Some(moved.clone()), ..Change::default() });
     w.post(commit.entry);
@@ -628,14 +646,13 @@ fn rules_bind_everyone() {
     let mut w = World::new(&["A", "B", "C", "E"]);
     w.found(0, &[1, 2]);
 
-    // Settings are fixed when a group is made: a commit that proposes them is refused by every member.
-    let mut changed = settings();
+    // A group's protocol is fixed when it is made: an admin's commit that changes it is refused by every member.
+    let mut changed = w.m[1].g().settings();
     changed.protocol = PROTOCOL + 1;
-    let cut = w.m[1].cut();
-    let wire = unruled(&mut w.m[1], cut, Some(changed));
+    let wire = unruled(&mut w.m[1], Aad::default(), |b| b.propose_group_context_extensions(context_extensions(&changed).unwrap()).unwrap());
     w.post(wire);
     let read = w.read(&[0, 1, 2]);
-    assert!(matches!(&read[1][0].0, Verdict::Skipped { reason } if reason.contains("GroupContextExtensions")));
+    assert!(matches!(&read[1][0].0, Verdict::Skipped { reason } if reason.contains("more than the admins and admitted devices")));
     assert!(read.iter().all(|reader| !is_commit(&reader[0])));
     w.agree(&[0, 1, 2]);
 
@@ -924,7 +941,7 @@ fn members_skip_commits_with_refused_cuts() {
     w.agree(&[0, 1, 2]);
     for (bad, why) in refusable(&good, &a, &b) {
         let mut liar = w.m[1].copy();
-        let wire = unruled(&mut liar, bad, None);
+        let wire = unruled(&mut liar, Aad { moved: bad, ..Aad::default() }, |b| b);
         w.post(wire);
         for reader in w.read(&[0, 2]) {
             assert!(matches!(&reader[0].0, Verdict::Skipped { reason, .. } if reason.contains(why)), "{why}");
@@ -1178,5 +1195,177 @@ fn only_an_add_alone_goes_without_an_update_path() {
     w.post(update.entry);
     let read = w.read(&[0, 1, 2]);
     assert!(read.iter().all(|reader| applied(&reader[0]).updated));
+    w.agree(&[0, 1, 2]);
+}
+
+impl World {
+    /// `by` adds `joiner`, which joins; `readers` read the commit.
+    fn add(&mut self, by: usize, joiner: usize, readers: &[usize]) {
+        let package = self.key_package(joiner);
+        let cut = self.m[by].cut();
+        let commit = self.m[by].commit(Change { cut, add: vec![package.clone()], invite: Some(INVITE.into()), ..Change::default() });
+        let (inner, admission) = (self.m[by].open_inner(&commit.entry), commit.admission.clone().unwrap());
+        let pos = self.post(commit.entry);
+        self.read(readers);
+        self.m[joiner].join(&inner, &admission, pos, &package);
+    }
+
+    /// `by` commits the group's settings as `edit` changes them; `readers` read the commit.
+    fn settle(&mut self, by: usize, edit: impl FnOnce(&mut Settings), readers: &[usize]) {
+        let mut settings = self.m[by].g().settings();
+        edit(&mut settings);
+        let cut = self.m[by].cut();
+        let commit = self.m[by].commit(Change { cut, settings: Some(settings), ..Change::default() });
+        self.post(commit.entry);
+        self.read(readers);
+    }
+
+    /// Posts what a copy of member `i` commits past the rules, and checks that every member of `readers`, but `i`, which
+    /// finds its state copied, skips it for a reason with `why`.
+    fn refused_past_rules(&mut self, i: usize, aad: Aad, propose: impl for<'a> FnOnce(CommitBuilder<'a, Initial>) -> CommitBuilder<'a, Initial>, readers: &[usize], why: &str) {
+        let mut liar = self.m[i].copy();
+        let wire = unruled(&mut liar, aad, propose);
+        self.post(wire);
+        for reader in self.read(readers) {
+            assert!(matches!(&reader[0].0, Verdict::Skipped { reason } if reason.contains(why)), "{:?}", reader[0].0);
+        }
+    }
+}
+
+/// A group's first admins are its founder and the device that certified it, whatever the settings it is made with name.
+#[test]
+fn a_group_starts_with_its_founder_and_its_device_as_admins() {
+    let mut w = World::new(&["A", "B", "C"]);
+    w.m[2].on(None);
+    w.found(0, &[1, 2]);
+    let [a, b, c] = [0, 1, 2].map(|i| w.m[i].session.key().to_vec());
+    assert_eq!(w.m[2].g().settings().admins, [Bytes(a), key_of(&device(0))]);
+    assert!(w.m[2].g().admin(&b), "a session on the founder's device is an admin");
+    assert!(!w.m[0].g().admin(&c), "one on no device is not");
+    let mut x = Member::new(memory(), "X");
+    x.on(None);
+    x.group = Some(Group::create(&x.provider, &x.session, &Settings { admins: vec![Bytes(vec![9; 32])], ..settings() }).unwrap());
+    assert_eq!(x.g().settings().admins, [Bytes(x.session.key().to_vec())]);
+}
+
+/// A member that is no admin adds only sessions that a device admitted or an admin certified: not one on another device,
+/// on none, or whose certificate is of another session. An admin adds any, and admits devices.
+#[test]
+fn a_member_that_is_no_admin_adds_only_sessions_on_admitted_devices() {
+    let (admins, admitted) = (device(1), device(4));
+    let mut w = World::new(&["A", "B", "C", "D", "E", "F", "G"]);
+    for (i, device) in [(0, &admins), (1, &device(2)), (2, &device(3)), (3, &admitted), (4, &admins)] {
+        w.m[i].on(Some(device));
+    }
+    w.m[5].on(None);
+    let forged = Leaf { device: Some(Device::sign(&admitted, w.m[3].session.key(), "laptop")), ..w.m[6].session.leaf.clone() };
+    let g = &mut w.m[6];
+    g.session.set_leaf(&g.provider, forged).unwrap();
+    w.found(0, &[1]);
+    w.add(1, 4, &[0, 1]);
+    w.agree(&[0, 1, 4]);
+    for joiner in [2, 3, 5, 6] {
+        let (package, cut) = (w.key_package(joiner), w.m[1].cut());
+        let error = refused(&mut w.m[1], Change { cut, add: vec![package], invite: Some(INVITE.into()), ..Change::default() });
+        assert!(error.contains("neither admitted nor an admin"), "{error}");
+    }
+    let package = key_package_in(&w.m[2].provider, &w.key_package(2)).unwrap();
+    w.refused_past_rules(1, Aad { invite: Some(INVITE.into()), ..Aad::default() }, |b| b.propose_adds([package]), &[0, 4], "neither admitted nor an admin");
+
+    w.settle(0, |s| s.admitted.push(key_of(&admitted)), &[0, 1, 4]);
+    assert_eq!(w.m[1].g().settings().admitted, [key_of(&admitted)]);
+    w.add(1, 3, &[0, 1, 4]);
+    w.add(0, 5, &[0, 1, 3, 4]);
+    w.agree(&[0, 1, 3, 4, 5]);
+    let (c, leaf) = (w.m[2].session.key().to_vec(), w.m[2].session.leaf.clone());
+    assert!(!w.m[3].g().admits(&c, Some(&leaf)));
+}
+
+/// A member that is no admin removes only members whose leave of their current membership its commit carries; an admin
+/// removes any.
+#[test]
+fn a_member_that_is_no_admin_removes_only_members_that_signed_their_leave() {
+    let mut w = World::new(&["A", "B", "C", "D"]);
+    for i in 1..4 {
+        w.m[i].on(None);
+    }
+    w.found(0, &[1, 2, 3]);
+    let (c, d) = (w.m[0].index_of("C"), w.m[0].index_of("D"));
+    let [leave, other] = [2, 3].map(|i| w.m[i].group.as_ref().unwrap().leave(&w.m[i].session).unwrap());
+    let key = w.m[2].session.key().to_vec();
+    assert!(w.m[1].g().left(&key, &leave.0) && !w.m[1].g().left(&key, &other.0));
+    for left in [vec![], vec![other.clone()]] {
+        let cut = w.m[1].cut();
+        let error = refused(&mut w.m[1], Change { cut, remove: vec![c], left, ..Change::default() });
+        assert!(error.contains("did not sign its leave"), "{error}");
+    }
+    w.refused_past_rules(1, Aad { left: vec![other], ..Aad::default() }, |b| b.propose_removals([LeafNodeIndex::new(c)]), &[0, 2, 3], "did not sign its leave");
+    let cut = w.m[1].cut();
+    let commit = w.m[1].commit(Change { cut, remove: vec![c], left: vec![leave.clone()], ..Change::default() });
+    w.post(commit.entry);
+    let read = w.read(&[0, 1, 2, 3]);
+    assert!(applied(&read[2][0]).gone);
+    w.agree(&[0, 1, 3]);
+
+    // C, added again with its key, is not removed by its earlier membership's leave; D is, by the admin, with none.
+    let gone = w.m[2].group.take().unwrap();
+    gone.delete(&w.m[2].provider).unwrap();
+    w.add(0, 2, &[0, 1, 3]);
+    let c = w.m[0].index_of("C");
+    let cut = w.m[1].cut();
+    let error = refused(&mut w.m[1], Change { cut, remove: vec![c], left: vec![leave], ..Change::default() });
+    assert!(error.contains("did not sign its leave"), "{error}");
+    let cut = w.m[0].cut();
+    let commit = w.m[0].commit(Change { cut, remove: vec![d], ..Change::default() });
+    w.post(commit.entry);
+    assert!(applied(&w.read(&[0, 1, 2, 3])[3][0]).gone);
+    w.agree(&[0, 1, 2]);
+}
+
+/// Only an admin changes a group's settings, and only its admins and admitted devices, leaving it an admin: every member
+/// skips any other change.
+#[test]
+fn only_an_admin_changes_the_admins_and_admitted_devices() {
+    let mut w = World::new(&["A", "B", "C"]);
+    for i in 1..3 {
+        w.m[i].on(Some(&device(i as u8)));
+    }
+    w.found(0, &[1, 2]);
+    let (b, c) = (Bytes(w.m[1].session.key().to_vec()), Bytes(w.m[2].session.key().to_vec()));
+    let cut = w.m[1].cut();
+    let mut changed = w.m[1].g().settings();
+    changed.admitted.push(key_of(&device(2)));
+    let error = refused(&mut w.m[1], Change { cut, settings: Some(changed.clone()), ..Change::default() });
+    assert!(error.contains("no admin"), "{error}");
+    w.refused_past_rules(1, Aad::default(), |b| b.propose_group_context_extensions(context_extensions(&changed).unwrap()).unwrap(), &[0, 2], "by a member that is no admin");
+
+    w.settle(0, |s| s.admins = vec![b.clone()], &[0, 1, 2]);
+    let a = w.m[0].session.key().to_vec();
+    assert!(w.m[2].g().admin(&b.0) && !w.m[2].g().admin(&a), "the admins are B alone");
+    w.settle(1, |s| s.admins.push(key_of(&device(2))), &[0, 1, 2]);
+    assert!(w.m[0].g().admin(&c.0), "C is an admin by its device");
+    let fixed: [fn(&mut Settings); 4] = [|s| s.carry += 1, |s| s.update += 1, |s| s.protocol += 1, |s| s.membership = service("other.example")];
+    for change in fixed {
+        let mut changed = w.m[1].g().settings();
+        change(&mut changed);
+        let cut = w.m[1].cut();
+        let error = refused(&mut w.m[1], Change { cut, settings: Some(changed), ..Change::default() });
+        assert!(error.contains("more than the admins and admitted devices"), "{error}");
+    }
+    let (cut, settings) = (w.m[1].cut(), w.m[1].g().settings());
+    let error = refused(&mut w.m[1], Change { cut, settings: Some(Settings { admins: vec![], ..settings }), ..Change::default() });
+    assert!(error.contains("leaves the group no admin"), "{error}");
+    let settings = w.m[1].g().settings();
+    let required = RequiredCapabilitiesExtension::new(&[ExtensionType::Unknown(SETTINGS_EXTENSION)], &[], &[]);
+    let fewer = vec![Extension::RequiredCapabilities(required), Extension::Unknown(SETTINGS_EXTENSION, UnknownExtension(serde_json::to_vec(&settings).unwrap()))];
+    let fewer = Extensions::from_vec(fewer).unwrap();
+    w.refused_past_rules(1, Aad::default(), |b| b.propose_group_context_extensions(fewer).unwrap(), &[0, 2], "other context extensions");
+    w.agree(&[0, 1, 2]);
+
+    // Any member updates.
+    let cut = w.m[0].cut();
+    let update = w.m[0].commit(Change { cut, ..Change::default() });
+    w.post(update.entry);
+    assert!(w.read(&[0, 1, 2]).iter().all(|reader| applied(reader.last().unwrap()).updated));
     w.agree(&[0, 1, 2]);
 }

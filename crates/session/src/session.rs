@@ -322,7 +322,7 @@ impl Session {
                         }
                         Ok((gid, target))
                     }),
-                    (Ok(target), None) => node.create(Settings { protocol: PROTOCOL, carry, update: UPDATE, membership: self.membership.clone() }).map(|gid| (gid, target)),
+                    (Ok(target), None) => node.create(Settings { protocol: PROTOCOL, carry, update: UPDATE, membership: self.membership.clone(), admins: vec![], admitted: vec![] }).map(|gid| (gid, target)),
                 };
                 let invite = async move {
                     let (gid, target) = gid?;
@@ -700,13 +700,14 @@ fn member_by_fp(node: &Node, gid: &Bytes, fp: &str) -> Result<Member> {
     }
 }
 
-/// The members of a group, but this session, whose certificates name the device whose fingerprint begins with `fp`.
+/// The members of a group, but this session, whose leaves name the device whose fingerprint begins with `fp`.
 fn on_device(node: &Node, gid: &Bytes, fp: &str) -> Result<Vec<Bytes>> {
-    let devices = node.devices(&gid.0)?;
-    let named: BTreeSet<&Bytes> = devices.values().map(|device| &device.key).filter(|key| !fp.is_empty() && lmk_node::fp(&key.0).starts_with(fp)).collect();
+    let members = node.members(&gid.0)?;
+    let devices = || members.iter().filter_map(|m| Some((&m.key, m.device.as_ref()?)));
+    let named: BTreeSet<&Bytes> = devices().map(|(_, device)| &device.key).filter(|key| !fp.is_empty() && lmk_node::fp(&key.0).starts_with(fp)).collect();
     ensure!(named.len() < 2, "several devices have fingerprints that begin {fp}; give more of it");
     let me = node.key();
-    let on: Vec<Bytes> = devices.iter().filter(|(key, device)| **key != me && named.contains(&device.key)).map(|(key, _)| key.clone()).collect();
+    let on: Vec<Bytes> = devices().filter(|(key, device)| **key != me && named.contains(&device.key)).map(|(key, _)| key.clone()).collect();
     ensure!(!on.is_empty(), "no other member of {} runs on a device whose fingerprint begins {fp}", b64(&gid.0));
     Ok(on)
 }
@@ -755,13 +756,13 @@ const INTRO: usize = 280;
 fn listed_members(node: &Node, gid: &Bytes, all: bool) -> Result<Value> {
     let (me, now) = (node.key(), lmk_node::now());
     let (mut members, mut offline) = (Vec::new(), 0);
-    let (intros, devices) = (node.intros(&gid.0)?, node.devices(&gid.0)?);
+    let intros = node.intros(&gid.0)?;
     for (member, seen) in node.presence(&gid.0)? {
         let mut item = describe(&me, &member);
         if let Some(intro) = intros.get(&member.key) {
             item["intro"] = json!(intro);
         }
-        if let Some(device) = devices.get(&member.key) {
+        if let Some(device) = &member.device {
             item["device"] = json!({ "fp": fp(&device.key.0), "name": device.name });
         }
         if let Some(Seen { at, connected }) = seen {
@@ -856,7 +857,7 @@ mod tests {
 
     #[test]
     fn a_member_shows_by_its_fingerprint() {
-        let member = |key: u8| Member { key: Bytes(vec![key]), iroh: Bytes(vec![key]), revision: 1, home: "h.example".into() };
+        let member = |key: u8| Member { key: Bytes(vec![key]), iroh: Bytes(vec![key]), home: "h.example".into(), device: None };
         let me = Bytes(vec![1]);
         assert_eq!(describe(&me, &member(1)), json!({ "fp": fp(&[1]), "you": true }));
         assert_eq!(describe(&me, &member(2)), json!({ "fp": fp(&[2]) }));

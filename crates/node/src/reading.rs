@@ -232,7 +232,7 @@ impl Inner {
             author.servable = author.servable.difference(&past);
             author.sealed.clear();
         }
-        g.rec.leaves.retain(|(key, joined, _)| state.iter().any(|r| r.key == *key && r.joined == *joined));
+        g.rec.leaves.retain(|(key, joined, _, _)| state.iter().any(|r| r.key == *key && r.joined == *joined));
         for (key, joined, seq) in dropped {
             if let Some(record) = st.record_at(gid, &key.0, joined, seq)? {
                 st.unstore(gid, &record)?;

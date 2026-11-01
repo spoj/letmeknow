@@ -307,7 +307,7 @@ impl State {
     /// A member by its key: the current one, or a bare one if it is gone.
     pub(crate) fn member_by_key(&self, gid: &[u8], key: &[u8]) -> Member {
         let found = self.groups.get(gid).and_then(|g| g.mls.members().into_iter().find(|m| m.key == key));
-        found.map_or_else(|| Member { key: Bytes(key.to_vec()), iroh: Bytes::default(), revision: 0, home: String::new() }, |m| Member::from(&m))
+        found.map_or_else(|| Member { key: Bytes(key.to_vec()), iroh: Bytes::default(), home: String::new(), device: None }, |m| Member::from(&m))
     }
 
     /// The deps of a message this session sends now: its frontier, of messages it still holds.
@@ -495,7 +495,7 @@ impl Inner {
                 record.sealing = Some((opened.epoch, Bytes(ciphertext.clone())));
                 st.store(gid, &record)?;
                 // A leaver's resealed messages may let the next cut keep its `leave`.
-                if st.group(gid)?.rec.leaves.iter().any(|(key, joined, _)| *key == h.author && *joined == h.joined) {
+                if st.group(gid)?.rec.leaves.iter().any(|(key, joined, _, _)| *key == h.author && *joined == h.joined) {
                     self.work.send(Work::Duties(gid.to_vec())).ok();
                 }
                 return Ok(Some((ciphertext, h.epoch)));
@@ -570,8 +570,8 @@ impl Inner {
         let me = st.me().to_vec();
         let rec = &mut st.group_mut(gid)?.rec;
         match control {
-            Control::Leave => {
-                rec.leaves.push((h.author.clone(), h.joined, h.seq));
+            Control::Leave { sig } => {
+                rec.leaves.push((h.author.clone(), h.joined, h.seq, sig));
                 self.work.send(Work::Duties(gid.to_vec())).ok();
             }
             Control::Invite { hash, expires } => {

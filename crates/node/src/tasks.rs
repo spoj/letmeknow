@@ -12,7 +12,7 @@ use lmk_core::provider::SqliteProvider;
 use lmk_net::peers::{Peers, WAIT};
 use lmk_net::Net;
 use lmk_proto::directory::relay_url;
-use lmk_proto::group::{Leaf, REVISION};
+use lmk_proto::group::{Device, Leaf};
 use lmk_proto::Bytes;
 use n0_future::time::{Duration, sleep};
 use n0_future::task::spawn;
@@ -26,9 +26,9 @@ impl Node {
         let ca = std::mem::take(&mut config.ca);
         let relay: RelayUrl = relay_url(&config.home).parse()?;
         let endpoint = lmk_net::builder([relay]).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
-        let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), revision: REVISION, home: config.home.clone() };
+        let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), home: config.home.clone(), device: None };
         let clients = logs::Clients::new(config.post.clone());
-        let state = State::open(provider, leaf)?;
+        let state = State::open(provider, leaf, &config.device)?;
         let (events, events_rx) = mpsc::unbounded_channel();
         let (work, work_rx) = mpsc::unbounded_channel();
         let (outbox, outbox_rx) = mpsc::unbounded_channel();
@@ -59,17 +59,19 @@ impl Node {
 
 /// Makes a new session in `provider`, living on the relay of `home`, which `Node::start` opens: answers its key.
 pub fn create(provider: &SqliteProvider, home: &str) -> Result<Bytes> {
-    let leaf = Leaf { key: Bytes(iroh_key(provider)?.public().as_bytes().to_vec()), revision: REVISION, home: home.into() };
+    let leaf = Leaf { key: Bytes(iroh_key(provider)?.public().as_bytes().to_vec()), home: home.into(), device: None };
     Ok(Bytes(Session::create(provider, leaf)?.key().to_vec()))
 }
 
 impl State {
-    /// The session in `provider`, created on first use, with its leaf as `leaf`; its logs and groups.
-    fn open(provider: SqliteProvider, leaf: Leaf) -> Result<Self> {
+    /// The session in `provider`, created on first use, with its leaf as `leaf`, certified by `device`; its logs and
+    /// groups.
+    fn open(provider: SqliteProvider, leaf: Leaf, (device, name): &(ed25519_dalek::SigningKey, String)) -> Result<Self> {
         let mut session = match provider.get(b"session")? {
             Some(_) => Session::load(&provider)?,
             None => Session::create(&provider, leaf.clone())?,
         };
+        let leaf = Leaf { device: Some(Device::sign(device, session.key(), name)), ..leaf };
         if session.leaf != leaf {
             session.set_leaf(&provider, leaf)?;
         }
@@ -87,7 +89,6 @@ impl State {
             scrub: false,
             events: Vec::new(),
             session,
-            device: None,
             groups,
             logs,
             peers,

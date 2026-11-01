@@ -7,12 +7,14 @@ use iroh::RelayUrl;
 use lmk_core::group::{Change, Group};
 use lmk_net::Net;
 use lmk_proto::directory::relay_url;
-use lmk_proto::group::Settings;
-use lmk_proto::peer::Device;
+use lmk_proto::group::{Control, Settings};
 use lmk_proto::Bytes;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::{G, Member, Message, Node, Rec, Seen, State, now};
+
+/// What a member that is no admin is told as it asks what only admins do.
+const NOT_ADMIN: &str = "this session is no admin of the group: only its admins (`admins` lists them) remove members, and change its admins and admitted devices";
 
 impl Node {
     /// Stops the peers and every task, and closes the provider.
@@ -83,9 +85,33 @@ impl Node {
         Ok(Bytes(gid))
     }
 
-    /// Removes members, in one commit. Returns whether this session's commit removed any, which it need not once others'
-    /// removed them all.
+    /// Whether the member with key `key` is an admin of the group: by its key, or by the device that certified it.
+    pub fn admin(&self, gid: &[u8], key: &[u8]) -> Result<bool> {
+        Ok(self.inner.lock().group(gid)?.mls.admin(key))
+    }
+
+    /// Changes the group's admins and admitted devices as `edit` does, in one commit, as an admin. Returns whether it
+    /// committed: not once they are as `edit` leaves them.
+    pub async fn change_settings(&self, gid: &[u8], edit: impl Fn(&mut Settings)) -> Result<bool> {
+        self.ensure_admin(gid)?;
+        let change = |_: &State, g: &G| {
+            let mut settings = g.mls.settings();
+            edit(&mut settings);
+            Ok((settings != g.mls.settings()).then(|| Change { settings: Some(settings), ..Change::default() }))
+        };
+        Ok(self.inner.commit(gid, change).await?.is_some())
+    }
+
+    fn ensure_admin(&self, gid: &[u8]) -> Result<()> {
+        let st = self.inner.lock();
+        ensure!(st.group(gid)?.mls.admin(st.me()), NOT_ADMIN);
+        Ok(())
+    }
+
+    /// Removes members, in one commit, as an admin. Returns whether this session's commit removed any, which it need not
+    /// once others' removed them all.
     pub async fn remove(&self, gid: &[u8], keys: &[Bytes]) -> Result<bool> {
+        self.ensure_admin(gid)?;
         let members = self.inner.lock().group(gid)?.mls.members();
         ensure!(keys.iter().all(|key| members.iter().any(|m| m.key == key.0)), "not a member");
         let remove = |_: &State, g: &G| {
@@ -95,8 +121,9 @@ impl Node {
         Ok(self.inner.commit(gid, remove).await?.is_some())
     }
 
-    /// Removes every other member, in one commit: the group is then this session's alone.
+    /// Removes every other member, in one commit, as an admin: the group is then this session's alone.
     pub async fn remove_others(&self, gid: &[u8]) -> Result<()> {
+        self.ensure_admin(gid)?;
         let others = |_: &State, g: &G| {
             let remove: Vec<u32> = g.mls.members().into_iter().map(|m| m.index).filter(|index| *index != g.mls.own_index()).collect();
             Ok((!remove.is_empty()).then(|| Change { remove, ..Change::default() }))
@@ -121,31 +148,9 @@ impl Node {
         Ok(st.group(gid)?.intros().filter_map(|(intro, _)| Some((intro.member, intro.text?))).collect())
     }
 
-    /// Names in this session's intros the device it runs on, by the device's certificate of it: the intro of each of its
-    /// groups that names another or none is signed again, for its neighbours to pass on.
-    pub fn set_device(&self, device: Device) -> Result<()> {
-        let mut st = self.inner.lock();
-        st.device = Some(device);
-        let me = st.me().to_vec();
-        let gids: Vec<Vec<u8>> = st.groups.iter().filter(|(_, g)| g.mls.active()).map(|(gid, _)| gid.clone()).collect();
-        for gid in gids {
-            let own = st.group(&gid)?.intros().find(|(intro, _)| intro.member.0 == me).map(|(intro, _)| intro);
-            if own.as_ref().is_none_or(|intro| intro.device != st.device) {
-                st.introduce(&gid, own.and_then(|intro| intro.text))?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Each member's device, by session key, where its intro carries a valid certificate of its session.
-    pub fn devices(&self, gid: &[u8]) -> Result<BTreeMap<Bytes, Device>> {
-        let st = self.inner.lock();
-        Ok(st.group(gid)?.intros().filter_map(|(intro, _)| Some((intro.member.clone(), intro.device.filter(|device| device.verify(&intro.member.0))?))).collect())
-    }
-
-    /// Marks the group as one this session leaves, and sends its `leave`: the others remove it once a cut keeps the
-    /// `leave`, and it is in the group until then. Forgets a group it is alone in. Returns the `leave`'s id; none once
-    /// this session is out of the group.
+    /// Marks the group as one this session leaves, and sends its `leave`, which carries its leave: the others remove it
+    /// once a cut keeps the `leave`, and it is in the group until then. Forgets a group it is alone in. Returns the
+    /// `leave`'s id; none once this session is out of the group.
     pub fn leave(&self, gid: &[u8]) -> Result<Option<Bytes>> {
         let mut st = self.inner.lock();
         st.group_mut(gid)?.rec.leaving = true;
@@ -155,10 +160,11 @@ impl Node {
         if g.mls.members().len() == 1 {
             self.inner.forget(&mut st, gid)?;
             Ok(None)
-        } else if let Some(seq) = g.left(&me) {
+        } else if let Some((seq, _)) = g.left(&me) {
             st.id_at(gid, &me, g.mls.joined(&me).context("a member of its group")?, seq)
         } else {
-            Ok(Some(self.inner.send(&mut st, gid, &json!({ "type": "leave" }), None)?))
+            let leave = serde_json::to_value(Control::Leave { sig: g.mls.leave(&st.session)? })?;
+            Ok(Some(self.inner.send(&mut st, gid, &leave, None)?))
         }
     }
 
