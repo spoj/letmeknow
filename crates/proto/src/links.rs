@@ -9,7 +9,7 @@ pub const INVITE_PREFIX: &str = "https://letmeknow.dev/i#";
 /// letmeknow.dev's domain: where its service publishes its directory, and runs its relay.
 pub const DOMAIN: &str = "relay.letmeknow.dev";
 /// letmeknow.dev's membership service key, hex. Its routes are at `DOMAIN`.
-pub const MEMBERSHIP_KEY: &str = "d594be0fec23e11083ed74f6df19c93950a2a2b7487cd370a6c3cf299f8b814e";
+pub const MEMBERSHIP_KEY: &str = "4b0be3befd0c240033aa446df4d24b69ff758fa93593123e525c98f7c46ae046";
 
 /// `https://letmeknow.dev/i#13.<secret>.<domain>.<member>[.<member>...]`, every field after the version in unpadded
 /// base64url: the domain is the group's service's, and each member is its iroh key, then its own service's domain unless
