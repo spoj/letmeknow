@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use ed25519_dalek::{Signature, VerifyingKey};
 use lmk_proto::{
     Bytes, clock, directory::Directory, group::Service, head::{self, Head},
-    membership::{self, Answer, Append, Appended, Expiry, Heads, Known, Moved, Page, Read, expiry_message, refusal_message},
+    membership::{self, Answer, Append, Appended, Expiry, Heads, Known, Moved, Page, Read, refusal_message},
 };
 use n0_future::boxed::BoxFuture;
 use serde::{Serialize, de::DeserializeOwned};
@@ -111,8 +111,7 @@ impl ServeClient {
             }
             Answer::Expired { sig } => {
                 let Some(log_ref) = log_ref else { bail!("an invalid membership reply") };
-                let sig = Signature::from_slice(&sig.0).map_err(|_| Forged)?;
-                ensure!(self.0.key.verify_strict(&expiry_message(&log_ref), &sig).is_ok(), Forged);
+                ensure!(Expiry { log_ref, sig }.verify(&self.0.key), Forged);
                 Err(Expired(log_ref).into())
             }
         }
@@ -141,10 +140,10 @@ impl ServeClient {
         Ok(page)
     }
 
-    /// The heads of the logs whose length differs from the one given, and the logs gone, from one request per `HEAD_LOGS`
-    /// logs. A log missing from the answer is unchanged at the time of the request. An expiry the service did not sign,
-    /// or of a log the request did not name, is ignored.
-    pub async fn heads(&self, logs: &[Known]) -> Result<Vec<Result<Head, Expired>>> {
+    /// The heads of the logs whose length differs from the one given, and the expiries of the logs gone, from one request
+    /// per `HEAD_LOGS` logs. A log missing from the answer is unchanged at the time of the request. An expiry the service
+    /// did not sign, or of a log the request did not name, is ignored.
+    pub async fn heads(&self, logs: &[Known]) -> Result<Vec<Result<Head, Expiry>>> {
         let mut moved = Vec::new();
         for chunk in logs.chunks(membership::HEAD_LOGS) {
             let sent = clock::now();
@@ -157,10 +156,9 @@ impl ServeClient {
                 record_time(sent, &head)?;
                 moved.push(Ok(head));
             }
-            for Expiry { log_ref, sig } in expired {
-                let signed = Signature::from_slice(&sig.0).is_ok_and(|sig| self.0.key.verify_strict(&expiry_message(&log_ref), &sig).is_ok());
-                if signed && chunk.iter().any(|Known(capability, _)| head::reference(self.0.key.as_bytes(), capability) == log_ref) {
-                    moved.push(Err(Expired(log_ref)));
+            for expiry in expired {
+                if expiry.verify(&self.0.key) && chunk.iter().any(|Known(capability, _)| head::reference(self.0.key.as_bytes(), capability) == expiry.log_ref) {
+                    moved.push(Err(expiry));
                 }
             }
         }

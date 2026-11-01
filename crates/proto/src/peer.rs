@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use serde_json::Value;
 
-use crate::{Bytes, head::Head, leading, membership::fixed32, ranges::Ranges};
+use crate::{Bytes, head::Head, leading, membership::{Expiry, fixed32}, ranges::Ranges};
 
 /// What a summary's signature covers, before its body.
 pub const SUMMARY: &[u8] = b"letmeknow summary v1\0";
@@ -58,6 +58,10 @@ pub struct At {
     /// Members' signed intros the sender holds and has not told the receiver, each as its member signed it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intros: Vec<Signed>,
+    /// Expiries of logs of the group's earlier epochs, as their service signed them, that the sender holds and has not
+    /// told the receiver.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expired: Vec<Expiry>,
 }
 
 /// A membership's seqs, carried as `[key, joined, seqs]`.
@@ -211,7 +215,7 @@ mod tests {
         let summary = r#"{"group":"AQ","member":"Ag","joined":0,"version":1,"time":2,"epoch":3}"#;
         let parsed: Summary = serde_json::from_str(summary).unwrap();
         assert_eq!(serde_json::to_string(&parsed).unwrap(), summary);
-        let at = At { group: Bytes(vec![1]), log: [0; 32], head: None, seen: BTreeMap::from([(Bytes(vec![2]), 5)]), intros: vec![] };
+        let at = At { group: Bytes(vec![1]), log: [0; 32], head: None, seen: BTreeMap::from([(Bytes(vec![2]), 5)]), intros: vec![], expired: vec![] };
         let text = serde_json::to_string(&at).unwrap();
         assert!(text.ends_with(r#""head":null,"seen":{"Ag":5}}"#), "{text}");
         assert_eq!(serde_json::from_str::<At>(&text).unwrap(), at);

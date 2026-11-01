@@ -95,6 +95,7 @@ impl State {
         let g = self.groups.get_mut(gid).unwrap();
         let (wanted, stale) = g.wanted(now, &me);
         let intros = g.intros().map(|(intro, signed)| ((intro.member, intro.joined), (intro.version, signed.clone()))).collect();
+        let expired = g.rec.epochs.iter().filter_map(|epoch| epoch.expired.clone()).collect();
         let members = g.mls.members().into_iter().filter(|m| m.key != me).filter_map(|m| {
             let iroh = m.leaf.as_ref()?.key.0.as_slice().try_into().ok()?;
             Some(((Bytes(m.key.clone()), g.mls.joined(&m.key)?), iroh))
@@ -109,6 +110,7 @@ impl State {
             wanted,
             stale,
             intros,
+            expired,
         }
     }
 
@@ -325,7 +327,7 @@ impl State {
             self.at(gid, &intro.member.0, epoch)?;
             let g = self.group_mut(gid)?;
             if epoch < g.mls.epoch() && g.at_epoch(&intro.member.0) == epoch && g.rec.epochs.iter().all(|e| e.epoch != epoch) {
-                g.rec.epochs.push(Epoch { epoch, capability, service: g.mls.settings().membership });
+                g.rec.epochs.push(Epoch { epoch, capability, service: g.mls.settings().membership, expired: None });
             }
         }
         self.save(gid)
@@ -518,6 +520,7 @@ impl Inner {
                 for signed in at.intros.clone() {
                     st.intro(&at.group.0, signed)?;
                 }
+                st.take_expiries(&at.group.0, &at.expired)?;
                 st.refresh(&at.group.0);
             }
             st.peers.frame(&key, &Frame::Hello { groups }, now);

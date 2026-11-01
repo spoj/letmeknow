@@ -30,6 +30,7 @@ use lmk_membership::client::Post;
 use lmk_net::peers::Peers;
 use lmk_net::Net;
 use lmk_proto::group::Service;
+use lmk_proto::membership::Expiry;
 use lmk_proto::peer::{At, Device, Frame, Seqs, Signed};
 use lmk_proto::Bytes;
 use n0_future::task::{JoinHandle, spawn};
@@ -257,6 +258,10 @@ struct Epoch {
     epoch: u64,
     capability: [u8; 32],
     service: Service,
+    /// The service's expiry of its log, once this session asked or a neighbour told it: the members in it are left
+    /// behind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expired: Option<Expiry>,
 }
 
 /// An invite, as its inviter shared it with the group, or kept for one member.
@@ -304,8 +309,6 @@ pub(crate) struct G {
     early_intros: Vec<Signed>,
     /// This session's summary changed since it was signed.
     changed: bool,
-    /// Epochs behind this session's whose logs their services let go, as the check before its last commit found.
-    lapsed: Vec<u64>,
 }
 
 impl G {
@@ -325,7 +328,6 @@ impl G {
             unverified: Vec::new(),
             early_intros: Vec::new(),
             changed: true,
-            lapsed: Vec::new(),
         }
     }
 
@@ -336,7 +338,8 @@ impl G {
 
     /// Whether the member with key `key` is in an epoch whose log its service let go.
     fn left_behind(&self, key: &[u8]) -> bool {
-        self.lapsed.contains(&self.at_epoch(key))
+        let at = self.at_epoch(key);
+        self.rec.epochs.iter().any(|epoch| epoch.epoch == at && epoch.expired.is_some())
     }
 
     /// The seq of the `leave` of the current membership of the member with key `key`, if it asked to leave.
@@ -562,6 +565,9 @@ impl State {
         self.early_hellos = others;
         for signed in early.iter().flat_map(|(_, at)| at.intros.clone()) {
             self.intro(&gid, signed)?;
+        }
+        for (_, at) in &early {
+            self.take_expiries(&gid, &at.expired)?;
         }
         self.refresh(&gid);
         for (peer, at) in early {

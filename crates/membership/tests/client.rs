@@ -145,7 +145,7 @@ async fn an_expiry_acts_only_when_the_service_signed_it() {
     assert_eq!(expired.append(&capability, &[b"two".to_vec()]).await.unwrap_err().downcast_ref::<Expired>().map(|e| e.0), Some(reference));
     let heads = expired.heads(&[Known(capability, 0)]).await.unwrap();
     assert_eq!(heads.len(), 1);
-    assert_eq!(heads[0].as_ref().unwrap_err().0, reference);
+    assert_eq!(heads[0].as_ref().unwrap_err().log_ref, reference);
 
     let signed = |message: Vec<u8>| Bytes(membership.key.sign(&message).to_bytes().to_vec());
     let unsigned = Bytes(vec![9; 64]);
@@ -163,7 +163,7 @@ async fn an_expiry_acts_only_when_the_service_signed_it() {
     assert!(other_heads.is_empty(), "an expiry of a log the request did not name is ignored");
     let signed_heads = client(heads(vec![listed(reference, signed(expiry_message(&reference)))])).heads(&[Known(capability, 0)]).await.unwrap();
     assert_eq!(signed_heads.len(), 1);
-    assert_eq!(signed_heads[0].as_ref().unwrap_err().0, reference);
+    assert_eq!(signed_heads[0].as_ref().unwrap_err().log_ref, reference);
 }
 
 #[tokio::test]

@@ -1,7 +1,8 @@
 //! A group's duties, each derived from committed records and idempotent: a pass runs at the log's head after each
 //! advance, at start, and at this session's next update, and one whose commit failed again after `RETRY`. It drops what
 //! the group kept past H, and commits at most once, with every Remove due (members whose `leave` the cut it builds
-//! keeps, and members left behind in an epoch whose log was let go, as the service answered at most a day before) and
+//! keeps, and members left behind in an epoch whose log was let go, as the service answered, asked at most daily, or a
+//! neighbour passed on its answer) and
 //! this session's update if due: T after the last, at an offset of its own, once the group delivered a message or
 //! changed its members since. The update first fetches for at most `HEAR` what the last commit kept and connected
 //! members hold past the cut. T grows with the group, so that its members update about hourly between them, up to three
@@ -29,7 +30,8 @@ use crate::{G, Inner, State, Work, days, get, now};
 const BLOCKED: u64 = 10_000;
 /// How soon a pass runs again after its commit failed, as while the service is down.
 const RETRY: u64 = 10 * 60 * 1000;
-/// How often a member asks which members' logs their services let go, at most, in milliseconds.
+/// How often a member asks which members' logs their services let go, of those it does not know to be, at most, in
+/// milliseconds.
 const EVICT: u64 = 24 * 3600 * 1000;
 /// How long after the group moved past the last epoch this session showed itself in, by a commit or message of its own,
 /// it sends a `present`: after the updates a message stirs, and well before the services let that epoch's log go, a

@@ -4,6 +4,7 @@
 use std::{fmt, marker::PhantomData};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::{Error, SeqAccess, Visitor}};
 use sha2::{Digest, Sha256};
 
@@ -180,6 +181,13 @@ pub struct Expiry {
     pub sig: Bytes,
 }
 
+impl Expiry {
+    /// Whether the service with key `key` signed it.
+    pub fn verify(&self, key: &VerifyingKey) -> bool {
+        Signature::from_slice(&self.sig.0).is_ok_and(|sig| key.verify_strict(&expiry_message(&self.log_ref), &sig).is_ok())
+    }
+}
+
 /// What the HTTPS routes answer: the value, a refusal the service signs over `refusal_message`, or a log's expiry it
 /// signs over `expiry_message`. Externally tagged: an untagged answer buffers arbitrary arrays before their bounded
 /// visitors run.
@@ -256,6 +264,16 @@ mod tests {
         assert!(matches!(serde_json::from_str::<Answer<()>>(&expired).unwrap(), Answer::Expired { .. }));
         assert_ne!(refusal_message(Refusal::Rate, b"a"), refusal_message(Refusal::Busy, b"a"));
         assert_ne!(refusal_message(Refusal::Rate, b"a"), refusal_message(Refusal::Rate, b"b"));
+    }
+
+    #[test]
+    fn an_expiry_holds_by_its_services_signature_of_its_log() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let expiry = Expiry { log_ref: [1; 32], sig: Bytes(key.sign(&expiry_message(&[1; 32])).to_bytes().to_vec()) };
+        assert!(expiry.verify(&key.verifying_key()));
+        assert!(!expiry.verify(&SigningKey::from_bytes(&[8; 32]).verifying_key()), "another service's key");
+        assert!(!Expiry { log_ref: [2; 32], ..expiry }.verify(&key.verifying_key()), "another log");
     }
 
     #[test]

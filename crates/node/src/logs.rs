@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, ensure};
+use ed25519_dalek::VerifyingKey;
 use lmk_core::provider::SqliteProvider;
 use lmk_membership::client::{Post, ServeClient};
 use lmk_membership::{Contradiction, Expired, Frontier, Unsupported, WrongDirectory};
@@ -15,7 +16,7 @@ use lmk_net::peers::WAIT;
 use lmk_proto::Bytes;
 use lmk_proto::group::Service;
 use lmk_proto::head::{self, Head};
-use lmk_proto::membership::{Known, STALE};
+use lmk_proto::membership::{Expiry, Known, STALE};
 use lmk_proto::clock::corrected;
 use n0_future::time::{Duration, timeout};
 use serde::{Deserialize, Serialize};
@@ -214,6 +215,24 @@ impl State {
         logs
     }
 
+    /// Takes expiries of logs of the group's earlier epochs, asked of their services or told by a neighbour: each that its
+    /// service signed, of an epoch a member is in, leaves the members in that epoch behind.
+    pub(crate) fn take_expiries(&mut self, gid: &[u8], expiries: &[Expiry]) -> Result<()> {
+        let g = self.group_mut(gid)?;
+        let key = VerifyingKey::from_bytes(&authority(&g.mls.settings().membership)?)?;
+        let mut taken = false;
+        for epoch in g.rec.epochs.iter_mut().filter(|epoch| epoch.expired.is_none()) {
+            let reference = epoch.reference()?;
+            if let Some(expiry) = expiries.iter().find(|expiry| expiry.log_ref == reference && expiry.verify(&key)) {
+                (epoch.expired, taken) = (Some(expiry.clone()), true);
+            }
+        }
+        if taken {
+            self.save(gid)?;
+        }
+        Ok(())
+    }
+
     /// Drops a group's earlier logs read longer than `before`.
     pub(crate) fn drop_earlier(&mut self, gid: &[u8], before: u64) -> Result<()> {
         let mut logs = self.group_logs(gid);
@@ -258,31 +277,24 @@ impl Inner {
         }
     }
 
-    /// Asks the services whether the logs the group's members are behind in were let go, so that the commit this
-    /// session builds next removes those members (`due`).
+    /// Asks the services whether the logs the group's members are behind in were let go, but those known to be, so that
+    /// the commit this session builds next removes those members (`due`).
     pub(crate) async fn ask_behind(self: &Arc<Self>, gid: &[u8]) -> Result<()> {
         let asked: Vec<Epoch> = {
             let st = self.lock();
             let g = st.group(gid)?;
-            g.rec.epochs.iter().filter(|e| e.epoch < g.mls.epoch()).cloned().collect()
+            g.rec.epochs.iter().filter(|e| e.epoch < g.mls.epoch() && e.expired.is_none()).cloned().collect()
         };
         if asked.is_empty() {
             return Ok(());
         }
         let gone = self.let_go(asked.iter().map(|epoch| (epoch.service.clone(), epoch.capability)).collect()).await;
-        let mut lapsed = Vec::new();
-        for epoch in asked {
-            if gone.contains(&epoch.reference()?) {
-                lapsed.push(epoch.epoch);
-            }
-        }
-        self.lock().group_mut(gid)?.lapsed = lapsed;
-        Ok(())
+        self.lock().take_expiries(gid, &gone)
     }
 
-    /// The references among `logs`, each a service and a capability, that their services let go. They are asked for heads
-    /// with no length, so each answers its expiry or its head, and only expiries are taken.
-    pub(crate) async fn let_go(&self, logs: Vec<(Service, [u8; 32])>) -> Vec<[u8; 32]> {
+    /// The expiries of the logs among `logs`, each a service and a capability, that their services let go. They are asked
+    /// for heads with no length, so each answers its expiry or its head, and only expiries are taken.
+    pub(crate) async fn let_go(&self, logs: Vec<(Service, [u8; 32])>) -> Vec<Expiry> {
         let mut services: Vec<(Service, Vec<Known>)> = Vec::new();
         for (service, capability) in logs {
             match services.iter_mut().find(|(s, _)| *s == service) {
@@ -297,7 +309,7 @@ impl Inner {
                 Err(error) => Err(error),
             };
             match answers {
-                Ok(answers) => gone.extend(answers.into_iter().filter_map(|answer| answer.err().map(|Expired(reference)| reference))),
+                Ok(answers) => gone.extend(answers.into_iter().filter_map(Result::err)),
                 Err(error) => self.report(&error),
             }
         }

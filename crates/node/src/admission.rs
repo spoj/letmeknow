@@ -260,8 +260,9 @@ impl Inner {
         }
     }
 
-    /// Removes the member whose key a joiner brings, in a commit of its own, if the log of the epoch it is in was let go: a
-    /// member that was out past the retention, and not yet removed, must go before its key is added.
+    /// Removes the member whose key a joiner brings, in a commit of its own, if the log of the epoch it is in was let go, as
+    /// known or as its service answers: a member that was out past the retention, and not yet removed, must go before its
+    /// key is added.
     async fn remove_lapsed(self: &Arc<Self>, gid: &[u8], key: &[u8]) -> Result<()> {
         let epoch = {
             let st = self.lock();
@@ -270,8 +271,12 @@ impl Inner {
             at.and_then(|at| g.rec.epochs.iter().find(|epoch| epoch.epoch == at).cloned())
         };
         let Some(epoch) = epoch else { return Ok(()) };
-        if !self.let_go(vec![(epoch.service.clone(), epoch.capability)]).await.contains(&epoch.reference()?) {
-            return Ok(());
+        if epoch.expired.is_none() {
+            let gone = self.let_go(vec![(epoch.service.clone(), epoch.capability)]).await;
+            if gone.is_empty() {
+                return Ok(());
+            }
+            self.lock().take_expiries(gid, &gone)?;
         }
         let remove = |_: &State, g: &G| Ok(g.mls.members().into_iter().find(|m| m.key == key).map(|m| Change { remove: vec![m.index], ..Change::default() }));
         self.commit(gid, remove).await?;

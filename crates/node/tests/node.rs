@@ -975,6 +975,93 @@ async fn members_see_the_devices_their_intros_certify() {
     }
 }
 
+/// Posts through `post`, but for the requests `fails` takes by their route, which fail as while the service is unreachable.
+fn failing(post: Post, fails: impl Fn(&str) -> bool + Send + Sync + 'static) -> Post {
+    Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
+        let (failed, post) = (fails(route), post.clone());
+        Box::pin(async move {
+            anyhow::ensure!(!failed, "unreachable");
+            post(domain, route, body).await
+        })
+    })
+}
+
+/// The epochs of a group whose logs' expiries a stored member holds, as its record of the group keeps them.
+fn expired_epochs(db: &Path, gid: &Bytes) -> Vec<u64> {
+    let mut provider = SqliteProvider::open(db).unwrap();
+    let rec: Value = serde_json::from_slice(&provider.get(&[b"node/group/".as_slice(), &gid.0].concat()).unwrap().unwrap()).unwrap();
+    provider.close().unwrap();
+    rec["epochs"].as_array().unwrap().iter().filter(|epoch| epoch.get("expired").is_some()).map(|epoch| epoch["epoch"].as_u64().unwrap()).collect()
+}
+
+/// A joiner takes from its admitter the devices and the expiries it holds. Alice, which asked the service, asks it no
+/// more of that log, and can append nothing past Carol's Add; Carol, which can ask it nothing, keeps the expiry, and
+/// started again removes Bob, whose epoch's log was let go.
+#[test]
+fn a_joiner_takes_the_devices_and_expiries_its_admitter_holds() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        use std::sync::atomic::{AtomicI64, Ordering::SeqCst};
+        let relay = relay().await;
+        let dir = folder("passed-on");
+        let (alice_db, carol_db) = (dir.join("alice.db"), dir.join("carol.db"));
+        let appends = Arc::new(AtomicI64::new(i64::MAX));
+        let (requests, post) = recording(relay.post());
+        let left = appends.clone();
+        let alice_post = failing(post, move |route| route.ends_with("/append") && left.fetch_sub(1, SeqCst) <= 0);
+        let mut alice = stored_with(&relay, &alice_db, alice_post.clone()).await;
+        let bob = stored(&relay, &dir.join("bob.db")).await;
+        let bob_key = bob.node.key();
+        let gid = alice.node.create(settings(&relay)).unwrap();
+        let spares = strangers(&mut alice, &gid, &relay, 2).await;
+        bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        bob.node.set_intro(&gid.0, Some("bob".into())).unwrap();
+        let behind = bob.node.epoch(&gid.0).unwrap();
+        eventually("Alice holds Bob's intro", || alice.node.intros(&gid.0).unwrap().contains_key(&bob_key)).await;
+        bob.node.shutdown().await.unwrap();
+        alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
+        alice.node.shutdown().await.unwrap();
+        drop(alice);
+
+        SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        while relay.membership.expire().await {}
+        let alice = stored_with(&relay, &alice_db, alice_post).await;
+        let alice_key = alice.node.key();
+        alice.node.set_device(Device::sign(&SigningKey::from_bytes(&[7; 32]), &alice_key.0, "laptop")).unwrap();
+        // Alice's commit updates her leaf, so that the invite's message stirs no update; she knows of no log let go yet.
+        alice.node.remove(&gid.0, &spares[1..]).await.unwrap();
+        let link = alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
+        alice.node.ask_behind(&gid.0).await.unwrap();
+        assert_eq!(expired_epochs(&alice_db, &gid), [behind]);
+        quiet(&requests).await;
+        let asked = requests.lock().unwrap().len();
+        alice.node.ask_behind(&gid.0).await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), asked, "a log known to be let go is not asked of again");
+
+        appends.store(1, SeqCst);
+        let carol = stored_with(&relay, &carol_db, failing(relay.post(), |route| !route.ends_with("/read"))).await;
+        carol.node.join(&link).await.unwrap();
+        let named = |node: &Node| node.devices(&gid.0).unwrap().get(&alice_key).map(|device| device.name.clone());
+        eventually("Carol sees Alice's device", || named(&carol.node).as_deref() == Some("laptop")).await;
+        eventually("Carol takes the expiry Alice holds", || expired_epochs(&carol_db, &gid) == [behind]).await;
+        assert!(carol.node.members(&gid.0).unwrap().iter().any(|m| m.key == bob_key), "no one could commit since the Add");
+        for session in [alice, carol] {
+            session.node.shutdown().await.unwrap();
+        }
+
+        let mut carol = stored_with(&relay, &carol_db, failing(relay.post(), |route| route.ends_with("/heads"))).await;
+        let by = carol.until(|e| match e {
+            Event::Left { member, by, .. } if member.key == bob_key => Some(by),
+            _ => None,
+        }).await;
+        assert_eq!(by.key, carol.node.key(), "Carol removes Bob");
+        carol.node.shutdown().await.unwrap();
+    });
+}
+
 /// The types of the payloads of a group's messages a stopped stored member holds, by its author's key.
 fn payload_types(db: &Path, gid: &Bytes) -> Vec<(Bytes, String)> {
     let db = rusqlite::Connection::open(db).unwrap();

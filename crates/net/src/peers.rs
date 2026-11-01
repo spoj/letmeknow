@@ -13,6 +13,7 @@ use std::{
 use lmk_proto::{
     Bytes,
     head::Head,
+    membership::Expiry,
     peer::{At, Frame, Seqs, Signed, Summary},
     ranges::Ranges,
 };
@@ -72,6 +73,8 @@ pub struct Own {
     /// The signed intros of the current memberships, own included, with their versions: each goes to every neighbour
     /// not told it.
     pub intros: BTreeMap<Membership, (u64, Signed)>,
+    /// The expiries held of logs of the group's earlier epochs: each goes to every neighbour not told it.
+    pub expired: Vec<Expiry>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,6 +150,8 @@ struct Conn {
     told: BTreeMap<Bytes, BTreeMap<Key, u64>>,
     /// Per group, the latest version of each membership's intro the peer told or was told.
     introduced: BTreeMap<Bytes, BTreeMap<Membership, u64>>,
+    /// Per group, the logs whose expiries the peer told or was told.
+    expired: BTreeMap<Bytes, BTreeSet<[u8; 32]>>,
     /// Per group, the held messages the peer announced it holds.
     has: BTreeMap<Bytes, Set>,
 }
@@ -183,7 +188,7 @@ impl Peers {
                 }
                 g.heard.retain(|m, _| *m == own.me || own.members.iter().any(|(n, _)| n == m));
                 g.seen.retain(|k, _| own.members.iter().any(|(_, n)| n == k));
-                let changed = (g.own.epoch, g.own.log, &g.own.head, &g.own.intros) != (own.epoch, own.log, &own.head, &own.intros);
+                let changed = (g.own.epoch, g.own.log, &g.own.head, &g.own.intros, &g.own.expired) != (own.epoch, own.log, &own.head, &own.intros, &own.expired);
                 let members = g.own.members != own.members;
                 g.own = own;
                 (changed, members)
@@ -216,6 +221,7 @@ impl Peers {
             c.sent.remove(id);
             c.told.remove(id);
             c.introduced.remove(id);
+            c.expired.remove(id);
             c.has.remove(id);
         }
     }
@@ -231,7 +237,7 @@ impl Peers {
             self.changed.get_or_insert(now);
         }
         self.backoff.remove(&peer);
-        let conn = Conn { dialed, served_at: now, active: now, hello: true, opened: served.clone(), served, sent: BTreeMap::new(), theirs: BTreeMap::new(), told: BTreeMap::new(), introduced: BTreeMap::new(), has: BTreeMap::new() };
+        let conn = Conn { dialed, served_at: now, active: now, hello: true, opened: served.clone(), served, sent: BTreeMap::new(), theirs: BTreeMap::new(), told: BTreeMap::new(), introduced: BTreeMap::new(), expired: BTreeMap::new(), has: BTreeMap::new() };
         self.conns.insert(peer, conn);
     }
 
@@ -261,6 +267,7 @@ impl Peers {
         c.sent.retain(|id, _| served.contains(id));
         c.told.retain(|id, _| served.contains(id));
         c.introduced.retain(|id, _| served.contains(id));
+        c.expired.retain(|id, _| served.contains(id));
         c.has.retain(|id, _| served.contains(id));
         c.served = served;
         for (id, g) in &mut self.groups {
@@ -312,8 +319,8 @@ impl Peers {
         }
     }
 
-    /// A frame from a connected peer, after the node's own checks: a `hello`'s intros after the node took them into
-    /// `Own`. A `summary` goes to `summary`.
+    /// A frame from a connected peer, after the node's own checks: a `hello`'s intros and expiries after the node took
+    /// them into `Own`. A `summary` goes to `summary`.
     pub fn frame(&mut self, peer: &Key, frame: &Frame, now: u64) {
         let Some(c) = self.conns.get_mut(peer) else { return };
         match frame {
@@ -331,6 +338,7 @@ impl Peers {
                     for (m, (version, _)) in g.own.intros.iter().filter(|(_, (_, signed))| at.intros.contains(signed)) {
                         introduced.insert(m.clone(), *version);
                     }
+                    c.expired.entry(at.group.clone()).or_default().extend(at.expired.iter().map(|expiry| expiry.log_ref));
                 }
             }
             Frame::Held { group, items, answers: Some(answers) } => {
@@ -560,7 +568,7 @@ impl Peers {
     }
 
     /// `entries` to peers that lack them, and `hello`s: each tells the peer the sightings it was not told, or was told
-    /// `RETELL` staler, and the intros it was not told.
+    /// `RETELL` staler, and the intros and expiries it was not told.
     fn hellos(&mut self, now: u64) -> Vec<Out> {
         let due = self.changed.is_some_and(|since| now - since >= DEBOUNCE);
         let sightings: BTreeMap<Bytes, BTreeMap<Key, u64>> = match due || self.conns.values().any(|c| c.hello) {
@@ -598,7 +606,9 @@ impl Peers {
                                     intros.push(signed.clone());
                                 }
                             }
-                            At { group: (*id).clone(), log: g.own.log, head: g.own.head.clone(), seen, intros }
+                            let expiries = c.expired.entry((*id).clone()).or_default();
+                            let expired = g.own.expired.iter().filter(|expiry| expiries.insert(expiry.log_ref)).cloned().collect();
+                            At { group: (*id).clone(), log: g.own.log, head: g.own.head.clone(), seen, intros, expired }
                         })
                         .collect();
                     out.push(Out::Frame(*key, Frame::Hello { groups }));
