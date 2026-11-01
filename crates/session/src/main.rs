@@ -1,4 +1,4 @@
-use letmeknow::cli::{Cli, Command, call, home_dir, running_session, session_dir, session_named};
+use letmeknow::cli::{Cli, Command, call, device_dir, home_dir, running_session, session_dir, session_named};
 use letmeknow::session::Config;
 use letmeknow::Network;
 use std::process::ExitCode;
@@ -21,6 +21,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
+    let device = device_dir(cli.home.as_deref())?;
     let home = home_dir(cli.home)?;
     match cli.command {
         Command::Listen { membership, detached } => {
@@ -29,7 +30,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 Some(session) => session_dir(&home, &session_named(&home, session)?)?,
                 None => letmeknow::new_session(&home, &membership)?,
             };
-            let config = Config { dir, membership, detached };
+            let config = Config { dir, device, membership, detached };
             let print = |line: String| {
                 use std::io::Write;
                 writeln!(std::io::stdout(), "{line}")
@@ -51,6 +52,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Sessions => {
             println!("{}", letmeknow::sessions(&home).await?);
+            Ok(())
+        }
+        Command::Device => {
+            let (key, name) = letmeknow::device(&device)?;
+            println!("{}", serde_json::json!({ "fp": lmk_node::fp(key.verifying_key().as_bytes()), "name": name }));
             Ok(())
         }
         Command::Skill => {

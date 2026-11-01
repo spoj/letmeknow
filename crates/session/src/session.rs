@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -30,6 +30,8 @@ const KEEP: u64 = 7;
 
 pub struct Config {
     pub dir: PathBuf,
+    /// Where the key of the device it runs on is kept (`cli::device_dir`).
+    pub device: PathBuf,
     /// The domain of the membership service for groups this session creates.
     pub membership: String,
     /// Whether it runs without a reader of its own: what concerns the agent goes to the reader attached, or waits for one.
@@ -339,11 +341,16 @@ impl Session {
                 _ = self.running.spawn_local(async move { Answered(join(&node, &joining, &link).await, Some(reply)) });
                 return;
             }
-            Request::Remove { group, members } => {
-                let found = self.resolve(group).and_then(|gid| Ok((members.iter().map(|m| member_by_fp(&node, &gid, m)).collect::<Result<Vec<_>>>()?, gid)));
+            Request::Remove { group, device, members } => {
+                let found = self.resolve(group).and_then(|gid| {
+                    let keys = match device {
+                        Some(device) => on_device(&node, &gid, &device)?,
+                        None => members.iter().map(|m| Ok(member_by_fp(&node, &gid, m)?.key)).collect::<Result<Vec<_>>>()?,
+                    };
+                    Ok((keys, gid))
+                });
                 let remove = async move {
-                    let (members, gid) = found?;
-                    let keys: Vec<Bytes> = members.into_iter().map(|m| m.key).collect();
+                    let (keys, gid) = found?;
                     ensure!(!keys.contains(&node.key()), "to leave a group, use `leave`");
                     node.remove(&gid.0, &keys).await?;
                     Ok(json!({ "group": b64(&gid.0), "removed": keys.iter().map(|key| fp(&key.0)).collect::<Vec<_>>() }))
@@ -693,6 +700,17 @@ fn member_by_fp(node: &Node, gid: &Bytes, fp: &str) -> Result<Member> {
     }
 }
 
+/// The members of a group, but this session, whose certificates name the device whose fingerprint begins with `fp`.
+fn on_device(node: &Node, gid: &Bytes, fp: &str) -> Result<Vec<Bytes>> {
+    let devices = node.devices(&gid.0)?;
+    let named: BTreeSet<&Bytes> = devices.values().map(|device| &device.key).filter(|key| !fp.is_empty() && lmk_node::fp(&key.0).starts_with(fp)).collect();
+    ensure!(named.len() < 2, "several devices have fingerprints that begin {fp}; give more of it");
+    let me = node.key();
+    let on: Vec<Bytes> = devices.iter().filter(|(key, device)| **key != me && named.contains(&device.key)).map(|(key, _)| key.clone()).collect();
+    ensure!(!on.is_empty(), "no other member of {} runs on a device whose fingerprint begins {fp}", b64(&gid.0));
+    Ok(on)
+}
+
 /// The member of any of this session's groups, other than this session, whose fingerprint begins with `fp`.
 fn known_member(node: &Node, fp: &str) -> Result<Member> {
     let me = node.key();
@@ -733,15 +751,18 @@ fn describe_key(me: &Bytes, members: &[Member], key: &Bytes) -> Value {
 const INTRO: usize = 280;
 
 /// A group's members as `members` and `join` list them: this session, and those seen in the last `RECENT`, with how long
-/// ago; only a count of the others, unless `all`.
+/// ago, each with its intro and device; only a count of the others, unless `all`.
 fn listed_members(node: &Node, gid: &Bytes, all: bool) -> Result<Value> {
     let (me, now) = (node.key(), lmk_node::now());
     let (mut members, mut offline) = (Vec::new(), 0);
-    let intros = node.intros(&gid.0)?;
+    let (intros, devices) = (node.intros(&gid.0)?, node.devices(&gid.0)?);
     for (member, seen) in node.presence(&gid.0)? {
         let mut item = describe(&me, &member);
         if let Some(intro) = intros.get(&member.key) {
             item["intro"] = json!(intro);
+        }
+        if let Some(device) = devices.get(&member.key) {
+            item["device"] = json!({ "fp": fp(&device.key.0), "name": device.name });
         }
         if let Some(Seen { at, connected }) = seen {
             let minutes = now.saturating_sub(at) / 60_000;

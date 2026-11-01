@@ -7,6 +7,7 @@ mod store;
 mod tests;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use ed25519_dalek::SigningKey;
 use lmk_core::provider::SqliteProvider;
 use lmk_membership::client::{Post, Resolve, https};
 use lmk_node::Node;
@@ -14,9 +15,12 @@ use lmk_proto::Bytes;
 use lmk_proto::directory::{Directory, MAX_BYTES, check_domain};
 use lmk_proto::group::Service;
 use lmk_proto::links::{DOMAIN, MEMBERSHIP_KEY};
+use lmk_proto::peer::Device;
 use n0_future::boxed::BoxFuture;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -221,6 +225,7 @@ pub async fn listen(
 ) -> Result<()> {
     own_format(home)?;
     cli::private_dir(&config.dir)?;
+    let (device_key, device_name) = device(&config.device)?;
     let directory = own_directory(home, &network, &config.membership).await?;
     let membership = Service::Serve { key: Bytes(directory.key.to_vec()), domain: config.membership.clone(), rest: Default::default() };
     // One process runs a session, even when two start at once.
@@ -236,6 +241,7 @@ pub async fn listen(
     let provider = SqliteProvider::open(&config.dir.join("session.db"))?;
     let node_config = lmk_node::Config { home: config.membership.clone(), post: network.post.clone(), ca: network.ca.clone() };
     let (node, events) = Node::start(provider, node_config).await?;
+    node.set_device(Device::sign(&device_key, &node.key().0, &device_name))?;
     let dir = config.dir.clone();
     let mut session = session::Session::open(config, db, node, held, membership).await?;
     session.start(delete_stopped_in_no_group(home.to_owned()));
@@ -245,6 +251,35 @@ pub async fn listen(
         std::fs::remove_dir_all(&dir)?;
     }
     Ok(())
+}
+
+/// This machine's device key, kept in `dir` (`cli::device_dir`), and its name: the host's as the key was made, on first use.
+pub fn device(dir: &Path) -> Result<(SigningKey, String)> {
+    #[derive(Serialize, Deserialize)]
+    struct Kept {
+        name: String,
+        /// An Ed25519 key's seed.
+        secret: Bytes,
+    }
+    cli::private_dir(dir)?;
+    let path = dir.join("device.json");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&path)?;
+    // Sessions that start at once make one key between them.
+    file.lock()?;
+    let mut kept = String::new();
+    file.read_to_string(&mut kept)?;
+    if kept.is_empty() {
+        let made = Kept { name: gethostname::gethostname().to_string_lossy().into_owned(), secret: Bytes(lmk_core::random::<32>().to_vec()) };
+        kept = serde_json::to_string(&made)?;
+        file.write_all(kept.as_bytes())?;
+        file.sync_all()?;
+    }
+    let Kept { name, secret } = serde_json::from_str(&kept).with_context(|| format!("reading the device key {}", path.display()))?;
+    Ok((SigningKey::from_bytes(secret.0.as_slice().try_into().context("a device key is 32 bytes")?), name))
 }
 
 /// Refuses a home that another format of letmeknow's state is in, and marks it as this one's.

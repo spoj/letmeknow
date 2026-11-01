@@ -46,6 +46,8 @@ pub enum Command {
     Attach,
     /// This machine's sessions: each one's fingerprint, whether it runs, and its groups
     Sessions,
+    /// This machine's device, which certifies its sessions to their groups' members: its fingerprint and name
+    Device,
     /// Print instructions for agents
     Skill,
     /// Run a membership service and an iroh relay
@@ -184,12 +186,16 @@ pub enum Request {
         group: Option<String>,
         text: Option<String>,
     },
-    /// Remove members, by fingerprint, from a group, in one commit
+    /// Remove members, by fingerprint or by their device, from a group, in one commit
     #[command(display_order = 16)]
     Remove {
         #[arg(long)]
         group: Option<String>,
-        #[arg(required = true)]
+        /// Every other member that runs on this device, by its fingerprint
+        #[arg(long, value_name = "FP", conflicts_with = "members")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device: Option<String>,
+        #[arg(required_unless_present = "device")]
         members: Vec<String>,
     },
     /// Leave a group; with --end, end it for everyone: remove the other members, and leave
@@ -267,6 +273,15 @@ pub fn parse<T: Into<OsString> + Clone>(args: impl IntoIterator<Item = T>) -> Re
 fn hyphens(command: clap::Command) -> clap::Command {
     let hyphenated = |arg: &clap::Arg| arg.get_action().takes_values() && !(arg.is_positional() && matches!(arg.get_action(), ArgAction::Append));
     command.mut_args(|arg| if hyphenated(&arg) { arg.allow_hyphen_values(true) } else { arg }).mut_subcommands(hyphens)
+}
+
+/// Where this machine's device key is kept: outside the versioned home, so that the sessions of a new minor run on the same
+/// device; in a home given, in that home, so that each such home is a device of its own.
+pub fn device_dir(home: Option<&Path>) -> Result<PathBuf> {
+    match home {
+        Some(home) => Ok(home.to_owned()),
+        None => Ok(dirs::data_local_dir().context("no local data directory")?.join("letmeknow")),
+    }
 }
 
 pub fn home_dir(home: Option<PathBuf>) -> Result<PathBuf> {
@@ -526,9 +541,16 @@ mod tests {
 
     #[test]
     fn remove_takes_several_members_and_flags_after_them() {
-        let Command::Request(Request::Remove { group, members }) = parse(["letmeknow", "remove", "ab", "cd", "--group", "-G"]).unwrap().command else { panic!("not a remove") };
+        let Command::Request(Request::Remove { group, members, device: None }) = parse(["letmeknow", "remove", "ab", "cd", "--group", "-G"]).unwrap().command else { panic!("not a remove") };
         assert_eq!((group.as_deref(), members), (Some("-G"), vec!["ab".to_owned(), "cd".to_owned()]));
         assert!(parse(["letmeknow", "remove"]).is_err());
+    }
+
+    #[test]
+    fn remove_takes_a_device_or_members() {
+        let Command::Request(Request::Remove { device, members, .. }) = parse(["letmeknow", "remove", "--device", "ab12"]).unwrap().command else { panic!("not a remove") };
+        assert_eq!((device.as_deref(), members), (Some("ab12"), vec![]));
+        assert!(parse(["letmeknow", "remove", "cd", "--device", "ab12"]).is_err(), "not both");
     }
 
     #[test]

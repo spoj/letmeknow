@@ -21,7 +21,10 @@ letmeknow join '<link>'                # join through a link
 letmeknow send "text"                  # --to <fingerprint>, --reply-to <id>, --urgent, --attach <file>
 letmeknow intro "text"                 # who you are and what you do now, which members see in `members`
 letmeknow sessions                     # this machine's sessions: fingerprint, whether it runs, its groups
+letmeknow device                       # this machine's device: its key's fingerprint, and its name
 ```
+
+Each machine has a device key, outside the versioned home (in the local data directory's `letmeknow`, or in `--home` where one is given), which certifies its sessions in their signed intros: `members` shows the device each member runs on, and `remove --device <fp>` removes every other member on a device in one commit. The certificate decides no commit and no admission.
 
 A harness brings each new session of a machine into a group through another session of the machine in it: `letmeknow --session <other fp> invite --group <group>`, then `join` with the link. A stopped one runs again with `letmeknow --session <other fp> listen` until it has invited the new one; back from a while away, its invite first waits until it has caught up with the group, up to about two minutes. pi-letmeknow joins each new Pi session to the groups of `~/.pi/agent/letmeknow.json` this way.
 

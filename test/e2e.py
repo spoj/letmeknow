@@ -160,6 +160,10 @@ def main():
         check(event["member"] == bob.ready["fp"], "alice sees bob join")
         check("unknown, used or expired" in run("carol", "join", invite["link"], ok=False), "an invite link works once")
         check(bob.ready["fp"] in [m["fp"] for m in run("alice", "members", "--all")["members"]], "alice's members list bob by fingerprint")
+        device = run("alice", "device")
+        check(len(device["fp"]) == 16 and device == run("alice", "device"), "device gives this home's device, made once")
+        members = until(lambda: run("bob", "members", "--all")["members"], lambda ms: any(m.get("device") == device for m in ms))
+        check(any(m["fp"] == alice.ready["fp"] and m.get("device") == device for m in members), "bob's members show the device alice runs on")
 
         sent = run("alice", "send", "hello bob")
         check(sent.get("id") and "pos" not in sent, "send answers the message's id at once")
@@ -181,8 +185,11 @@ def main():
         check(len(joined["members"]) + joined.get("offline", 0) == 3, "a member invites another")
         alice.expect("joined", lambda e: e["member"] == carol.ready["fp"] and e["by"] == bob.ready["fp"])
 
-        # A removal.
-        run("alice", "remove", f"--group={group}", carol.ready["fp"])
+        # A removal, of the members on carol's device.
+        carols = run("carol", "device")
+        until(lambda: run("alice", "members", "--all")["members"], lambda ms: any(m.get("device") == carols for m in ms))
+        removed = run("alice", "remove", f"--group={group}", "--device", carols["fp"][:8])
+        check(removed["removed"] == [carol.ready["fp"]], "remove --device removes the member on that device")
         check(carol.expect("removed")["by"] == alice.ready["fp"], "carol is told alice removed her")
         alice.expect("left", lambda e: e["member"] == carol.ready["fp"])
         check(run("carol", "groups") == {}, "and is in no group")

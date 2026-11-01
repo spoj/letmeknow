@@ -344,14 +344,15 @@ impl State {
         self.introduce(gid, own.and_then(|intro| intro.text))
     }
 
-    /// Signs what this session says of itself to the group, and the epoch it is in, for its neighbours to pass on.
+    /// Signs what this session says of itself to the group, the epoch it is in and its device, for its neighbours to pass
+    /// on.
     pub(crate) fn introduce(&mut self, gid: &[u8], text: Option<String>) -> Result<()> {
         let (me, now) = (self.me().to_vec(), self.tick());
         let g = self.group(gid)?;
         let last = g.intros().find(|(intro, _)| intro.member.0 == me).map_or(0, |(intro, _)| intro.version);
         let joined = g.mls.joined(&me).context("a member of its group")?;
         let shown = Shown { epoch: g.mls.epoch(), capability: g.mls.capability(&self.provider)? };
-        let intro = Intro { group: Bytes(gid.to_vec()), member: Bytes(me), joined, version: (last + 1).max(now), shown: Some(shown), text };
+        let intro = Intro { group: Bytes(gid.to_vec()), member: Bytes(me), joined, version: (last + 1).max(now), shown: Some(shown), text, device: self.device.clone() };
         let body = serde_json::to_vec(&intro)?;
         let sig = self.session.sign(&[INTRO, &body].concat());
         self.group_mut(gid)?.keep_intro(&intro, Signed { body: Bytes(body), sig: Bytes(sig) });

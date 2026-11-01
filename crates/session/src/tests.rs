@@ -102,10 +102,17 @@ impl World {
         self.launch(self.config(home, name), usize::MAX).await
     }
 
-    /// A session's configuration, in the home `home`.
+    /// The device of the home `home`, as `members` shows it.
+    fn device(&self, home: &str) -> Value {
+        let (key, name) = crate::device(&self.root.path().join(home)).unwrap();
+        json!({ "fp": lmk_node::fp(key.verifying_key().as_bytes()), "name": name })
+    }
+
+    /// A session's configuration, in the home `home`, which is a device of its own.
     fn config(&self, home: &str, name: &str) -> Config {
         Config {
             dir: session_dir(&self.root.path().join(home), name).unwrap(),
+            device: self.root.path().join(home),
             membership: self.domain.clone(),
             detached: false,
         }
@@ -322,7 +329,7 @@ fn membership_changes_are_told_and_a_removed_session_learns_it() {
         let (mut alice, mut bob, group) = pair(&world).await;
         let members = bob.cmd(&["members", "--all", "--group", &group[..6]]).await.unwrap();
         assert_eq!((&members["members"][0]["fp"], &members["members"][0]["last_seen"]), (&json!(alice.fp), &json!("now")));
-        assert_eq!(members["members"][1], json!({ "fp": bob.fp, "you": true }));
+        assert_eq!(members["members"][1], json!({ "fp": bob.fp, "you": true, "device": world.device("bob") }));
         let other = alice.cmd(&["invite"]).await.unwrap()["group"].as_str().unwrap().to_owned();
         assert_eq!(alice.cmd(&["groups"]).await.unwrap()["groups"].as_array().unwrap().len(), 2);
         let status = alice.cmd(&["groups", &format!("--group={}", &group[..8])]).await.unwrap();
@@ -862,6 +869,33 @@ fn an_intro_shows_in_every_members_list() {
         alice.cmd(&["intro"]).await.unwrap();
         let seen = until(|| async { bob.cmd(&["members"]).await.unwrap() }, |members| intro(members, &alice.fp).is_null()).await;
         assert!(intro(&seen, &alice.fp).is_null(), "{seen}");
+    });
+}
+
+/// Each home here is a device: `members` shows the device each member runs on, by the fingerprint and name `device`
+/// gives, and `remove --device` removes every other member on a device in one commit, never the caller.
+#[test]
+fn members_show_their_devices_and_remove_device_removes_a_devices_members() {
+    local(async {
+        let world = world("device").await;
+        let (alice, mut bob, group) = pair(&world).await;
+        let mut desk = world.start_in("bob", "desk").await;
+        desk.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
+        let (alices, bobs) = (world.device("alice"), world.device("bob"));
+        assert_ne!(alices["fp"], bobs["fp"]);
+        assert_eq!(bobs["name"], gethostname::gethostname().to_string_lossy().as_ref());
+        let shown = |members: &Value| members["members"].as_array().unwrap().iter().filter(|m| m.get("device").is_some()).count();
+        let listed = until(|| async { alice.cmd(&["members"]).await.unwrap() }, |members| shown(members) == 3).await;
+        for member in listed["members"].as_array().unwrap() {
+            assert_eq!(member["device"], if member["you"] == true { alices.clone() } else { bobs.clone() }, "{listed}");
+        }
+        let refused = alice.cmd(&["remove", "--device", alices["fp"].as_str().unwrap()]).await.unwrap_err().to_string();
+        assert!(refused.contains("no other member"), "{refused}");
+        let removed = alice.cmd(&["remove", "--device", &bobs["fp"].as_str().unwrap()[..8]]).await.unwrap();
+        let removed: BTreeSet<&str> = removed["removed"].as_array().unwrap().iter().map(|fp| fp.as_str().unwrap()).collect();
+        assert_eq!(removed, BTreeSet::from([bob.fp.as_str(), desk.fp.as_str()]));
+        assert_eq!(bob.told(&["removed"]).await["by"], alice.fp);
+        assert_eq!(desk.told(&["removed"]).await["by"], alice.fp);
     });
 }
 

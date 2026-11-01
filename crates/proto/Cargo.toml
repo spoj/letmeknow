@@ -12,6 +12,7 @@ hex.workspace = true
 getrandom = "0.4"
 hkdf.workspace = true
 n0-future = "0.3"
+p256 = "0.13.2"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

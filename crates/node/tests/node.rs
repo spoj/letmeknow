@@ -17,7 +17,8 @@ use lmk_proto::group::{ChatMessage, PROTOCOL, Service, Settings};
 use lmk_proto::Bytes;
 use lmk_proto::frame::{self, ALPN};
 use lmk_proto::head::Head;
-use lmk_proto::peer::{Frame, SUMMARY, Seqs, Signed, Summary};
+use lmk_proto::peer::{Device, Frame, SUMMARY, Seqs, Signed, Summary};
+use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -941,6 +942,37 @@ fn a_joiner_removes_a_member_away_since_before_it_joined_by_its_intro() {
         assert_eq!(carol.node.members(&gid.0).unwrap().len(), 2, "Alice, there four days ago, stays");
         carol.node.shutdown().await.unwrap();
     });
+}
+
+/// A session names its device in its intro, signed again with no commit as the device is set: the members, and a joiner,
+/// see it, and a certificate of another session's shows no device.
+#[tokio::test(flavor = "multi_thread")]
+async fn members_see_the_devices_their_intros_certify() {
+    let relay = relay().await;
+    let (alice, bob) = (session(&relay).await, session(&relay).await);
+    let (alice_key, bob_key) = (alice.node.key(), bob.node.key());
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    let epoch = bob.node.epoch(&gid.0).unwrap();
+    eventually("Alice reads Bob's update", || alice.node.epoch(&gid.0).unwrap() == epoch).await;
+
+    let laptop = SigningKey::from_bytes(&[7; 32]);
+    alice.node.set_device(Device::sign(&laptop, &alice_key.0, "laptop")).unwrap();
+    bob.node.set_device(Device::sign(&laptop, &alice_key.0, "laptop")).unwrap();
+    bob.node.set_intro(&gid.0, Some("bob".into())).unwrap();
+    let named = |node: &Node, key: &Bytes| node.devices(&gid.0).unwrap().get(key).map(|device| device.name.clone());
+    eventually("Bob sees Alice's device", || named(&bob.node, &alice_key).as_deref() == Some("laptop")).await;
+    eventually("Alice holds Bob's intro", || alice.node.intros(&gid.0).unwrap().contains_key(&bob_key)).await;
+    assert_eq!(named(&alice.node, &bob_key), None, "Bob's certificate is of Alice's session");
+    assert_eq!(named(&alice.node, &alice_key).as_deref(), Some("laptop"));
+    assert_eq!((alice.node.epoch(&gid.0).unwrap(), bob.node.epoch(&gid.0).unwrap()), (epoch, epoch), "no commit");
+
+    let carol = session(&relay).await;
+    carol.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    eventually("Carol sees Alice's device", || named(&carol.node, &alice_key).as_deref() == Some("laptop")).await;
+    for session in [alice, bob, carol] {
+        session.node.shutdown().await.unwrap();
+    }
 }
 
 /// The types of the payloads of a group's messages a stopped stored member holds, by its author's key.

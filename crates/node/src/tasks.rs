@@ -87,6 +87,7 @@ impl State {
             scrub: false,
             events: Vec::new(),
             session,
+            device: None,
             groups,
             logs,
             peers,

@@ -30,7 +30,7 @@ use lmk_membership::client::Post;
 use lmk_net::peers::Peers;
 use lmk_net::Net;
 use lmk_proto::group::Service;
-use lmk_proto::peer::{At, Frame, Seqs, Signed};
+use lmk_proto::peer::{At, Device, Frame, Seqs, Signed};
 use lmk_proto::Bytes;
 use n0_future::task::{JoinHandle, spawn};
 use n0_future::time::Duration;
@@ -355,6 +355,8 @@ pub(crate) struct State {
     /// What the current step tells the session, sent once it commits.
     events: Vec<Event>,
     session: Session,
+    /// The certificate of this session by the device it runs on, which its intros carry.
+    device: Option<Device>,
     groups: BTreeMap<Vec<u8>, G>,
     /// The logs this session follows, by id.
     logs: BTreeMap<Vec<u8>, logs::Log>,

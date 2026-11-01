@@ -8,6 +8,7 @@ use lmk_core::group::{Change, Group};
 use lmk_net::Net;
 use lmk_proto::directory::relay_url;
 use lmk_proto::group::Settings;
+use lmk_proto::peer::Device;
 use lmk_proto::Bytes;
 use serde_json::{Value, json};
 
@@ -118,6 +119,28 @@ impl Node {
     pub fn intros(&self, gid: &[u8]) -> Result<BTreeMap<Bytes, String>> {
         let st = self.inner.lock();
         Ok(st.group(gid)?.intros().filter_map(|(intro, _)| Some((intro.member, intro.text?))).collect())
+    }
+
+    /// Names in this session's intros the device it runs on, by the device's certificate of it: the intro of each of its
+    /// groups that names another or none is signed again, for its neighbours to pass on.
+    pub fn set_device(&self, device: Device) -> Result<()> {
+        let mut st = self.inner.lock();
+        st.device = Some(device);
+        let me = st.me().to_vec();
+        let gids: Vec<Vec<u8>> = st.groups.iter().filter(|(_, g)| g.mls.active()).map(|(gid, _)| gid.clone()).collect();
+        for gid in gids {
+            let own = st.group(&gid)?.intros().find(|(intro, _)| intro.member.0 == me).map(|(intro, _)| intro);
+            if own.as_ref().is_none_or(|intro| intro.device != st.device) {
+                st.introduce(&gid, own.and_then(|intro| intro.text))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Each member's device, by session key, where its intro carries a valid certificate of its session.
+    pub fn devices(&self, gid: &[u8]) -> Result<BTreeMap<Bytes, Device>> {
+        let st = self.inner.lock();
+        Ok(st.group(gid)?.intros().filter_map(|(intro, _)| Some((intro.member.clone(), intro.device.filter(|device| device.verify(&intro.member.0))?))).collect())
     }
 
     /// Marks the group as one this session leaves, and sends its `leave`: the others remove it once a cut keeps the
