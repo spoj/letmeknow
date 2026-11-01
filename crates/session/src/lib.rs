@@ -284,15 +284,15 @@ fn own_format(home: &Path) -> Result<()> {
     let format = home.join("format");
     let found = std::fs::read_to_string(&format).ok().map(|found| found.trim().to_owned());
     match found.as_deref() {
-        Some("13") | None => {}
-        Some(newer) if newer.parse::<u32>().is_ok_and(|format| format > 13) => bail!(
+        Some("14") | None => {}
+        Some(newer) if newer.parse::<u32>().is_ok_and(|format| format > 14) => bail!(
             "{home} holds state that a newer letmeknow wrote (format {newer}), which this one cannot read: run the newest release, `npx -y @letmeknow/cli@latest --home {home} listen`, or use another --home for this one",
             home = home.display()
         ),
         _ => bail!("{} holds the state of an earlier letmeknow, which this one cannot read: move it away, or use another --home", home.display()),
     }
     cli::private_dir(home)?;
-    Ok(std::fs::write(&format, "13\n")?)
+    Ok(std::fs::write(&format, "14\n")?)
 }
 
 /// Makes a new session in `home`, living on the relay of `membership`, in a directory named by its fingerprint.

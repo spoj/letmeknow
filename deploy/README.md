@@ -14,7 +14,7 @@ Its domain, directory and public key are in deploy/backend.json; crates/proto/sr
 
 ## A new minor
 
-Nothing carries over: it gets a new service, and the previous minor's sessions stop working once the old one goes. In this order:
+Its sessions share no group with the previous minor's: links, groups and homes are each minor's own. A minor that keeps the membership routes (`/membership/N/`) keeps the service, on which the previous minor's sessions go on working while their machines move: release it as any other, then do steps 4 and 5 below. One that changes them gets a new service, and nothing carries over: the previous minor's sessions stop working once the old one goes. In this order:
 
 1. Before the release: make the new service's state into /var/lib/letmeknow.new ("A new service", below), and commit its key in deploy/backend.json and crates/proto/src/links.rs.
 2. npm: `release.sh` publishes `@letmeknow/cli@X.Y.0`, which the pins and `npx` start.
@@ -24,7 +24,7 @@ Nothing carries over: it gets a new service, and the previous minor's sessions s
 
 ## A new service
 
-`serve` runs only on state that `serve --initialize` of its own minor made, so a new minor's state is made before its release, by a binary built from `main` (`cargo build --release --target x86_64-unknown-linux-musl -p letmeknow`) and copied to the VPS. There, as root, into a directory that does not exist yet:
+A new service's state is made before its release, which names its key, by a binary built from `main` (`cargo build --release --target x86_64-unknown-linux-musl -p letmeknow`) and copied to the VPS. There, as root, into a directory that does not exist yet:
 
     ./letmeknow serve --initialize --domain relay.letmeknow.dev --state /var/lib/letmeknow.new
     chown -R letmeknow: /var/lib/letmeknow.new

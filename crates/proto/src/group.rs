@@ -6,7 +6,7 @@ use serde_json::{Map, Value};
 
 use crate::{Bytes, directory};
 
-pub const PROTOCOL: u32 = 13;
+pub const PROTOCOL: u32 = 14;
 /// What a device's certificate of a session covers, before the session's key.
 pub const DEVICE: &[u8] = b"letmeknow device v1\0";
 /// What a member's leave covers, before the group's id and the epoch its membership began in.
