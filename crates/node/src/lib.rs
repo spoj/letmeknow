@@ -61,8 +61,8 @@ pub struct Config {
     /// Posts to a membership service's routes, as the shell does over https.
     pub post: Post,
     pub ca: CaTlsConfig,
-    /// The key of the device it runs on, and the device's name: its leaf carries the device's certificate of it.
-    pub device: (ed25519_dalek::SigningKey, String),
+    /// The key of the device it runs on: its leaf carries the device's certificate of it.
+    pub device: ed25519_dalek::SigningKey,
 }
 
 /// When a member was last known online, in milliseconds since the epoch, and whether this session is connected to it now.
@@ -634,7 +634,7 @@ mod tests {
     use lmk_testing::Relay;
 
     async fn node(relay: &Relay, post: Post) -> Node {
-        let device = (ed25519_dalek::SigningKey::from_bytes(&[9; 32]), "test".into());
+        let device = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
         let config = Config { home: relay.domain.clone(), post, ca: relay.ca(), device };
         Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0
     }

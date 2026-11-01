@@ -110,8 +110,8 @@ impl World {
 
     /// The device of the home `home`, as `members` shows it.
     fn device(&self, home: &str) -> Value {
-        let (key, name) = crate::device(&self.root.path().join(home)).unwrap();
-        json!({ "fp": lmk_node::fp(key.verifying_key().as_bytes()), "name": name })
+        let key = crate::device(&self.root.path().join(home)).unwrap();
+        json!({ "fp": lmk_node::fp(key.verifying_key().as_bytes()) })
     }
 
     /// A session's configuration, in the home `home`, which is a device of its own.
@@ -883,8 +883,8 @@ fn an_intro_shows_in_every_members_list() {
     });
 }
 
-/// Each home here is a device: `members` shows the device each member runs on, by the fingerprint and name `device`
-/// gives, and `remove --device` removes every other member on a device in one commit, never the caller.
+/// Each home here is a device: `members` shows the device each member runs on, by the fingerprint `device` gives, and
+/// `remove --device` removes every other member on a device in one commit, never the caller.
 #[test]
 fn members_show_their_devices_and_remove_device_removes_a_devices_members() {
     local(async {
@@ -894,7 +894,6 @@ fn members_show_their_devices_and_remove_device_removes_a_devices_members() {
         desk.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
         let (alices, bobs) = (world.device("alice"), world.device("bob"));
         assert_ne!(alices["fp"], bobs["fp"]);
-        assert_eq!(bobs["name"], gethostname::gethostname().to_string_lossy().as_ref());
         let shown = |members: &Value| members["members"].as_array().unwrap().iter().filter(|m| m.get("device").is_some()).count();
         let listed = until(|| async { alice.cmd(&["members"]).await.unwrap() }, |members| shown(members) == 3).await;
         for member in listed["members"].as_array().unwrap() {

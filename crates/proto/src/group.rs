@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 use crate::{Bytes, directory};
 
 pub const PROTOCOL: u32 = 13;
-/// What a device's certificate of a session covers, before the session's key and the device's name.
+/// What a device's certificate of a session covers, before the session's key.
 pub const DEVICE: &[u8] = b"letmeknow device v1\0";
 /// What a member's leave covers, before the group's id and the epoch its membership began in.
 pub const LEAVE: &[u8] = b"letmeknow leave v1\0";
@@ -60,26 +60,25 @@ pub struct Leaf {
     pub device: Option<Device>,
 }
 
-/// A device's certificate that a session runs on it: its signature over `DEVICE ‖ session key ‖ name`, by `algorithm`:
+/// A device's certificate that a session runs on it: its signature over `DEVICE ‖ session key`, by `algorithm`:
 /// `ed25519`, or `p256`, ECDSA on P-256 with SHA-256, whose key is SEC1-encoded and whose signature is r ‖ s.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Device {
     pub algorithm: String,
     pub key: Bytes,
-    pub name: String,
     pub sig: Bytes,
 }
 
 impl Device {
-    /// An Ed25519 device key's certificate of the session with key `session`, on the device named `name`.
-    pub fn sign(key: &SigningKey, session: &[u8], name: &str) -> Self {
-        let sig = key.sign(&[DEVICE, session, name.as_bytes()].concat());
-        Device { algorithm: "ed25519".into(), key: key.verifying_key().to_bytes().into(), name: name.into(), sig: sig.to_bytes().into() }
+    /// An Ed25519 device key's certificate of the session with key `session`.
+    pub fn sign(key: &SigningKey, session: &[u8]) -> Self {
+        let sig = key.sign(&[DEVICE, session].concat());
+        Device { algorithm: "ed25519".into(), key: key.verifying_key().to_bytes().into(), sig: sig.to_bytes().into() }
     }
 
     /// Whether it certifies the session with key `session`.
     pub fn verify(&self, session: &[u8]) -> bool {
-        let signed = [DEVICE, session, self.name.as_bytes()].concat();
+        let signed = [DEVICE, session].concat();
         match self.algorithm.as_str() {
             "ed25519" => {
                 let (Ok(key), Ok(sig)) = (<[u8; 32]>::try_from(self.key.0.as_slice()), Signature::from_slice(&self.sig.0)) else { return false };
@@ -186,10 +185,9 @@ mod tests {
     #[test]
     fn a_device_certifies_one_session_by_ed25519_or_p256() {
         let (session, other) = ([1; 32], [2; 32]);
-        let device = Device::sign(&SigningKey::from_bytes(&[7; 32]), &session, "laptop");
+        let device = Device::sign(&SigningKey::from_bytes(&[7; 32]), &session);
         assert!(device.verify(&session));
         assert!(!device.verify(&other), "another session's");
-        assert!(!Device { name: "desk".into(), ..device.clone() }.verify(&session), "the name is signed");
         assert!(!Device { algorithm: "p256".into(), ..device.clone() }.verify(&session));
         assert!(!Device { algorithm: "rsa".into(), ..device.clone() }.verify(&session), "an algorithm this release does not know");
         let leaf = Leaf { key: Bytes(vec![1]), home: "h.example".into(), device: Some(device.clone()) };
@@ -197,9 +195,9 @@ mod tests {
 
         use p256::ecdsa::signature::Signer as _;
         let key = p256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();
-        let sig: p256::ecdsa::Signature = key.sign(&[DEVICE, &session, b"phone"].concat());
+        let sig: p256::ecdsa::Signature = key.sign(&[DEVICE, &session].concat());
         let encoded = key.verifying_key().to_encoded_point(true);
-        let device = Device { algorithm: "p256".into(), key: Bytes::from(encoded.as_bytes()), name: "phone".into(), sig: sig.to_bytes().as_slice().into() };
+        let device = Device { algorithm: "p256".into(), key: Bytes::from(encoded.as_bytes()), sig: sig.to_bytes().as_slice().into() };
         assert_eq!(device.sig.0.len(), 64, "r and s");
         assert!(device.verify(&session));
         assert!(!device.verify(&other));

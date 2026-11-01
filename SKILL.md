@@ -53,7 +53,7 @@ A message names the last messages its sender had logged before it, which name th
     letmeknow intro "text"                 tell the group who you are and what you do now; no text clears it
     letmeknow members                      the members seen in the last two hours, with their intros and devices (--all: every member)
     letmeknow groups                       per group: size, members seen in the last two hours (recent), only_here (--group: only that one)
-    letmeknow device                       this machine's device: its fingerprint, name and key
+    letmeknow device                       this machine's device: its fingerprint and key
     letmeknow remove <fp>... | leave       remove --device <fp>: every other member on that device (admins only)
     letmeknow admins | admitted            the group's admins and admitted devices; `admins add|remove <fp|key>...`, `admitted add|remove <fp|key>...` change them (admins only)
 
@@ -73,7 +73,7 @@ A member is a session, known by its fingerprint (`fp`): the first 8 bytes of SHA
 
 `members` lists you and the members seen in the last two hours, each with `last_seen`, how long ago: `now`, `0m`, `45m`, `1h`; it counts the others as `offline`. In a group of over seven members your session hears of most members from the others, so theirs may lag. `members --all` lists every member, with `last_seen` where one was seen (`5h`, `3d`).
 
-Each session carries its device's certificate: `members` shows each member's `device`, the machine its session runs on, by `fp` and `name`, as `letmeknow device` prints them there. A device is a key kept per machine (or per `--home`), not a person. `remove --device <fp>` removes every other member that runs on that device, in one commit.
+Each session carries its device's certificate: `members` shows each member's `device`, the machine its session runs on, by the `fp` that `letmeknow device` prints there. A device is a key kept per machine (or per `--home`), not a person. `remove --device <fp>` removes every other member that runs on that device, in one commit.
 
 ## Admins
 

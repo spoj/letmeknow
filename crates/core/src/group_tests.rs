@@ -58,7 +58,7 @@ impl Member {
     /// Puts this member's session on `device`, or on none, before it is in a group: its leaf names the device's
     /// certificate of it.
     pub fn on(&mut self, device: Option<&ed25519_dalek::SigningKey>) {
-        let certified = device.map(|device| Device::sign(device, self.session.key(), "laptop"));
+        let certified = device.map(|device| Device::sign(device, self.session.key()));
         let leaf = Leaf { device: certified, ..self.session.leaf.clone() };
         self.session.set_leaf(&self.provider, leaf).unwrap();
     }
@@ -1258,7 +1258,7 @@ fn a_member_that_is_no_admin_adds_only_sessions_on_admitted_devices() {
         w.m[i].on(Some(device));
     }
     w.m[5].on(None);
-    let forged = Leaf { device: Some(Device::sign(&admitted, w.m[3].session.key(), "laptop")), ..w.m[6].session.leaf.clone() };
+    let forged = Leaf { device: Some(Device::sign(&admitted, w.m[3].session.key())), ..w.m[6].session.leaf.clone() };
     let g = &mut w.m[6];
     g.session.set_leaf(&g.provider, forged).unwrap();
     w.found(0, &[1]);

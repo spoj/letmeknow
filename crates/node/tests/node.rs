@@ -49,15 +49,15 @@ async fn session_trusting(relays: &[&Relay]) -> Session {
     Session { node, events }
 }
 
-/// A session's configuration: every session a test starts so is on one device, `test`, which founds its groups, so that
-/// each is an admin.
+/// A session's configuration: every session a test starts so is on one device, whose key's seed is 9s, which founds its
+/// groups, so that each is an admin.
 fn config(relay: &Relay) -> Config {
-    Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: (SigningKey::from_bytes(&[9; 32]), "test".into()) }
+    Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: SigningKey::from_bytes(&[9; 32]) }
 }
 
-/// A session on the device named `name`, whose key's seed is `seed`'s bytes.
-async fn session_on(relay: &Relay, seed: u8, name: &str) -> Session {
-    let device = (SigningKey::from_bytes(&[seed; 32]), name.into());
+/// A session on the device whose key's seed is `seed`'s bytes.
+async fn session_on(relay: &Relay, seed: u8) -> Session {
+    let device = SigningKey::from_bytes(&[seed; 32]);
     let (node, events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), Config { device, ..config(relay) }).await.unwrap();
     Session { node, events }
 }
@@ -449,16 +449,16 @@ async fn a_session_updates_its_leaf_as_it_starts() {
     let bob = start().await;
     let bob_key = bob.key();
     bob.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
-    let device = |wanted: Option<&'static str>| {
+    let device = |wanted: bool| {
         let (node, gid, bob_key) = (&alice.node, &gid, &bob_key);
-        let named = move || node.members(&gid.0).unwrap().into_iter().any(|m| m.key == *bob_key && m.device.map(|d| d.name).as_deref() == wanted);
+        let named = move || node.members(&gid.0).unwrap().into_iter().any(|m| m.key == *bob_key && m.device.is_some() == wanted);
         tokio::time::timeout(WAIT, async move {
             while !named() {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         })
     };
-    device(Some("test")).await.expect("a joiner's leaf names its device");
+    device(true).await.expect("a joiner's leaf names its device");
     bob.shutdown().await.unwrap();
     drop(bob);
 
@@ -473,10 +473,10 @@ async fn a_session_updates_its_leaf_as_it_starts() {
     ServeClient::for_service(relay.post(), &relay.service).unwrap().append(&capability, &[commit.entry]).await.unwrap();
     drop(provider);
     alice.node.read_group(&gid.0).await.unwrap();
-    device(None).await.expect("Alice sees Bob's leaf name no device");
+    device(false).await.expect("Alice sees Bob's leaf name no device");
 
     let bob = start().await;
-    device(Some("test")).await.expect("Bob's leaf names his device once he starts");
+    device(true).await.expect("Bob's leaf names his device once he starts");
     bob.shutdown().await.unwrap();
     alice.node.shutdown().await.unwrap();
 }
@@ -961,13 +961,14 @@ fn a_joiner_removes_a_member_away_since_before_it_joined_by_its_intro() {
 #[tokio::test(flavor = "multi_thread")]
 async fn members_see_the_devices_their_leaves_name() {
     let relay = relay().await;
-    let alice = session_on(&relay, 1, "laptop").await;
+    let alice = session_on(&relay, 1).await;
     let gid = alice.node.create(settings(&relay)).unwrap();
     let bob = session(&relay).await;
     bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
-    let named = |node: &Node, key: &Bytes| node.members(&gid.0).unwrap().into_iter().find(|m| m.key == *key).and_then(|m| Some(m.device?.name));
-    assert_eq!(named(&bob.node, &alice.node.key()).as_deref(), Some("laptop"));
-    eventually("Alice sees Bob's device", || named(&alice.node, &bob.node.key()).as_deref() == Some("test")).await;
+    let device = |node: &Node, key: &Bytes| node.members(&gid.0).unwrap().into_iter().find(|m| m.key == *key).and_then(|m| Some(m.device?.key));
+    let key = |seed: u8| Bytes::from(SigningKey::from_bytes(&[seed; 32]).verifying_key().to_bytes());
+    assert_eq!(device(&bob.node, &alice.node.key()), Some(key(1)));
+    eventually("Alice sees Bob's device", || device(&alice.node, &bob.node.key()) == Some(key(9))).await;
     for session in [alice, bob] {
         session.node.shutdown().await.unwrap();
     }
@@ -2962,14 +2963,14 @@ fn device_of(node: &Node, gid: &Bytes, key: &Bytes) -> Bytes {
 async fn only_an_admin_removes_or_admits_sessions_of_other_devices() {
     use lmk_proto::links::Invite;
     let relay = relay().await;
-    let mut alice = session_on(&relay, 1, "alice").await;
+    let mut alice = session_on(&relay, 1).await;
     let gid = alice.node.create(settings(&relay)).unwrap();
-    let bob = session_on(&relay, 2, "bob").await;
+    let bob = session_on(&relay, 2).await;
     bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     assert!(alice.node.admin(&gid.0, &alice.node.key().0).unwrap() && !alice.node.admin(&gid.0, &bob.node.key().0).unwrap());
 
-    let carol = session_on(&relay, 3, "carol").await;
+    let carol = session_on(&relay, 3).await;
     let link = bob.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
     assert_eq!(link.members.len(), 2, "the link names Bob and Alice");
     let refused = carol.node.join(&Invite { members: link.members[..1].to_vec(), ..link.clone() }).await.unwrap_err();
@@ -2995,9 +2996,9 @@ async fn only_an_admin_removes_or_admits_sessions_of_other_devices() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_of_an_admitted_device_joins_through_a_member_that_is_no_admin() {
     let relay = relay().await;
-    let alice = session_on(&relay, 1, "alice").await;
+    let alice = session_on(&relay, 1).await;
     let gid = alice.node.create(settings(&relay)).unwrap();
-    let laptop = session_on(&relay, 2, "laptop").await;
+    let laptop = session_on(&relay, 2).await;
     laptop.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
     let device = device_of(&alice.node, &gid, &laptop.node.key());
     let emptied = alice.node.change_settings(&gid.0, |s| s.admins.clear()).await.unwrap_err();
@@ -3007,7 +3008,7 @@ async fn a_session_of_an_admitted_device_joins_through_a_member_that_is_no_admin
     eventually("the laptop applies the change", || laptop.node.settings(&gid.0).unwrap().admitted == [device.clone()]).await;
     alice.node.shutdown().await.unwrap();
 
-    let second = session_on(&relay, 2, "laptop").await;
+    let second = session_on(&relay, 2).await;
     let (joined, by) = second.node.join(&laptop.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
     assert_eq!((joined, by), (gid.clone(), laptop.node.address().0));
     for session in [laptop, second] {
@@ -3019,9 +3020,9 @@ async fn a_session_of_an_admitted_device_joins_through_a_member_that_is_no_admin
 #[tokio::test(flavor = "multi_thread")]
 async fn a_member_that_is_no_admin_removes_a_leaver_by_its_leave() {
     let relay = relay().await;
-    let mut alice = session_on(&relay, 1, "alice").await;
+    let mut alice = session_on(&relay, 1).await;
     let gid = alice.node.create(settings(&relay)).unwrap();
-    let (mut bob, carol) = (session_on(&relay, 2, "bob").await, session_on(&relay, 3, "carol").await);
+    let (mut bob, carol) = (session_on(&relay, 2).await, session_on(&relay, 3).await);
     for joiner in [&bob, &carol] {
         joiner.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;

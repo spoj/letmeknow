@@ -251,11 +251,10 @@ pub async fn listen(
     Ok(())
 }
 
-/// This machine's device key, kept in `dir` (`cli::device_dir`), and its name: the host's as the key was made, on first use.
-pub fn device(dir: &Path) -> Result<(SigningKey, String)> {
+/// This machine's device key, kept in `dir` (`cli::device_dir`), made on first use.
+pub fn device(dir: &Path) -> Result<SigningKey> {
     #[derive(Serialize, Deserialize)]
     struct Kept {
-        name: String,
         /// An Ed25519 key's seed.
         secret: Bytes,
     }
@@ -271,13 +270,13 @@ pub fn device(dir: &Path) -> Result<(SigningKey, String)> {
     let mut kept = String::new();
     file.read_to_string(&mut kept)?;
     if kept.is_empty() {
-        let made = Kept { name: gethostname::gethostname().to_string_lossy().into_owned(), secret: Bytes(lmk_core::random::<32>().to_vec()) };
+        let made = Kept { secret: Bytes(lmk_core::random::<32>().to_vec()) };
         kept = serde_json::to_string(&made)?;
         file.write_all(kept.as_bytes())?;
         file.sync_all()?;
     }
-    let Kept { name, secret } = serde_json::from_str(&kept).with_context(|| format!("reading the device key {}", path.display()))?;
-    Ok((SigningKey::from_bytes(secret.0.as_slice().try_into().context("a device key is 32 bytes")?), name))
+    let Kept { secret } = serde_json::from_str(&kept).with_context(|| format!("reading the device key {}", path.display()))?;
+    Ok(SigningKey::from_bytes(secret.0.as_slice().try_into().context("a device key is 32 bytes")?))
 }
 
 /// Refuses a home that another format of letmeknow's state is in, and marks it as this one's.

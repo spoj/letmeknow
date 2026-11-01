@@ -762,20 +762,10 @@ fn keys_named(args: &[String], known: &[Bytes]) -> Result<Vec<Bytes>> {
         .collect()
 }
 
-/// A group's admins and admitted devices, each key by its fingerprint, as this session, or with the name of the device it
-/// is where a member's leaf names it.
+/// A group's admins and admitted devices, each key by its fingerprint, and as this session where it is.
 fn listed_lists(node: &Node, gid: &Bytes) -> Result<Value> {
-    let (settings, members, me) = (node.settings(&gid.0)?, node.members(&gid.0)?, node.key());
-    let describe = |key: &Bytes| {
-        let mut item = json!({ "fp": fp(&key.0) });
-        if *key == me {
-            item["you"] = json!(true);
-        }
-        if let Some(device) = members.iter().filter_map(|m| m.device.as_ref()).find(|device| device.key == *key) {
-            item["name"] = json!(device.name);
-        }
-        item
-    };
+    let (settings, me) = (node.settings(&gid.0)?, node.key());
+    let describe = |key: &Bytes| describe_key(&me, &[], key);
     let (admins, admitted): (Vec<Value>, Vec<Value>) = (settings.admins.iter().map(describe).collect(), settings.admitted.iter().map(describe).collect());
     Ok(json!({ "group": b64(&gid.0), "admins": admins, "admitted": admitted }))
 }
@@ -831,7 +821,7 @@ fn listed_members(node: &Node, gid: &Bytes, all: bool) -> Result<Value> {
             item["intro"] = json!(intro);
         }
         if let Some(device) = &member.device {
-            item["device"] = json!({ "fp": fp(&device.key.0), "name": device.name });
+            item["device"] = json!({ "fp": fp(&device.key.0) });
         }
         if node.admin(&gid.0, &member.key.0)? {
             item["admin"] = json!(true);

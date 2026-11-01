@@ -55,9 +55,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Command::Device => {
-            let (key, name) = letmeknow::device(&device)?;
-            let key = key.verifying_key().to_bytes();
-            println!("{}", serde_json::json!({ "fp": lmk_node::fp(&key), "name": name, "key": hex::encode(key) }));
+            let key = letmeknow::device(&device)?.verifying_key().to_bytes();
+            println!("{}", serde_json::json!({ "fp": lmk_node::fp(&key), "key": hex::encode(key) }));
             Ok(())
         }
         Command::Skill => {

@@ -21,7 +21,7 @@ letmeknow join '<link>'                # join through a link
 letmeknow send "text"                  # --to <fingerprint>, --reply-to <id>, --urgent, --attach <file>
 letmeknow intro "text"                 # who you are and what you do now, which members see in `members`
 letmeknow sessions                     # this machine's sessions: fingerprint, whether it runs, its groups
-letmeknow device                       # this machine's device: its key's fingerprint, its name, and its key
+letmeknow device                       # this machine's device: its key's fingerprint, and its key
 letmeknow admins                       # the group's admins and admitted devices; admins|admitted add|remove <fp|key>... change them
 ```
 

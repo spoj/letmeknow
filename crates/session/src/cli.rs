@@ -46,7 +46,7 @@ pub enum Command {
     Attach,
     /// This machine's sessions: each one's fingerprint, whether it runs, and its groups
     Sessions,
-    /// This machine's device, which certifies its sessions to their groups' members: its fingerprint, name and key
+    /// This machine's device, which certifies its sessions to their groups' members: its fingerprint and key
     Device,
     /// Print instructions for agents
     Skill,

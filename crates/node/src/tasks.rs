@@ -66,12 +66,12 @@ pub fn create(provider: &SqliteProvider, home: &str) -> Result<Bytes> {
 impl State {
     /// The session in `provider`, created on first use, with its leaf as `leaf`, certified by `device`; its logs and
     /// groups.
-    fn open(provider: SqliteProvider, leaf: Leaf, (device, name): &(ed25519_dalek::SigningKey, String)) -> Result<Self> {
+    fn open(provider: SqliteProvider, leaf: Leaf, device: &ed25519_dalek::SigningKey) -> Result<Self> {
         let mut session = match provider.get(b"session")? {
             Some(_) => Session::load(&provider)?,
             None => Session::create(&provider, leaf.clone())?,
         };
-        let leaf = Leaf { device: Some(Device::sign(device, session.key(), name)), ..leaf };
+        let leaf = Leaf { device: Some(Device::sign(device, session.key())), ..leaf };
         if session.leaf != leaf {
             session.set_leaf(&provider, leaf)?;
         }
