@@ -161,9 +161,10 @@ def main():
         check("unknown, used or expired" in run("carol", "join", invite["link"], ok=False), "an invite link works once")
         check(bob.ready["fp"] in [m["fp"] for m in run("alice", "members", "--all")["members"]], "alice's members list bob by fingerprint")
         device = run("alice", "device")
-        check(len(device["fp"]) == 16 and device == run("alice", "device"), "device gives this home's device, made once")
+        check(len(device["fp"]) == 16 and len(device["key"]) == 64 and device == run("alice", "device"), "device gives this home's device, made once")
+        device = {"fp": device["fp"], "name": device["name"]}
         members = until(lambda: run("bob", "members", "--all")["members"], lambda ms: any(m.get("device") == device for m in ms))
-        check(any(m["fp"] == alice.ready["fp"] and m.get("device") == device for m in members), "bob's members show the device alice runs on")
+        check(any(m["fp"] == alice.ready["fp"] and m.get("device") == device and m.get("admin") for m in members), "bob's members show the device alice runs on, and that she is an admin")
 
         sent = run("alice", "send", "hello bob")
         check(sent.get("id") and "pos" not in sent, "send answers the message's id at once")
@@ -180,13 +181,18 @@ def main():
         message = bob.expect("message", lambda e: e["content"] == "the token")
         check(content(message["attachment"]["path"]) == "s3cret", "the attachment arrives as a private file")
 
-        # Carol joins through bob.
+        # Carol joins through bob, who is no admin, once alice, who is, admits her device.
+        carols = run("carol", "device")
+        admitted = run("alice", "admitted", "add", carols["key"])["admitted"]
+        check(admitted == [{"fp": carols["fp"]}], "an admin admits a device by its key")
+        until(lambda: run("bob", "admins")["admitted"], lambda listed: listed == admitted)
         joined = run("carol", "join", run("bob", "invite", f"--group={group}")["link"])
         check(len(joined["members"]) + joined.get("offline", 0) == 3, "a member invites another")
         alice.expect("joined", lambda e: e["member"] == carol.ready["fp"] and e["by"] == bob.ready["fp"])
+        check("no admin" in run("bob", "remove", carol.ready["fp"], ok=False), "a member that is no admin removes no one")
 
         # A removal, of the members on carol's device.
-        carols = run("carol", "device")
+        carols = {"fp": carols["fp"], "name": carols["name"]}
         until(lambda: run("alice", "members", "--all")["members"], lambda ms: any(m.get("device") == carols for m in ms))
         removed = run("alice", "remove", f"--group={group}", "--device", carols["fp"][:8])
         check(removed["removed"] == [carol.ready["fp"]], "remove --device removes the member on that device")
