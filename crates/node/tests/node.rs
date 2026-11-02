@@ -2958,10 +2958,9 @@ fn device_of(node: &Node, gid: &Bytes, key: &Bytes) -> Bytes {
 }
 
 /// A member that is no admin removes no one, at once, and refuses a joiner whose device is neither admitted nor an admin;
-/// an admin the link names too admits it, and removes it.
+/// so does an admin its link names, as the invite is no admin's. An admin's own invite admits it, and the admin removes it.
 #[tokio::test(flavor = "multi_thread")]
 async fn only_an_admin_removes_or_admits_sessions_of_other_devices() {
-    use lmk_proto::links::Invite;
     let relay = relay().await;
     let mut alice = session_on(&relay, 1).await;
     let gid = alice.node.create(settings(&relay)).unwrap();
@@ -2973,9 +2972,9 @@ async fn only_an_admin_removes_or_admits_sessions_of_other_devices() {
     let carol = session_on(&relay, 3).await;
     let link = bob.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
     assert_eq!(link.members.len(), 2, "the link names Bob and Alice");
-    let refused = carol.node.join(&Invite { members: link.members[..1].to_vec(), ..link.clone() }).await.unwrap_err();
+    let refused = carol.node.join(&link).await.unwrap_err();
     assert!(format!("{refused:#}").contains("neither admitted nor an admin"), "{refused:#}");
-    let (_, by) = carol.node.join(&link).await.unwrap();
+    let (_, by) = carol.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
     assert_eq!(by, alice.node.address().0, "Alice admits Carol");
     eventually("Bob holds Carol's Add", || bob.node.members(&gid.0).unwrap().len() == 3).await;
 

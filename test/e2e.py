@@ -200,10 +200,12 @@ def main():
         alice.expect("left", lambda e: e["member"] == carol.ready["fp"])
         check(run("carol", "groups") == {}, "and is in no group")
 
-        # Any member that holds an invite admits by it: erin gets in while bob, who made her link, is stopped.
+        # Any member that holds an invite admits by it: erin gets in while bob, who made her link, is stopped. bob is no
+        # admin, so his invite brings in only an admitted device: alice admits erin's.
         link = run("bob", "invite", f"--group={group}")["link"]
         erin = Listener("erin")
         listeners.append(erin)
+        run("alice", "admitted", "add", run("erin", "device")["key"])
 
         # A restart: bob misses a message and a commit, and catches up when he is back.
         stopping = time.time()

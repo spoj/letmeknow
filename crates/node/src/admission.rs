@@ -1,7 +1,8 @@
 //! Admission, both sides: a joiner asks the members an invite link names, keeping its KeyPackage until one admits it; a
 //! member answers by the invite's rule, checked again as the Add is built, with the commit entry that added the joiner,
-//! or with the one it kept to a joiner it added before whose answer was lost. A member that is no admin admits only
-//! joiners whose device is admitted, or an admin.
+//! or with the one it kept to a joiner it added before whose answer was lost. A joiner whose device is neither admitted
+//! nor an admin gets in only by an admin's invite, which an admin answers: a member that is no admin brings in no other
+//! device, not even through an admin its link names.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -215,7 +216,7 @@ const UNKNOWN: &str = "unknown, used or expired invite";
 const INVITER_LEFT: &str = "its inviter left the group";
 const MEMBER_ALREADY: &str = "this session is a member already";
 const FOR_ANOTHER: &str = "this invite is for another member";
-const NOT_ADMITTED: &str = "this member is no admin, and the joining session's device is neither admitted nor an admin: an admin admits it, or its device (`admitted add`)";
+const NOT_ADMITTED: &str = "the joining session's device is neither admitted nor an admin, so only an admin admits it, by an admin's invite: an admin invites it, or admits its device (`admitted add`)";
 
 /// Whether `g`, as it stands, admits a joiner, by its key and leaf data, by an invite, as the member with key `me`:
 /// checked when its request comes, and each time the commit that adds it is built. An invite dies when its inviter
@@ -226,7 +227,7 @@ fn admits(g: &G, me: &[u8], (joiner, leaf): &(Vec<u8>, Option<Leaf>), rule: &Rul
     ensure!(members.iter().any(|m| m.key == rule.by.0) && g.left(&rule.by.0).is_none(), INVITER_LEFT);
     ensure!(rule.to.as_ref().is_none_or(|to| to.0 == *joiner), FOR_ANOTHER);
     ensure!(members.iter().all(|member| member.key != *joiner), MEMBER_ALREADY);
-    ensure!(g.mls.admin(me) || g.mls.admits(joiner, leaf.as_ref()), NOT_ADMITTED);
+    ensure!(g.mls.admits(joiner, leaf.as_ref()) || (g.mls.admin(me) && g.mls.admin(&rule.by.0)), NOT_ADMITTED);
     Ok(())
 }
 
