@@ -27,9 +27,9 @@ sed "s|@DOMAIN@|$domain|" "$tmp/letmeknow.service" > "$tmp/service"
 scp -q "$tmp/service" "$host:/etc/systemd/system/letmeknow.service"
 ssh "$host" 'set -eu
   systemctl daemon-reload
-  systemctl stop letmeknow
   chmod 755 /usr/local/bin/letmeknow.new
   mv /usr/local/bin/letmeknow.new /usr/local/bin/letmeknow
-  systemctl enable --now letmeknow
+  systemctl enable letmeknow
+  systemctl restart letmeknow
 '
 python3 deploy/check-backend.py "$tmp/backend.json" "$tag"

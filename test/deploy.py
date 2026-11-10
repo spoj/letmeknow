@@ -117,6 +117,15 @@ with tempfile.TemporaryDirectory(prefix="lmk-deploy-test-") as directory:
             assert evidence == {"version": VERSION, "membership": BACKEND["directory"]["key"], "domain": BACKEND["domain"]}
             assert uploads[0][-1] == "mock-host:/usr/local/bin/letmeknow.new"
             assert uploads[1][-1] == "mock-host:/etc/systemd/system/letmeknow.service"
+            install = [call for call in calls if call[0] == "ssh"][-1]
+            assert [line.strip() for line in install[-1].splitlines()] == [
+                "set -eu",
+                "systemctl daemon-reload",
+                "chmod 755 /usr/local/bin/letmeknow.new",
+                "mv /usr/local/bin/letmeknow.new /usr/local/bin/letmeknow",
+                "systemctl enable letmeknow",
+                "systemctl restart letmeknow",
+            ], install
             assert calls.index(probes[0]) > max(i for i, call in enumerate(calls) if call[0] == "ssh")
         print(f"ok - {name}, deployment={ok}")
 
