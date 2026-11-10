@@ -242,10 +242,13 @@ impl Session {
     /// session is in no such group; the lines held for a reader go as theirs in the log go.
     fn prune(&self, gone: Option<&Bytes>) -> Result<()> {
         let path = self.log_path();
-        let log = match std::fs::read_to_string(&path) {
+        let log = match std::fs::read(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             log => log?,
         };
+        // A last line cut short, as when the disk filled while it was written, goes.
+        let whole = log.iter().rposition(|byte| *byte == b'\n').map_or(0, |end| end + 1);
+        let log = std::str::from_utf8(&log[..whole])?;
         let now = lmk_proto::clock::now();
         let cutoff = |days: u64| short::iso(now.saturating_sub(days * 24 * 3600 * 1000));
         let mut cutoffs = std::collections::HashMap::new();
@@ -569,16 +572,19 @@ impl Session {
 
     /// Takes in a chat message, in delivery order: printed, with its attachment saved into a file only this user can read.
     fn received(&mut self, message: &Message) -> Result<()> {
-        let attachment: Option<Attachment> = message.payload.get("attachment").map(|a| serde_json::from_value(a.clone())).transpose()?;
-        let item = self.message_item(message)?;
+        // A payload is its sender's: an attachment that is not shaped as one shows as none.
+        let attachment: Option<Attachment> = message.payload.get("attachment").and_then(|a| serde_json::from_value(a.clone()).ok());
+        let item = self.message_item(message, attachment.as_ref().map(|attachment| attachment.name.as_str()));
         let gid: Bytes = serde_json::from_value(item["group"].clone())?;
         let id = message_id(item["id"].as_str().context("a message has an id")?)?;
         let path = item["attachment"]["path"].as_str();
-        self.db.execute("INSERT OR IGNORE INTO taken (id, gid, at, attachment) VALUES (?, ?, ?, ?)", params![id, gid.0, lmk_proto::clock::now(), path])?;
+        // Its file is saved before the message counts as taken in: one whose file could not be saved is taken in again
+        // as the session next starts.
         if let (Some(attachment), Some(path)) = (attachment, path) {
             std::fs::create_dir_all(self.attachments_dir(&gid))?;
             private_file(Path::new(path), &attachment.data.0)?;
         }
+        self.db.execute("INSERT OR IGNORE INTO taken (id, gid, at, attachment) VALUES (?, ?, ?, ?)", params![id, gid.0, lmk_proto::clock::now(), path])?;
         let wakes = wakes(&item, |id| self.mine(id));
         self.out.push((item, wakes));
         Ok(())
@@ -616,7 +622,7 @@ impl Session {
 
     /// A chat message as the agent reads it: in delivery order, with what it needed and this session gave up on
     /// (`missing`), and whether messages that needed those were delivered without them (`late`).
-    fn message_item(&self, message: &Message) -> Result<Value> {
+    fn message_item(&self, message: &Message, attachment: Option<&str>) -> Value {
         let (gid, payload, me) = (&message.group, &message.payload, self.node.key());
         let members = self.node.members(&gid.0).unwrap_or_default();
         let missing: Vec<Value> = message.missing.iter().map(|seqs| json!({ "from": describe_key(&me, &members, &seqs.key), "seqs": seqs.seqs.iter().collect::<Vec<_>>() })).collect();
@@ -631,7 +637,7 @@ impl Session {
         if let Some(reply_to) = &message.reply_to {
             item["reply_to"] = json!(hex::encode(&reply_to.0));
         }
-        let to: Vec<Bytes> = serde_json::from_value(payload.get("to").cloned().unwrap_or(json!([])))?;
+        let to: Vec<Bytes> = payload.get("to").and_then(|to| serde_json::from_value(to.clone()).ok()).unwrap_or_default();
         let to: Vec<String> = to.iter().map(|fp| hex::encode(&fp.0)).collect();
         item["content"] = payload.get("content").cloned().unwrap_or(Value::Null);
         if !to.is_empty() {
@@ -644,15 +650,17 @@ impl Session {
         if let Some(sent_at) = payload["sent_at"].as_u64() {
             item["sent_at"] = json!(short::iso(sent_at));
         }
-        // An attachment shows as the file another member's attached is saved in.
-        if let Some(name) = payload["attachment"]["name"].as_str() {
+        // An attachment shows as the file another member's attached is saved in, named by the end of its name: a file's
+        // name is at most 255 bytes on most file systems.
+        if let Some(name) = attachment {
             item["attachment"] = json!({ "name": name });
             if item["from"]["you"] != true {
-                let file = format!("{}-{}", &id[..16], name.replace(|c: char| !c.is_ascii_alphanumeric() && !"._-".contains(c), "-"));
+                let name = name.replace(|c: char| !c.is_ascii_alphanumeric() && !"._-".contains(c), "-");
+                let file = format!("{}-{}", &id[..16], &name[name.len().saturating_sub(200)..]);
                 item["attachment"]["path"] = json!(self.attachments_dir(gid).join(file));
             }
         }
-        Ok(item)
+        item
     }
 
     /// Marks a delivered message shown, as logged. Its text is then deleted from the node, unless it is this session's

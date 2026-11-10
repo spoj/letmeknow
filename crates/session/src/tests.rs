@@ -1048,3 +1048,58 @@ fn a_detached_session_holds_what_concerns_it_for_one_reader_at_a_time() {
         assert_eq!(read(&mut printed).await["type"], "removed");
     });
 }
+
+/// A log whose last line was cut short, as when the disk filled while it was written, loses that line as the session next
+/// starts, and no other.
+#[test]
+fn a_log_cut_short_loses_its_last_line_as_the_session_starts() {
+    local(async {
+        let world = world("cut").await;
+        let (mut alice, _bob, _) = pair(&world).await;
+        alice.stop().await;
+        let whole = alice.log();
+        let log = session_dir(&alice.home, &alice.name).unwrap().join("log.jsonl");
+        std::io::Write::write_all(&mut std::fs::OpenOptions::new().append(true).open(log).unwrap(), br#"{"type":"message","con"#).unwrap();
+        let alice = world.start("alice").await;
+        assert_eq!(alice.log(), whole);
+    });
+}
+
+/// An attachment whose name is as long as a file's may be is saved under the end of its name.
+#[test]
+fn an_attachment_with_a_long_name_is_saved_under_the_end_of_it() {
+    local(async {
+        let world = world("name").await;
+        let (mut alice, bob, _) = pair(&world).await;
+        let name = format!("{}.txt", "a".repeat(250));
+        let file = world.root.path().join(&name);
+        std::fs::write(&file, "s3cret").unwrap();
+        bob.cmd(&["send", "--to", &alice.fp, "--attach", file.to_str().unwrap(), "the token"]).await.unwrap();
+        let message = alice.expect("message").await;
+        assert_eq!(message["attachment"]["name"], name);
+        let path = Path::new(message["attachment"]["path"].as_str().unwrap());
+        assert!(path.to_str().unwrap().ends_with("aaa.txt"), "{path:?}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "s3cret");
+    });
+}
+
+/// A payload is its sender's: of a chat message whose `to` and `attachment` are shaped as none are, the session shows
+/// the rest, and starts again.
+#[test]
+fn a_chat_message_with_a_malformed_to_and_attachment_shows_without_them() {
+    local(async {
+        let world = world("shape").await;
+        let mut alice = world.start("alice").await;
+        let invite = alice.cmd(&["invite"]).await.unwrap();
+        let device = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let config = lmk_node::Config { home: world.domain.clone(), post: world.network.post.clone(), ca: world.network.ca.clone(), device };
+        let (mallory, _events) = lmk_node::Node::start(lmk_core::provider::SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap();
+        let (gid, _) = mallory.join(&lmk_proto::links::Invite::parse(invite["link"].as_str().unwrap()).unwrap()).await.unwrap();
+        mallory.send(&gid.0, &json!({ "type": "message", "content": "hi", "to": "all", "attachment": { "name": 7 } }), None).await.unwrap();
+        let message = alice.told(&["message"]).await;
+        assert_eq!((message["content"].as_str(), message.get("to"), message.get("attachment")), (Some("hi"), None, None));
+        alice.stop().await;
+        world.start("alice").await;
+        mallory.shutdown().await.unwrap();
+    });
+}
