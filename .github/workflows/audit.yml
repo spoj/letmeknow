@@ -1,6 +1,7 @@
 name: audit
 on:
   push:
+    branches: [main]
     paths: [Cargo.lock]
   schedule:
     - cron: "23 4 * * *"
