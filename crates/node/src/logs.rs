@@ -248,9 +248,10 @@ impl State {
 }
 
 impl Inner {
-    /// Before a send: asks the service about the group's current log, and if it moved, waits until this session caught up
-    /// with it, through each epoch a commit moves it to. Fails when the log counts as let go. A service that does not
-    /// answer within `SEND_WAIT` holds nothing back: chat goes on while it is down.
+    /// Before a send: asks the service about the group's current log, and if it moved, or this session holds a commit of
+    /// it that it has not applied, as while it waits for what the last one kept, waits until this session caught up with
+    /// it, through each epoch a commit moves it to. Fails when the log counts as let go. A service that does not answer
+    /// within `SEND_WAIT` holds nothing back: chat goes on while it is down.
     pub(crate) async fn refresh(self: &Arc<Self>, gid: &[u8]) -> Result<()> {
         let (id, service, known) = {
             let mut st = self.lock();
@@ -273,7 +274,10 @@ impl Inner {
         match answer.into_iter().next() {
             Some(Err(_)) => self.lapse(&mut self.lock(), &id).and(Err(SendError::LetGo.into())),
             Some(Ok(_)) => self.caught_up(gid).await,
-            None => self.lock().read_as_of(&id, sent),
+            None => {
+                self.lock().read_as_of(&id, sent)?;
+                if self.lock().at_head(gid) { Ok(()) } else { self.caught_up(gid).await }
+            }
         }
     }
 

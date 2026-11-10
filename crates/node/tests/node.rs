@@ -3140,3 +3140,46 @@ async fn a_dep_on_what_came_before_a_member_joined_tells_it_nothing_of_the_deps_
         session.node.shutdown().await.unwrap();
     }
 }
+
+/// A send waits for a commit this session holds and has not applied, as while it waits for what the last one kept: what
+/// it sends is sealed past that commit, which may remove a member.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_send_waits_for_a_commit_held_and_not_applied() {
+    use lmk_core::group::{Change, Group, Session as Mls};
+    let relay = relay().await;
+    let dir = folder("held-commit");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bob_db = dir.join("bob.db");
+    let alice = session(&relay).await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    let bob = Node::start(SqliteProvider::open(&bob_db).unwrap(), config(&relay)).await.unwrap().0;
+    bob.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    eventually("both at the joiner's first update", || alice.node.epoch(&gid.0).unwrap() == 2 && bob.epoch(&gid.0).unwrap() == 2).await;
+    bob.shutdown().await.unwrap();
+    drop(bob);
+
+    // Bob's cut, moved one past what he sent, then another commit of his: Alice waits before it for what no one holds.
+    let provider = SqliteProvider::open(&bob_db).unwrap();
+    let mls = Mls::load(&provider).unwrap();
+    let mut group = Group::load(&provider, &gid.0).unwrap();
+    let client = ServeClient::for_service(relay.post(), &relay.service).unwrap();
+    let mut cut = group.cut().to_vec();
+    let own = cut.iter_mut().find(|r| r.key.0 == mls.key()).unwrap();
+    (own.seq, own.id, own.epoch) = (own.seq + 1, Bytes(vec![7; 32]), 2);
+    let capability = group.capability(&provider).unwrap();
+    let first = group.commit(&provider, &mls, Change { cut, ..Change::default() }).unwrap();
+    client.append(&capability, from_ref(&first.entry)).await.unwrap();
+    group.apply(&provider, &first.entry).unwrap();
+    let capability = group.capability(&provider).unwrap();
+    let cut = group.cut().to_vec();
+    let second = group.commit(&provider, &mls, Change { cut, ..Change::default() }).unwrap();
+    client.append(&capability, from_ref(&second.entry)).await.unwrap();
+    drop(group);
+    drop(provider);
+
+    alice.node.read_group(&gid.0).await.unwrap();
+    assert_eq!(alice.node.epoch(&gid.0).unwrap(), 3, "Alice waits before Bob's second commit");
+    alice.node.send(&gid.0, &message("after it"), None).await.unwrap();
+    assert_eq!(alice.node.epoch(&gid.0).unwrap(), 4);
+    alice.node.shutdown().await.unwrap();
+}
