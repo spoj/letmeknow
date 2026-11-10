@@ -669,6 +669,42 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rate_refused_send_keeps_the_next_messages_deps() {
+        let relay = lmk_testing::relay().await;
+        let (alice, bob) = (node(&relay, relay.post()).await, node(&relay, relay.post()).await);
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let gid = alice.create(settings).unwrap();
+        bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        let text = serde_json::json!({ "type": "message", "content": "hi" });
+        let first = alice.send(&gid.0, &text, None).await.unwrap();
+        n0_future::time::timeout(Duration::from_secs(60), async {
+            while bob.message(&gid.0, &first.0).unwrap().is_none() {
+                n0_future::time::sleep(Duration::from_millis(50)).await;
+            }
+        }).await.unwrap();
+        bob.mark_shown(&gid.0, std::slice::from_ref(&first)).unwrap();
+        {
+            let mut st = bob.inner.lock();
+            let g = st.group_mut(&gid.0).unwrap();
+            // No refill during the send, regardless of the wall clock.
+            while g.sending.take(0, 1.0, u64::MAX) {}
+            let refused = bob.inner.send(&mut st, &gid.0, &text, None).unwrap_err();
+            assert!(matches!(refused.downcast_ref(), Some(SendError::Rate)), "{refused:#}");
+        }
+        bob.inner.lock().group_mut(&gid.0).unwrap().sending = held::Bucket::default();
+        let next = bob.send(&gid.0, &text, None).await.unwrap();
+        let after = bob.send(&gid.0, &text, None).await.unwrap();
+        {
+            let st = bob.inner.lock();
+            assert_eq!(st.record(&gid.0, &next.0).unwrap().unwrap().header.deps.iter().map(|r| r.id.clone()).collect::<Vec<_>>(), [first]);
+            assert!(st.record(&gid.0, &after.0).unwrap().unwrap().header.deps.is_empty(), "the successful send covered the frontier");
+        }
+        for node in [alice, bob] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
     /// Two members that chatted, once all is delivered and said, poll for nothing: no timed work is due.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_idle_session_polls_for_nothing() {

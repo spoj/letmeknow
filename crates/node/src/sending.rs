@@ -116,9 +116,6 @@ impl Inner {
                 None => deps.push(r.clone()),
             }
         }
-        if !control {
-            st.group_mut(gid)?.rec.frontier.clear();
-        }
         let header = Header {
             group: Bytes(gid.to_vec()),
             author: Bytes(me.clone()),
@@ -150,6 +147,9 @@ impl Inner {
         let id = Bytes(held::id(&plaintext).to_vec());
         let record = Record { id: id.clone(), header, plaintext: Some(Bytes(plaintext)), sealing: Some((epoch, Bytes(ciphertext.clone()))), opened: now, released: false, delivered: None };
         st.store(gid, &record)?;
+        if !control {
+            st.group_mut(gid)?.rec.frontier.clear();
+        }
         st.present(gid)?;
         self.control(st, gid, &record.header)?;
         self.deliver(st, gid, record)?;

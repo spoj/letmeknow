@@ -2127,6 +2127,29 @@ async fn three_members_chat_in_causal_order() {
     alice.node.shutdown().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_size_refused_send_keeps_the_next_messages_deps() {
+    let relay = relay().await;
+    let dir = folder("size-refused-deps");
+    let db = dir.join("bob.db");
+    let alice = session(&relay).await;
+    let mut bob = stored(&relay, &db).await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    let first = alice.node.send(&gid.0, &message("first"), None).await.unwrap();
+    bob.until(|e| matches!(e, Event::Message(message) if message.id == first).then_some(())).await;
+    bob.node.mark_shown(&gid.0, from_ref(&first)).unwrap();
+
+    let refused = bob.node.send(&gid.0, &message(&"x".repeat(16 << 20)), None).await.unwrap_err();
+    assert!(matches!(refused.downcast_ref(), Some(SendError::Size(_))), "{refused:#}");
+    let next = bob.node.send(&gid.0, &message("next"), None).await.unwrap();
+    let after = bob.node.send(&gid.0, &message("after"), None).await.unwrap();
+    bob.node.shutdown().await.unwrap();
+    assert_eq!(deps_of(&db, &gid, &next).iter().map(|r| r.id.clone()).collect::<Vec<_>>(), [first]);
+    assert!(deps_of(&db, &gid, &after).is_empty(), "the successful send covered the frontier");
+    alice.node.shutdown().await.unwrap();
+}
+
 /// A message whose dep is withheld waits for it, then is delivered with the dep named in `missing`, and the withheld
 /// message comes `late` once its holder is back. Sam's first message is held by Bob alone, and Sam's reply depends on
 /// it; Sam is then a hand that pushes the reply to Carol, and answers nothing.
