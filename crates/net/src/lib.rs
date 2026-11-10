@@ -46,7 +46,7 @@ pub trait Admit: Send + Sync + 'static {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// A `peer` stream with the peer started, replacing any other; true when this side dialed it.
+    /// A connection to the peer registered, replacing any other; true when this side dialed it.
     Connected(EndpointId, bool),
     Disconnected(EndpointId),
     /// A frame on the peer's stream.
@@ -205,11 +205,11 @@ impl Inner {
     /// before the stream's frames, and of its end after.
     async fn serve(self: Arc<Self>, conn: Connection, dialed: bool, out: mpsc::UnboundedReceiver<Frame>) {
         let peer = conn.remote_id();
+        self.events.send(Event::Connected(peer, dialed)).await.ok();
         let mut out = Some(out);
         if dialed {
             match open_peer(&conn).await {
                 Ok((send, recv)) => {
-                    self.events.send(Event::Connected(peer, dialed)).await.ok();
                     spawn(peer::run(self.clone(), conn.clone(), send, recv, out.take().unwrap()));
                 }
                 Err(e) => tracing::debug!("no peer stream to {}: {e:#}", peer.fmt_short()),
@@ -220,7 +220,6 @@ impl Inner {
             match open.stream {
                 Stream::Peer => {
                     if let Some(out) = out.take() {
-                        self.events.send(Event::Connected(peer, dialed)).await.ok();
                         spawn(peer::run(self.clone(), conn.clone(), send, recv, out));
                     }
                 }
