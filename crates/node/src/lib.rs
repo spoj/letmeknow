@@ -297,9 +297,9 @@ pub(crate) struct G {
     seen: VecDeque<[u8; 32]>,
     /// Seqs that came to be known lately, and when: not asked for until `HOLD_OFF` passed.
     fresh: Vec<(Bytes, u64, lmk_proto::ranges::Ranges, u64)>,
-    /// When reading began its last wait before a commit. The commits made before then, which this session missed while
-    /// away, share that wait: it waits once for them all, not once for each epoch it missed.
-    reading: Option<u64>,
+    /// When reading began its last wait before a commit, and that commit's position. The commits made before then, which
+    /// this session missed while away, share that wait: it waits once for them all, not once for each epoch it missed.
+    reading: Option<(u64, u64)>,
     /// Reading waits before a commit that deletes the keys of an epoch whose kept messages this session lacks.
     waiting: bool,
     /// The seqs an update waits to fetch before it commits, and when it first waited, in this epoch.

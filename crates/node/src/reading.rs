@@ -57,7 +57,8 @@ impl Inner {
                 self.work.send(Work::Gone(gid.to_vec())).ok();
                 return Ok(false);
             }
-            Verdict::Commit { removes, time } => return self.apply(st, gid, position, entry, removes, time),
+            // Its time is its committer's word: one dated ahead counts as made now.
+            Verdict::Commit { removes, time } => return self.apply(st, gid, position, entry, removes, time.min(corrected())),
         }
         st.group_mut(gid)?.rec.position = position;
         Ok(true)
@@ -70,8 +71,8 @@ impl Inner {
         let now = st.tick();
         let g = st.group_mut(gid)?;
         let read = match g.reading {
-            Some(read) if time < read => read,
-            _ => *g.reading.insert(now),
+            Some((read, at)) if at == position || time < read => read,
+            _ => g.reading.insert((now, position)).0,
         };
         g.waiting = true;
         let prior = g.mls.epoch().saturating_sub(1);

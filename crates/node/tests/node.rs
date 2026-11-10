@@ -3039,3 +3039,52 @@ async fn a_member_that_is_no_admin_removes_a_leaver_by_its_leave() {
         session.node.shutdown().await.unwrap();
     }
 }
+
+/// A commit's time is its committer's word. A member's commit dated years ahead, after one whose cut keeps a message no
+/// one holds, is waited before as any other: once, for `HEAR`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_dated_ahead_is_waited_before_as_any_other() {
+    use lmk_core::group::{Change, Group, Session as Mls};
+    fn real() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+    fn ahead() -> u64 {
+        real() + 50 * 365 * 86_400_000
+    }
+    let relay = relay().await;
+    let dir = folder("ahead");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bob_db = dir.join("bob.db");
+    let alice = session(&relay).await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    let bob = Node::start(SqliteProvider::open(&bob_db).unwrap(), config(&relay)).await.unwrap().0;
+    bob.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    eventually("both at the joiner's first update", || alice.node.epoch(&gid.0).unwrap() == 2 && bob.epoch(&gid.0).unwrap() == 2).await;
+    bob.shutdown().await.unwrap();
+    drop(bob);
+
+    let provider = SqliteProvider::open(&bob_db).unwrap();
+    let mls = Mls::load(&provider).unwrap();
+    let mut group = Group::load(&provider, &gid.0).unwrap();
+    let client = ServeClient::for_service(relay.post(), &relay.service).unwrap();
+    // Bob's cut, moved one past what he sent.
+    let mut cut = group.cut().to_vec();
+    let own = cut.iter_mut().find(|r| r.key.0 == mls.key()).unwrap();
+    (own.seq, own.id, own.epoch) = (own.seq + 1, Bytes(vec![7; 32]), 2);
+    let capability = group.capability(&provider).unwrap();
+    let first = group.commit(&provider, &mls, Change { cut, ..Change::default() }).unwrap();
+    client.append(&capability, from_ref(&first.entry)).await.unwrap();
+    group.apply(&provider, &first.entry).unwrap();
+    let capability = group.capability(&provider).unwrap();
+    lmk_proto::clock::set(ahead);
+    let cut = group.cut().to_vec();
+    let second = group.commit(&provider, &mls, Change { cut, ..Change::default() }).unwrap();
+    lmk_proto::clock::set(real);
+    client.append(&capability, from_ref(&second.entry)).await.unwrap();
+    drop(group);
+    drop(provider);
+
+    alice.node.read_group(&gid.0).await.unwrap();
+    eventually("Alice applies the commit dated ahead", || alice.node.epoch(&gid.0).unwrap() == 4).await;
+    alice.node.shutdown().await.unwrap();
+}
