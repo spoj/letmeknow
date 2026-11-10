@@ -301,6 +301,10 @@ enum Ask {
     Attach {},
 }
 
+/// The most bytes of a call: a message of the 16 MiB members take, as a 12 MiB attachment is in base64, and the call's
+/// other fields.
+pub(crate) const MAX_CALL: u64 = (16 << 20) + (64 << 10);
+
 /// How often `attach` looks for its session again, once that stopped.
 const AGAIN: Duration = Duration::from_secs(1);
 
@@ -410,9 +414,9 @@ pub async fn open_channel(endpoint_path: &Path, inbound: mpsc::UnboundedSender<I
 
 async fn answer(stream: TcpStream, token: String, inbound: mpsc::UnboundedSender<Inbound>) {
     let (read, mut write) = stream.into_split();
-    let mut read = BufReader::new(read);
+    let mut read = BufReader::new(read).take(MAX_CALL + 1);
     let mut line = String::new();
-    if read.read_line(&mut line).await.is_err() {
+    if read.read_line(&mut line).await.is_err() || line.len() as u64 > MAX_CALL {
         return;
     }
     let response = match serde_json::from_str::<Call>(&line) {
@@ -517,7 +521,9 @@ pub async fn attach(home: &Path, session: &str, mut print: impl FnMut(String) ->
 /// Sends a request over a command channel and returns its answer.
 pub async fn exchange((stream, token): (TcpStream, String), request: Request) -> Result<Value> {
     let (read, mut write) = stream.into_split();
-    write.write_all(format!("{}\n", serde_json::to_string(&Call { token, ask: Ask::Request(request) })?).as_bytes()).await?;
+    let call = format!("{}\n", serde_json::to_string(&Call { token, ask: Ask::Request(request) })?);
+    ensure!(call.len() as u64 <= MAX_CALL, "size: the message is over the 16 MiB members take");
+    write.write_all(call.as_bytes()).await?;
     let mut line = String::new();
     BufReader::new(read).read_line(&mut line).await?;
     let response: Value = serde_json::from_str(&line).context("session process closed the connection")?;

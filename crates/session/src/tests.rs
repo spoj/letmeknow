@@ -525,6 +525,53 @@ fn the_command_channel_needs_its_token_and_a_running_session() {
 }
 
 #[test]
+fn the_command_channel_drops_an_oversized_call_without_a_newline() {
+    local(async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let home = tempfile::tempdir().unwrap();
+        let endpoint = home.path().join("endpoint");
+        let (inbound, mut requests) = mpsc::unbounded_channel();
+        crate::cli::open_channel(&endpoint, inbound).await.unwrap();
+        let (mut stream, token) = crate::cli::connect(&endpoint).await.unwrap();
+        let mut call = serde_json::to_vec(&json!({ "token": token, "request": { "cmd": "groups" } })).unwrap();
+        call.resize(crate::cli::MAX_CALL as usize + 1, b' ');
+        stream.write_all(&call).await.unwrap();
+        let mut byte = [0];
+        let read = tokio::time::timeout(WAIT, stream.read(&mut byte)).await.expect("an oversized call closes without a newline");
+        assert_eq!(read.unwrap(), 0, "an oversized call gets no response");
+        assert!(requests.try_recv().is_err(), "even a valid prefix is not dispatched");
+    });
+}
+
+#[test]
+fn the_command_channel_takes_a_twelve_mib_attachment_and_no_larger_call() {
+    local(async {
+        use base64::{Engine, engine::general_purpose::STANDARD as B64};
+        let home = tempfile::tempdir().unwrap();
+        let endpoint = home.path().join("endpoint");
+        let (inbound, mut requests) = mpsc::unbounded_channel();
+        crate::cli::open_channel(&endpoint, inbound).await.unwrap();
+        let channel = crate::cli::connect(&endpoint).await.unwrap();
+        let attach = B64.encode(vec![0; 12 << 20]);
+        let request = Request::Send {
+            group: None, to: vec![], reply_to: None, urgent: false, attach: Some(attach.clone()), attach_name: "large.bin".into(), text: "a large file".into(),
+        };
+        let calling = tokio::spawn(crate::cli::exchange(channel, request));
+        let request = tokio::time::timeout(WAIT, requests.recv()).await.unwrap().unwrap();
+        let crate::session::Inbound::Request(Request::Send { attach: received, .. }, reply) = request else { panic!("not a send") };
+        assert_eq!(received.as_deref(), Some(attach.as_str()));
+        reply.send(json!({ "id": "sent" })).unwrap();
+        assert_eq!(calling.await.unwrap().unwrap(), json!({ "id": "sent" }));
+        let channel = crate::cli::connect(&endpoint).await.unwrap();
+        let request = Request::Send {
+            group: None, to: vec![], reply_to: None, urgent: false, attach: Some(B64.encode(vec![0; 13 << 20])), attach_name: "larger.bin".into(), text: String::new(),
+        };
+        let refused = crate::cli::exchange(channel, request).await.unwrap_err();
+        assert!(refused.to_string().starts_with("size: "), "{refused:#}");
+    });
+}
+
+#[test]
 fn a_restarted_session_takes_in_what_it_missed_in_delivery_order() {
     local(async {
         let world = world("causal").await;
