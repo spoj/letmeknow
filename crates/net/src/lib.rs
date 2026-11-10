@@ -18,13 +18,20 @@ use iroh::{
 };
 use lmk_proto::{
     Answer,
-    frame::{self, ALPN, Open, Stream},
+    frame::{self, ALPN, MAX_ASK, Open, Stream},
     peer::{Admitted, Frame, Join},
 };
-use n0_future::{boxed::BoxFuture, task::spawn};
+use n0_future::{
+    boxed::BoxFuture,
+    task::spawn,
+    time::{Duration, timeout},
+};
 use tokio::sync::mpsc;
 
-use crate::peer::Input;
+/// How many events wait for the node: past that, the peers that send them wait.
+const EVENTS: usize = 64;
+/// How long a joiner has to send its request on the stream it opened for it.
+const ASK: Duration = Duration::from_secs(30);
 
 /// What this crate needs from the group logic to gate frames. Calls are quick and local.
 pub trait Groups: Send + Sync + 'static {
@@ -63,13 +70,14 @@ pub(crate) struct Inner {
     groups: Arc<dyn Groups>,
     admit: Arc<dyn Admit>,
     links: Mutex<BTreeMap<EndpointId, Link>>,
-    events: mpsc::UnboundedSender<Event>,
+    events: mpsc::Sender<Event>,
 }
 
 struct Link {
     conn: Connection,
     dialer: EndpointId,
-    input: mpsc::UnboundedSender<Input>,
+    /// The frames to write to the peer.
+    out: mpsc::UnboundedSender<Frame>,
 }
 
 impl Net {
@@ -77,8 +85,8 @@ impl Net {
         endpoint: Endpoint,
         groups: Arc<dyn Groups>,
         admit: Arc<dyn Admit>,
-    ) -> Result<(Net, mpsc::UnboundedReceiver<Event>)> {
-        let (events, rx) = mpsc::unbounded_channel();
+    ) -> Result<(Net, mpsc::Receiver<Event>)> {
+        let (events, rx) = mpsc::channel(EVENTS);
         let inner = Arc::new(Inner {
             endpoint: endpoint.clone(),
             groups,
@@ -113,7 +121,7 @@ impl Net {
 
     /// Sends a frame to a peer, if it is connected.
     pub fn frame(&self, peer: EndpointId, frame: Frame) -> bool {
-        self.inner.input(&peer).is_some_and(|input| input.send(Input::Send(frame)).is_ok())
+        self.inner.links.lock().unwrap().get(&peer).is_some_and(|link| link.out.send(frame).is_ok())
     }
 
     /// Asks a member, at `relays`, to admit this session, on an `admission` stream of its own.
@@ -139,8 +147,8 @@ impl Inner {
         }
         let conn = self.endpoint.connect(addr(key, relays), ALPN).await?;
         match self.register(&conn, true) {
-            Some((input, rx)) => {
-                spawn(self.clone().serve(conn.clone(), true, input, rx));
+            Some(out) => {
+                spawn(self.clone().serve(conn.clone(), true, out));
                 Ok(conn)
             }
             None => self.live(&key).context("the connection closed"),
@@ -152,19 +160,15 @@ impl Inner {
         links.get(key).map(|link| link.conn.clone()).filter(|conn| conn.close_reason().is_none())
     }
 
-    fn input(&self, peer: &EndpointId) -> Option<mpsc::UnboundedSender<Input>> {
-        self.links.lock().unwrap().get(peer).map(|link| link.input.clone())
-    }
-
     async fn accept(self: Arc<Self>, conn: Connection) {
-        if let Some((input, rx)) = self.register(&conn, false) {
-            self.serve(conn, false, input, rx).await;
+        if let Some(out) = self.register(&conn, false) {
+            self.serve(conn, false, out).await;
         }
     }
 
     /// Keeps one connection per peer: of two live ones, the one dialed by the smaller key, which
     /// both sides pick alike; a redial replaces the old one.
-    fn register(&self, conn: &Connection, dialed: bool) -> Option<(mpsc::UnboundedSender<Input>, mpsc::UnboundedReceiver<Input>)> {
+    fn register(&self, conn: &Connection, dialed: bool) -> Option<mpsc::UnboundedReceiver<Frame>> {
         let (me, peer) = (self.endpoint.id(), conn.remote_id());
         let dialer = if dialed { me } else { peer };
         let mut links = self.links.lock().unwrap();
@@ -176,38 +180,43 @@ impl Inner {
             Some(old) => old.conn.close(0u32.into(), b"duplicate"),
             None => {}
         }
-        let (input, rx) = mpsc::unbounded_channel();
-        links.insert(peer, Link { conn: conn.clone(), dialer, input: input.clone() });
-        Some((input, rx))
+        let (out, rx) = mpsc::unbounded_channel();
+        links.insert(peer, Link { conn: conn.clone(), dialer, out });
+        Some(rx)
     }
 
-    fn unregister(&self, conn: &Connection) {
+    /// Whether the connection was the peer's link, which it no longer is.
+    fn unregister(&self, conn: &Connection) -> bool {
         let peer = conn.remote_id();
         let mut links = self.links.lock().unwrap();
-        if links.get(&peer).is_some_and(|link| link.conn.stable_id() == conn.stable_id()) {
+        let linked = links.get(&peer).is_some_and(|link| link.conn.stable_id() == conn.stable_id());
+        if linked {
             links.remove(&peer);
-            self.events.send(Event::Disconnected(peer)).ok();
         }
+        linked
     }
 
-    /// Runs a connection's streams until it closes. The dialer opens the one `peer` stream.
-    async fn serve(self: Arc<Self>, conn: Connection, dialed: bool, input: mpsc::UnboundedSender<Input>, rx: mpsc::UnboundedReceiver<Input>) {
+    /// Runs a connection's streams until it closes. The dialer opens the one `peer` stream. It tells of the connection
+    /// before the stream's frames, and of its end after.
+    async fn serve(self: Arc<Self>, conn: Connection, dialed: bool, out: mpsc::UnboundedReceiver<Frame>) {
         let peer = conn.remote_id();
-        let mut rx = Some(rx);
+        let mut out = Some(out);
         if dialed {
             match open_peer(&conn).await {
                 Ok((send, recv)) => {
-                    spawn(peer::run(self.clone(), conn.clone(), send, recv, input.clone(), rx.take().unwrap(), dialed));
+                    self.events.send(Event::Connected(peer, dialed)).await.ok();
+                    spawn(peer::run(self.clone(), conn.clone(), send, recv, out.take().unwrap()));
                 }
                 Err(e) => tracing::debug!("no peer stream to {}: {e:#}", peer.fmt_short()),
             }
         }
         while let Ok((send, mut recv)) = conn.accept_bi().await {
-            let Ok(open) = frame::read::<Open, _>(&mut recv).await else { continue };
+            let Ok(open) = frame::read_within::<Open, _>(&mut recv, MAX_ASK).await else { continue };
             match open.stream {
                 Stream::Peer => {
-                    if let Some(rx) = rx.take() {
-                        spawn(peer::run(self.clone(), conn.clone(), send, recv, input.clone(), rx, dialed));
+                    if let Some(out) = out.take() {
+                        self.events.send(Event::Connected(peer, dialed)).await.ok();
+                        spawn(peer::run(self.clone(), conn.clone(), send, recv, out));
                     }
                 }
                 Stream::Admission => {
@@ -215,13 +224,15 @@ impl Inner {
                 }
             }
         }
-        self.unregister(&conn);
+        if self.unregister(&conn) {
+            self.events.send(Event::Disconnected(peer)).await.ok();
+        }
     }
 
-    /// Answers a joiner's request to be admitted.
+    /// Answers a joiner's request to be admitted, which it sends within `ASK`.
     async fn admit(self: Arc<Self>, peer: EndpointId, mut send: SendStream, mut recv: RecvStream) {
         let answered = async {
-            let join: Join = frame::read(&mut recv).await?;
+            let join: Join = timeout(ASK, frame::read_within(&mut recv, MAX_ASK)).await??;
             let answer = self.admit.join(peer, join).await;
             frame::write(&mut send, &answer).await
         };

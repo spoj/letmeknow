@@ -60,7 +60,7 @@ pub async fn relays(n: usize) -> Vec<Relay> {
 
 pub struct Node {
     pub net: Net,
-    pub events: mpsc::UnboundedReceiver<Event>,
+    pub events: mpsc::Receiver<Event>,
 }
 
 /// A node on `relay`; with `relay_only`, reached only through it.

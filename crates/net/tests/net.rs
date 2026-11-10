@@ -93,3 +93,48 @@ async fn dial_to_absent_key_gives_up() {
     assert!(dialed.is_err());
     assert!(took >= Duration::from_secs(28) && took < Duration::from_secs(40), "gave up after {took:?}");
 }
+
+/// A peer whose frames the node does not take yet waits to send more: they are not kept for it without bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_that_sends_faster_than_the_node_takes_waits() {
+    const FRAMES: usize = 200;
+    let relay = relay().await;
+    let keys = keys(2);
+    let mut a = node(&relay, keys[0].clone(), false).await;
+    let peer = lmk_net::builder([relay.url.clone()]).secret_key(keys[1].clone()).ca_tls_config(iroh::tls::CaTlsConfig::custom_roots([relay.cert.clone()]));
+    let peer = peer.bind().await.unwrap();
+    let conn = peer.connect(iroh::EndpointAddr::new(keys[0].public()).with_relay_url(relay.url.clone()), frame::ALPN).await.unwrap();
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    frame::write(&mut send, &frame::Open { stream: frame::Stream::Peer }).await.unwrap();
+    let held = Frame::Held { group: Bytes(G.to_vec()), items: vec![Bytes(vec![0; 256 << 10])], answers: None };
+    let mut sending = tokio::spawn(async move {
+        for _ in 0..FRAMES {
+            frame::write(&mut send, &held).await.unwrap();
+        }
+        send
+    });
+    assert!(tokio::time::timeout(Duration::from_secs(10), &mut sending).await.is_err(), "the peer waits while the node takes nothing");
+    for _ in 0..FRAMES {
+        a.until(|e| matches!(e, Event::Frame(..))).await;
+    }
+    tokio::time::timeout(WAIT, sending).await.expect("the peer sent the rest").unwrap();
+    a.net.shutdown().await.unwrap();
+}
+
+/// A joiner's request is small: a stream that announces a larger one is dropped, not read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_to_be_admitted_that_is_too_large_is_dropped() {
+    use tokio::io::AsyncWriteExt;
+    let relay = relay().await;
+    let keys = keys(2);
+    let member = node(&relay, keys[0].clone(), false).await;
+    let joiner = lmk_net::builder([relay.url.clone()]).secret_key(keys[1].clone()).ca_tls_config(iroh::tls::CaTlsConfig::custom_roots([relay.cert.clone()]));
+    let joiner = joiner.bind().await.unwrap();
+    let conn = joiner.connect(iroh::EndpointAddr::new(keys[0].public()).with_relay_url(relay.url.clone()), frame::ALPN).await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    frame::write(&mut send, &frame::Open { stream: frame::Stream::Admission }).await.unwrap();
+    send.write_u32(frame::MAX_ASK + 1).await.unwrap();
+    let answer = tokio::time::timeout(WAIT, frame::read::<Answer<lmk_proto::peer::Admitted>, _>(&mut recv)).await.expect("the stream ended");
+    assert!(answer.is_err());
+    member.net.shutdown().await.unwrap();
+}

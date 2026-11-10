@@ -9,44 +9,33 @@ use tokio::sync::mpsc;
 
 use crate::{Event, Inner};
 
-pub(crate) enum Input {
-    Frame(Frame),
-    Closed,
-    Send(Frame),
-}
-
-/// Runs the connection's one peer stream; the connection closes with it.
-pub(crate) async fn run(
-    inner: Arc<Inner>,
-    conn: Connection,
-    mut send: SendStream,
-    mut recv: RecvStream,
-    input: mpsc::UnboundedSender<Input>,
-    mut rx: mpsc::UnboundedReceiver<Input>,
-    dialed: bool,
-) {
+/// Runs the connection's one peer stream; the connection closes with it. The peer's frames are read one at a time, as
+/// the node takes them: a peer that sends faster than that waits, and so does one that does not read what it is sent.
+pub(crate) async fn run(inner: Arc<Inner>, conn: Connection, mut send: SendStream, mut recv: RecvStream, mut out: mpsc::UnboundedReceiver<Frame>) {
     let peer = conn.remote_id();
-    inner.events.send(Event::Connected(peer, dialed)).ok();
+    let (read, mut frames) = mpsc::channel(1);
     spawn(async move {
         while let Ok(frame) = frame::read_known(&mut recv).await {
-            if input.send(Input::Frame(frame)).is_err() {
+            if read.send(frame).await.is_err() {
                 return;
             }
         }
-        input.send(Input::Closed).ok();
     });
     let result = async {
-        while let Some(input) = rx.recv().await {
-            match input {
-                Input::Frame(frame) => {
-                    inner.events.send(Event::Frame(peer, frame)).ok();
-                }
-                Input::Closed => break,
-                Input::Send(frame) => {
-                    if let Some(frame) = inner.groups.admit(&peer, frame) {
-                        frame::write(&mut send, &frame).await?;
+        loop {
+            tokio::select! {
+                frame = frames.recv() => match frame {
+                    Some(frame) => inner.events.send(Event::Frame(peer, frame)).await?,
+                    None => break,
+                },
+                frame = out.recv() => match frame {
+                    Some(frame) => {
+                        if let Some(frame) = inner.groups.admit(&peer, frame) {
+                            frame::write(&mut send, &frame).await?;
+                        }
                     }
-                }
+                    None => break,
+                },
             }
         }
         anyhow::Ok(())

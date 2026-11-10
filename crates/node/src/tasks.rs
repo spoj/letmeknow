@@ -109,7 +109,7 @@ impl Inner {
     /// Starts the tasks, opens the logs, and picks up where the session stopped: its groups it was removed from told.
     fn run(
         self: &Arc<Self>,
-        mut net_events: mpsc::UnboundedReceiver<lmk_net::Event>,
+        mut net_events: mpsc::Receiver<lmk_net::Event>,
         work: mpsc::UnboundedReceiver<Work>,
         outbox: mpsc::UnboundedReceiver<(Vec<Out>, Vec<Event>)>,
     ) {
