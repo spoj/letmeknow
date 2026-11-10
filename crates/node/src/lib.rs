@@ -641,6 +641,111 @@ mod tests {
         Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_signed_log_fork_is_reported_once_from_the_service_or_entries() {
+        use ed25519_dalek::SigningKey;
+        use lmk_membership::Contradiction;
+        use lmk_proto::{head::{self, Head}, membership::{Answer, Page, Read}};
+
+        let relay = lmk_testing::relay().await;
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let service = Service::Serve { key: Bytes(key.verifying_key().to_bytes().to_vec()), domain: relay.domain.clone(), rest: Default::default() };
+        for from_service in [true, false] {
+            let signing = key.clone();
+            let post: Post = Arc::new(move |_, route, body| {
+                assert!(route.ends_with("/read"));
+                let read: Read = serde_json::from_slice(&body).unwrap();
+                let id = head::reference(signing.verifying_key().as_bytes(), &read.capability);
+                let hash = head::next(&head::start(signing.verifying_key().as_bytes(), &id), b"theirs");
+                let head = Head::sign(&signing, &id, 1, hash, now());
+                Box::pin(async move { Ok(serde_json::to_vec(&Answer::Ok(Page { after: read.after, entries: vec![], head })).unwrap()) })
+            });
+            let config = Config { home: relay.domain.clone(), post, ca: relay.ca(), device: SigningKey::from_bytes(&[9; 32]) };
+            let (alice, mut events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap();
+            let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: service.clone(), admins: vec![], admitted: vec![] };
+            let gid = alice.create(settings).unwrap();
+            let id: [u8; 32] = alice.log(&gid.0).unwrap().0.try_into().unwrap();
+            let start = head::start(key.verifying_key().as_bytes(), &id);
+            let ours = Head::sign(&key, &id, 1, head::next(&start, b"ours"), now());
+            let theirs = Head::sign(&key, &id, 1, head::next(&start, b"theirs"), now());
+            {
+                let mut st = alice.inner.lock();
+                st.provider.put(&logs::entry_key(&id, 1), &[ours.hash.as_slice(), b"ours"].concat()).unwrap();
+                st.logs.get_mut(id.as_slice()).unwrap().head = Some(ours.clone());
+                st.save_log(&id).unwrap();
+            }
+            for _ in 0..2 {
+                if from_service {
+                    let error = alice.inner.read(&id).await.unwrap_err();
+                    let contradiction = error.downcast_ref::<Contradiction>().unwrap();
+                    assert_eq!((&contradiction.ours, contradiction.theirs.hash), (&ours, theirs.hash));
+                } else {
+                    alice.inner.take_entries(&mut alice.inner.lock(), &id, 0, vec![Bytes(b"theirs".to_vec())], theirs.clone()).unwrap();
+                }
+            }
+            alice.inner.contradicted(&alice.inner.lock(), &id, &Contradiction { ours: theirs.clone(), theirs: ours.clone() }, "a peer");
+            let Event::Warning { group, text } = events.try_recv().unwrap() else { panic!("a fork must warn") };
+            assert_eq!(group, Some(gid));
+            assert_eq!(text, format!(
+                "the membership service showed this session another version of the group's log: length 1 with hash {} here, length 1 with hash {} there",
+                hex(&ours.hash), hex(&theirs.hash)
+            ));
+            assert!(events.try_recv().is_err(), "the same heads, even reversed, warn only once");
+            {
+                let st = alice.inner.lock();
+                assert_eq!(st.log(&id).unwrap().head.as_ref(), Some(&ours));
+                assert_eq!(st.entry(&id, 1).unwrap().unwrap(), b"ours");
+            }
+            alice.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_commit_refused_for_good_is_no_longer_pending() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use lmk_membership::Refused;
+        use lmk_proto::{head::{self, Head}, membership::{Answer, Append, Page, Read, Refusal, refusal_message}};
+
+        let relay = lmk_testing::relay().await;
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let service = Service::Serve { key: Bytes(key.verifying_key().to_bytes().to_vec()), domain: relay.domain.clone(), rest: Default::default() };
+        for refusal in [Refusal::Policy, Refusal::Size] {
+            let signing = key.clone();
+            let post: Post = Arc::new(move |_, route, body| {
+                let answer = if route.ends_with("/append") {
+                    let append: Append = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(append.entries.len(), 1);
+                    Answer::Refused { refusal, sig: Bytes(signing.sign(&refusal_message(refusal, &body)).to_bytes().to_vec()) }
+                } else {
+                    assert!(route.ends_with("/read"));
+                    let read: Read = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(read.after, 0);
+                    let id = head::reference(signing.verifying_key().as_bytes(), &read.capability);
+                    let head = Head::sign(&signing, &id, 0, head::start(signing.verifying_key().as_bytes(), &id), now());
+                    Answer::Ok(Page { after: 0, entries: vec![], head })
+                };
+                Box::pin(async move { Ok(serde_json::to_vec(&answer).unwrap()) })
+            });
+            let alice = node(&relay, post).await;
+            let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: service.clone(), admins: vec![], admitted: vec![] };
+            let gid = alice.create(settings).unwrap();
+            let before = alice.settings(&gid.0).unwrap();
+            let epoch = alice.epoch(&gid.0).unwrap();
+            for device in [8, 9] {
+                let admitted = Bytes(SigningKey::from_bytes(&[device; 32]).verifying_key().to_bytes().to_vec());
+                let error = alice.change_settings(&gid.0, |settings| settings.admitted.push(admitted.clone())).await.unwrap_err();
+                assert!(matches!(error.downcast_ref::<Refused>(), Some(Refused(code)) if code == refusal.code()), "{error:#}");
+                let st = alice.inner.lock();
+                let group = &st.group(&gid.0).unwrap().mls;
+                assert!(group.posted().is_none(), "a permanent refusal cancels the pending commit");
+                assert_eq!(group.epoch(), epoch);
+                assert_eq!(group.settings(), before);
+                assert!(Group::load(&st.provider, &gid.0).unwrap().posted().is_none(), "cancellation is stored");
+            }
+            alice.shutdown().await.unwrap();
+        }
+    }
+
     /// A group is handed to `Peers` as it is added, and its new members as their Add applies, before the next poll: a
     /// joiner's summary that arrives at once is kept.
     #[tokio::test(flavor = "multi_thread")]
