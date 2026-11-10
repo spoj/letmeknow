@@ -3088,3 +3088,55 @@ async fn a_commit_dated_ahead_is_waited_before_as_any_other() {
     eventually("Alice applies the commit dated ahead", || alice.node.epoch(&gid.0).unwrap() == 4).await;
     alice.node.shutdown().await.unwrap();
 }
+
+/// A dep is its message's author's word. Bob's message, whose dep says Alice's seq far past what she sent came before
+/// Carol joined, is delivered to Carol, and tells her nothing of Alice: Alice's next message reaches her.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dep_on_what_came_before_a_member_joined_tells_it_nothing_of_the_deps_author() {
+    let relay = relay().await;
+    let dir = folder("dep");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bob_db = dir.join("bob.db");
+    let mut alice = session(&relay).await;
+    let bob = stored(&relay, &bob_db).await;
+    let mut carol = session(&relay).await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    for joiner in [&bob.node, &carol.node] {
+        joiner.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    }
+    eventually("all at Carol's first update", || [&alice, &bob, &carol].iter().all(|s| s.node.epoch(&gid.0).unwrap() == 4)).await;
+    let alice_key = alice.node.key();
+    bob.node.shutdown().await.unwrap();
+    drop(bob);
+
+    let provider = SqliteProvider::open(&bob_db).unwrap();
+    let (iroh, session) = member_of(&bob_db);
+    let mut group = lmk_core::group::Group::load(&provider, &gid.0).unwrap();
+    let header = lmk_proto::held::Header {
+        group: gid.clone(),
+        author: Bytes(session.key().to_vec()),
+        joined: group.joined(session.key()).unwrap(),
+        seq: 1,
+        epoch: group.epoch(),
+        prev: None,
+        deps: vec![lmk_proto::held::Ref { key: alice_key, joined: 0, seq: 1 << 40, id: Bytes(vec![7; 32]), epoch: 0 }],
+        reply_to: None,
+        payload: message("from Bob"),
+    };
+    let ciphertext = Bytes(group.seal(&provider, &session, &header.encode()).unwrap());
+    drop(group);
+    drop(provider);
+    let mut hand = hand(&relay, iroh, &carol.node).await;
+    hand.send(&Frame::Held { group: gid.clone(), items: vec![ciphertext], answers: None }).await;
+    let content = |e| match e {
+        Event::Message(message) => Some(message.payload["content"].clone()),
+        _ => None,
+    };
+    assert_eq!(carol.until(content).await, "from Bob");
+    alice.node.send(&gid.0, &message("from Alice"), None).await.unwrap();
+    assert_eq!(carol.until(content).await, "from Alice");
+    for session in [&alice, &carol] {
+        session.node.shutdown().await.unwrap();
+    }
+}

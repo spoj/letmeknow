@@ -1,6 +1,7 @@
 //! Held messages: taken by the membership and seq their ciphertexts claim in the clear, opened in each membership's seq
 //! order within a window, kept by id and by membership and seq, and delivered in causal order once their requirements,
-//! `prev` and deps, are resolved: delivered, given up, lost, kept before this session joined, or past a final cut.
+//! `prev` and deps, are resolved: delivered, given up, lost, kept before this session joined, or past a final cut. A dep
+//! on what was sent before this session joined is not its to have, and requires nothing.
 //! Giving up releases dependents only: what was given up is still asked for, and is delivered `late` if it comes.
 
 use std::collections::BTreeMap;
@@ -203,6 +204,13 @@ impl G {
 
     pub(crate) fn author_mut(&mut self, key: &[u8], joined: u64) -> Option<&mut Author> {
         self.rec.authors.iter_mut().find(|a| a.key.0 == key && a.joined == joined)
+    }
+
+    /// A message's deps on what was sent since the session with key `me` joined: an earlier one is not its to have, and
+    /// tells it nothing of the dep's author, whose word it is not.
+    pub(crate) fn deps<'a>(&self, h: &'a Header, me: &[u8]) -> impl Iterator<Item = &'a lmk_proto::held::Ref> + use<'a> {
+        let own = self.mls.joined(me);
+        h.deps.iter().filter(move |dep| own.is_none_or(|own| dep.epoch >= own))
     }
 
     /// The current membership of the member with key `key`.
@@ -521,11 +529,8 @@ impl Inner {
         {
             g.before(&h.author.0, h.joined, h.seq - 1);
         }
-        for dep in h.deps.iter().filter(|dep| dep.epoch < own) {
-            g.before(&dep.key.0, dep.joined, dep.seq);
-        }
         g.learn(&h.author.0, h.joined, h.seq.saturating_sub(1), now);
-        for dep in &h.deps {
+        for dep in g.deps(&h, &me) {
             g.learn(&dep.key.0, dep.joined, dep.seq, now);
         }
         let author = g.author_mut(&h.author.0, h.joined).context("an author")?;
@@ -620,7 +625,7 @@ impl Inner {
                 let record = st.record_at(gid, &author.key.0, author.joined, seq)?.context("a held message without its record")?;
                 let reach = |dep: &lmk_proto::held::Ref, a: &Author| if record.released { dep.seq.min(a.evidence()) } else { dep.seq };
                 let met = |dep: &lmk_proto::held::Ref| g.author(&dep.key.0, dep.joined).is_none_or(|a| a.through(reach(dep, a)));
-                if record.header.deps.iter().all(met) {
+                if g.deps(&record.header, st.me()).all(met) {
                     ready = Some(record);
                     break;
                 }
@@ -636,12 +641,12 @@ impl Inner {
     pub(crate) fn deliver(&self, st: &mut State, gid: &[u8], mut record: Record) -> Result<()> {
         let now = st.tick();
         let h = record.header.clone();
-        let mut requirements: Vec<(Bytes, u64, u64)> = h.deps.iter().map(|dep| (dep.key.clone(), dep.joined, dep.seq)).collect();
+        let me = st.me().to_vec();
+        let mut requirements: Vec<(Bytes, u64, u64)> = st.group(gid)?.deps(&h, &me).map(|dep| (dep.key.clone(), dep.joined, dep.seq)).collect();
         if h.seq > 1 {
             requirements.push((h.author.clone(), h.joined, h.seq - 1));
         }
         let sender = st.member_by_key(gid, &h.author.0);
-        let me = st.me().to_vec();
         let shown = !Control::TYPES.contains(&type_of(&h.payload)) && h.author.0 != me;
         let g = st.group_mut(gid)?;
         let mut missing = Vec::new();
@@ -690,7 +695,7 @@ impl Inner {
             if waited < HOLD_OFF {
                 continue;
             }
-            let mut requirements: Vec<(Bytes, u64, u64)> = record.header.deps.iter().map(|dep| (dep.key.clone(), dep.joined, dep.seq)).collect();
+            let mut requirements: Vec<(Bytes, u64, u64)> = g.deps(&record.header, st.me()).map(|dep| (dep.key.clone(), dep.joined, dep.seq)).collect();
             requirements.push((author.key.clone(), author.joined, seq - 1));
             for (key, joined, seq) in requirements {
                 let Some(required) = g.author(&key.0, joined) else { continue };
