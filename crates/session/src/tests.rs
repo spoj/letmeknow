@@ -569,7 +569,6 @@ fn a_stale_endpoint_on_a_live_port_does_not_make_a_session_running() {
         let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("session.lock")).unwrap();
         assert_eq!(crate::cli::running(&alice.home).await, ["alice"]);
         assert_eq!(crate::cli::running_session(&alice.home).await.unwrap(), "alice");
-        assert_eq!(crate::sessions(&alice.home).await.unwrap(), json!({ "sessions": [{ "fp": "alice", "running": true }, { "fp": "stopped" }] }));
         held.try_lock().unwrap();
         assert_eq!(crate::cli::running(&alice.home).await, ["alice", "stopped"]);
         drop(held);
@@ -732,10 +731,19 @@ fn sessions_lists_this_machines_sessions_running_or_stopped() {
             sessions.sort_by(|a, b| a["fp"].as_str().cmp(&b["fp"].as_str()));
             json!({ "sessions": sessions })
         };
-        let running = until(|| async { crate::sessions(&bob.home).await.unwrap() }, |running| *running == listed(true)).await;
+        // Each with when it last ran, which is about now.
+        let sessions = || async {
+            let mut listed = crate::sessions(&bob.home).await.unwrap();
+            for session in listed["sessions"].as_array_mut().unwrap() {
+                let at = session.as_object_mut().unwrap().remove("last_ran").unwrap();
+                assert!(at.as_str().unwrap().starts_with(&crate::short::iso(lmk_proto::clock::now())[..13]), "{at}");
+            }
+            listed
+        };
+        let running = until(sessions, |running| *running == listed(true)).await;
         assert_eq!(running, listed(true));
         desk.stop().await;
-        assert_eq!(crate::sessions(&bob.home).await.unwrap(), listed(false));
+        assert_eq!(sessions().await, listed(false));
         bob.stop().await;
     });
 }
@@ -906,6 +914,28 @@ async fn lookups_during_a_fetch_do_not_start_another() {
         assert!(answer.unwrap_err().to_string().contains("started less than a minute ago"));
     }
     assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
+
+/// As a session starts, the stopped sessions that have not run for 28 days go, whatever their groups, by the last change
+/// of any of their files; and so do those in no group.
+#[tokio::test]
+async fn stopped_sessions_that_have_not_run_for_28_days_are_deleted() {
+    let home = tempfile::tempdir().unwrap();
+    let ago = |days: u64| SystemTime::now() - Duration::from_secs(days * 24 * 3600);
+    for (name, days, log_days, groups) in [("old", 28, 28, r#"["group"]"#), ("recent", 27, 27, r#"["group"]"#), ("logged", 40, 1, r#"["group"]"#), ("running", 29, 29, r#"["group"]"#), ("empty", 0, 0, "[]")] {
+        let dir = session_dir(home.path(), name).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        for (file, days) in [("groups.json", days), ("session.db", days), ("session.lock", days), ("log.jsonl", log_days)] {
+            std::fs::write(dir.join(file), if file == "groups.json" { groups } else { "" }).unwrap();
+            std::fs::File::options().write(true).open(dir.join(file)).unwrap().set_modified(ago(days)).unwrap();
+        }
+    }
+    let held = std::fs::File::options().write(true).open(session_dir(home.path(), "running").unwrap().join("session.lock")).unwrap();
+    held.try_lock().unwrap();
+    assert!(crate::delete_stopped(home.path().to_owned()).await.unwrap().is_empty());
+    for (name, kept) in [("old", false), ("recent", true), ("logged", true), ("running", true), ("empty", false)] {
+        assert_eq!(session_dir(home.path(), name).unwrap().exists(), kept, "{name}");
+    }
 }
 
 /// A stopped session that the group moved past while it was stopped, started again, catches up with the group before it

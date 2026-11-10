@@ -14,7 +14,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -59,8 +59,8 @@ pub struct Session {
     membership: Service,
     /// The invite secrets it is joining by.
     joining: Rc<RefCell<HashSet<Vec<u8>>>>,
-    /// The session's lock, held while this process runs it.
-    _held: std::fs::File,
+    /// The session's lock, held while this process runs it. Its time, moved each hour, tells that the session ran.
+    held: std::fs::File,
     /// When the session next forgets the messages it took in more than H ago.
     forget_at: Instant,
     /// The groups as last written to `groups.json`.
@@ -90,7 +90,7 @@ impl Session {
             node,
             membership,
             joining: Rc::default(),
-            _held: held,
+            held,
             forget_at: Instant::now() + FORGET,
             config,
             out: Vec::new(),
@@ -99,6 +99,7 @@ impl Session {
             running: JoinSet::new(),
         };
         session.forget_old()?;
+        session.held.set_modified(SystemTime::now())?;
         session.write_groups();
         for gid in session.node.groups() {
             // What was delivered after the last message logged, as when the session stopped before logging it.
@@ -146,6 +147,9 @@ impl Session {
 
     pub fn tick(&mut self) {
         self.forget_at = Instant::now() + FORGET;
+        if let Err(error) = self.held.set_modified(SystemTime::now()) {
+            self.warn(format!("marking that this session runs: {error}"));
+        }
         if let Err(error) = self.forget_old() {
             self.warn(format!("forgetting old messages: {error:#}"));
         }

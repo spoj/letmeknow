@@ -15,6 +15,7 @@ use lmk_proto::Bytes;
 use lmk_proto::directory::{Directory, MAX_BYTES, check_domain};
 use lmk_proto::group::Service;
 use lmk_proto::links::{DOMAIN, MEMBERSHIP_KEY};
+use lmk_proto::membership::STALE;
 use n0_future::boxed::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -22,7 +23,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// How long a fetched directory answers without another fetch, and how long a fetch of one may take.
 const FRESH: Duration = Duration::from_secs(10 * 60);
@@ -242,7 +243,7 @@ pub async fn listen(
     let (node, events) = Node::start(provider, node_config).await?;
     let dir = config.dir.clone();
     let mut session = session::Session::open(config, db, node, held, membership).await?;
-    session.start(delete_stopped_in_no_group(home.to_owned()));
+    session.start(delete_stopped(home.to_owned()));
     session::run(session, queue, events, print, shutdown).await?;
     // A session that stops in no group leaves nothing behind.
     if serde_json::from_slice::<Vec<String>>(&std::fs::read(dir.join("groups.json"))?)?.is_empty() {
@@ -308,16 +309,23 @@ pub fn new_session(home: &Path, membership: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// When a session last ran: when the last of its files changed. One that runs moves its lock's time each hour.
+fn last_ran(dir: &Path) -> Option<SystemTime> {
+    std::fs::read_dir(dir).ok()?.flatten().filter_map(|entry| entry.metadata().ok()?.modified().ok()).max()
+}
+
 /// Deletes the home's stopped sessions in no group, as each would have as it stopped: those that found, started again to
-/// invite a new session, that they were removed while stopped. Answers what it warns of: one
-/// not deleted, as when Windows finds a file of it open, is tried again as the next session starts.
-async fn delete_stopped_in_no_group(home: PathBuf) -> Result<Vec<String>> {
+/// invite a new session, that they were removed while stopped. And those that have not run for `STALE`, whatever their
+/// groups: one that started would take its groups' logs as let go, and leave them. Answers what it warns of: one not
+/// deleted, as when Windows finds a file of it open, is tried again as the next session starts.
+async fn delete_stopped(home: PathBuf) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
     for entry in std::fs::read_dir(home.join("sessions"))?.flatten() {
         let dir = entry.path();
         let deleted = || -> Result<()> {
             let Ok(groups) = std::fs::read(dir.join("groups.json")) else { return Ok(()) };
-            if !serde_json::from_slice::<Vec<String>>(&groups)?.is_empty() {
+            let stale = last_ran(&dir).and_then(|at| at.elapsed().ok()).is_some_and(|idle| idle >= Duration::from_millis(STALE));
+            if !stale && !serde_json::from_slice::<Vec<String>>(&groups)?.is_empty() {
                 return Ok(());
             }
             let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("session.lock"))?;
@@ -328,14 +336,14 @@ async fn delete_stopped_in_no_group(home: PathBuf) -> Result<Vec<String>> {
             Ok(())
         };
         if let Err(error) = deleted() {
-            warnings.push(format!("deleting the stopped session {}, in no group: {error:#}", entry.file_name().to_string_lossy()));
+            warnings.push(format!("deleting the stopped session {}: {error:#}", entry.file_name().to_string_lossy()));
         }
     }
     Ok(warnings)
 }
 
-/// This machine's sessions: each one's fingerprint, whether its session lock is held, and its groups as its
-/// `groups.json` says.
+/// This machine's sessions: each one's fingerprint, whether its session lock is held, when it last ran, and its groups
+/// as its `groups.json` says.
 pub async fn sessions(home: &Path) -> Result<Value> {
     let running = cli::running(home).await;
     let mut sessions = Vec::new();
@@ -347,6 +355,9 @@ pub async fn sessions(home: &Path) -> Result<Value> {
         }
         let groups: Vec<String> = std::fs::read(dir.join("groups.json")).ok().and_then(|groups| serde_json::from_slice(&groups).ok()).unwrap_or_default();
         let mut session = json!({ "fp": fp });
+        if let Some(at) = last_ran(&dir) {
+            session["last_ran"] = json!(short::iso(at.duration_since(SystemTime::UNIX_EPOCH)?.as_millis() as u64));
+        }
         if !groups.is_empty() {
             session["groups"] = json!(groups);
         }

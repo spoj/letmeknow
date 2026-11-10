@@ -44,7 +44,7 @@ pub enum Command {
     },
     /// Be the reader of a session that runs detached, one at a time: print its `ready`, what concerned it since its last reader, and what comes
     Attach,
-    /// This machine's sessions: each one's fingerprint, whether it runs, and its groups
+    /// This machine's sessions: each one's fingerprint, whether it runs, when it last ran, and its groups
     Sessions,
     /// This machine's device, which certifies its sessions to their groups' members: its fingerprint and key
     Device,
