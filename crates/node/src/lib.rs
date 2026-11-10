@@ -690,4 +690,32 @@ mod tests {
             node.shutdown().await.unwrap();
         }
     }
+    /// A seq a session knows of that no member holds, as one a dep or a `have` named and its author never sent, is
+    /// waited for with no poll.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_seq_no_member_holds_is_waited_for_with_no_poll() {
+        let relay = lmk_testing::relay().await;
+        let (alice, bob) = (node(&relay, relay.post()).await, node(&relay, relay.post()).await);
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let gid = alice.create(settings).unwrap();
+        bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        {
+            let mut st = bob.inner.lock();
+            let now = st.tick();
+            let g = st.group_mut(&gid.0).unwrap();
+            let known = g.current(&alice.key().0).unwrap().known;
+            g.learn(&alice.key().0, 0, known + 1, now);
+        }
+        let idle = |node: &Node| node.inner.lock().next_poll().is_none_or(|at| at > now() + 60_000);
+        let quiet = async {
+            while !(idle(&alice) && idle(&bob)) {
+                n0_future::time::sleep(Duration::from_millis(500)).await;
+            }
+        };
+        n0_future::time::timeout(Duration::from_secs(60), quiet).await.expect("both go idle");
+        assert!(!bob.inner.lock().group(&gid.0).unwrap().current(&alice.key().0).unwrap().wanted().is_empty(), "Bob still wants it");
+        for node in [alice, bob] {
+            node.shutdown().await.unwrap();
+        }
+    }
 }

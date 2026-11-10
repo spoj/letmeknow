@@ -426,9 +426,17 @@ impl Peers {
         out
     }
 
-    /// When `poll` is next due, if nothing changes before: `BUSY` after `now` while a repair or a wait is on.
+    /// When `poll` is next due, if nothing changes before: `BUSY` after `now` while a request or a wait is on, or a holder
+    /// of what a group wants may be asked, and when the backoff of one that may not ends. What no member holds is waited
+    /// for with no poll: a summary, a connection or an epoch brings it.
     pub fn next(&self, now: u64) -> Option<u64> {
-        let busy = self.groups.values().any(|g| g.request.is_some() || !g.own.wanted.is_empty() || !g.own.stale.is_empty() || !g.waiting.is_empty());
+        let busy = self.groups.values().any(|g| g.request.is_some() || !g.waiting.is_empty());
+        let repair = self.groups.iter().flat_map(|(id, g)| {
+            let (wanted, stale) = (union(to_set(&g.own.wanted), &g.waiting), to_set(&g.own.stale));
+            let offers = move |(k, held, sealed): &(Key, Set, Set)| !offer(&wanted, held, &g.struck, k).is_empty() || !offer(&stale, sealed, &g.struck, k).is_empty();
+            let due = move |(k, _, _): (Key, Set, Set)| if self.untried(id, &k, now) { Some(now + BUSY) } else { self.backoff.get(&k).map(|b| b.until) };
+            self.holds(id).into_iter().filter(offers).filter_map(due)
+        });
         let dial = self.dial.iter().any(|id| self.groups.contains_key(id) && self.flight(id) < DIALS);
         let due = dial || self.conns.values().any(|c| c.hello || !c.opened.is_empty());
         let targeted = self.targeted(now);
@@ -438,7 +446,7 @@ impl Peers {
             _ => None,
         });
         let times = [due.then_some(now), busy.then_some(now + BUSY), self.changed.map(|since| since + DEBOUNCE)];
-        times.into_iter().flatten().chain(closes).min()
+        times.into_iter().flatten().chain(closes).chain(repair).min()
     }
 
     fn backing(&self, peer: &Key, now: u64) -> bool {
