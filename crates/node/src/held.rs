@@ -478,9 +478,6 @@ impl Inner {
             Ok(opened) => opened,
             Err(error) => {
                 tracing::debug!("a held message did not open: {error:#}");
-                if error.is::<core::Unheld>() {
-                    self.unheld(st, gid, &ciphertext)?;
-                }
                 return Ok(None);
             }
         };
@@ -545,25 +542,6 @@ impl Inner {
         st.store(gid, &record)?;
         self.control(st, gid, &record.header)?;
         Ok(Some((ciphertext, record.header.epoch)))
-    }
-
-    /// A ciphertext of a kept seq that is too old to open: no sealing of it can come that opens, so it is lost.
-    fn unheld(&self, st: &mut State, gid: &[u8], ciphertext: &[u8]) -> Result<()> {
-        let (claim, _) = core::claim(ciphertext)?;
-        let g = st.group_mut(gid)?;
-        let Some(author) = g.author_mut(&claim.key.0, claim.joined) else { return Ok(()) };
-        if claim.seq > author.cut || author.held.contains(claim.seq) || author.lost.contains(claim.seq) {
-            return Ok(());
-        }
-        author.lost.insert(claim.seq);
-        g.changed = true;
-        g.rec.lost.push(Seqs { key: claim.key.clone(), joined: claim.joined, seqs: Ranges::range(claim.seq, claim.seq) });
-        self.work.send(Work::Duties(gid.to_vec())).ok();
-        let from = st.member_by_key(gid, &claim.key.0);
-        let messages = vec![LostOf { from, joined: claim.joined, seqs: vec![claim.seq], ids: Vec::new() }];
-        let member = st.member_by_key(gid, st.me());
-        st.events.push(Event::Lost(Lost { group: Bytes(gid.to_vec()), member, messages }));
-        Ok(())
     }
 
     /// Acts on one of the core's payloads as it opens, or as this session sends it.

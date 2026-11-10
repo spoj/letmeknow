@@ -9,7 +9,6 @@ use lmk_proto::clock::{corrected, now};
 use lmk_proto::entry::{Entry, signed, welcome_signed};
 use lmk_proto::group::{Device, LEAF_EXTENSION, LEAVE, Leaf, PROTOCOL, SETTINGS_EXTENSION, Service, Settings};
 use lmk_proto::held::{self, Claim, Header, Ref};
-use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::signatures::Signer;
@@ -204,19 +203,6 @@ struct Aad {
     #[serde(default)]
     time: u64,
 }
-
-/// A message this session holds no key for: sealed in an epoch it never was in or whose keys it deleted, too far behind
-/// the newest of its sender's it opened, or opened before.
-#[derive(Debug)]
-pub struct Unheld;
-
-impl std::fmt::Display for Unheld {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("sealed under an epoch whose keys this session does not hold")
-    }
-}
-
-impl std::error::Error for Unheld {}
 
 /// A commit's sealed wire entry, and for an Add the Welcome that admits its joiner.
 pub struct Commit {
@@ -802,12 +788,7 @@ impl Group {
     pub fn open(&mut self, provider: &SqliteProvider, bytes: &[u8]) -> Result<Opened> {
         let message = parse::<MlsMessageIn>(bytes)?.try_into_protocol_message()?;
         ensure!(message.content_type() == ContentType::Application, "not an application message");
-        let processed = match self.mls.process_message(provider, message) {
-            Err(ProcessMessageError::ValidationError(ValidationError::UnableToDecrypt(MessageDecryptionError::SecretTreeError(
-                SecretTreeError::TooDistantInThePast | SecretTreeError::SecretReuseError,
-            )))) => return Err(Unheld.into()),
-            processed => processed?,
-        };
+        let processed = self.mls.process_message(provider, message)?;
         let epoch = processed.epoch().as_u64();
         let claim: Claim = serde_json::from_slice(processed.aad()).context("a held message's claim")?;
         let sender = processed.credential().serialized_content().to_vec();

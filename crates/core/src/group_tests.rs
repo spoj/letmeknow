@@ -467,8 +467,8 @@ fn two_epochs_of_keys() {
     let commit = w.m[1].commit(Change { cut, ..Change::default() });
     w.post(commit.entry);
     w.read(&[0, 1, 2]);
-    assert!(w.m[1].open(&m2).unwrap_err().is::<Unheld>(), "two commits on, the epoch's keys are gone");
-    assert!(w.m[2].open(&m1).unwrap_err().is::<Unheld>());
+    assert!(w.m[1].open(&m2).is_err(), "two commits on, the epoch's keys are gone");
+    assert!(w.m[2].open(&m1).is_err());
 
     let batch: Vec<_> = (1..=1_100).map(|i| w.m[0].send(&format!("n{i}"))).collect();
     let mut late = w.m[1].copy();
@@ -869,8 +869,7 @@ fn held_headers_are_checked() {
     let hi = w.m[0].send("hi");
     assert_eq!(text(&w.m[1].open(&hi).unwrap()), "hi");
     let b = &mut w.m[1];
-    let again = b.group.as_mut().unwrap().open(&b.provider, &hi).unwrap_err();
-    assert!(again.is::<Unheld>(), "opened before: {again}");
+    assert!(b.group.as_mut().unwrap().open(&b.provider, &hi).is_err(), "opened before");
 }
 
 /// Cuts advance, a removed member leaves them, an added one starts at seq 0 of the new epoch, and every cut `rules`
