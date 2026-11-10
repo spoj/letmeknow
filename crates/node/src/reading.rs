@@ -23,6 +23,10 @@ pub(crate) fn commit_key(gid: &[u8], epoch: u64) -> Vec<u8> {
     [b"node/commit/".as_slice(), gid, b"/", &epoch.to_be_bytes()].concat()
 }
 
+#[cfg(test)]
+#[path = "reading_tests.rs"]
+mod tests;
+
 impl Inner {
     /// Reads the stored entries of a group's log this session has not judged yet, in order.
     pub(crate) fn advance(&self, st: &mut State, gid: &[u8]) -> Result<()> {

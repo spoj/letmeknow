@@ -359,6 +359,10 @@ impl State {
     }
 }
 
+#[cfg(test)]
+#[path = "held_tests.rs"]
+mod tests;
+
 impl Inner {
     /// Takes held ciphertexts a peer sent, or that came early: opens what is in order, keeps a while what is not, passes
     /// on what it opened beyond a full mesh, to members that joined before it was sent: announces those over `PUSH`, and
