@@ -335,6 +335,35 @@ async fn any_member_admits_an_invite_once() {
     bob.until(|e| matches!(e, Event::Joined { member, .. } if member.key == erin_key).then_some(())).await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_join_leaves_no_key_package() {
+    use lmk_proto::links::Invite;
+    let relay = relay().await;
+    let dir = folder("refused-join");
+    let db = dir.join("bob.db");
+    let alice = session(&relay).await;
+    let bob = stored(&relay, &db).await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    let own = bob.node.create(settings(&relay)).unwrap();
+    let link = alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
+    let unknown = Invite { secret: [7; 16], ..link };
+    let joining = [b"node/joining/".as_slice(), &Sha256::digest(unknown.secret)].concat();
+    for _ in 0..3 {
+        let refused = bob.node.join(&unknown).await.unwrap_err();
+        assert!(format!("{refused:#}").contains("unknown, used or expired"));
+        let rows = dump(&db);
+        assert!(!rows.iter().any(|row| row.starts_with("lmk ") && row.contains(&format!("Blob({joining:?})"))), "no joining record remains");
+        assert!(!rows.iter().any(|row| row.starts_with("openmls_key_packages ")), "no KeyPackage's private keys remain");
+        assert_eq!(std::fs::metadata(db.with_extension("db-wal")).unwrap().len(), 0, "deleted keys leave no copy in the WAL");
+    }
+    bob.node.shutdown().await.unwrap();
+    let bob = stored(&relay, &db).await;
+    assert_eq!(bob.node.groups(), vec![own]);
+    assert!(!dump(&db).iter().any(|row| row.starts_with("openmls_key_packages ")));
+    bob.node.shutdown().await.unwrap();
+    alice.node.shutdown().await.unwrap();
+}
+
 /// A member reached first that never answers keeps the joiner from no other member it dials meanwhile.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_silent_member_reached_first_holds_up_no_other() {

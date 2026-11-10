@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{EndpointId, RelayUrl};
-use lmk_core::group::{Change, Group, key_package_leaf, key_package_reference};
+use lmk_core::group::{Change, Group, delete_key_package, key_package_leaf, key_package_reference};
 use lmk_net::Admit;
 use lmk_proto::directory::relay_url;
 use lmk_proto::group::{Control, Leaf, Service};
@@ -182,7 +182,10 @@ impl Node {
             }
         }
         if refused_by_all {
-            self.inner.lock().provider.delete(&joining)?;
+            let mut st = self.inner.lock();
+            delete_key_package(&st.provider, &join.key_package.0)?;
+            st.provider.delete(&joining)?;
+            st.scrub = true;
         }
         Err(refusal)
     }

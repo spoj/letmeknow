@@ -640,6 +640,18 @@ fn key_packages_never_expire() {
     assert_eq!((lifetime.not_before(), lifetime.not_after()), (0, u64::MAX));
 }
 
+#[test]
+fn deleting_a_key_package_leaves_only_what_was_there_before_it() {
+    let w = World::new(&["A"]);
+    w.key_package(0);
+    let provider = &w.m[0].provider;
+    let before = provider.rows();
+    let package = w.key_package(0);
+    assert_ne!(provider.rows(), before);
+    delete_key_package(provider, &package).unwrap();
+    assert_eq!(provider.rows(), before);
+}
+
 /// Commits that break the app's rules are skipped by every member, the committer too.
 #[test]
 fn rules_bind_everyone() {

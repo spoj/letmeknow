@@ -163,6 +163,11 @@ pub fn key_package_reference(provider: &SqliteProvider, key_package: &[u8]) -> R
     Ok(key_package_in(provider, key_package)?.hash_ref(provider.crypto())?.as_slice().try_into()?)
 }
 
+pub fn delete_key_package(provider: &SqliteProvider, key_package: &[u8]) -> Result<()> {
+    let key_package = key_package_in(provider, key_package)?;
+    Ok(provider.storage().delete_key_package(&key_package.hash_ref(provider.crypto())?)?)
+}
+
 fn key_package_in(provider: &SqliteProvider, bytes: &[u8]) -> Result<KeyPackage> {
     let MlsMessageBodyIn::KeyPackage(key_package) = parse::<MlsMessageIn>(bytes)?.extract() else {
         bail!("not a KeyPackage")
