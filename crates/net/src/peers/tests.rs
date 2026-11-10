@@ -437,6 +437,39 @@ fn hello_on_connect_carries_the_served_groups_positions() {
     assert!(p.poll(0).contains(&Out::Frame(key(1), Frame::Hello { groups })));
 }
 
+/// Of a served group, a connection keeps the peer's positions in the logs this member holds and in the last other log
+/// the peer named, whatever it names; of a group that is not served to the peer, none.
+#[test]
+fn a_hello_leaves_positions_in_held_logs_and_the_last_other_named() {
+    let mut p = peers();
+    let earlier = Head { log_ref: [8; 32], length: 3, hash: [0; 32], time: 0, sig: Bytes::default() };
+    p.group(id(), Own { earlier: vec![earlier], ..own(2, &[1]) }, 0);
+    p.connect(key(1), gs(), false, 0);
+    p.connect(key(2), BTreeSet::new(), false, 0);
+    let at = |n: u8| At { group: id(), log: [n; 32], head: None, seen: BTreeMap::new(), intros: vec![], expired: vec![] };
+    for n in [1, 2] {
+        p.frame(&key(n), &Frame::Hello { groups: (0..64).map(at).collect() }, 0);
+    }
+    assert_eq!(p.conns[&key(1)].theirs, BTreeMap::from([(id(), BTreeMap::from([([7; 32], 0), ([8; 32], 0), ([63; 32], 0)]))]));
+    assert!(p.conns[&key(2)].theirs.is_empty());
+    p.forget(&id());
+    assert!(p.conns[&key(1)].theirs.is_empty());
+}
+
+/// A peer ahead names a log this member does not hold yet: once this member holds it, the entries the peer lacks go to
+/// it, with no other hello.
+#[test]
+fn a_peer_that_was_ahead_is_sent_what_it_lacks_of_its_log() {
+    let mut p = peers();
+    p.group(id(), own(1, &[1]), 0);
+    p.connect(key(1), gs(), false, 0);
+    p.frame(&key(1), &Frame::Hello { groups: vec![At { group: id(), log: [9; 32], head: None, seen: BTreeMap::new(), intros: vec![], expired: vec![] }] }, 0);
+    p.poll(0);
+    let head = Head { log_ref: [9; 32], length: 1, hash: [0; 32], time: 0, sig: Bytes::default() };
+    p.group(id(), Own { log: [9; 32], head: Some(head), ..own(2, &[1]) }, 0);
+    assert!(p.poll(0).contains(&Out::Entries { peer: key(1), log: Bytes(vec![9; 32]), after: 0 }));
+}
+
 /// A neighbour's summary goes no further; this member's own goes to every neighbour, once.
 #[test]
 fn only_the_own_summary_goes_to_the_neighbours_once() {

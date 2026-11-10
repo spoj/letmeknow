@@ -144,8 +144,9 @@ struct Conn {
     opened: BTreeSet<Bytes>,
     /// Per group, the version of the own summary it was sent.
     sent: BTreeMap<Bytes, u64>,
-    /// Per log, the longest the peer showed or was sent.
-    theirs: BTreeMap<[u8; 32], u64>,
+    /// Per group and log, the longest the peer showed or was sent: of the logs this member holds, and of the last other
+    /// one the peer named, which this member may come to hold.
+    theirs: BTreeMap<Bytes, BTreeMap<[u8; 32], u64>>,
     /// Per group, the latest sighting of each member the peer told or was told.
     told: BTreeMap<Bytes, BTreeMap<Key, u64>>,
     /// Per group, the latest version of each membership's intro the peer told or was told.
@@ -219,6 +220,7 @@ impl Peers {
             c.served.remove(id);
             c.opened.remove(id);
             c.sent.remove(id);
+            c.theirs.remove(id);
             c.told.remove(id);
             c.introduced.remove(id);
             c.expired.remove(id);
@@ -325,15 +327,15 @@ impl Peers {
         let Some(c) = self.conns.get_mut(peer) else { return };
         match frame {
             Frame::Hello { groups } => {
-                for (log, length) in groups.iter().map(|at| (at.log, at.head.as_ref().map_or(0, |h| h.length))) {
-                    let theirs = c.theirs.entry(log).or_default();
-                    *theirs = (*theirs).max(length);
-                }
                 let served: Vec<&At> = groups.iter().filter(|at| c.served.contains(&at.group)).collect();
                 for at in served {
                     self.saw(peer, &at.group, &at.seen, now);
                     let Some(g) = self.groups.get(&at.group) else { continue };
                     let c = self.conns.get_mut(peer).expect("a connected peer");
+                    let theirs = c.theirs.entry(at.group.clone()).or_default();
+                    theirs.retain(|log, _| *log == at.log || *log == g.own.log || g.own.earlier.iter().any(|head| head.log_ref == *log));
+                    let length = theirs.entry(at.log).or_default();
+                    *length = (*length).max(at.head.as_ref().map_or(0, |head| head.length));
                     let introduced = c.introduced.entry(at.group.clone()).or_default();
                     for (m, (version, _)) in g.own.intros.iter().filter(|(_, (_, signed))| at.intros.contains(signed)) {
                         introduced.insert(m.clone(), *version);
@@ -586,9 +588,9 @@ impl Peers {
         let mut out = Vec::new();
         for (key, c) in &mut self.conns {
             let served: Vec<(&Bytes, &Group)> = c.served.iter().filter_map(|id| Some((id, self.groups.get(id)?))).collect();
-            for (_, g) in &served {
+            for (id, g) in &served {
                 for head in g.own.head.iter().chain(&g.own.earlier) {
-                    if let Some(theirs) = c.theirs.get_mut(&head.log_ref)
+                    if let Some(theirs) = c.theirs.get_mut(*id).and_then(|logs| logs.get_mut(&head.log_ref))
                         && *theirs < head.length
                     {
                         out.push(Out::Entries { peer: *key, log: Bytes(head.log_ref.to_vec()), after: *theirs });
