@@ -1,10 +1,11 @@
-use std::{net::{Ipv4Addr, Ipv6Addr}, path::Path, sync::Arc, time::Duration};
+use std::{net::Ipv4Addr, path::Path, sync::Arc, time::Duration};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use iroh::tls::CaTlsConfig;
 use lmk_membership::client::ServeClient;
 use lmk_proto::{Bytes, directory::Directory, head, membership::{Answer, Append, Appended, Heads, Known, Moved, Page, Read, Refusal, refusal_message}};
 use lmk_serve::{Certificate, ServeConfig, serve};
+use lmk_testing::free_port;
 use rustls::pki_types::{CertificateDer, ServerName};
 use serde::de::DeserializeOwned;
 use tokio::{
@@ -12,18 +13,6 @@ use tokio::{
     net::TcpStream,
     time::timeout,
 };
-
-/// A port free for TCP and UDP, below the ephemeral range: a port `bind(0)` returned could be taken by another test's relay
-/// or endpoint before the service binds it. It is tried on `[::]`, as the service binds it: on macOS and Windows, 127.0.0.1
-/// binds beside another test process's service there, whose port this one's would then fail to take.
-fn free_port() -> u16 {
-    loop {
-        let port = rand::random_range(1024..32768);
-        if std::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)).is_ok() && std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, port)).is_ok() {
-            return port;
-        }
-    }
-}
 
 async fn tls_connect(host: &str, port: u16, cert: &CertificateDer<'static>) -> tokio_rustls::client::TlsStream<TcpStream> {
     tls_over(TcpStream::connect((host, port)).await.unwrap(), cert).await

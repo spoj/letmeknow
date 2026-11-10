@@ -25,10 +25,10 @@ tokio-stream = "0.1"
 tracing = "0.1"
 
 [dev-dependencies]
+lmk-testing.workspace = true
 ed25519-dalek.workspace = true
 serde.workspace = true
 n0-future = "0.3"
-rand.workspace = true
 rcgen = "0.14"
 tempfile.workspace = true
 base64 = "0.22"

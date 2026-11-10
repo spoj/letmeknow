@@ -5,10 +5,11 @@
 use anyhow::Result;
 use lmk_proto::directory::Directory;
 use lmk_serve::{Certificate, ServeConfig};
+use lmk_testing::free_port;
 use n0_future::boxed::BoxFuture;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -39,20 +40,6 @@ async fn world(test: &str) -> World {
     let ca = iroh::tls::CaTlsConfig::custom_roots([certified.cert.der().clone()]);
     let network = crate::Network::new(root.path(), ca).unwrap();
     World { network, root, domain, key }
-}
-
-/// A port free for TCP and UDP, below the ephemeral range: a port `bind(0)` returned could be taken by another test's relay
-/// or endpoint before the service binds it. No two tests of this process get the same one, though both could find it free.
-/// It is tried on `[::]`, as the service binds it: on macOS and Windows, 127.0.0.1 binds beside another test process's
-/// service there, whose port this one's would then fail to take.
-fn free_port() -> u16 {
-    static TAKEN: std::sync::Mutex<BTreeSet<u16>> = std::sync::Mutex::new(BTreeSet::new());
-    loop {
-        let port = rand::random_range(1024..32768);
-        if TAKEN.lock().unwrap().insert(port) && std::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)).is_ok() && std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, port)).is_ok() {
-            return port;
-        }
-    }
 }
 
 /// A membership service run by `serve` on `runtime`, its state in `root`'s directory `name`, at a localhost domain of its

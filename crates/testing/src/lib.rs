@@ -1,7 +1,7 @@
 //! What `letmeknow serve` runs, in a test's process: membership services with self-signed certificates, each with its relay
 //! beside it, on a local port of its own that is its domain.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -33,6 +33,44 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tokio_rustls::TlsAcceptor;
+
+/// A port free for TCP and UDP on [::], below the ephemeral range, reserved until this process exits.
+/// File locks keep other test processes from choosing it before the service binds it. The files stay: unlinking one
+/// would let another process lock a different file for the same port.
+pub fn free_port() -> u16 {
+    static TAKEN: Mutex<Vec<std::fs::File>> = Mutex::new(Vec::new());
+    loop {
+        let port = rand::random_range(1024..32768);
+        let reservation = std::fs::File::options().read(true).write(true).create(true).truncate(false)
+            .open(std::env::temp_dir().join(format!("lmk-test-port-{port}"))).unwrap();
+        match reservation.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => continue,
+            Err(std::fs::TryLockError::Error(error)) => panic!("{error}"),
+        }
+        if std::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)).is_ok() && std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, port)).is_ok() {
+            TAKEN.lock().unwrap().push(reservation);
+            return port;
+        }
+    }
+}
+
+#[test]
+fn a_chosen_port_is_reserved_in_other_processes() {
+    if let Ok(port) = std::env::var("LMK_TEST_RESERVED_PORT") {
+        let file = std::fs::File::options().read(true).write(true).create(true).truncate(false)
+            .open(std::env::temp_dir().join(format!("lmk-test-port-{port}"))).unwrap();
+        assert!(matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+        assert_ne!(free_port().to_string(), port);
+        return;
+    }
+    let port = free_port();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "a_chosen_port_is_reserved_in_other_processes", "--nocapture"])
+        .env("LMK_TEST_RESERVED_PORT", port.to_string())
+        .output().unwrap();
+    assert!(child.status.success(), "{}{}", String::from_utf8_lossy(&child.stdout), String::from_utf8_lossy(&child.stderr));
+}
 
 /// The certificates of the services made here, each of which `post` trusts.
 static CERTS: Mutex<Vec<CertificateDer<'static>>> = Mutex::new(Vec::new());
