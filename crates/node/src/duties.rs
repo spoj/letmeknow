@@ -118,13 +118,19 @@ impl State {
             self.provider.delete(&commit_key(gid, epoch))?;
         }
         let rec = &self.group(gid)?.rec;
-        let (mut first, last) = (rec.first.max(1), rec.index);
-        while first <= last {
-            if let Some(id) = get::<Bytes>(&self.provider, &delivered_key(gid, first))?
+        let (start, last) = (rec.first.max(1), rec.index);
+        let mut first = last + 1;
+        for index in start..=last {
+            if let Some(id) = get::<Bytes>(&self.provider, &delivered_key(gid, index))?
                 && let Some(record) = self.record(gid, &id.0)?
             {
-                if record.delivered.as_ref().is_some_and(|d| d.at >= before) || record.plaintext.is_some() {
+                if record.delivered.as_ref().is_some_and(|d| d.at >= before) {
+                    first = first.min(index);
                     break;
+                }
+                if record.plaintext.is_some() {
+                    first = first.min(index);
+                    continue;
                 }
                 let h = &record.header;
                 if let Some(author) = self.group_mut(gid)?.author_mut(&h.author.0, h.joined) {
@@ -133,7 +139,6 @@ impl State {
                 self.unstore(gid, &record)?;
                 self.scrub = true;
             }
-            first += 1;
         }
         let rec = &mut self.group_mut(gid)?.rec;
         rec.first = first;
@@ -302,6 +307,72 @@ mod tests {
 
     fn seqs(key: &[u8], joined: u64, seqs: &[u64]) -> Seqs {
         Seqs { key: Bytes(key.to_vec()), joined, seqs: seqs.iter().copied().collect::<Ranges>() }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn expiry_passes_own_unkept_messages_and_starts_at_the_first_still_held() {
+        use crate::{Config, INVITE_VALID, Node};
+        use lmk_core::provider::SqliteProvider;
+        use lmk_proto::group::{PROTOCOL, Settings, UPDATE};
+        use serde_json::json;
+
+        let relay = lmk_testing::relay().await;
+        let mut nodes = Vec::new();
+        for _ in 0..2 {
+            let config = Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[9; 32]) };
+            nodes.push(Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0);
+        }
+        let (alice, bob) = (&nodes[0], &nodes[1]);
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let gid = alice.create(settings).unwrap();
+        bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        let own = alice.send(&gid.0, &json!({ "type": "message", "content": "unkept" }), None).await.unwrap();
+        let old = bob.send(&gid.0, &json!({ "type": "message", "content": "old" }), None).await.unwrap();
+        let recent = bob.send(&gid.0, &json!({ "type": "message", "content": "recent" }), None).await.unwrap();
+        n0_future::time::timeout(Duration::from_secs(60), async {
+            while alice.message(&gid.0, &recent.0).unwrap().is_none() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        {
+            let mut st = alice.inner.lock();
+            let messages = st.messages(&gid.0).unwrap();
+            let mut first = u64::MAX;
+            for message in messages {
+                let mut record = st.record(&gid.0, &message.id.0).unwrap().unwrap();
+                if message.id != recent {
+                    record.delivered.as_mut().unwrap().at = now() - days(8);
+                }
+                if record.plaintext.is_some() {
+                    first = first.min(message.index);
+                }
+                st.store(&gid.0, &record).unwrap();
+            }
+            assert!(st.record(&gid.0, &own.0).unwrap().unwrap().plaintext.is_some());
+            let recent_index = st.message(&gid.0, &recent.0).unwrap().unwrap().index;
+            st.expire(&gid.0).unwrap();
+            assert!(st.record(&gid.0, &old.0).unwrap().is_none(), "an unkept message holds up no later expiry");
+            assert!(st.message(&gid.0, &own.0).unwrap().is_some());
+            assert!(st.message(&gid.0, &recent.0).unwrap().is_some());
+            assert_eq!(st.group(&gid.0).unwrap().rec.first, first);
+            for message in st.messages(&gid.0).unwrap() {
+                let mut record = st.record(&gid.0, &message.id.0).unwrap().unwrap();
+                record.plaintext = None;
+                st.store(&gid.0, &record).unwrap();
+            }
+            st.expire(&gid.0).unwrap();
+            assert_eq!(st.group(&gid.0).unwrap().rec.first, recent_index);
+            assert_eq!(st.messages(&gid.0).unwrap().iter().map(|m| &m.id).collect::<Vec<_>>(), [&recent]);
+            let mut record = st.record(&gid.0, &recent.0).unwrap().unwrap();
+            record.delivered.as_mut().unwrap().at = now() - days(8);
+            st.store(&gid.0, &record).unwrap();
+            st.expire(&gid.0).unwrap();
+            assert_eq!(st.group(&gid.0).unwrap().rec.first, recent_index + 1);
+            assert!(st.messages(&gid.0).unwrap().is_empty());
+        }
+        for node in nodes {
+            node.shutdown().await.unwrap();
+        }
     }
 
     #[test]
