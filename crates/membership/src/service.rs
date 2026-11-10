@@ -300,20 +300,19 @@ impl Service {
         let Append { capability, entries } = decode(body)?;
         let log = self.0.store.log(&capability);
         let bytes: u64 = entries.iter().map(|e| e.0.len() as u64).sum();
-        let may_start = {
+        {
             let mut budgets = self.0.budgets.lock().unwrap();
             ensure!(budgets.appends.take(at, sources, 1) && budgets.append_bytes.take(at, sources, bytes), Refused("rate".into()));
-            budgets.new_logs.fits(at, sources, 1)
-        };
-        let (appended, started) = self.work(move |inner| {
-            let started = !inner.store.records(&log)?;
-            ensure!(may_start || !started, Refused("rate".into()));
-            Ok((inner.store.append(&log, &entries)?, started))
-        }).await?;
-        if started {
-            self.0.budgets.lock().unwrap().new_logs.charge(at, sources, 1);
         }
-        Ok(appended)
+        let sources = sources.to_vec();
+        // A log that starts is charged in the work, which goes on once its request is gone, and before its append, so that
+        // no append holds the budgets.
+        self.work(move |inner| {
+            if !inner.store.records(&log)? {
+                ensure!(inner.budgets.lock().unwrap().new_logs.take(at, &sources, 1), Refused("rate".into()));
+            }
+            inner.store.append(&log, &entries)
+        }).await
     }
 
     async fn read(&self, sources: &[(Source, u64)], at: u64, body: &[u8]) -> Result<Page> {
@@ -448,6 +447,54 @@ mod tests {
         release.send(()).unwrap();
         running.await.unwrap().unwrap();
         drop(service);
+    }
+
+    #[tokio::test]
+    async fn concurrent_appends_share_the_new_log_budget() {
+        let (_dir, service) = service(Policy { new_logs_per_day: 1, db_work: 1, ..Policy::default() });
+        let sources = sources("192.0.2.1".parse().unwrap());
+        let body = |capability| serde_json::to_vec(&Append { capability: [capability; 32], entries: vec![Bytes(vec![1])] }).unwrap();
+        let (one, two) = (body(1), body(2));
+        let held = service.0.work.acquire().await.unwrap();
+        let first = service.append(&sources, 0, &one);
+        let second = service.append(&sources, 0, &two);
+        tokio::pin!(first, second);
+        tokio::select! {
+            biased;
+            _ = &mut first => panic!("work started without a slot"),
+            _ = &mut second => panic!("work started without a slot"),
+            () = std::future::ready(()) => {}
+        }
+        drop(held);
+        let (first, second) = tokio::join!(first, second);
+        first.unwrap();
+        assert_eq!(second.unwrap_err().downcast::<Refused>().unwrap().0, "rate");
+        assert!(!service.0.store.records(&service.0.store.log(&[2; 32])).unwrap());
+    }
+
+    #[test]
+    fn cancelled_appends_charge_the_new_log_budget() {
+        tokio::runtime::Builder::new_current_thread().enable_all().max_blocking_threads(1).build().unwrap().block_on(async {
+            let (_dir, service) = service(Policy { new_logs_per_day: 1, db_work: 1, ..Policy::default() });
+            let sources = sources("192.0.2.1".parse().unwrap());
+            let body = |capability| serde_json::to_vec(&Append { capability: [capability; 32], entries: vec![Bytes(vec![1])] }).unwrap();
+            let (entered, inside) = tokio::sync::oneshot::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || { entered.send(()).unwrap(); wait.recv().unwrap(); });
+            inside.await.unwrap();
+            let one = body(1);
+            tokio::select! {
+                biased;
+                _ = service.append(&sources, 0, &one) => panic!("the blocking thread is occupied"),
+                () = std::future::ready(()) => {}
+            }
+            assert_eq!(service.0.work.available_permits(), 0);
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            drop(service.0.work.acquire().await.unwrap());
+            assert!(service.0.store.records(&service.0.store.log(&[1; 32])).unwrap());
+            assert_eq!(service.append(&sources, 0, &body(2)).await.unwrap_err().downcast::<Refused>().unwrap().0, "rate");
+        });
     }
 
     #[tokio::test]
