@@ -36,6 +36,20 @@ pub fn compact(value: &mut Value) {
     }
 }
 
+/// How many bytes of a message's content print.
+pub const CONTENT: usize = 8 << 10;
+
+/// Cuts a message's content, as it prints, at `CONTENT` bytes, and marks it `truncated`: printing wakes the agent, which
+/// pays for every character, and the log has it whole.
+pub fn cut(item: &mut Value) {
+    if let Some(Value::String(content)) = item.get_mut("content")
+        && content.len() > CONTENT
+    {
+        content.truncate(content.floor_char_boundary(CONTENT));
+        item["truncated"] = Value::Bool(true);
+    }
+}
+
 /// A time in milliseconds since the Unix epoch as UTC to the second, as "2026-10-21T08:39:12Z".
 pub fn iso(ms: u64) -> String {
     let (days, secs) = ((ms / 1000 / 86_400) as i64, ms / 1000 % 86_400);

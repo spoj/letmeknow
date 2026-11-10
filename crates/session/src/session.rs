@@ -156,8 +156,8 @@ impl Session {
         Ok(json!({ "type": "ready", "fp": fp(&self.node.key().0), "bin": bin, "membership": self.config.membership, "log": self.log_path() }))
     }
 
-    /// Logs what is waiting, made short and stamped with when, and prints what wakes the agent: detached, to its reader, or
-    /// held for the next one. A message is delivered, and marked shown, once its line is synced to the log, whether or not
+    /// Logs what is waiting, made short and stamped with when, and prints what wakes the agent, a message's content cut
+    /// (`short::cut`): detached, to its reader, or held for the next one. A message is delivered, and marked shown, once its line is synced to the log, whether or not
     /// it prints. Answers false once a line cannot be printed.
     pub fn emit(&mut self, print: &mut impl FnMut(String) -> std::io::Result<()>) -> Result<bool> {
         let out = std::mem::take(&mut self.out);
@@ -165,16 +165,16 @@ impl Session {
             return Ok(true);
         }
         let at = short::iso(lmk_proto::clock::now());
-        let lines: Vec<String> = out
+        let items: Vec<Value> = out
             .iter()
             .map(|(item, _)| {
                 let mut item = item.clone();
                 item["at"] = json!(at);
                 short::compact(&mut item);
-                short::line(&item)
+                item
             })
             .collect();
-        append(&self.log_path(), lines.iter().map(|line| format!("{line}\n")).collect::<String>().as_bytes()).context("writing the log")?;
+        append(&self.log_path(), items.iter().map(|item| format!("{}\n", short::line(item))).collect::<String>().as_bytes()).context("writing the log")?;
         for (item, _) in &out {
             if item["type"] == "message" {
                 let shown = || -> Result<()> {
@@ -186,10 +186,12 @@ impl Session {
                 }
             }
         }
-        for ((_, wake), line) in out.iter().zip(lines) {
+        for ((_, wake), mut item) in out.iter().zip(items) {
             if !*wake {
                 continue;
             }
+            short::cut(&mut item);
+            let line = short::line(&item);
             if self.config.detached {
                 self.hand(line).context("holding a line for a reader")?;
             } else if print(line).is_err() {
@@ -639,7 +641,7 @@ impl Session {
         }
         let to: Vec<Bytes> = payload.get("to").and_then(|to| serde_json::from_value(to.clone()).ok()).unwrap_or_default();
         let to: Vec<String> = to.iter().map(|fp| hex::encode(&fp.0)).collect();
-        item["content"] = payload.get("content").cloned().unwrap_or(Value::Null);
+        item["content"] = json!(payload["content"].as_str());
         if !to.is_empty() {
             let described: Vec<Value> = members.iter().map(|m| describe(&me, m)).collect();
             item["to"] = to.iter().map(|fp| described.iter().find(|m| m["fp"] == fp.as_str()).cloned().unwrap_or_else(|| json!(fp))).collect();

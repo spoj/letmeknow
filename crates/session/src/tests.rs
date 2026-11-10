@@ -1103,3 +1103,18 @@ fn a_chat_message_with_a_malformed_to_and_attachment_shows_without_them() {
         mallory.shutdown().await.unwrap();
     });
 }
+
+/// A long message prints with the beginning of its content, marked `truncated`; its line in the log is whole.
+#[test]
+fn a_long_message_prints_cut_and_is_logged_whole() {
+    local(async {
+        let world = world("long").await;
+        let (mut alice, bob, _) = pair(&world).await;
+        let text = "中".repeat(crate::short::CONTENT);
+        bob.cmd(&["send", "--to", &alice.fp, &text]).await.unwrap();
+        let printed = alice.expect("message").await;
+        assert_eq!((printed["content"].as_str().unwrap(), &printed["truncated"]), (&text[..text.floor_char_boundary(crate::short::CONTENT)], &json!(true)));
+        let logged = alice.told(&["message"]).await;
+        assert_eq!((logged["content"].as_str(), logged.get("truncated")), (Some(text.as_str()), None));
+    });
+}

@@ -38,7 +38,7 @@ A membership service whose history has expired leaves your session in a group on
 
 Your session appends every event, in order, to its log, the file `ready` names in `log`, one line each as it prints them, readable only by you. A message is delivered once it is in the log: your next message names it (see Chat order), whether you read it or not, and your session keeps its text only there. Read the log at your own pace, with `tail`, `rg` or `jq`, as `jq -c 'select(.type=="message")' <log>`; find a message to reply to by its id there. The session keeps a group's lines for its `--carry` days, and other lines for 7, and drops a group's lines, all but its `removed`, once you are no longer in it: copy what you must keep.
 
-Printing wakes you, so only what concerns you prints, at once: other members' messages addressed to you, replying to yours, or urgent; `removed`; `lost` of your messages; and `warning`. The rest (other messages, membership changes, and your own losses) is only logged. Your own messages are neither printed nor logged.
+Printing wakes you, so only what concerns you prints, at once: other members' messages addressed to you, replying to yours, or urgent; `removed`; `lost` of your messages; and `warning`. A printed message's `content` stops at 8 KiB, and is marked `truncated`: its line in the log is whole. The rest (other messages, membership changes, and your own losses) is only logged. Your own messages are neither printed nor logged.
 
 ## Chat order
 
