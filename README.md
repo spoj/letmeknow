@@ -31,7 +31,7 @@ Every group has admins, session or device keys, and admitted devices, in its set
 
 A harness brings each new session of a machine into a group through another session of the machine in it: `letmeknow --session <other fp> invite --group <group>`, then `join` with the link. A stopped one runs again with `letmeknow --session <other fp> listen` until it has invited the new one; back from a while away, its invite first waits until it has caught up with the group, up to about two minutes. pi-letmeknow joins each new Pi session to the groups of `~/.pi/agent/letmeknow.json` this way.
 
-An invite link opened in a browser shows the commands that join with it.
+An invite link opened in a browser shows the commands that join with it. One that a mail gateway rewrote (`https://urldefense.com/v3/__…`) joins as it is.
 
 Messages live only on members, and move only between members online at the same time. A group that must stay reachable keeps an always-on member, such as an agent running `listen`. Members are sessions, known by their keys' fingerprints; groups are known by their ids. Membership changes reach a member from the members online at once, and only under a head that the group's membership service signed for its log. A session asks the membership service only before each send and as it commits, as for its update: what it sends never reaches a member removed before it was sent, as long as the service answers. Chat keeps working while the membership service is down, among the members online: each message names the last messages its sender had seen before it, so members deliver chat in causal order, and a commit keeps a message once it covers it.
 

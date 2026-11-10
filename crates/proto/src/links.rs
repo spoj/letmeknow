@@ -5,6 +5,9 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
 use crate::directory;
 
+/// The digits of a run's length in a link that URL Defense v3 rewrote.
+const RUNS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
 pub const INVITE_PREFIX: &str = "https://letmeknow.dev/i#";
 /// letmeknow.dev's domain: where its service publishes its directory, and runs its relay.
 pub const DOMAIN: &str = "relay.letmeknow.dev";
@@ -34,6 +37,28 @@ impl Invite {
     }
 
     pub fn parse(link: &str) -> Result<Self> {
+        // A mail gateway's URL Defense v3 wraps a link as `.../v3/__<link>__;<replaced>!...`: each `*` of the link stands
+        // for the next of the characters `replaced` lists, in base64url, and `**` with a base64url digit for a run of them,
+        // two at `A`.
+        let mut unwrapped = String::new();
+        let link = match link.split_once("/v3/__").and_then(|(_, wrapped)| wrapped.split_once("__;")) {
+            Some((wrapped, rest)) => {
+                let replaced = String::from_utf8(URL_SAFE_NO_PAD.decode(rest.split('!').next().unwrap())?)?;
+                let (mut replaced, mut chars) = (replaced.chars(), wrapped.chars().peekable());
+                while let Some(c) = chars.next() {
+                    if c != '*' {
+                        unwrapped.push(c);
+                    } else if chars.next_if_eq(&'*').is_some() {
+                        let run = chars.next().and_then(|digit| RUNS.find(digit)).context("a rewritten invite link names its runs' lengths")?;
+                        unwrapped.extend(replaced.by_ref().take(run + 2));
+                    } else {
+                        unwrapped.extend(replaced.next());
+                    }
+                }
+                unwrapped.as_str()
+            }
+            None => link,
+        };
         let fragment = link.split_once('#').context("an invite link has a part after #")?.1;
         let mut fields = fragment.split('.');
         ensure!(fields.next() == Some("14"), "this invite link is from another version of letmeknow");
@@ -79,6 +104,20 @@ mod tests {
         let link = Invite { secret: [2; 16], domain: "relay.example".into(), members }.link();
         assert!(Invite::parse(&link.replacen("#14.", "#13.", 1)).unwrap_err().to_string().contains("another version"));
         assert!(Invite::parse(&link.replacen("#14.", "#15.", 1)).unwrap_err().to_string().contains("another version"));
+    }
+
+    /// A link that a mail gateway's URL Defense v3 rewrote parses as the invite it wraps.
+    #[test]
+    fn invite_unwraps_url_defense_v3() {
+        let invite = Invite { secret: [2; 16], domain: "relay.example".into(), members: vec![([1; 32], "relay.example".into())] };
+        let link = invite.link();
+        for (rewritten, replaced) in [(link.replace('#', "*"), "#"), (link.replace("#14", "**B"), "#14"), (link.replace("i#", "**A"), "i#")] {
+            let wrapped = format!("https://urldefense.com/v3/__{rewritten}__;{}!!recipient!signature$", URL_SAFE_NO_PAD.encode(replaced));
+            assert_eq!(Invite::parse(&wrapped).unwrap(), invite, "{wrapped}");
+        }
+        // A published sample: https://github.com/cardi/proofpoint-url-decoder/issues/4
+        let sample = "https://urldefense.com/v3/__https://contact.framasoft.org/*newsletter__;Iw!!LIr3w8kk_Xxm!6BNqFLJ13q7N5_lf3XQFlmTtgY5CkKjhfcIn4ybAhA1_gx_y07jmQ4uvR2QZ$";
+        assert!(Invite::parse(sample).unwrap_err().to_string().contains("another version"), "its * stands for #");
     }
 
     #[test]
