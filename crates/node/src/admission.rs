@@ -51,7 +51,9 @@ impl Node {
         {
             let mut st = self.inner.lock();
             let by = Bytes(st.me().to_vec());
-            st.group_mut(gid)?.rec.invites.push(Rule { hash: hash.clone(), expires, by, to: to.clone() });
+            let g = st.group_mut(gid)?;
+            let joined = g.mls.joined(&by.0);
+            g.rec.invites.push(Rule { hash: hash.clone(), expires, by, joined, to: to.clone() });
             st.save(gid)?;
         }
         let holders = match to {
@@ -227,7 +229,8 @@ const NOT_ADMITTED: &str = "the joining session's device is neither admitted nor
 fn admits(g: &G, me: &[u8], (joiner, leaf): &(Vec<u8>, Option<Leaf>), rule: &Rule) -> Result<()> {
     let members = g.mls.members();
     ensure!(corrected() < rule.expires && !g.mls.used(&rule.hash.0), UNKNOWN);
-    ensure!(members.iter().any(|m| m.key == rule.by.0) && g.left(&rule.by.0).is_none(), INVITER_LEFT);
+    let since = g.mls.joined(&rule.by.0);
+    ensure!(members.iter().any(|m| m.key == rule.by.0) && rule.joined.is_none_or(|joined| since == Some(joined)) && g.left(&rule.by.0).is_none(), INVITER_LEFT);
     ensure!(rule.to.as_ref().is_none_or(|to| to.0 == *joiner), FOR_ANOTHER);
     ensure!(members.iter().all(|member| member.key != *joiner), MEMBER_ALREADY);
     ensure!(g.mls.admits(joiner, leaf.as_ref()) || (g.mls.admin(me) && g.mls.admin(&rule.by.0)), NOT_ADMITTED);

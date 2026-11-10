@@ -382,7 +382,7 @@ async fn a_silent_member_reached_first_holds_up_no_other() {
     alice.node.shutdown().await.unwrap();
 }
 
-/// An invite dies when its inviter leaves the group, removed or by `leave`.
+/// An invite dies when its inviter leaves the group, removed or by `leave`, even if it returns with the same key.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_invite_dies_when_its_inviter_leaves() {
     use lmk_proto::links::Invite;
@@ -411,7 +411,42 @@ async fn an_invite_dies_when_its_inviter_leaves() {
     while let Ok(event) = alice.events.try_recv() {
         assert!(!matches!(&event, Event::Warning { text, .. } if text.contains("refused a join")), "a routine refusal is no warning: {event:?}");
     }
+    for joiner in [&bob, &carol] {
+        eventually("the inviter forgot the group", || joiner.node.groups().is_empty()).await;
+        joiner.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    }
+    for link in [&by_bob, &by_carol] {
+        let refused = dave.node.join(&ask_alice(link)).await.unwrap_err();
+        assert!(format!("{refused:#}").contains("its inviter left the group"), "{refused:#}");
+    }
     alice.node.shutdown().await.unwrap();
+}
+
+/// An invite kept since 0.25.2 or earlier, which names no epoch of its inviter's membership, still admits.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invite_kept_without_its_inviters_epoch_admits() {
+    let relay = relay().await;
+    let dir = folder("kept-invites");
+    let db = dir.join("alice.db");
+    let alice = stored(&relay, &db).await;
+    let bob = session(&relay).await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    let link = alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
+    alice.node.shutdown().await.unwrap();
+    drop(alice);
+
+    let mut provider = SqliteProvider::open(&db).unwrap();
+    let key = [b"node/group/".as_slice(), &gid.0].concat();
+    let mut rec: Value = serde_json::from_slice(&provider.get(&key).unwrap().unwrap()).unwrap();
+    assert!(rec["invites"][0].as_object_mut().unwrap().remove("joined").is_some());
+    provider.put(&key, &serde_json::to_vec(&rec).unwrap()).unwrap();
+    provider.close().unwrap();
+
+    let alice = stored(&relay, &db).await;
+    assert_eq!(bob.node.join(&link).await.unwrap().0, gid);
+    for session in [alice, bob] {
+        session.node.shutdown().await.unwrap();
+    }
 }
 
 /// A membership service like `letmeknow serve`'s, which signs its heads.

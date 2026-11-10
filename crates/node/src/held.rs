@@ -559,7 +559,7 @@ impl Inner {
             }
             Control::Invite { hash, expires } => {
                 if !rec.invites.iter().any(|rule| rule.hash == hash) {
-                    rec.invites.push(Rule { hash, expires, by: h.author.clone(), to: None });
+                    rec.invites.push(Rule { hash, expires, by: h.author.clone(), joined: Some(h.joined), to: None });
                 }
             }
             // Each author is told of its own seqs lost, of those it knows it sent, with the ids of the chat messages among

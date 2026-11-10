@@ -273,6 +273,10 @@ struct Rule {
     expires: u64,
     /// The inviter's session key.
     by: Bytes,
+    /// The epoch the inviter's membership began in, which the invite dies with. A rule kept since 0.25.2 or earlier has
+    /// none, and admits while its inviter's key is a member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    joined: Option<u64>,
     /// The only session key it admits, when made for one member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     to: Option<Bytes>,
