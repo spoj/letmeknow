@@ -1057,9 +1057,9 @@ fn expired_epochs(db: &Path, gid: &Bytes) -> Vec<u64> {
     rec["epochs"].as_array().unwrap().iter().filter(|epoch| epoch.get("expired").is_some()).map(|epoch| epoch["epoch"].as_u64().unwrap()).collect()
 }
 
-/// A joiner takes from its admitter the expiries it holds. Alice, which asked the service, asks it no more of that log,
-/// and can append nothing past Carol's Add; Carol, which can ask it nothing, keeps the expiry, and started again removes
-/// Bob, whose epoch's log was let go.
+/// A joiner takes from its admitter the expiries it holds. Alice, no longer an admin, passes on Bob's expiry without her
+/// duties removing him before Carol's Add, and can append nothing past it. Carol, the admin, can ask the service nothing,
+/// keeps the expiry, and started again removes Bob, whose epoch's log was let go.
 #[test]
 fn a_joiner_takes_the_expiries_its_admitter_holds() {
     static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1092,8 +1092,14 @@ fn a_joiner_takes_the_expiries_its_admitter_holds() {
         SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         while relay.membership.expire().await {}
         let alice = stored_with(&relay, &alice_db, alice_post).await;
-        // Alice's commit updates her leaf, so that the invite's message stirs no update; she knows of no log let go yet.
         alice.node.remove(&gid.0, &spares[1..]).await.unwrap();
+        let carol = stored_with(&relay, &carol_db, failing(relay.post(), |route| !route.ends_with("/read"))).await;
+        let device = Bytes(SigningKey::from_bytes(&[9; 32]).verifying_key().to_bytes().to_vec());
+        alice.node.change_settings(&gid.0, |settings| {
+            settings.admins = vec![carol.node.key()];
+            settings.admitted = vec![device.clone()];
+        }).await.unwrap();
+        // Alice's commit updates her leaf, so that the invite's message stirs no update; she knows of no log let go yet.
         let link = alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
         alice.node.ask_behind(&gid.0).await.unwrap();
         assert_eq!(expired_epochs(&alice_db, &gid), [behind]);
@@ -1103,10 +1109,9 @@ fn a_joiner_takes_the_expiries_its_admitter_holds() {
         assert_eq!(requests.lock().unwrap().len(), asked, "a log known to be let go is not asked of again");
 
         appends.store(1, SeqCst);
-        let carol = stored_with(&relay, &carol_db, failing(relay.post(), |route| !route.ends_with("/read"))).await;
         carol.node.join(&link).await.unwrap();
+        assert!(carol.node.members(&gid.0).unwrap().iter().any(|m| m.key == bob_key), "Bob stays for Carol to remove");
         eventually("Carol takes the expiry Alice holds", || expired_epochs(&carol_db, &gid) == [behind]).await;
-        assert!(carol.node.members(&gid.0).unwrap().iter().any(|m| m.key == bob_key), "no one could commit since the Add");
         for session in [alice, carol] {
             session.node.shutdown().await.unwrap();
         }
