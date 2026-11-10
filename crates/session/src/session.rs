@@ -42,7 +42,10 @@ pub struct Config {
 /// prints go.
 pub enum Inbound {
     Request(Request, oneshot::Sender<Value>),
-    Attach(mpsc::UnboundedSender<String>),
+    /// A reader's lines go here, each held one with its seq.
+    Attach(mpsc::UnboundedSender<(Option<i64>, String)>),
+    /// The held line of this seq was written to a reader's connection.
+    Written(i64),
 }
 
 /// What work the session loop started gave: a request's answer, and where it goes; or, with no request, warnings to
@@ -66,7 +69,10 @@ pub struct Session {
     /// What waits to be logged, and whether it also prints.
     out: Vec<(Value, bool)>,
     /// The reader attached to this detached session, while one is.
-    reader: Option<mpsc::UnboundedSender<String>>,
+    reader: Option<mpsc::UnboundedSender<(Option<i64>, String)>>,
+    /// The last held line's seq, never one again while this process runs: SQLite gives a deleted last row's again, and a
+    /// reader's word that it was written a line would then let a later one go.
+    held_seq: i64,
     /// Work in flight: the loop takes each as it finishes, and never waits on one.
     running: JoinSet<Answered>,
 }
@@ -77,6 +83,7 @@ fn b64(bytes: &[u8]) -> String {
 
 impl Session {
     pub async fn open(config: Config, db: Connection, node: Node, held: std::fs::File, membership: Service) -> Result<Self> {
+        let held_seq = db.query_row("SELECT coalesce(max(seq), 0) FROM held", [], |row| row.get(0))?;
         let mut session = Self {
             db,
             groups: node.groups(),
@@ -88,6 +95,7 @@ impl Session {
             config,
             out: Vec::new(),
             reader: None,
+            held_seq,
             running: JoinSet::new(),
         };
         session.forget_old()?;
@@ -157,8 +165,8 @@ impl Session {
     }
 
     /// Logs what is waiting, made short and stamped with when, and prints what wakes the agent, a message's content cut
-    /// (`short::cut`): detached, to its reader, or held for the next one. A message is delivered, and marked shown, once its line is synced to the log, whether or not
-    /// it prints. Answers false once a line cannot be printed.
+    /// (`short::cut`): detached, it holds them for its reader. A message is delivered, and marked shown, once its line is
+    /// synced to the log, whether or not it prints. Answers false once a line cannot be printed.
     pub fn emit(&mut self, print: &mut impl FnMut(String) -> std::io::Result<()>) -> Result<bool> {
         let out = std::mem::take(&mut self.out);
         if out.is_empty() {
@@ -175,6 +183,17 @@ impl Session {
             })
             .collect();
         append(&self.log_path(), items.iter().map(|item| format!("{}\n", short::line(item))).collect::<String>().as_bytes()).context("writing the log")?;
+        let mut lines: Vec<String> = out.iter().zip(items).filter(|((_, wake), _)| *wake).map(|(_, mut item)| {
+            short::cut(&mut item);
+            short::line(&item)
+        }).collect();
+        // A line is held before its message is marked shown: a session that stops in between shows the message again as
+        // it starts, where one that marked it first would hold nothing of it for a reader.
+        if self.config.detached {
+            for line in lines.drain(..) {
+                self.hand(line).context("holding a line for a reader")?;
+            }
+        }
         for (item, _) in &out {
             if item["type"] == "message" {
                 let shown = || -> Result<()> {
@@ -186,38 +205,27 @@ impl Session {
                 }
             }
         }
-        for ((_, wake), mut item) in out.iter().zip(items) {
-            if !*wake {
-                continue;
-            }
-            short::cut(&mut item);
-            let line = short::line(&item);
-            if self.config.detached {
-                self.hand(line).context("holding a line for a reader")?;
-            } else if print(line).is_err() {
+        for line in lines {
+            if print(line).is_err() {
                 return Ok(false);
             }
         }
         Ok(true)
     }
 
-    /// Gives a line that wakes the agent to the reader attached, or else holds it for the next one.
+    /// Holds a line that wakes the agent until a reader's connection wrote it, and gives it to the reader attached.
     fn hand(&mut self, line: String) -> Result<()> {
-        let line = match &self.reader {
-            Some(reader) => match reader.send(line) {
-                Ok(()) => return Ok(()),
-                Err(mpsc::error::SendError(line)) => line,
-            },
-            None => line,
-        };
-        self.reader = None;
-        self.db.execute("INSERT INTO held (line) VALUES (?)", [line])?;
+        self.held_seq += 1;
+        self.db.execute("INSERT INTO held (seq, line) VALUES (?, ?)", params![self.held_seq, line])?;
+        if let Some(reader) = &self.reader && reader.send((Some(self.held_seq), line)).is_err() {
+            self.reader = None;
+        }
         Ok(())
     }
 
     /// Makes `reader` the reader of this detached session, unless it has one: it gets `ready`, then the lines held for it,
     /// then those that come.
-    fn attach(&mut self, reader: mpsc::UnboundedSender<String>) -> Result<()> {
+    fn attach(&mut self, reader: mpsc::UnboundedSender<(Option<i64>, String)>) -> Result<()> {
         let fp = fp(&self.node.key().0);
         let refused = if !self.config.detached {
             Some(format!("session {fp} prints to the program that started it; one started with `listen --detached` takes a reader"))
@@ -227,15 +235,15 @@ impl Session {
             None
         };
         if let Some(error) = refused {
-            _ = reader.send(json!({ "error": error }).to_string());
+            _ = reader.send((None, json!({ "error": error }).to_string()));
             return Ok(());
         }
-        _ = reader.send(short::line(&self.ready()?));
-        let held: Vec<String> = self.db.prepare("SELECT line FROM held ORDER BY seq")?.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
-        for line in held {
-            _ = reader.send(line);
+        _ = reader.send((None, short::line(&self.ready()?)));
+        let held: Vec<(i64, String)> =
+            self.db.prepare("SELECT seq, line FROM held ORDER BY seq")?.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        for (seq, line) in held {
+            _ = reader.send((Some(seq), line));
         }
-        self.db.execute("DELETE FROM held", [])?;
         self.reader = Some(reader);
         Ok(())
     }
@@ -293,6 +301,12 @@ impl Session {
             Inbound::Attach(reader) => {
                 if let Err(error) = self.attach(reader) {
                     self.warn(format!("attaching a reader: {error:#}"));
+                }
+                return;
+            }
+            Inbound::Written(seq) => {
+                if let Err(error) = self.db.execute("DELETE FROM held WHERE seq = ?", [seq]) {
+                    self.warn(format!("letting go a line its reader was written: {error:#}"));
                 }
                 return;
             }

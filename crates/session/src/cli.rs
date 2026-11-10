@@ -432,8 +432,15 @@ async fn answer(stream: TcpStream, token: String, inbound: mpsc::UnboundedSender
             loop {
                 tokio::select! {
                     line = lines.recv() => match line {
-                        Some(line) if write.write_all(format!("{line}\n").as_bytes()).await.is_ok() => {}
-                        _ => return,
+                        Some((seq, line)) => {
+                            if write.write_all(format!("{line}\n").as_bytes()).await.is_err() {
+                                return;
+                            }
+                            if let Some(seq) = seq {
+                                let _ = inbound.send(Inbound::Written(seq));
+                            }
+                        }
+                        None => return,
                     },
                     _ = read.read(&mut gone) => return,
                 }

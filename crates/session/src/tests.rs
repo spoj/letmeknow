@@ -124,6 +124,21 @@ impl World {
         }
     }
 
+    async fn open_session(&self, config: Config) -> (crate::session::Session, mpsc::UnboundedReceiver<lmk_node::Event>) {
+        let db = crate::store::open(&config.dir.join("session.db")).unwrap();
+        let provider = lmk_core::provider::SqliteProvider::open(&config.dir.join("session.db")).unwrap();
+        let node_config = lmk_node::Config {
+            home: config.membership.clone(),
+            post: self.network.post.clone(),
+            ca: self.network.ca.clone(),
+            device: crate::device(&config.device).unwrap(),
+        };
+        let (node, events) = lmk_node::Node::start(provider, node_config).await.unwrap();
+        let held = std::fs::OpenOptions::new().write(true).open(config.dir.join("session.lock")).unwrap();
+        let membership = lmk_proto::group::Service::Serve { key: lmk_proto::Bytes(hex::decode(&self.key).unwrap()), domain: self.domain.clone(), rest: Default::default() };
+        (crate::session::Session::open(config, db, node, held, membership).await.unwrap(), events)
+    }
+
     /// A session process; writing the message after its first `messages` fails, as when its reader is gone.
     async fn launch(&self, config: Config, messages: usize) -> Agent {
         let home = config.dir.parent().unwrap().parent().unwrap().to_path_buf();
@@ -1126,6 +1141,106 @@ fn a_detached_session_holds_what_concerns_it_for_one_reader_at_a_time() {
         let (mut printed, _reading) = attached(&alice);
         assert_eq!(read(&mut printed).await["type"], "ready");
         assert_eq!(read(&mut printed).await["type"], "removed");
+    });
+}
+
+#[test]
+fn a_detached_message_is_not_shown_before_its_wakeup_is_held() {
+    local(async {
+        let world = world("hold-before-shown").await;
+        let (mut alice, bob, _) = pair(&world).await;
+        alice.stop().await;
+        let detached = || Config { detached: true, ..world.config("alice", "alice") };
+        let db = crate::store::open(&detached().dir.join("session.db")).unwrap();
+        let (mut session, mut events) = world.open_session(detached()).await;
+        db.execute_batch("CREATE TRIGGER no_hold BEFORE INSERT ON held BEGIN SELECT RAISE(FAIL, 'holding failed'); END").unwrap();
+        bob.cmd(&["send", "--to", &alice.fp, "wake me"]).await.unwrap();
+        loop {
+            let event = tokio::time::timeout(WAIT, events.recv()).await.unwrap().unwrap();
+            let message = matches!(&event, lmk_node::Event::Message(_));
+            session.event(event);
+            if message {
+                break;
+            }
+        }
+        assert!(session.emit(&mut |_| Ok(())).is_err());
+        session.shutdown().await;
+        drop(session);
+        db.execute_batch("DROP TRIGGER no_hold").unwrap();
+
+        let (mut session, _events) = world.open_session(detached()).await;
+        session.emit(&mut |_| Ok(())).unwrap();
+        let held: Vec<String> = db.prepare("SELECT line FROM held").unwrap().query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert!(held.iter().any(|line| serde_json::from_str::<Value>(line).unwrap()["content"] == "wake me"), "the unshown message is held after restarting: {held:?}");
+        session.shutdown().await;
+    });
+}
+
+#[test]
+fn a_detached_session_keeps_lines_queued_for_a_reader_that_goes_away() {
+    local(async {
+        let world = world("queued-reader").await;
+        let (mut alice, bob, _) = pair(&world).await;
+        alice.stop().await;
+        let config = Config { detached: true, ..world.config("alice", "alice") };
+        let mut alice = world.launch(config, usize::MAX).await;
+        bob.cmd(&["send", "--to", &alice.fp, "wake me"]).await.unwrap();
+        alice.told(&["message"]).await;
+        alice.stop().await;
+        let (mut session, _events) = world.open_session(Config { detached: true, ..world.config("alice", "alice") }).await;
+        let db = crate::store::open(&world.config("alice", "alice").dir.join("session.db")).unwrap();
+        let (reader, queued) = mpsc::unbounded_channel();
+        session.handle(crate::session::Inbound::Attach(reader));
+        drop(queued);
+        assert_eq!(db.query_row("SELECT count(*) FROM held", [], |row| row.get::<_, i64>(0)).unwrap(), 1, "queuing is not writing");
+        let (reader, mut queued) = mpsc::unbounded_channel();
+        session.handle(crate::session::Inbound::Attach(reader));
+        assert!(queued.try_recv().is_ok(), "ready");
+        let (seq, line) = queued.try_recv().expect("the next reader gets the unwritten line");
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["content"], "wake me");
+        session.handle(crate::session::Inbound::Written(seq.unwrap()));
+        assert_eq!(db.query_row("SELECT count(*) FROM held", [], |row| row.get::<_, i64>(0)).unwrap(), 0, "writing releases the line");
+        session.shutdown().await;
+    });
+}
+
+#[test]
+fn a_detached_readers_late_acknowledgment_does_not_release_a_newer_line() {
+    local(async {
+        let world = world("late-reader-ack").await;
+        let (mut alice, bob, _) = pair(&world).await;
+        alice.stop().await;
+        let config = Config { detached: true, ..world.config("alice", "alice") };
+        let (mut session, mut events) = world.open_session(config).await;
+        let db = crate::store::open(&world.config("alice", "alice").dir.join("session.db")).unwrap();
+        let (reader, mut queued) = mpsc::unbounded_channel();
+        session.handle(crate::session::Inbound::Attach(reader));
+        assert_eq!(queued.try_recv().unwrap().0, None, "ready has no held line");
+        let mut seqs = Vec::new();
+        for text in ["old", "new"] {
+            bob.cmd(&["send", "--to", &alice.fp, text]).await.unwrap();
+            loop {
+                let event = tokio::time::timeout(WAIT, events.recv()).await.unwrap().unwrap();
+                let message = matches!(&event, lmk_node::Event::Message(_));
+                session.event(event);
+                if message {
+                    break;
+                }
+            }
+            session.emit(&mut |_| Ok(())).unwrap();
+            let (seq, line) = queued.try_recv().unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["content"], text);
+            seqs.push(seq.unwrap());
+            assert_eq!(db.query_row("SELECT count(*) FROM held", [], |row| row.get::<_, i64>(0)).unwrap(), 1, "live lines are held until written too");
+            if text == "old" {
+                db.execute("DELETE FROM held", []).unwrap();
+            }
+        }
+        session.handle(crate::session::Inbound::Written(seqs[0]));
+        assert_eq!(db.query_row("SELECT count(*) FROM held", [], |row| row.get::<_, i64>(0)).unwrap(), 1, "a pruned line's acknowledgment cannot release its successor");
+        session.handle(crate::session::Inbound::Written(seqs[1]));
+        assert_eq!(db.query_row("SELECT count(*) FROM held", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        session.shutdown().await;
     });
 }
 
