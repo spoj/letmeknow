@@ -219,6 +219,22 @@ async fn stalled_handshakes_are_dropped() {
     server.abort();
 }
 
+/// A connection to port 80 that sends no request is dropped, as a stalled handshake is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_connection_to_port_80_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let (config, _) = configure(&state);
+    let (https, http) = (config.https_port, config.http_port.unwrap());
+    let server = tokio::spawn(serve(config));
+    wait_for_https(https).await;
+
+    let mut silent = TcpStream::connect((Ipv4Addr::LOCALHOST, http)).await.unwrap();
+    let mut rest = Vec::new();
+    assert!(timeout(Duration::from_secs(14), silent.read_to_end(&mut rest)).await.is_ok(), "a silent connection was kept open");
+    server.abort();
+}
+
 /// Reads one HTTP response whose body has a `content-length`.
 async fn response(tls: &mut tokio_rustls::client::TlsStream<TcpStream>) -> String {
     let mut bytes = Vec::new();

@@ -38,12 +38,16 @@ use socket2::{Domain, Socket, Type};
 use tokio::{
     net::TcpListener,
     sync::{Notify, watch},
-    time::{Instant, sleep_until, timeout},
+    time::{Instant, sleep, sleep_until, timeout},
 };
 use tokio_rustls_acme::{AcmeConfig, caches::DirCache};
 use tokio_stream::StreamExt;
 
+/// How long a connection has for its TLS handshake, and one to port 80 for its request's headers.
 const HANDSHAKE: Duration = Duration::from_secs(10);
+/// How long accepting waits after it failed, as while the process is out of file descriptors: the connections it has
+/// go on.
+const ACCEPT: Duration = Duration::from_millis(100);
 /// How long a connection waits for a request's headers, idle between requests included: a session's requests minutes
 /// apart keep one connection.
 const HEADERS: Duration = Duration::from_secs(150);
@@ -195,7 +199,10 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
 
     let tls = Arc::new(tls);
     loop {
-        let (tcp, peer) = https.accept().await?;
+        let Ok((tcp, peer)) = https.accept().await else {
+            sleep(ACCEPT).await;
+            continue;
+        };
         let (tls, relay, health, directory, membership) = (tls.clone(), relay.clone(), health.clone(), directory.clone(), membership.clone());
         tokio::spawn(async move {
             let stream = timeout(HANDSHAKE, async move {
@@ -269,10 +276,11 @@ fn json(bytes: impl Into<Bytes>) -> http::Result<Response<BytesBody>> {
         .body(body(bytes))
 }
 
-/// Port 80: the captive-portal check iroh clients make, and redirects to HTTPS.
+/// Port 80: the captive-portal check iroh clients make, and redirects to HTTPS, one request a connection.
 async fn redirect(listener: TcpListener, base: String) {
     loop {
         let Ok((tcp, _)) = listener.accept().await else {
+            sleep(ACCEPT).await;
             continue;
         };
         let base = base.clone();
@@ -291,7 +299,13 @@ async fn redirect(listener: TcpListener, base: String) {
             };
             std::future::ready(res)
         });
-        tokio::spawn(hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(tcp), service));
+        tokio::spawn(
+            hyper::server::conn::http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(HANDSHAKE)
+                .keep_alive(false)
+                .serve_connection(TokioIo::new(tcp), service),
+        );
     }
 }
 
