@@ -56,7 +56,12 @@ pub enum Event {
 /// An endpoint with these relays and no address lookup; relay connections honour the proxy
 /// environment variables.
 pub fn builder(relays: impl IntoIterator<Item = RelayUrl>) -> Builder {
-    Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Custom(relays.into_iter().collect())).proxy_from_env()
+    let builder = Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Custom(relays.into_iter().collect())).proxy_from_env();
+    // iroh's default resolver reads Android's DNS configuration through a JVM, which a Termux process has not: it
+    // panics there, catches that, and goes on with its public nameservers, which this one starts with.
+    #[cfg(target_os = "android")]
+    let builder = builder.dns_resolver(iroh::dns::DnsResolver::builder().build());
+    builder
 }
 
 #[derive(Clone)]
