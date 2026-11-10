@@ -34,15 +34,21 @@ use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tokio_rustls::TlsAcceptor;
 
-/// A port free for TCP and UDP on [::], below the ephemeral range, reserved until this process exits.
-/// File locks keep other test processes from choosing it before the service binds it. The files stay: unlinking one
-/// would let another process lock a different file for the same port.
+/// The file whose lock reserves a port among test processes. The files stay: unlinking one would let another process
+/// lock a different file for the same port.
+fn reservation(port: &str) -> std::fs::File {
+    let dir = std::env::temp_dir().join("lmk-test-ports");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::File::options().read(true).write(true).create(true).truncate(false).open(dir.join(port)).unwrap()
+}
+
+/// A port free for TCP and UDP on [::], below the ephemeral range, reserved until this process exits: its file's lock
+/// keeps other test processes from choosing it before the service binds it.
 pub fn free_port() -> u16 {
     static TAKEN: Mutex<Vec<std::fs::File>> = Mutex::new(Vec::new());
     loop {
         let port = rand::random_range(1024..32768);
-        let reservation = std::fs::File::options().read(true).write(true).create(true).truncate(false)
-            .open(std::env::temp_dir().join(format!("lmk-test-port-{port}"))).unwrap();
+        let reservation = reservation(&port.to_string());
         match reservation.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => continue,
@@ -58,9 +64,7 @@ pub fn free_port() -> u16 {
 #[test]
 fn a_chosen_port_is_reserved_in_other_processes() {
     if let Ok(port) = std::env::var("LMK_TEST_RESERVED_PORT") {
-        let file = std::fs::File::options().read(true).write(true).create(true).truncate(false)
-            .open(std::env::temp_dir().join(format!("lmk-test-port-{port}"))).unwrap();
-        assert!(matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+        assert!(matches!(reservation(&port).try_lock(), Err(std::fs::TryLockError::WouldBlock)));
         assert_ne!(free_port().to_string(), port);
         return;
     }
