@@ -364,19 +364,19 @@ pub fn session_named(home: &Path, name: String) -> Result<String> {
     }
 }
 
-/// How long finding the running session waits for each to answer: on Windows a refused connection takes seconds.
-const PROBE: Duration = Duration::from_millis(200);
-
-/// The directory names of the sessions in `home` whose processes answer, in order.
+/// The directory names of the sessions in `home` that run, in order: those whose session locks are held. A lock is
+/// asked for only where a session left its endpoint, and shared, so that a session that starts finds its lock taken by
+/// one that asks only if it stopped without its shutdown, and those that ask at once find none taken.
 pub async fn running(home: &Path) -> Vec<String> {
-    let mut probes = tokio::task::JoinSet::new();
+    let mut running = Vec::new();
     for entry in std::fs::read_dir(home.join("sessions")).into_iter().flatten().flatten() {
-        probes.spawn(async move {
-            let answered = tokio::time::timeout(PROBE, connect(&entry.path().join("endpoint"))).await;
-            matches!(answered, Ok(Ok(_))).then(|| entry.file_name().to_string_lossy().into_owned())
-        });
+        if entry.path().join("endpoint").exists()
+            && let Ok(held) = std::fs::File::open(entry.path().join("session.lock"))
+            && matches!(held.try_lock_shared(), Err(std::fs::TryLockError::WouldBlock))
+        {
+            running.push(entry.file_name().to_string_lossy().into_owned());
+        }
     }
-    let mut running: Vec<String> = probes.join_all().await.into_iter().flatten().collect();
     running.sort();
     running
 }
@@ -395,11 +395,9 @@ pub async fn connect(endpoint: &Path) -> Result<(TcpStream, String)> {
     Ok((TcpStream::connect(("127.0.0.1", endpoint.port)).await?, endpoint.token))
 }
 
-/// Opens a command channel, written to `endpoint_path`: requests that come with its token go to `inbound`.
+/// Opens a command channel, written to `endpoint_path`: requests that come with its token go to `inbound`. The caller
+/// holds the session lock.
 pub async fn open_channel(endpoint_path: &Path, inbound: mpsc::UnboundedSender<Inbound>) -> Result<()> {
-    if connect(endpoint_path).await.is_ok() {
-        bail!("{} is already answered by a running session", endpoint_path.display());
-    }
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let token = hex::encode(rand::random::<[u8; 32]>());
     let endpoint = Endpoint { port: listener.local_addr()?.port(), token: token.clone() };

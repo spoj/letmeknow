@@ -544,6 +544,25 @@ fn the_command_channel_drops_an_oversized_call_without_a_newline() {
 }
 
 #[test]
+fn a_stale_endpoint_on_a_live_port_does_not_make_a_session_running() {
+    local(async {
+        let world = world("stale-running").await;
+        let alice = world.start("alice").await;
+        let dir = session_dir(&alice.home, "stopped").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(world.config("alice", "alice").dir.join("endpoint"), dir.join("endpoint")).unwrap();
+        let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("session.lock")).unwrap();
+        assert_eq!(crate::cli::running(&alice.home).await, ["alice"]);
+        assert_eq!(crate::cli::running_session(&alice.home).await.unwrap(), "alice");
+        assert_eq!(crate::sessions(&alice.home).await.unwrap(), json!({ "sessions": [{ "fp": "alice", "running": true }, { "fp": "stopped" }] }));
+        held.try_lock().unwrap();
+        assert_eq!(crate::cli::running(&alice.home).await, ["alice", "stopped"]);
+        drop(held);
+        assert_eq!(crate::cli::running(&alice.home).await, ["alice"]);
+    });
+}
+
+#[test]
 fn the_command_channel_takes_a_twelve_mib_attachment_and_no_larger_call() {
     local(async {
         use base64::{Engine, engine::general_purpose::STANDARD as B64};
@@ -568,6 +587,20 @@ fn the_command_channel_takes_a_twelve_mib_attachment_and_no_larger_call() {
         };
         let refused = crate::cli::exchange(channel, request).await.unwrap_err();
         assert!(refused.to_string().starts_with("size: "), "{refused:#}");
+    });
+}
+
+#[test]
+fn a_session_starts_with_a_stale_endpoint_on_a_live_port() {
+    local(async {
+        let world = world("stale-channel").await;
+        let alice = world.start("alice").await;
+        let dir = session_dir(&alice.home, "bob").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(world.config("alice", "alice").dir.join("endpoint"), dir.join("endpoint")).unwrap();
+        let bob = world.start_in("alice", "bob").await;
+        assert_eq!(bob.cmd(&["groups"]).await.unwrap(), json!({}));
+        assert_eq!(alice.cmd(&["groups"]).await.unwrap(), json!({}));
     });
 }
 

@@ -334,8 +334,8 @@ async fn delete_stopped_in_no_group(home: PathBuf) -> Result<Vec<String>> {
     Ok(warnings)
 }
 
-/// This machine's sessions: each one's fingerprint, whether its process answers, and its groups as its `groups.json`
-/// says.
+/// This machine's sessions: each one's fingerprint, whether its session lock is held, and its groups as its
+/// `groups.json` says.
 pub async fn sessions(home: &Path) -> Result<Value> {
     let running = cli::running(home).await;
     let mut sessions = Vec::new();
