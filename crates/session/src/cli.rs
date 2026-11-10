@@ -321,7 +321,11 @@ fn hyphens(command: clap::Command) -> clap::Command {
 pub fn device_dir(home: Option<&Path>) -> Result<PathBuf> {
     match home {
         Some(home) => Ok(home.to_owned()),
-        None => Ok(dirs::data_local_dir().context("no local data directory")?.join("letmeknow")),
+        None => {
+            let dir = dirs::data_local_dir().context("no local data directory")?.join("letmeknow");
+            ensure!(!dir.join("format").exists(), "{} holds the state of an earlier letmeknow, which this one cannot read: move it away, or use another --home", dir.display());
+            Ok(dir)
+        }
     }
 }
 

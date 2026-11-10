@@ -85,6 +85,41 @@ fn the_binary_leaves_an_earlier_home_as_it_is() {
     assert!(!home.join("sessions").exists());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn the_binary_refuses_an_earlier_home_in_the_default_device_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("letmeknow");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(home.join("format"), "4\n").unwrap();
+    std::fs::write(home.join("device.json"), r#"{"name":"old device"}"#).unwrap();
+    for command in ["device", "listen"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_letmeknow"))
+            .arg(command)
+            .env("XDG_DATA_HOME", dir.path())
+            .env_remove("LETMEKNOW_HOME")
+            .env_remove("LETMEKNOW_SESSION")
+            .output().unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains(&format!("{} holds the state of an earlier letmeknow, which this one cannot read: move it away", home.display())), "{error}");
+        assert_eq!(std::fs::read_to_string(home.join("format")).unwrap(), "4\n");
+        assert_eq!(std::fs::read_to_string(home.join("device.json")).unwrap(), r#"{"name":"old device"}"#);
+        assert!(!dir.path().join("letmeknow-v14").exists());
+    }
+}
+
+#[test]
+fn the_binary_reuses_the_device_key_in_an_explicit_current_home() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("format"), "14\n").unwrap();
+    let first = letmeknow(dir.path(), &["device"]);
+    assert!(first.status.success());
+    let again = letmeknow(dir.path(), &["device"]);
+    assert!(again.status.success());
+    assert_eq!(first.stdout, again.stdout);
+}
+
 /// A session run with `listen --detached` prints `ready`, and runs on once its reader is gone; `attach` prints its `ready`
 /// as its reader, and another `attach` meanwhile fails.
 #[test]
