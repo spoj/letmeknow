@@ -165,7 +165,8 @@ impl Inner {
     }
 
     /// Seals this session's messages past its cut again in the current epoch, in seq order, and pushes them in frames,
-    /// to each member that joined before they were sent: once per epoch, at the head of its log as far as it knows.
+    /// or announces those over `PUSH` beyond a full mesh, to each member that joined before they were sent: once per
+    /// epoch, at the head of its log as far as it knows.
     pub(crate) fn reseal(&self, st: &mut State, gid: &[u8]) -> Result<()> {
         let g = st.group(gid)?;
         let epoch = g.mls.epoch();
@@ -183,7 +184,7 @@ impl Inner {
             g.author_mut(&me, mine.joined).unwrap().sealed.insert(seq, epoch);
             record.sealing = Some((epoch, Bytes(ciphertext.clone())));
             st.store(gid, &record)?;
-            items.push((record.header.epoch, Bytes(ciphertext)));
+            items.push((record.header.epoch, seq, Bytes(ciphertext)));
         }
         let g = st.group_mut(gid)?;
         g.rec.resealed = epoch;
@@ -191,11 +192,17 @@ impl Inner {
         if !items.is_empty() {
             st.present(gid)?;
         }
-        for peer in st.peers.neighbours(&Bytes(gid.to_vec())) {
+        let group = Bytes(gid.to_vec());
+        let (large, small): (Vec<_>, Vec<_>) = items.into_iter().partition(|(_, _, item)| item.0.len() > PUSH && !st.peers.full_mesh(&group));
+        for peer in st.peers.neighbours(&group) {
             let peer = EndpointId::from_bytes(&peer)?;
             let joined = st.joined_of(gid, &peer);
-            for items in frames(items.iter().filter(|(sent, _)| *sent >= joined).map(|(_, item)| item.clone()).collect()) {
-                st.emit(gid, peer, Frame::Held { group: Bytes(gid.to_vec()), items, answers: None });
+            for items in frames(small.iter().filter(|(sent, _, _)| *sent >= joined).map(|(_, _, item)| item.clone()).collect()) {
+                st.emit(gid, peer, Frame::Held { group: group.clone(), items, answers: None });
+            }
+            let seqs = large.iter().filter(|(sent, _, _)| *sent >= joined).map(|(_, seq, _)| *seq).collect::<Ranges>();
+            if !seqs.is_empty() {
+                st.emit(gid, peer, Frame::Have { group: group.clone(), held: vec![Seqs { key: Bytes(me.clone()), joined: mine.joined, seqs }] });
             }
         }
         st.save(gid)

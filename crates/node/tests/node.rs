@@ -1754,6 +1754,53 @@ async fn past_a_full_mesh_a_large_message_is_announced_and_fetched() {
     assert!(items.len() == 1 && items[0].0.len() > LARGE, "Alice gives the large message");
 }
 
+/// A message past its author's cut is announced again when resealed beyond a full mesh, and fetched in the new
+/// epoch. Once the group fits a full mesh, its next resealing is pushed instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn past_a_full_mesh_a_large_resealed_message_is_announced_and_fetched() {
+    let relay = relay().await;
+    let dir = folder("resealed-announced");
+    let sam_db = dir.join("sam.db");
+    let rita_db = dir.join("rita.db");
+    let mut sam = stored(&relay, &sam_db).await;
+    let gid = sam.node.create(settings(&relay)).unwrap();
+    let spares = strangers(&mut sam, &gid, &relay, 7).await;
+    let rita = stored(&relay, &rita_db).await;
+    rita.node.join(&sam.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    rita.node.shutdown().await.unwrap();
+    eventually("Sam has nine members", || sam.node.members(&gid.0).unwrap().len() == 9).await;
+    let mut rita = hand(&relay, member_of(&rita_db).0, &sam.node).await;
+    rita.settle(&gid).await;
+
+    sam.node.send(&gid.0, &message("small"), None).await.unwrap();
+    let large = sam.node.send(&gid.0, &message(&"L".repeat(LARGE)), None).await.unwrap();
+    let first = announced(&mut rita).await;
+    rita.settle(&gid).await;
+    let old_sealing = sealed(&sam_db, &gid, &large);
+
+    sam.node.remove(&gid.0, &spares[..1]).await.unwrap();
+    let resealed = announced(&mut rita).await;
+    assert_eq!(resealed, first);
+    let epoch = sam.node.epoch(&gid.0).unwrap();
+    let new_sealing = sealed(&sam_db, &gid, &large);
+    assert_eq!(new_sealing.0, epoch);
+    assert_ne!(new_sealing, old_sealing);
+    rita.send(&Frame::Want { group: gid.clone(), epoch, wants: resealed }).await;
+    let items = rita.until(|f| match f {
+        Frame::Held { items, answers: Some(_), .. } => Some(items),
+        _ => None,
+    }).await;
+    assert_eq!(items, vec![new_sealing.1]);
+
+    sam.node.remove(&gid.0, &spares[1..2]).await.unwrap();
+    let pushed = rita.until(|f| match f {
+        Frame::Held { items, answers: None, .. } if items.iter().any(|item| item.0.len() > LARGE) => Some(items),
+        _ => None,
+    }).await;
+    assert!(pushed.contains(&sealed(&sam_db, &gid, &large).1));
+    sam.node.shutdown().await.unwrap();
+}
+
 /// A member asks for what a peer announced, though nothing else shows it was sent: Quinn, by hand, announces Sam's
 /// message sent while Alice was away, and Alice asks her for it.
 #[tokio::test(flavor = "multi_thread")]
