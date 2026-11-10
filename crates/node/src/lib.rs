@@ -440,8 +440,6 @@ pub(crate) enum Work {
     },
     /// A group's duties to run.
     Duties(Vec<u8>),
-    /// A group's current log, just found let go: read again once `WAIT` passed.
-    Lapsed(Vec<u8>),
     /// A group this session is out of, by no one's commit.
     Gone(Vec<u8>),
 }

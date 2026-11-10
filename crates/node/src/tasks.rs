@@ -9,12 +9,11 @@ use anyhow::{Context, Result};
 use iroh::{EndpointId, RelayUrl};
 use lmk_core::group::{Group, Session};
 use lmk_core::provider::SqliteProvider;
-use lmk_net::peers::{Peers, WAIT};
+use lmk_net::peers::Peers;
 use lmk_net::Net;
 use lmk_proto::directory::relay_url;
 use lmk_proto::group::{Device, Leaf};
 use lmk_proto::Bytes;
-use n0_future::time::{Duration, sleep};
 use n0_future::task::spawn;
 use tokio::sync::mpsc;
 
@@ -182,15 +181,6 @@ impl Inner {
             match item {
                 Work::Applied { group, by, added, removed, gone } => self.applied(&group, by.map(|by| *by), added, removed, gone).await,
                 Work::Duties(gid) => self.duties(&gid),
-                Work::Lapsed(log) => {
-                    let node = self.clone();
-                    self.spawn(async move {
-                        sleep(Duration::from_millis(WAIT)).await;
-                        if let Err(error) = node.read(&log).await {
-                            tracing::debug!("reading the lapsed log {}: {error:#}", hex(&log));
-                        }
-                    });
-                }
                 Work::Gone(group) => self.gone(&group, None),
             }
         }

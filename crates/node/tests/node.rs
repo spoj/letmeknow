@@ -1254,6 +1254,92 @@ fn a_member_whose_log_the_service_let_go_leaves_when_no_peer_brings_it_within_wa
     });
 }
 
+/// A session that found its log let go, and stopped, leaves the group on its own once it runs again: `WAIT` after it
+/// found that, or at once if that has passed.
+#[test]
+fn a_session_back_after_it_found_its_log_let_go_leaves_at_the_end_of_wait() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        for past in [false, true] {
+            SHIFT.store(0, std::sync::atomic::Ordering::Relaxed);
+            let relay = relay().await;
+            let dir = folder("let-go-restart");
+            let mut alice = session(&relay).await;
+            let bob = stored(&relay, &dir.join("bob.db")).await;
+            let gid = alice.node.create(settings(&relay)).unwrap();
+            let spares = strangers(&mut alice, &gid, &relay, 1).await;
+            bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+            alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+            bob.node.shutdown().await.unwrap();
+            alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
+            alice.node.shutdown().await.unwrap();
+
+            SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+            while relay.membership.expire().await {}
+            let bob = stored(&relay, &dir.join("bob.db")).await;
+            bob.node.read_group(&gid.0).await.unwrap_err();
+            bob.node.shutdown().await.unwrap();
+            SHIFT.fetch_add(if past { lmk_net::peers::WAIT + 60_000 } else { lmk_net::peers::WAIT - 5_000 }, std::sync::atomic::Ordering::Relaxed);
+            let mut bob = stored(&relay, &dir.join("bob.db")).await;
+            assert!(past || bob.node.groups().contains(&gid), "the wait is not over");
+            bob.until(|e| matches!(&e, Event::Removed { group, by: None, .. } if *group == gid).then_some(())).await;
+            assert!(!bob.node.groups().contains(&gid));
+            bob.node.shutdown().await.unwrap();
+        }
+    });
+}
+
+/// The read at the end of `WAIT` that the service does not answer is made again ten minutes later, with no send or
+/// read of the session's operator. Tokio's clock is moved on with the session's.
+#[tokio::test]
+async fn a_read_of_a_log_let_go_that_the_service_does_not_answer_is_made_again() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    lmk_proto::clock::set(shifted);
+    let relay = relay().await;
+    let dir = folder("lapsed-retry");
+    let mut alice = session(&relay).await;
+    let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let failed = down.clone();
+    let (requests, post) = recording(failing(relay.post(), move |_| failed.load(std::sync::atomic::Ordering::Relaxed)));
+    let bob = stored_with(&relay, &dir.join("bob.db"), post.clone()).await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    let spares = strangers(&mut alice, &gid, &relay, 1).await;
+    bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    bob.node.shutdown().await.unwrap();
+    alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
+    alice.node.shutdown().await.unwrap();
+
+    SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+    while relay.membership.expire().await {}
+    let mut bob = stored_with(&relay, &dir.join("bob.db"), post).await;
+    bob.node.read_group(&gid.0).await.unwrap_err();
+    quiet(&requests).await;
+    let asked = requests.lock().unwrap().len();
+    down.store(true, std::sync::atomic::Ordering::Relaxed);
+    tokio::time::pause();
+    SHIFT.fetch_add(lmk_net::peers::WAIT + 1_000, std::sync::atomic::Ordering::Relaxed);
+    tokio::time::advance(Duration::from_millis(lmk_net::peers::WAIT + 1_000)).await;
+    tokio::time::resume();
+    eventually("the deadline's read failed", || requests.lock().unwrap().len() > asked).await;
+    assert!(bob.node.groups().contains(&gid), "no answer is not a log let go");
+    quiet(&requests).await;
+    down.store(false, std::sync::atomic::Ordering::Relaxed);
+    tokio::time::pause();
+    SHIFT.fetch_add(10 * 60 * 1000 + 1_000, std::sync::atomic::Ordering::Relaxed);
+    tokio::time::advance(Duration::from_secs(10 * 60 + 1)).await;
+    tokio::time::resume();
+    bob.until(|e| matches!(&e, Event::Removed { group, by: None, .. } if *group == gid).then_some(())).await;
+    assert!(!bob.node.groups().contains(&gid));
+    bob.node.shutdown().await.unwrap();
+}
+
 /// A group nobody is online in for longer than `STALE` ends for each member as it comes back: it takes the group's log as
 /// let go, as the service may have forgotten that it let it go.
 #[test]

@@ -426,7 +426,7 @@ impl Inner {
         if now >= since + WAIT {
             self.work.send(Work::Gone(group)).ok();
         } else if since == now {
-            self.work.send(Work::Lapsed(id.to_vec())).ok();
+            self.work.send(Work::Duties(group)).ok();
         }
         Ok(())
     }

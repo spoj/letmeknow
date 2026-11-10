@@ -7,6 +7,9 @@
 //! changed its members since. The update first fetches for at most `HEAR` what the last commit kept and connected
 //! members hold past the cut. T grows with the group, so that its members update about hourly between them, up to three
 //! days: an online member's update shows it is there well within the services' retention.
+//!
+//! A pass first reads the group's log again where its service let it go: `WAIT` after the session found that, at once
+//! if it starts later, and again after `RETRY` while the service does not answer.
 
 use std::sync::Arc;
 
@@ -19,16 +22,16 @@ use lmk_proto::held::Ref;
 use n0_future::time::{Duration, sleep};
 use sha2::{Digest, Sha256};
 
-use lmk_net::peers::HEAR;
+use lmk_net::peers::{HEAR, WAIT};
 use lmk_proto::peer::Seqs;
 
 use crate::held::delivered_key;
 use crate::reading::commit_key;
-use crate::{G, Inner, State, Work, days, get, now};
+use crate::{G, Inner, State, Work, days, get, hex, now};
 
 /// How soon a pass runs again while an update waits for its fetch.
 const BLOCKED: u64 = 10_000;
-/// How soon a pass runs again after its commit failed, as while the service is down.
+/// How soon a pass runs again after its read or commit failed, as while the service is down.
 const RETRY: u64 = 10 * 60 * 1000;
 /// How often a member asks which members' logs their services let go, of those it does not know to be, at most, in
 /// milliseconds.
@@ -202,6 +205,23 @@ impl Inner {
     }
 
     async fn pass(self: &Arc<Self>, gid: &[u8]) -> Result<()> {
+        // The log read again says whether it is still gone, and the group is left then.
+        let lapsed = {
+            let st = self.lock();
+            st.groups.get(gid).and_then(|g| {
+                let log = &g.rec.log.0;
+                st.logs[log].lapsed.map(|(since, _)| (log.clone(), since + WAIT))
+            })
+        };
+        if let Some((log, at)) = lapsed {
+            if now() < at {
+                self.time(gid, at);
+            } else if let Err(error) = self.read(&log).await {
+                self.time(gid, now() + RETRY);
+                tracing::debug!("reading the lapsed log {}: {error:#}", hex(&log));
+                return Ok(());
+            }
+        }
         let (commit, next) = {
             let mut st = self.lock();
             let Some(g) = st.groups.get(gid) else { return Ok(()) };
