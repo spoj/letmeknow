@@ -118,6 +118,38 @@ async fn expired_logs_answer_signed_expiries_on_every_route() {
 }
 
 #[tokio::test]
+async fn logs_past_retention_while_down_are_expired_as_the_service_starts() {
+    use lmk_membership::store::DAY_MS;
+    clock::set(fixed);
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let store = Store::initialize(&state).unwrap();
+    store.append(&store.log(&[7; 32]), &[Bytes(b"old".to_vec())]).unwrap();
+    clock::set(|| T0 + 2 * DAY_MS);
+    store.append(&store.log(&[8; 32]), &[Bytes(b"live".to_vec())]).unwrap();
+    drop(store);
+
+    clock::set(|| T0 + 8 * DAY_MS);
+    let store = Store::open(&state).unwrap();
+    let key = store.key().verifying_key();
+    let http = Http { _dir: dir, service: Service::new(store, Policy::default()), key };
+    let reference = head::reference(http.key.as_bytes(), &[7; 32]);
+    let read = |capability| serde_json::to_vec(&Read { capability: [capability; 32], after: 0 }).unwrap();
+    let Answer::<Page>::Expired { sig } = http.post(Route::Read, "192.0.2.1", &read(7)).await else { panic!("read answered") };
+    assert!(http.expiry_signed(&reference, &sig));
+    let Answer::<Appended>::Expired { sig } = http.post(Route::Append, "192.0.2.1", &append_body(7, &one(b"more"))).await else {
+        panic!("append answered")
+    };
+    assert!(http.expiry_signed(&reference, &sig));
+    let Answer::Ok(page) = http.post::<Page>(Route::Read, "192.0.2.1", &read(8)).await else { panic!("live log refused") };
+    assert_eq!(page.entries, [Bytes(b"live".to_vec())]);
+    let heads = serde_json::to_vec(&Heads { logs: vec![Known([7; 32], 0), Known([8; 32], 0)] }).unwrap();
+    let Answer::<Moved>::Ok(moved) = http.post(Route::Heads, "192.0.2.1", &heads).await else { panic!("heads refused") };
+    assert_eq!((moved.heads.len(), moved.expired.len(), moved.expired[0].log_ref), (1, 1, reference));
+    assert!(http.expiry_signed(&reference, &moved.expired[0].sig));
+}
+
+#[tokio::test]
 async fn refusals_are_signed_over_their_request_and_code() {
     let http = Http::new(Policy::default());
     let Answer::<()>::Refused { refusal, sig } = http.post(Route::Append, "192.0.2.1", b"{}").await else { panic!("accepted") };

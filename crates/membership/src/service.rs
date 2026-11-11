@@ -223,6 +223,10 @@ impl std::fmt::Debug for Service {
 impl Service {
     pub fn new(mut store: Store, policy: Policy) -> Self {
         store.disk = policy.disk;
+        while store.expire(now().saturating_sub(policy.retention_days * DAY_MS)).unwrap_or_else(|_| {
+            tracing::warn!("membership expiry deferred");
+            false
+        }) {}
         let service = Self(Arc::new(Inner {
             store, budgets: Mutex::new(Budgets::new(&policy)), in_flight: Mutex::default(),
             work: Arc::new(Semaphore::new(policy.db_work)), expiry: Mutex::default(), policy,
