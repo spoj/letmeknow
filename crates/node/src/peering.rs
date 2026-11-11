@@ -12,7 +12,7 @@ use lmk_membership::Contradiction;
 use lmk_net::Groups;
 use lmk_net::peers::{self, Own};
 use lmk_proto::Bytes;
-use lmk_proto::directory::relay_url;
+use lmk_proto::directory::{check_domain, relay_url};
 use lmk_proto::head::Head;
 use lmk_proto::peer::{At, Frame, INTRO, Intro, MAX_INTRO, SUMMARY, Seqs, Shown, Signed, Summary};
 use n0_future::time::{Duration, timeout};
@@ -122,6 +122,7 @@ impl State {
         for g in self.groups.values() {
             for member in g.mls.members() {
                 if let Some(leaf) = member.leaf.filter(|leaf| leaf.key.0 == peer.as_bytes())
+                    && check_domain(&leaf.home).is_ok()
                     && let Ok(relay) = relay_url(&leaf.home).parse()
                     && !relays.contains(&relay)
                 {

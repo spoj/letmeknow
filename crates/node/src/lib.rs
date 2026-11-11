@@ -940,6 +940,58 @@ mod tests {
         }
     }
 
+    /// A member whose leaf names no canonical domain as its home gives no relay to dial it at, and is left out of the
+    /// invite links that members connected to it make.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_member_whose_leaf_home_is_no_domain_gives_no_relay_and_is_not_in_invites() {
+        use lmk_proto::links::Invite;
+
+        let relay = lmk_testing::relay().await;
+        let (alice, bob, carol, dave) = (
+            node(&relay, relay.post()).await,
+            node(&relay, relay.post()).await,
+            node(&relay, relay.post()).await,
+            node(&relay, relay.post()).await,
+        );
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let gid = alice.create(settings).unwrap();
+        for joiner in [&bob, &carol] {
+            joiner.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        }
+        n0_future::time::timeout(Duration::from_secs(30), async {
+            while alice.connected(&gid.0).unwrap().len() < 2 {
+                n0_future::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        for bad in ["127.0.0.1:9/x", "Relay.example", ""] {
+            {
+                let mut st = bob.inner.lock();
+                let st = &mut *st;
+                let leaf = lmk_proto::group::Leaf { home: bad.into(), ..st.session.leaf.clone() };
+                st.session.set_leaf(&st.provider, leaf).unwrap();
+            }
+            bob.inner.merge(&gid.0).await.unwrap();
+            alice.read_group(&gid.0).await.unwrap();
+            assert!(alice.connected(&gid.0).unwrap().iter().any(|m| m.key == bob.key()));
+            assert!(alice.inner.lock().relays_of(&bob.net().id()).is_empty(), "{bad}");
+            let invite = alice.invite(&gid.0, INVITE_VALID, None).await.unwrap();
+            assert_eq!(Invite::parse(&invite.link()).unwrap(), invite, "{bad}");
+            assert_eq!(
+                invite.members,
+                vec![(*alice.net().id().as_bytes(), relay.domain.clone()), (*carol.net().id().as_bytes(), relay.domain.clone())],
+                "{bad}"
+            );
+        }
+        let invite = alice.invite(&gid.0, INVITE_VALID, None).await.unwrap();
+        alice.shutdown().await.unwrap();
+        assert_eq!(dave.join(&Invite::parse(&invite.link()).unwrap()).await.unwrap().0, gid);
+        for node in [bob, carol, dave] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_rate_refused_send_keeps_the_next_messages_deps() {
         let relay = lmk_testing::relay().await;

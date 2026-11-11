@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail, ensure};
 use iroh::{EndpointId, RelayUrl};
 use lmk_core::group::{Change, Group, delete_key_package, key_package_leaf, key_package_reference};
 use lmk_net::Admit;
-use lmk_proto::directory::relay_url;
+use lmk_proto::directory::{check_domain, relay_url};
 use lmk_proto::group::{Control, Leaf, Service};
 use lmk_proto::links::Invite;
 use lmk_proto::peer::{Admitted, Join};
@@ -67,7 +67,7 @@ impl Node {
                 let seq = self.inner.lock().record(gid, &id.0)?.context("the invite's message")?.header.seq;
                 // The members connected whose summaries hold the invite's message admit by it too: a member asked before its
                 // push arrived would refuse the joiner.
-                let connected = self.connected(gid)?;
+                let connected: Vec<Member> = self.connected(gid)?.into_iter().filter(|m| check_domain(&m.home).is_ok()).collect();
                 let holding = || -> Result<Vec<Member>> {
                     let holders = self.inner.lock().holders_of(gid, seq)?;
                     Ok(connected.iter().filter(|m| holders.contains(&m.key)).cloned().collect())
@@ -88,7 +88,7 @@ impl Node {
         let st = self.inner.lock();
         let Service::Serve { domain, .. } = st.group(gid)?.mls.settings().membership else { bail!("unsupported membership service") };
         let mut members = vec![(*self.inner.net().id().as_bytes(), self.inner.home.clone())];
-        members.extend(holders.iter().take(LINK_MEMBERS).filter_map(|member| Some((*endpoint_id(&member.iroh.0)?.as_bytes(), member.home.clone()))));
+        members.extend(holders.iter().filter_map(|member| Some((*endpoint_id(&member.iroh.0)?.as_bytes(), member.home.clone()))).take(LINK_MEMBERS));
         Ok(Invite { secret, domain, members })
     }
 
