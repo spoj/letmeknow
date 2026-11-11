@@ -278,14 +278,14 @@ impl Inner {
         }
     }
 
-    /// Removes the member whose key a joiner brings, in a commit of its own, if the log of the epoch it is in was let go, as
-    /// known or as its service answers: a member that was out past the retention, and not yet removed, must go before its
-    /// key is added.
+    /// Removes the member whose key a joiner brings, in a commit of its own, as an admin, if the log of the epoch it is in
+    /// was let go, as known or as its service answers: a member that was out past the retention, and not yet removed, must
+    /// go before its key is added.
     async fn remove_lapsed(self: &Arc<Self>, gid: &[u8], key: &[u8]) -> Result<()> {
         let epoch = {
             let st = self.lock();
             let g = st.group(gid)?;
-            let at = g.mls.members().iter().any(|m| m.key == key).then(|| g.at_epoch(key));
+            let at = (g.mls.admin(st.me()) && g.mls.members().iter().any(|m| m.key == key)).then(|| g.at_epoch(key));
             at.and_then(|at| g.rec.epochs.iter().find(|epoch| epoch.epoch == at).cloned())
         };
         let Some(epoch) = epoch else { return Ok(()) };

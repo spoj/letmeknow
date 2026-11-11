@@ -1622,6 +1622,73 @@ fn a_joiner_whose_key_is_in_the_tree_of_a_lapsed_member_is_removed_before_its_ad
     });
 }
 
+/// A member that is no admin does not try to remove a lapsed member whose key a joiner brings: it refuses the joiner as a
+/// member already, with no warning, and the joiner moves on to an admin the link names.
+#[test]
+fn a_member_that_is_no_admin_refuses_a_lapsed_member_for_an_admin_to_admit() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let dir = folder("lapsed-non-admin");
+        let mut alice = stored(&relay, &dir.join("alice.db")).await;
+        let bob = stored(&relay, &dir.join("bob.db")).await;
+        let bob_key = bob.node.key();
+        let gid = alice.node.create(settings(&relay)).unwrap();
+        let spares = strangers(&mut alice, &gid, &relay, 2).await;
+        bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        bob.node.set_intro(&gid.0, Some("bob".into())).unwrap();
+        eventually("Alice holds Bob's intro", || alice.node.intros(&gid.0).unwrap().contains_key(&bob_key)).await;
+        bob.node.shutdown().await.unwrap();
+        alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
+        alice.node.shutdown().await.unwrap();
+        drop(alice);
+
+        SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        while relay.membership.expire().await {}
+        let mut bob = stored(&relay, &dir.join("bob.db")).await;
+        bob.node.read_group(&gid.0).await.unwrap_err();
+        SHIFT.fetch_add(lmk_net::peers::WAIT + 60_000, std::sync::atomic::Ordering::Relaxed);
+        bob.node.read_group(&gid.0).await.unwrap_err();
+        bob.until(|e| matches!(&e, Event::Removed { group, .. } if *group == gid).then_some(())).await;
+        bob.node.shutdown().await.unwrap();
+
+        let mut alice = stored(&relay, &dir.join("alice.db")).await;
+        let alice_key = alice.node.key();
+        alice.node.remove(&gid.0, &spares[1..]).await.unwrap();
+        let device = Bytes(SigningKey::from_bytes(&[9; 32]).verifying_key().to_bytes().to_vec());
+        alice.node.change_settings(&gid.0, |s| {
+            s.admins = vec![alice_key.clone()];
+            s.admitted = vec![device.clone()];
+        }).await.unwrap();
+        let mut carol = session(&relay).await;
+        carol.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+        eventually("Carol holds Bob's intro", || carol.node.intros(&gid.0).unwrap().contains_key(&bob_key)).await;
+        assert!(!alice.node.admin(&gid.0, &carol.node.key().0).unwrap());
+
+        let bob = stored(&relay, &dir.join("bob.db")).await;
+        let only_carol = carol.node.invite(&gid.0, INVITE_VALID, Some(&bob_key.0)).await.unwrap();
+        let refused = bob.node.join(&only_carol).await.unwrap_err();
+        assert!(format!("{refused:#}").contains("a member already"), "{refused:#}");
+
+        let shared = carol.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
+        assert_eq!(shared.members.len(), 2, "the link names Carol and Alice");
+        let (joined, by) = bob.node.join(&shared).await.unwrap();
+        assert_eq!((joined, by), (gid.clone(), alice.node.address().0));
+        alice.until(|e| matches!(&e, Event::Left { member, .. } if member.key == bob_key).then_some(())).await;
+        alice.until(|e| matches!(&e, Event::Joined { member, .. } if member.key == bob_key).then_some(())).await;
+        while let Ok(event) = carol.events.try_recv().or_else(|_| alice.events.try_recv()) {
+            assert!(!matches!(event, Event::Warning { .. }), "{event:?}");
+        }
+        for session in [alice, bob, carol] {
+            session.node.shutdown().await.unwrap();
+        }
+    });
+}
+
 /// A session that has not seen its group's log alive for `STALE` takes the log as let go, as its service may have
 /// forgotten that it let it go, and asks the service nothing of it: it leaves the group once no peer brought the commits
 /// within `WAIT`.
