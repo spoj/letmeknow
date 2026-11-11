@@ -2729,6 +2729,57 @@ async fn a_commit_keeps_what_an_online_member_holds() {
     carol.node.shutdown().await.unwrap();
 }
 
+/// A commit that removes the only other member holding Alice's message, whether Alice removes him or her pass commits
+/// his leave, does not keep the message: it stays in `only_here`, and reaches Carol after another commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_removing_a_messages_only_holder_does_not_keep_it() {
+    let relay = relay().await;
+    for (case, by_leave) in [("remove", false), ("leave", true)] {
+        let dir = folder(&format!("removed-holder-{case}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = |name: &str| dir.join(format!("{name}.db"));
+        let mut alice = stored(&relay, &db("alice")).await;
+        let mut bob = session(&relay).await;
+        let carol = stored(&relay, &db("carol")).await;
+        let dave = session(&relay).await;
+        let gid = alice.node.create(settings(&relay)).unwrap();
+        for joiner in [&bob.node, &carol.node, &dave.node] {
+            joiner.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+            alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+        }
+        eventually("Alice has four members", || alice.node.members(&gid.0).unwrap().len() == 4).await;
+        let (bob_key, dave_key) = (bob.node.key(), dave.node.key());
+        carol.node.shutdown().await.unwrap();
+        drop(carol);
+        dave.node.shutdown().await.unwrap();
+
+        let sent = alice.node.send(&gid.0, &message("for Carol"), None).await.unwrap();
+        bob.until(|e| matches!(e, Event::Message(m) if m.id == sent).then_some(())).await;
+        let held = |node: &Node| node.only_here(&gid.0).unwrap().into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+        eventually("Alice hears that Bob holds it", || held(&alice.node).is_empty()).await;
+
+        if by_leave {
+            bob.node.leave(&gid.0).unwrap().unwrap();
+            alice.until(|e| matches!(e, Event::Left { member, .. } if member.key == bob_key).then_some(())).await;
+        } else {
+            assert!(alice.node.remove(&gid.0, from_ref(&bob_key)).await.unwrap());
+        }
+        bob.node.shutdown().await.unwrap();
+        assert_eq!(held(&alice.node), from_ref(&sent), "{case}: a removed holder does not keep it");
+
+        assert!(alice.node.remove(&gid.0, from_ref(&dave_key)).await.unwrap());
+        let mut carol = stored(&relay, &db("carol")).await;
+        let got = carol.until(|e| match e {
+            Event::Message(m) => Some(m.id),
+            Event::Lost(lost) => panic!("{case}: Carol lost {lost:?}"),
+            _ => None,
+        }).await;
+        assert_eq!(got, sent);
+        alice.node.shutdown().await.unwrap();
+        carol.node.shutdown().await.unwrap();
+    }
+}
+
 /// A message Bob holds sealed in an epoch that Alice's commit ended is only here until Bob holds it sealed in the new
 /// epoch. Bob is away across the commit, and then connected as a stand-in that takes no reseal: it lists the message
 /// held sealed in the ended epoch, which does not count, and then sealed in the new one, which Alice's reseal would have

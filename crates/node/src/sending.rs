@@ -37,13 +37,16 @@ impl State {
         Ok(self.online_summaries(gid)?.into_iter().filter(holds).map(|summary| summary.member.clone()).collect())
     }
 
-    /// Whether this session's message waits for another member to hold it: some other member joined by the epoch it was
-    /// sent in, and none connected shows it held. One sent before the others joined is no one else's to have.
-    pub(crate) fn unheld(&self, gid: &[u8], record: &Record) -> Result<bool> {
+    /// Whether this session's message waits for another member outside `removing` to hold it: some such member joined by
+    /// the epoch it was sent in, and none connected shows it held. One sent before the others joined is no one else's to
+    /// have.
+    pub(crate) fn unheld(&self, gid: &[u8], record: &Record, removing: &[u32]) -> Result<bool> {
         let g = self.group(gid)?;
         let me = self.me();
-        let entitled = g.mls.members().iter().any(|m| m.key != me && g.mls.joined(&m.key).is_some_and(|joined| joined <= record.header.epoch));
-        Ok(entitled && self.holders_of(gid, record.header.seq)?.is_empty())
+        let stays = |m: &lmk_core::group::Member| m.key != me && !removing.contains(&m.index);
+        let members = g.mls.members();
+        let entitled = members.iter().any(|m| stays(m) && g.mls.joined(&m.key).is_some_and(|joined| joined <= record.header.epoch));
+        Ok(entitled && !self.holders_of(gid, record.header.seq)?.iter().any(|h| members.iter().any(|m| stays(m) && m.key == h.0)))
     }
 
     /// What this session lacks of what the last commit kept, and of the seqs past the cut of each other membership that

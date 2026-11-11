@@ -626,7 +626,7 @@ impl Node {
         for seq in mine.cut + 1..=mine.last() {
             if let Some(record) = st.record_at(gid, me, mine.joined, seq)?
                 && !lmk_proto::group::Control::TYPES.contains(&lmk_proto::group::type_of(&record.header.payload))
-                && st.unheld(gid, &record)?
+                && st.unheld(gid, &record, &[])?
             {
                 unkept.push((record.id, record.header.payload));
             }

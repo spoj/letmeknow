@@ -65,10 +65,10 @@ fn next(g: &G, me: &[u8]) -> u64 {
 }
 
 impl State {
-    /// The cut a commit this session builds now carries: per member of the epoch, from the cut state on, each seq it
-    /// holds sealed in the current epoch whose `prev` chains to the last; its own only as far as another member that
-    /// may have them holds them.
-    pub(crate) fn cut_for(&self, gid: &[u8]) -> Result<Vec<Ref>> {
+    /// The cut a commit removing `removing` carries: per member of the epoch, from the cut state on, each seq this
+    /// session holds sealed in the current epoch whose `prev` chains to the last; its own only as far as another member
+    /// staying that may have them holds them.
+    pub(crate) fn cut_for(&self, gid: &[u8], removing: &[u32]) -> Result<Vec<Ref>> {
         let g = self.group(gid)?;
         let (epoch, me) = (g.mls.epoch(), self.me());
         let mut cut = Vec::new();
@@ -78,7 +78,7 @@ impl State {
                 let Some(record) = self.record_at(gid, &r.key.0, r.joined, kept.seq + 1)? else { break };
                 let sealed = record.sealing.as_ref().is_some_and(|(sealed, _)| *sealed == epoch);
                 let chained = record.header.prev.as_ref().map(|(id, _)| id) == (kept.seq > 0).then_some(&kept.id);
-                if !sealed || !chained || (r.key.0 == me && self.unheld(gid, &record)?) {
+                if !sealed || !chained || (r.key.0 == me && self.unheld(gid, &record, removing)?) {
                     break;
                 }
                 kept = Ref { seq: kept.seq + 1, id: record.id, epoch: record.header.epoch, ..kept };
@@ -157,10 +157,11 @@ fn due(st: &State, g: &G) -> Result<Option<Change>> {
     let gid = g.mls.id();
     let me = st.me();
     let admin = g.mls.admin(me);
-    let mut change = Change { cut: st.cut_for(gid)?, ..Change::default() };
+    let cut = st.cut_for(gid, &[])?;
+    let mut change = Change::default();
     let members = g.mls.members();
     for m in members.iter().filter(|m| m.key != me) {
-        let kept = |seq: &u64| change.cut.iter().any(|r| r.key.0 == m.key && r.seq >= *seq);
+        let kept = |seq: &u64| cut.iter().any(|r| r.key.0 == m.key && r.seq >= *seq);
         match g.left(&m.key).filter(|(seq, _)| kept(seq)) {
             Some((_, sig)) if admin || g.mls.left(&m.key, &sig.0) => {
                 change.remove.push(m.index);

@@ -34,7 +34,7 @@ impl Inner {
                     Some(posted) => (posted.to_vec(), true, service, capability, epoch),
                     None => {
                         let Some(mut change) = change(st, g)? else { return Ok(None) };
-                        change.cut = st.cut_for(gid)?;
+                        change.cut = st.cut_for(gid, &change.remove)?;
                         let g = st.groups.get_mut(gid).unwrap();
                         let commit = g.mls.commit(&st.provider, &st.session, change)?;
                         built = Some(commit.entry.clone());
