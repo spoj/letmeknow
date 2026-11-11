@@ -1723,6 +1723,65 @@ fn a_group_nobody_is_online_in_lives_until_stale() {
     });
 }
 
+/// A member that last saw a quiet group's log alive longer than `STALE` ago still asks the service, and catches up when
+/// the log has new entries within the service's retention; a service that does not answer neither lets the send through
+/// nor counts as let go.
+#[test]
+fn a_member_past_stale_catches_up_from_a_log_with_entries() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let dir = folder("stale-alive");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = |name: &str| dir.join(format!("{name}.db"));
+        let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let failed = down.clone();
+        let post = failing(relay.post(), move |_| failed.load(std::sync::atomic::Ordering::Relaxed));
+        let mut alice = stored(&relay, &db("alice")).await;
+        let bob = stored_with(&relay, &db("bob"), post.clone()).await;
+        let gid = alice.node.create(settings(&relay)).unwrap();
+        bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+        let epoch = bob.node.epoch(&gid.0).unwrap();
+        eventually("Alice reads Bob's update", || alice.node.epoch(&gid.0).unwrap() == epoch).await;
+
+        SHIFT.store(27 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        bob.node.shutdown().await.unwrap();
+        drop(bob);
+
+        SHIFT.store(lmk_proto::membership::STALE - 3_600_000, std::sync::atomic::Ordering::Relaxed);
+        let carol = session(&relay).await;
+        carol.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+        let moved = carol.node.epoch(&gid.0).unwrap();
+        eventually("Alice reads Carol's update", || alice.node.epoch(&gid.0).unwrap() == moved).await;
+        alice.node.shutdown().await.unwrap();
+        drop(alice);
+        carol.node.shutdown().await.unwrap();
+
+        SHIFT.store(lmk_proto::membership::STALE + DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        while relay.membership.expire().await {}
+        down.store(true, std::sync::atomic::Ordering::Relaxed);
+        let bob = stored_with(&relay, &db("bob"), post).await;
+        let error = bob.node.send(&gid.0, &message("while down"), None).await.unwrap_err();
+        assert!(!error.is::<SendError>(), "no answer is not let go: {error:#}");
+        SHIFT.fetch_add(lmk_net::peers::WAIT + 60_000, std::sync::atomic::Ordering::Relaxed);
+        bob.node.read_group(&gid.0).await.unwrap_err();
+        assert!(bob.node.groups().contains(&gid), "no answer past STALE does not leave the group");
+
+        down.store(false, std::sync::atomic::Ordering::Relaxed);
+        bob.node.send(&gid.0, &message("back"), None).await.unwrap();
+        assert!(bob.node.epoch(&gid.0).unwrap() >= moved);
+        let mut alice = stored(&relay, &db("alice")).await;
+        alice.until(|e| matches!(e, Event::Message(m) if m.payload == message("back")).then_some(())).await;
+        alice.node.shutdown().await.unwrap();
+        bob.node.shutdown().await.unwrap();
+    });
+}
+
 /// A member that left behind, by its log let go, comes back by invite with the key it had: that key is still in the tree
 /// until a commit of its own removes it, which comes before the Add that lets it in again.
 #[test]
@@ -1834,30 +1893,69 @@ fn a_member_that_is_no_admin_refuses_a_lapsed_member_for_an_admin_to_admit() {
     });
 }
 
-/// A session that has not seen its group's log alive for `STALE` takes the log as let go, as its service may have
-/// forgotten that it let it go, and asks the service nothing of it: it leaves the group once no peer brought the commits
-/// within `WAIT`.
+/// A log the service let go and forgot after `EXPIRED_DAYS` answers as empty, and a session past `STALE` asks the
+/// service, never appends to it, takes nothing new as let go whether it held entries of that log or not, and leaves the
+/// group after `WAIT`.
 #[test]
-fn a_log_not_seen_alive_for_stale_is_let_go_without_asking() {
+fn a_log_forgotten_past_stale_is_let_go_and_never_appended_to() {
     static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     fn shifted() -> u64 {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
     }
     on_clock(shifted, async {
-        let relay = relay().await;
-        let (requests, post) = recording(relay.post());
-        let mut alice = session_with(&relay, post).await;
-        let gid = alice.node.create(settings(&relay)).unwrap();
-        alice.node.read_group(&gid.0).await.unwrap();
-        quiet(&requests).await;
-        let asked = requests.lock().unwrap().len();
-        SHIFT.store(lmk_proto::membership::STALE + 60_000, std::sync::atomic::Ordering::Relaxed);
-        alice.node.read_group(&gid.0).await.unwrap_err();
-        SHIFT.fetch_add(lmk_net::peers::WAIT + 60_000, std::sync::atomic::Ordering::Relaxed);
-        alice.node.read_group(&gid.0).await.unwrap_err();
-        alice.until(|e| matches!(&e, Event::Removed { group, .. } if *group == gid).then_some(())).await;
-        assert_eq!(requests.lock().unwrap().len(), asked, "nothing asked of the service");
-        alice.node.shutdown().await.unwrap();
+        for held_skipped in [false, true] {
+            SHIFT.store(0, std::sync::atomic::Ordering::Relaxed);
+            let relay = relay().await;
+            let dir = folder(if held_skipped { "forgotten-skipped" } else { "forgotten-empty" });
+            std::fs::create_dir_all(&dir).unwrap();
+            let bob_db = dir.join("bob.db");
+            let mut alice = session(&relay).await;
+            let (requests, post) = recording(relay.post());
+            let bob = stored_with(&relay, &bob_db, post.clone()).await;
+            let gid = alice.node.create(settings(&relay)).unwrap();
+            let spares = strangers(&mut alice, &gid, &relay, 1).await;
+            bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+            alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+            let epoch = bob.node.epoch(&gid.0).unwrap();
+            eventually("Alice reads Bob's update", || alice.node.epoch(&gid.0).unwrap() == epoch).await;
+            alice.node.change_settings(&gid.0, |s| s.admins.push(bob.node.key())).await.unwrap();
+            eventually("Bob is an admin", || bob.node.admin(&gid.0, &bob.node.key().0).unwrap()).await;
+            if held_skipped {
+                bob.node.shutdown().await.unwrap();
+                drop(bob);
+                let provider = SqliteProvider::open(&bob_db).unwrap();
+                let capability = lmk_core::group::Group::load(&provider, &gid.0).unwrap().capability(&provider).unwrap();
+                drop(provider);
+                ServeClient::for_service(relay.post(), &relay.service, false).unwrap().append(&capability, &[b"skipped".to_vec()]).await.unwrap();
+                let bob = stored_with(&relay, &bob_db, post.clone()).await;
+                bob.node.read_group(&gid.0).await.unwrap();
+                bob.node.shutdown().await.unwrap();
+            } else {
+                bob.node.shutdown().await.unwrap();
+            }
+            alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
+            alice.node.shutdown().await.unwrap();
+
+            SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+            while relay.membership.expire().await {}
+            SHIFT.store((9 + lmk_proto::membership::EXPIRED_DAYS) * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+            while relay.membership.expire().await {}
+
+            let mut bob = stored_with(&relay, &bob_db, post).await;
+            quiet(&requests).await;
+            let before = requests.lock().unwrap().len();
+            let refused = bob.node.send(&gid.0, &message("hi"), None).await.unwrap_err();
+            assert!(matches!(refused.downcast_ref::<SendError>(), Some(SendError::LetGo)), "{refused:#}");
+            let error = bob.node.change_settings(&gid.0, |s| s.admitted.push(Bytes(vec![7; 32]))).await.unwrap_err();
+            assert!(error.is::<lmk_membership::Expired>(), "{error:#}");
+            SHIFT.fetch_add(lmk_net::peers::WAIT + 60_000, std::sync::atomic::Ordering::Relaxed);
+            bob.node.read_group(&gid.0).await.unwrap_err();
+            bob.until(|e| matches!(&e, Event::Removed { group, .. } if *group == gid).then_some(())).await;
+            let asked: Vec<&str> = requests.lock().unwrap()[before..].iter().map(|(_, route)| *route).collect();
+            assert!(!asked.is_empty(), "asked the service");
+            assert!(asked.iter().all(|route| !route.ends_with("/append")), "never appended to the forgotten log: {asked:?}");
+            bob.node.shutdown().await.unwrap();
+        }
     });
 }
 

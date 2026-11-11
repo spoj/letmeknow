@@ -719,7 +719,7 @@ mod tests {
         alice.inner.peer_event(lmk_net::Event::Frame(peer, Frame::Entries { log: log.clone(), entries: vec![Bytes(b"skipped".to_vec())], head }));
         {
             let st = alice.inner.lock();
-            st.capability(&id).unwrap();
+            assert!(!st.log(&id).unwrap().stale());
             assert_eq!(st.log(&id).unwrap().at, 0);
             assert!(st.log(&id).unwrap().head.is_none());
         }

@@ -33,7 +33,7 @@ It prints the new domain and public key: put the key in deploy/backend.json's di
 
 ## Limits
 
-The protocol's limits (entry and page sizes, the 30 days a log let go is remembered, the 28 days a session waits before taking a log as let go) are fixed. The service's are its own, set by `serve` flags sized to its machine; each defaults as below:
+The protocol's limits (entry and page sizes, the 30 days a log let go is remembered, the 28 days a session waits before taking a log with nothing new as let go) are fixed. The service's are its own, set by `serve` flags sized to its machine; each defaults as below:
 
 | Flag | Default | Limits |
 | --- | --- | --- |

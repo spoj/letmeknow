@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
 use lmk_core::group::{self as core, Change};
-use lmk_membership::Refused;
+use lmk_membership::{Expired, Refused};
 use lmk_proto::Bytes;
 
 use crate::held::delivered_key;
@@ -29,6 +29,7 @@ impl Inner {
                 let mut st = self.lock();
                 let st = &mut *st;
                 let g = st.group(gid)?;
+                ensure!(!st.log(&g.rec.log.0)?.stale(), Expired(g.rec.log.0.as_slice().try_into()?));
                 let (service, capability, epoch) = (g.mls.settings().membership, st.capability(&g.rec.log.0)?, g.mls.epoch());
                 match g.mls.posted() {
                     Some(posted) => (posted.to_vec(), true, service, capability, epoch),

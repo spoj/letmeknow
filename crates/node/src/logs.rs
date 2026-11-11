@@ -11,7 +11,7 @@ use anyhow::{Context, Result, ensure};
 use ed25519_dalek::VerifyingKey;
 use lmk_core::provider::SqliteProvider;
 use lmk_membership::client::{Post, ServeClient};
-use lmk_membership::{Contradiction, Expired, Frontier, Unsupported, WrongDirectory};
+use lmk_membership::{Contradiction, Expired, Frontier, Refused, Unsupported, WrongDirectory};
 use lmk_net::peers::WAIT;
 use lmk_proto::Bytes;
 use lmk_proto::group::Service;
@@ -87,6 +87,12 @@ impl Log {
         self.head.as_ref().map_or(0, |head| head.length)
     }
 
+    /// Whether this session has not seen the log alive for `STALE`: past that, the service may have forgotten that it
+    /// let the log go, so only new entries show it alive, and it is never appended to.
+    pub fn stale(&self) -> bool {
+        corrected() > self.at.max(self.since) + STALE
+    }
+
     /// How far the log is authenticated, for the membership client.
     pub(crate) fn frontier(&self, id: &[u8]) -> Result<Frontier> {
         let (service, id) = (authority(&self.service)?, id.try_into()?);
@@ -131,7 +137,7 @@ impl State {
     /// Records that a log was read from its service as of `at`, if this session still follows it.
     pub(crate) fn read_as_of(&mut self, id: &[u8], at: u64) -> Result<()> {
         let Some(log) = self.logs.get_mut(id) else { return Ok(()) };
-        log.at = at;
+        log.at = log.at.max(at);
         self.save_log(id)
     }
 
@@ -174,13 +180,10 @@ impl State {
     }
 
     /// The capability that names a log at its service, from the MLS state of the epoch the log is of, while the group is
-    /// in it, and while this session saw the log alive within `STALE`: past that, the service may have forgotten that it
-    /// let the log go, so the log counts as let go.
+    /// in it.
     pub(crate) fn capability(&self, id: &[u8]) -> Result<[u8; 32]> {
-        let log = self.log(id)?;
-        let g = self.group(&log.group.0)?;
+        let g = self.group(&self.log(id)?.group.0)?;
         ensure!(g.rec.log.0 == id, "the group has moved on from that log");
-        ensure!(corrected() <= log.at.max(log.since) + STALE, Expired(id.try_into()?));
         g.mls.capability(&self.provider)
     }
 
@@ -252,34 +255,42 @@ impl State {
 impl Inner {
     /// Before a send: asks the service about the group's current log, and if it moved, or this session holds a commit of
     /// it that it has not applied, as while it waits for what the last one kept, waits until this session caught up with
-    /// it, through each epoch a commit moves it to. Fails when the log counts as let go. A service that does not answer
-    /// within `SEND_WAIT` holds nothing back: chat goes on while it is down.
+    /// it, through each epoch a commit moves it to. Fails when the log counts as let go. Within `STALE`, a service that
+    /// does not answer within `SEND_WAIT` holds nothing back: chat goes on while it is down.
     pub(crate) async fn refresh(self: &Arc<Self>, gid: &[u8]) -> Result<()> {
         let (id, service, known) = {
-            let mut st = self.lock();
+            let st = self.lock();
             let id = st.group(gid)?.rec.log.0.clone();
-            let capability = match st.capability(&id) {
-                Err(error) if error.is::<Expired>() => return self.lapse(&mut st, &id).and(Err(SendError::LetGo.into())),
-                capability => capability?,
-            };
-            (id.clone(), st.log(&id)?.service.clone(), Known(capability, st.log(&id)?.length()))
+            (id.clone(), st.log(&id)?.service.clone(), Known(st.capability(&id)?, st.log(&id)?.length()))
         };
         let sent = corrected();
+        let current_stale = |st: &State| st.group(gid).and_then(|g| st.log(&g.rec.log.0)).is_ok_and(Log::stale);
         let answer = match timeout(SEND_WAIT, async { self.clients.client(&service)?.heads(&[known]).await }).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(error)) => {
                 self.report(&error);
+                if current_stale(&self.lock()) {
+                    return Err(error);
+                }
                 return Ok(());
             }
-            Err(_) => return Ok(()),
+            Err(_) => {
+                if current_stale(&self.lock()) {
+                    anyhow::bail!("the membership service did not answer");
+                }
+                return Ok(());
+            }
         };
+        let stale = self.lock().log(&id).is_ok_and(Log::stale);
         match answer.into_iter().next() {
-            Some(Err(_)) => self.lapse(&mut self.lock(), &id).and(Err(SendError::LetGo.into())),
-            Some(Ok(_)) => self.caught_up(gid).await,
-            None => {
+            Some(Ok(head)) if !stale || head.length > known.1 => {
+                self.caught_up(gid).await.map_err(|e| if e.is::<Expired>() { SendError::LetGo.into() } else { e })
+            }
+            None if !stale => {
                 self.lock().read_as_of(&id, sent)?;
                 if self.lock().at_head(gid) { Ok(()) } else { self.caught_up(gid).await }
             }
+            _ => self.lapse(&mut self.lock(), &id).and(Err(SendError::LetGo.into())),
         }
     }
 
@@ -335,12 +346,8 @@ impl Inner {
     pub(crate) async fn read(&self, id: &[u8]) -> Result<()> {
         loop {
             let (capability, service, frontier) = {
-                let mut st = self.lock();
-                let capability = match st.capability(id) {
-                    Ok(capability) => capability,
-                    Err(error) if error.is::<Expired>() => return self.lapse(&mut st, id).and(Err(error)),
-                    Err(_) => return Ok(()),
-                };
+                let st = self.lock();
+                let Ok(capability) = st.capability(id) else { return Ok(()) };
                 let log = st.log(id)?;
                 (capability, log.service.clone(), log.frontier(id)?)
             };
@@ -350,6 +357,12 @@ impl Inner {
                     if let Some(contradiction) = error.downcast_ref::<Contradiction>() {
                         self.contradicted(&self.lock(), id, contradiction, "this session");
                     }
+                    if matches!(error.downcast_ref::<Refused>(), Some(Refused(code)) if code == "policy")
+                        && self.lock().log(id).is_ok_and(Log::stale)
+                    {
+                        let expired = Expired(id.try_into()?);
+                        return self.lapse(&mut self.lock(), id).and(Err(expired.into()));
+                    }
                     if error.is::<Expired>() {
                         self.lapse(&mut self.lock(), id)?;
                     }
@@ -357,11 +370,18 @@ impl Inner {
                 }
             };
             let more = !page.entries.is_empty();
-            self.take_entries(&mut self.lock(), id, page.after, page.entries, page.head)?;
+            if !more && self.lock().log(id).is_ok_and(Log::stale) {
+                let expired = Expired(id.try_into()?);
+                return self.lapse(&mut self.lock(), id).and(Err(expired.into()));
+            }
+            let end = page.head.length;
+            let mut st = self.lock();
+            self.take_entries(&mut st, id, page.after, page.entries, page.head)?;
+            if st.log(id).is_ok_and(|log| log.length() >= end) {
+                st.read_as_of(id, corrected())?;
+            }
             if !more {
-                let mut st = self.lock();
-                st.logs.get_mut(id).context("dropped the log")?.at = corrected();
-                return st.save_log(id);
+                return Ok(());
             }
         }
     }
