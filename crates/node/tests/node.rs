@@ -382,6 +382,60 @@ async fn a_silent_member_reached_first_holds_up_no_other() {
     alice.node.shutdown().await.unwrap();
 }
 
+/// An `Answer::Ok` whose admission `Group::join` refuses counts as that member's refusal, with its error as the
+/// refusal's text: the join asks the next member, and when none admits it, leaves no KeyPackage or joining record.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalid_admission_counts_as_a_refusal_and_asks_the_next_member() {
+    use lmk_net::{Admit, Groups, Net};
+    use lmk_proto::{Answer, links::Invite, peer::{Admitted, Join}};
+
+    struct NoGroups;
+    impl Groups for NoGroups {
+        fn admit(&self, _: &iroh::EndpointId, _: Frame) -> Option<Frame> {
+            None
+        }
+    }
+    struct BadAdmit;
+    impl Admit for BadAdmit {
+        fn join(&self, _: iroh::EndpointId, _: Join) -> n0_future::boxed::BoxFuture<Answer<Admitted>> {
+            Box::pin(async {
+                Answer::Ok(Admitted { commit: Bytes::default(), welcome: Bytes::default(), cut: vec![], sig: Bytes::default() })
+            })
+        }
+    }
+
+    let relay = relay().await;
+    let dir = folder("invalid-admission");
+    let db = dir.join("bob.db");
+    let alice = session(&relay).await;
+    let bob = stored(&relay, &db).await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    let link = alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
+    let endpoint = lmk_net::builder([relay.url.clone()]).ca_tls_config(relay.ca()).bind().await.unwrap();
+    let (bad, _rx) = Net::spawn(endpoint, Arc::new(NoGroups), Arc::new(BadAdmit)).await.unwrap();
+    bad.dial(bob.node.net().id(), vec![relay.url.clone()]).await.unwrap();
+    eventually("the bad peer is connected", || bob.node.net().connected().contains(&bad.id())).await;
+    let bad_member = (*bad.id().as_bytes(), relay.domain.clone());
+
+    let only_bad = Invite { secret: [7; 16], members: vec![bad_member.clone()], ..link.clone() };
+    let joining = [b"node/joining/".as_slice(), &Sha256::digest(only_bad.secret)].concat();
+    let refused = bob.node.join(&only_bad).await.unwrap_err();
+    assert_eq!(format!("{refused:#}"), "refused: an empty entry");
+    let rows = dump(&db);
+    assert!(!rows.iter().any(|row| row.starts_with("lmk ") && row.contains(&format!("Blob({joining:?})"))), "no joining record remains");
+    assert!(!rows.iter().any(|row| row.starts_with("openmls_key_packages ")), "no KeyPackage's private keys remain");
+    assert_eq!(std::fs::metadata(db.with_extension("db-wal")).unwrap().len(), 0, "deleted keys leave no copy in the WAL");
+
+    let both = Invite { members: vec![bad_member, link.members[0].clone()], ..link };
+    let joining = [b"node/joining/".as_slice(), &Sha256::digest(both.secret)].concat();
+    let (joined, by) = bob.node.join(&both).await.unwrap();
+    assert_eq!((joined, by), (gid, link.members[0].0));
+    assert!(!dump(&db).iter().any(|row| row.starts_with("lmk ") && row.contains(&format!("Blob({joining:?})"))));
+    bad.shutdown().await.unwrap();
+    bob.node.shutdown().await.unwrap();
+    alice.node.shutdown().await.unwrap();
+}
+
 /// An invite dies when its inviter leaves the group, removed or by `leave`, even if it returns with the same key.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_invite_dies_when_its_inviter_leaves() {

@@ -164,11 +164,13 @@ impl Node {
             };
             let answer = timeout(JOIN_WAIT, self.inner.net().join(peer, relays.clone(), join.clone())).await;
             match answer {
-                Ok(Ok(Answer::Ok(admitted))) => {
-                    let gid = self.inner.welcomed(admitted, &join.key_package.0).await?;
-                    self.inner.lock().provider.delete(&joining)?;
-                    return Ok((gid, *peer.as_bytes()));
-                }
+                Ok(Ok(Answer::Ok(admitted))) => match self.inner.welcomed(admitted, &join.key_package.0).await {
+                    Ok(gid) => {
+                        self.inner.lock().provider.delete(&joining)?;
+                        return Ok((gid, *peer.as_bytes()));
+                    }
+                    Err(error) => refusal = anyhow::anyhow!("refused: {error:#}"),
+                },
                 Ok(Ok(Answer::Refused { refused })) => refusal = anyhow::anyhow!("refused: {refused}"),
                 // The connection may have been replaced by one the member dialed meanwhile; asking again is safe, as a
                 // member that added this session answers with the Add it kept. The ask may have added it.
