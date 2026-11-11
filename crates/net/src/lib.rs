@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 
 /// How many events wait for the node: past that, the peers that send them wait.
 const EVENTS: usize = 64;
-/// How long a joiner has to send its request on the stream it opened for it.
+/// How long a connection has to open its `peer` stream, and a stream to send its opening frame or a joiner's request.
 const ASK: Duration = Duration::from_secs(30);
 
 /// What this crate needs from the group logic to gate frames. Calls are quick and local.
@@ -201,32 +201,36 @@ impl Inner {
         linked
     }
 
-    /// Runs a connection's streams until it closes. The dialer opens the one `peer` stream. It tells of the connection
-    /// before the stream's frames, and of its end after.
+    /// Runs a connection's streams until it closes. The dialer opens the one `peer` stream, within `ASK`; it tells of the
+    /// connection before the stream's frames, and of its end after.
     async fn serve(self: Arc<Self>, conn: Connection, dialed: bool, out: mpsc::UnboundedReceiver<Frame>) {
         let peer = conn.remote_id();
         self.events.send(Event::Connected(peer, dialed)).await.ok();
-        let mut out = Some(out);
-        if dialed {
-            match open_peer(&conn).await {
-                Ok((send, recv)) => {
-                    spawn(peer::run(self.clone(), conn.clone(), send, recv, out.take().unwrap()));
-                }
-                Err(e) => tracing::debug!("no peer stream to {}: {e:#}", peer.fmt_short()),
+        let opened = timeout(ASK, async {
+            if dialed {
+                return open_peer(&conn).await.inspect_err(|e| tracing::debug!("no peer stream to {}: {e:#}", peer.fmt_short())).ok();
             }
-        }
-        while let Ok((send, mut recv)) = conn.accept_bi().await {
-            let Ok(open) = frame::read_within::<Open, _>(&mut recv, MAX_ASK).await else { continue };
-            match open.stream {
-                Stream::Peer => {
-                    if let Some(out) = out.take() {
-                        spawn(peer::run(self.clone(), conn.clone(), send, recv, out));
+            while let Ok((send, mut recv)) = conn.accept_bi().await {
+                let Ok(open) = frame::read_within::<Open, _>(&mut recv, MAX_ASK).await else { continue };
+                match open.stream {
+                    Stream::Peer => return Some((send, recv)),
+                    Stream::Admission => {
+                        spawn(self.clone().admit(peer, send, recv));
                     }
                 }
-                Stream::Admission => {
+            }
+            None
+        })
+        .await;
+        if let Ok(Some((send, recv))) = opened {
+            spawn(peer::run(self.clone(), conn.clone(), send, recv, out));
+            while let Ok((send, mut recv)) = conn.accept_bi().await {
+                if let Ok(Ok(Open { stream: Stream::Admission })) = timeout(ASK, frame::read_within(&mut recv, MAX_ASK)).await {
                     spawn(self.clone().admit(peer, send, recv));
                 }
             }
+        } else {
+            conn.close(0u32.into(), b"no peer stream");
         }
         if self.unregister(&conn) {
             self.events.send(Event::Disconnected(peer)).await.ok();

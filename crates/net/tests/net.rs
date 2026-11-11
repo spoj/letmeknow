@@ -124,6 +124,58 @@ async fn a_connection_without_a_peer_stream_is_counted_and_closed() {
     member.net.shutdown().await.unwrap();
 }
 
+/// A connection whose `peer` stream does not open within `ASK`, whether the peer dialed in and opened none or refused
+/// the dialer's, is closed, and what was queued for it goes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_whose_peer_stream_never_opens_is_closed() {
+    let relay = relay().await;
+    let keys = keys(3);
+    let mut a = node(&relay, keys[0].clone(), false).await;
+    let inbound = lmk_net::builder([relay.url.clone()])
+        .secret_key(keys[1].clone())
+        .ca_tls_config(iroh::tls::CaTlsConfig::custom_roots([relay.cert.clone()]))
+        .bind()
+        .await
+        .unwrap();
+    let in_conn = inbound.connect(iroh::EndpointAddr::new(keys[0].public()).with_relay_url(relay.url.clone()), frame::ALPN).await.unwrap();
+    let no_streams = iroh::endpoint::QuicTransportConfig::builder().max_concurrent_bidi_streams(0u32.into()).build();
+    let outbound = lmk_net::builder([relay.url.clone()])
+        .secret_key(keys[2].clone())
+        .ca_tls_config(iroh::tls::CaTlsConfig::custom_roots([relay.cert.clone()]))
+        .alpns(vec![frame::ALPN.to_vec()])
+        .transport_config(no_streams)
+        .bind()
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, outbound.online()).await.expect("online");
+    let accepting = tokio::spawn({
+        let outbound = outbound.clone();
+        async move { outbound.accept().await.unwrap().await.unwrap() }
+    });
+    a.net.dial(keys[2].public(), vec![relay.url.clone()]).await.unwrap();
+    let out_conn = accepting.await.unwrap();
+    for _ in 0..2 {
+        a.until(|e| matches!(e, Event::Connected(..))).await;
+    }
+    for peer in [keys[1].public(), keys[2].public()] {
+        assert!(a.net.frame(peer, want(1)));
+    }
+    let closed = tokio::time::timeout(Duration::from_secs(40), async {
+        let first = a.events.recv().await.unwrap();
+        let second = a.events.recv().await.unwrap();
+        (first, second)
+    })
+    .await
+    .expect("both connections without a peer stream closed");
+    for peer in [keys[1].public(), keys[2].public()] {
+        assert!(closed.0 == Event::Disconnected(peer) || closed.1 == Event::Disconnected(peer));
+        assert!(!a.net.frame(peer, want(2)), "the closed connection keeps no queued frames");
+    }
+    assert!(matches!(in_conn.closed().await, iroh::endpoint::ConnectionError::ApplicationClosed(_)));
+    assert!(matches!(out_conn.closed().await, iroh::endpoint::ConnectionError::ApplicationClosed(_)));
+    a.net.shutdown().await.unwrap();
+}
+
 /// Each request to be admitted goes on a stream of its own, answered there.
 #[tokio::test(flavor = "multi_thread")]
 async fn requests_to_be_admitted_are_answered_each_on_its_stream() {
@@ -204,6 +256,32 @@ async fn a_peer_that_does_not_read_is_closed() {
     assert!(matches!(conn.closed().await, iroh::endpoint::ConnectionError::ApplicationClosed(_)));
     assert!(!a.net.frame(keys[1].public(), want(1)), "the closed connection keeps no queued frames");
     a.net.shutdown().await.unwrap();
+}
+
+/// A stream whose opening frame is not sent within `ASK` is dropped, so a stream opened after it is still answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_that_never_sends_open_ends_its_wait() {
+    use tokio::io::AsyncWriteExt;
+    let relay = relay().await;
+    let keys = keys(2);
+    let member = node(&relay, keys[0].clone(), false).await;
+    let peer = lmk_net::builder([relay.url.clone()]).secret_key(keys[1].clone()).ca_tls_config(iroh::tls::CaTlsConfig::custom_roots([relay.cert.clone()]));
+    let peer = peer.bind().await.unwrap();
+    let conn = peer.connect(iroh::EndpointAddr::new(keys[0].public()).with_relay_url(relay.url.clone()), frame::ALPN).await.unwrap();
+    let (mut peer_send, _peer_recv) = conn.open_bi().await.unwrap();
+    frame::write(&mut peer_send, &frame::Open { stream: frame::Stream::Peer }).await.unwrap();
+    let (mut stalled_send, _stalled_recv) = conn.open_bi().await.unwrap();
+    stalled_send.write_u8(0).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    frame::write(&mut send, &frame::Open { stream: frame::Stream::Admission }).await.unwrap();
+    frame::write(&mut send, &Join { secret: Bytes::from(SECRET), key_package: Bytes(b"kp".to_vec()) }).await.unwrap();
+    let answer = tokio::time::timeout(Duration::from_secs(40), frame::read::<Answer<lmk_proto::peer::Admitted>, _>(&mut recv))
+        .await
+        .expect("the stalled stream's wait ended")
+        .unwrap();
+    assert!(matches!(answer, Answer::Ok(_)));
+    member.net.shutdown().await.unwrap();
 }
 
 /// A joiner's request is small: a stream that announces a larger one is dropped, not read.
