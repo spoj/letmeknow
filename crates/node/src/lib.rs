@@ -1107,6 +1107,38 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rate_refused_leave_does_not_mark_the_group_leaving() {
+        let relay = lmk_testing::relay().await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("bob.db");
+        let start = || async {
+            let config = Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[9; 32]) };
+            Node::start(SqliteProvider::open(&db).unwrap(), config).await.unwrap().0
+        };
+        let (alice, bob) = (node(&relay, relay.post()).await, start().await);
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let gid = alice.create(settings).unwrap();
+        bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        {
+            let mut st = bob.inner.lock();
+            let g = st.group_mut(&gid.0).unwrap();
+            while g.sending.take(0, 1.0, u64::MAX) {}
+        }
+        let refused = bob.leave(&gid.0).unwrap_err();
+        assert!(matches!(refused.downcast_ref(), Some(SendError::Rate)), "{refused:#}");
+        assert!(!bob.leaving(&gid.0));
+        bob.shutdown().await.unwrap();
+        let bob = start().await;
+        assert!(!bob.leaving(&gid.0));
+        let id = bob.leave(&gid.0).unwrap().unwrap();
+        assert!(bob.leaving(&gid.0));
+        assert_eq!(bob.leave(&gid.0).unwrap(), Some(id));
+        for node in [alice, bob] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
     /// Two members that chatted, once all is delivered and said, poll for nothing: no timed work is due.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_idle_session_polls_for_nothing() {

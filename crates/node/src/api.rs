@@ -148,24 +148,27 @@ impl Node {
         Ok(st.group(gid)?.intros().filter_map(|(intro, _)| Some((intro.member, intro.text?))).collect())
     }
 
-    /// Marks the group as one this session leaves, and sends its `leave`, which carries its leave: the others remove it
+    /// Sends this session's `leave`, which carries its leave, and marks the group as one it leaves: the others remove it
     /// once a cut keeps the `leave`, and it is in the group until then. Forgets a group it is alone in. Returns the
     /// `leave`'s id; none once this session is out of the group.
     pub fn leave(&self, gid: &[u8]) -> Result<Option<Bytes>> {
         let mut st = self.inner.lock();
-        st.group_mut(gid)?.rec.leaving = true;
-        st.save(gid)?;
         let g = st.group(gid)?;
         let me = st.me().to_vec();
         if g.mls.members().len() == 1 {
             self.inner.forget(&mut st, gid)?;
-            Ok(None)
-        } else if let Some((seq, _)) = g.left(&me) {
-            st.id_at(gid, &me, g.mls.joined(&me).context("a member of its group")?, seq)
-        } else {
-            let leave = serde_json::to_value(Control::Leave { sig: g.mls.leave(&st.session)? })?;
-            Ok(Some(self.inner.send(&mut st, gid, &leave, None)?))
+            return Ok(None);
         }
+        let id = match g.left(&me) {
+            Some((seq, _)) => st.id_at(gid, &me, g.mls.joined(&me).context("a member of its group")?, seq)?,
+            None => {
+                let leave = serde_json::to_value(Control::Leave { sig: g.mls.leave(&st.session)? })?;
+                Some(self.inner.send(&mut st, gid, &leave, None)?)
+            }
+        };
+        st.group_mut(gid)?.rec.leaving = true;
+        st.save(gid)?;
+        Ok(id)
     }
 
     /// Sends a held payload, a reply to the delivered message `reply_to` if given. The node first asks the membership
