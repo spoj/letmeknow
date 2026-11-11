@@ -316,6 +316,27 @@ async fn an_answer_that_does_not_drain_closes_its_connection() {
     server.abort();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_connection_is_kept_after_a_membership_answer_drained() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let (config, cert) = configure(&state);
+    let https = config.https_port;
+    let server = tokio::spawn(serve(config));
+    wait_for_https(https).await;
+
+    let mut tls = tls_connect("127.0.0.1", https, &cert).await;
+    let heads = String::from_utf8(post("/membership/6/heads", None, &serde_json::to_vec(&Heads { logs: vec![] }).unwrap()))
+        .unwrap()
+        .replace("Connection: close\r\n", "");
+    tls.write_all(heads.as_bytes()).await.unwrap();
+    assert!(response(&mut tls).await.starts_with("HTTP/1.1 200"));
+    tokio::time::sleep(Duration::from_secs(32)).await;
+    tls.write_all(heads.as_bytes()).await.unwrap();
+    assert!(response(&mut tls).await.starts_with("HTTP/1.1 200"));
+    server.abort();
+}
+
 /// The journal a service keeps, which an operator's unit writes at its level, as the service's own log lines.
 #[derive(Clone, Default)]
 struct Journal(Arc<std::sync::Mutex<Vec<u8>>>);

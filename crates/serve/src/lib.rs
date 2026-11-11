@@ -319,12 +319,16 @@ struct Site {
     membership: Service,
     /// The address membership budgets count the request against.
     peer: IpAddr,
-    /// When the last membership answer must have drained, unless another request follows it.
+    /// When the membership answer being written must have drained.
     drain: watch::Sender<Option<Instant>>,
 }
 
-/// An answer, which holds its admission until it is written or dropped.
-struct Held { answer: Bytes, _admission: Admission }
+/// An answer, which holds its admission and drain deadline until it is written or dropped.
+struct Held { answer: Bytes, drain: watch::Sender<Option<Instant>>, _admission: Admission }
+
+impl Drop for Held {
+    fn drop(&mut self) { self.drain.send_replace(None); }
+}
 
 impl Body for Held {
     type Data = Bytes;
@@ -363,7 +367,7 @@ async fn answer_membership(route: Option<Route>, service: Service, peer: IpAddr,
                     respond(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "application/json")
                         .header(header::CACHE_CONTROL, "no-store")
-                        .body(Box::new(Held { answer: answer.into(), _admission: admission }))
+                        .body(Box::new(Held { answer: answer.into(), drain, _admission: admission }))
                 }
                 Err(_) => respond(StatusCode::INTERNAL_SERVER_ERROR).body(body("")),
             }
@@ -380,7 +384,6 @@ impl HyperService<Request<Incoming>> for Site {
     type Future = Answer;
 
     fn call(&self, req: Request<Incoming>) -> Answer {
-        self.drain.send_replace(None);
         if req.uri().path().starts_with("/membership/") {
             let route = Route::parse(req.uri().path());
             let (service, peer, drain) = (self.membership.clone(), self.peer, self.drain.clone());
