@@ -2922,6 +2922,59 @@ async fn a_message_an_online_member_holds_is_kept_by_the_next_commit() {
     alice.node.shutdown().await.unwrap();
 }
 
+/// A message no cut kept that its only other holder drops past H leaves that holder's `sealed` too, and its summary is
+/// signed again: its author sees it as `only_here` again, keeps its plaintext across its next commit, and still delivers
+/// it to a member back later.
+#[test]
+fn a_message_dropped_past_h_is_only_here_again_and_kept_by_its_author() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let dir = folder("expired-sealed");
+        let (alice_db, bob_db, carol_db) = (dir.join("alice.db"), dir.join("bob.db"), dir.join("carol.db"));
+        let mut alice = stored(&relay, &alice_db).await;
+        let bob = stored(&relay, &bob_db).await;
+        let carol = stored(&relay, &carol_db).await;
+        let gid = alice.node.create(Settings { carry: 1, update: u32::MAX, ..settings(&relay) }).unwrap();
+        let spares = strangers(&mut alice, &gid, &relay, 1).await;
+        for joiner in [&bob, &carol] {
+            joiner.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+            alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+        }
+        let epoch = carol.node.epoch(&gid.0).unwrap();
+        eventually("Alice and Bob have Carol's update", || [&alice.node, &bob.node].iter().all(|n| n.epoch(&gid.0).unwrap() == epoch)).await;
+        carol.node.shutdown().await.unwrap();
+        drop(carol);
+
+        let (alice_key, bob_key) = (alice.node.key(), bob.node.key());
+        let m1 = bob.node.send(&gid.0, &message("kept by author"), None).await.unwrap();
+        alice.until(|e| matches!(&e, Event::Message(m) if m.id == m1).then_some(())).await;
+        eventually("Bob hears that Alice holds m1", || bob.node.only_here(&gid.0).unwrap().is_empty()).await;
+        alice.node.shutdown().await.unwrap();
+        drop(alice);
+
+        SHIFT.store(2 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        let alice = stored(&relay, &alice_db).await;
+        eventually("Alice dropped m1 and sent Bob her new summary", || {
+            alice.node.message(&gid.0, &m1.0).unwrap().is_none()
+                && bob.node.connected(&gid.0).unwrap().iter().any(|m| m.key == alice_key)
+                && bob.node.heard(&gid.0).unwrap().iter().any(|h| h.member.key == alice_key && !h.held.iter().any(|s| s.key == bob_key))
+        }).await;
+        assert!(bob.node.only_here(&gid.0).unwrap().iter().any(|(id, _)| *id == m1), "Alice's summary no longer lists m1 sealed");
+        bob.node.remove(&gid.0, &spares[..1]).await.unwrap();
+        alice.node.shutdown().await.unwrap();
+        assert!(bob.node.only_here(&gid.0).unwrap().iter().any(|(id, _)| *id == m1), "Bob's commit did not keep m1");
+
+        let mut carol = stored(&relay, &carol_db).await;
+        carol.until(|e| matches!(&e, Event::Message(m) if m.id == m1).then_some(())).await;
+        bob.node.shutdown().await.unwrap();
+        carol.node.shutdown().await.unwrap();
+    });
+}
+
 /// An update waiting for what connected members list commits once HEAR is up, not later: Bob's stand-in lists seqs that
 /// Alice never got, and nothing sends them. It lists right after an update Alice's message stirred; her next message
 /// stirs the next update, due within T, which waits in the epoch it lists for.

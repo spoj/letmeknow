@@ -136,9 +136,12 @@ impl State {
                     continue;
                 }
                 let h = &record.header;
-                if let Some(author) = self.group_mut(gid)?.author_mut(&h.author.0, h.joined) {
+                let g = self.group_mut(gid)?;
+                if let Some(author) = g.author_mut(&h.author.0, h.joined) {
                     author.servable.remove(h.seq);
+                    author.sealed.remove(&h.seq);
                 }
+                g.changed = true;
                 self.unstore(gid, &record)?;
                 self.scrub = true;
             }
@@ -366,8 +369,12 @@ mod tests {
             }
             assert!(st.record(&gid.0, &own.0).unwrap().unwrap().plaintext.is_some());
             let recent_index = st.message(&gid.0, &recent.0).unwrap().unwrap().index;
+            let old_seq = st.record(&gid.0, &old.0).unwrap().unwrap().header.seq;
+            st.group_mut(&gid.0).unwrap().changed = false;
             st.expire(&gid.0).unwrap();
             assert!(st.record(&gid.0, &old.0).unwrap().is_none(), "an unkept message holds up no later expiry");
+            let g = st.group(&gid.0).unwrap();
+            assert!(g.changed && !g.current(&bob.key().0).unwrap().sealed.contains_key(&old_seq));
             assert!(st.message(&gid.0, &own.0).unwrap().is_some());
             assert!(st.message(&gid.0, &recent.0).unwrap().is_some());
             assert_eq!(st.group(&gid.0).unwrap().rec.first, first);
