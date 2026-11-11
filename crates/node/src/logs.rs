@@ -219,7 +219,7 @@ impl State {
 
     /// Takes expiries of logs of the group's earlier epochs, asked of their services or told by a neighbour: each that its
     /// service signed, of an epoch a member is in, leaves the members in that epoch behind.
-    pub(crate) fn take_expiries(&mut self, gid: &[u8], expiries: &[Expiry]) -> Result<()> {
+    pub(crate) fn take_expiries(&mut self, gid: &[u8], expiries: &[Expiry]) -> Result<bool> {
         let g = self.group_mut(gid)?;
         let key = VerifyingKey::from_bytes(&authority(&g.mls.settings().membership)?)?;
         let mut taken = false;
@@ -232,7 +232,7 @@ impl State {
         if taken {
             self.save(gid)?;
         }
-        Ok(())
+        Ok(taken)
     }
 
     /// Drops a group's earlier logs read longer than `before`.
@@ -295,7 +295,7 @@ impl Inner {
             return Ok(());
         }
         let gone = self.let_go(asked.iter().map(|epoch| (epoch.service.clone(), epoch.capability)).collect()).await;
-        self.lock().take_expiries(gid, &gone)
+        self.lock().take_expiries(gid, &gone).map(drop)
     }
 
     /// The expiries of the logs among `logs`, each a service and a capability, that their services let go. They are asked

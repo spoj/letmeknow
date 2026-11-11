@@ -1364,6 +1364,74 @@ fn a_joiner_takes_the_expiries_its_admitter_holds() {
     });
 }
 
+/// An expiry a neighbour passes on in `hello` runs the group's duties: an admin already at the head with no update due,
+/// and unable to ask the service `/heads` itself, removes the member left behind at once.
+#[test]
+fn an_idle_admin_removes_a_member_whose_expiry_a_neighbour_passes_on() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let dir = folder("passed-expiry-idle");
+        let (alice_db, bob_db) = (dir.join("alice.db"), dir.join("bob.db"));
+        let start_on = |db: std::path::PathBuf, seed: u8, post: Post| {
+            let relay = &relay;
+            async move {
+                let device = SigningKey::from_bytes(&[seed; 32]);
+                let (node, events) = Node::start(SqliteProvider::open(&db).unwrap(), Config { device, post, ..config(relay) }).await.unwrap();
+                Session { node, events }
+            }
+        };
+        let mut alice = start_on(alice_db.clone(), 1, relay.post()).await;
+        let gid = alice.node.create(settings(&relay)).unwrap();
+        let spares = strangers(&mut alice, &gid, &relay, 1).await;
+        let bob = start_on(bob_db.clone(), 2, relay.post()).await;
+        let dave = session_on(&relay, 3).await;
+        let dave_key = dave.node.key();
+        for joiner in [&bob, &dave] {
+            joiner.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+            alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+        }
+        let dave_epoch = dave.node.epoch(&gid.0).unwrap();
+        eventually("Alice and Bob have Dave's update", || {
+            [&alice.node, &bob.node].iter().all(|n| n.epoch(&gid.0).unwrap() == dave_epoch)
+        }).await;
+        dave.node.shutdown().await.unwrap();
+
+        // Alice's removal moves the group past Dave and leaves Alice unstirred, while stirring non-admin Bob.
+        alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
+        eventually("Bob applied the removal", || bob.node.members(&gid.0).unwrap().len() == 3).await;
+        let before = bob.node.epoch(&gid.0).unwrap();
+        alice.node.shutdown().await.unwrap();
+        bob.node.shutdown().await.unwrap();
+        drop((alice, bob));
+
+        SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        while relay.membership.expire().await {}
+        let bob = start_on(bob_db.clone(), 2, relay.post()).await;
+        eventually("Bob holds Dave's expiry and updated", || {
+            !expired_epochs(&bob_db, &gid).is_empty() && bob.node.epoch(&gid.0).unwrap() > before
+        }).await;
+        bob.node.shutdown().await.unwrap();
+        drop(bob);
+
+        let mut alice = start_on(alice_db.clone(), 1, failing(relay.post(), |route| route.ends_with("/heads"))).await;
+        alice.node.caught_up(&gid.0).await.unwrap();
+        assert!(alice.node.members(&gid.0).unwrap().iter().any(|m| m.key == dave_key));
+
+        let bob = start_on(bob_db, 2, relay.post()).await;
+        let by = alice.until(|e| match e {
+            Event::Left { member, by, .. } if member.key == dave_key => Some(by),
+            _ => None,
+        }).await;
+        assert_eq!(by.key, alice.node.key());
+        alice.node.shutdown().await.unwrap();
+        bob.node.shutdown().await.unwrap();
+    });
+}
+
 /// The types of the payloads of a group's messages a stopped stored member holds, by its author's key.
 fn payload_types(db: &Path, gid: &Bytes) -> Vec<(Bytes, String)> {
     let db = rusqlite::Connection::open(db).unwrap();

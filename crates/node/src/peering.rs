@@ -18,7 +18,7 @@ use lmk_proto::peer::{At, Frame, INTRO, Intro, MAX_INTRO, SUMMARY, Seqs, Shown, 
 use n0_future::time::{Duration, timeout};
 use serde::{Deserialize, Serialize};
 
-use crate::{Epoch, G, Inner, Member, Node, Out, State, endpoint_id, get, now, put};
+use crate::{Epoch, G, Inner, Member, Node, Out, State, Work, endpoint_id, get, now, put};
 
 /// How many summaries of memberships not known yet a group keeps.
 const UNVERIFIED: usize = 32;
@@ -525,7 +525,9 @@ impl Inner {
                 for signed in at.intros.clone() {
                     st.intro(&at.group.0, signed)?;
                 }
-                st.take_expiries(&at.group.0, &at.expired)?;
+                if st.take_expiries(&at.group.0, &at.expired)? {
+                    self.work.send(Work::Duties(at.group.0.clone())).ok();
+                }
                 st.refresh(&at.group.0);
             }
             st.peers.frame(&key, &Frame::Hello { groups }, now);
