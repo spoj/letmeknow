@@ -1087,6 +1087,33 @@ fn a_credential_that_names_another_key_is_refused() {
     assert!(matches!(&read[0][0].0, Verdict::Skipped { reason, .. } if reason.contains("a credential that names another key")), "{:?}", read[0][0].0);
 }
 
+/// A KeyPackage must carry the unbounded lifetime `Session::key_package` gives: none with a bounded lifetime is taken in,
+/// and an Add of one built past `Group::commit` is skipped by every member while it is valid, as it would be once expired.
+#[test]
+fn a_key_package_with_a_bounded_lifetime_is_refused() {
+    let mut w = World::new(&["A", "B", "C", "D"]);
+    w.found(0, &[1]);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    for (joiner, lifetime) in [(2, Lifetime::init(0, now + 300)), (3, Lifetime::init(1, u64::MAX))] {
+        let m = &w.m[joiner];
+        let bundle = KeyPackage::builder()
+            .leaf_node_capabilities(capabilities())
+            .leaf_node_extensions(leaf_extensions(&m.session.leaf).unwrap())
+            .key_package_lifetime(lifetime)
+            .build(CIPHERSUITE, &m.provider, &m.session.signer, m.session.with_key())
+            .unwrap();
+        let bytes = MlsMessageOut::from(bundle.key_package().clone()).to_bytes().unwrap();
+        let error = key_package_leaf(&w.m[0].provider, &bytes).unwrap_err().to_string();
+        assert!(error.contains("bounded lifetime"), "{error}");
+        let cut = w.m[0].cut();
+        let error = refused(&mut w.m[0], Change { cut, add: vec![bytes], invite: Some(INVITE.into()), ..Change::default() });
+        assert!(error.contains("bounded lifetime"), "{error}");
+        w.refused_past_rules(0, Aad { invite: Some(INVITE.into()), ..Aad::default() }, |b| b.propose_adds([bundle.key_package().clone()]), &[1], "bounded lifetime");
+        w.read(&[0]);
+        w.agree(&[0, 1]);
+    }
+}
+
 /// An Add's committer keeps its Welcome, with which the joiner joins; another member keeps none.
 #[test]
 fn the_committer_keeps_the_welcome_of_its_add() {

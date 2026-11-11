@@ -172,7 +172,9 @@ fn key_package_in(provider: &SqliteProvider, bytes: &[u8]) -> Result<KeyPackage>
     let MlsMessageBodyIn::KeyPackage(key_package) = parse::<MlsMessageIn>(bytes)?.extract() else {
         bail!("not a KeyPackage")
     };
-    Ok(key_package.validate(provider.crypto(), ProtocolVersion::Mls10)?)
+    let key_package = key_package.validate(provider.crypto(), ProtocolVersion::Mls10)?;
+    ensure!(*key_package.life_time() == Lifetime::init(0, u64::MAX), "a KeyPackage with a bounded lifetime");
+    Ok(key_package)
 }
 
 /// Everything one commit changes, all inline. The default is an empty key update. Only a commit that adds and changes
@@ -880,11 +882,11 @@ fn well_formed(r: &Ref) -> bool {
 }
 
 /// The app's rules on a commit, from MLS state alone and the commit, binding the committer too: changes inline only, of
-/// the kinds we make: Adds, which name the invite they came in by, and none of a key it removes, of sessions whose
-/// device is admitted or an admin unless the committer is an admin; Removes, of members that signed their leave unless
-/// the committer is an admin; and settings, by an admin, that change only the admins and admitted devices and leave an
-/// admin; the committer's key unchanged; and cut entries that each name a member of the cut state `cut` once, by key, in
-/// order, at its membership, past its entry there by at most `MAX_CUT_STEP`.
+/// the kinds we make: Adds, of KeyPackages that never expire, which name the invite they came in by, and none of a key
+/// it removes, of sessions whose device is admitted or an admin unless the committer is an admin; Removes, of members
+/// that signed their leave unless the committer is an admin; and settings, by an admin, that change only the admins and
+/// admitted devices and leave an admin; the committer's key unchanged; and cut entries that each name a member of the
+/// cut state `cut` once, by key, in order, at its membership, past its entry there by at most `MAX_CUT_STEP`.
 fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad, cut: &[Ref]) -> Result<()> {
     let settings = settings_of(group.extensions())?;
     let committer = Member::of(group, by).context("not a member")?;
@@ -894,6 +896,7 @@ fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad, 
         ensure!(proposal.proposal_or_ref_type() == ProposalOrRefType::Proposal, "a proposal by reference");
         match proposal.proposal() {
             Proposal::Add(add) => {
+                ensure!(*add.key_package().life_time() == Lifetime::init(0, u64::MAX), "a KeyPackage with a bounded lifetime");
                 let leaf = add.key_package().leaf_node();
                 let key = leaf.signature_key().as_slice();
                 ensure!(names_its_key(leaf.credential(), key), "a credential that names another key");
