@@ -117,8 +117,9 @@ impl Quota {
 
     fn charge(&mut self, at: u64, keys: &[(Source, u64)], amount: u64) {
         self.roll(at);
+        let full = self.spent.len() >= self.sources;
         for (key, _) in keys {
-            if !self.tracks(key) { continue; }
+            if !self.tracks(key) || (full && !self.spent.contains_key(key)) { continue; }
             if let Some(net) = key.net48().filter(|_| !self.spent.contains_key(key)) { *self.nets.entry(net).or_default() += 1; }
             *self.spent.entry(*key).or_default() += amount;
         }
@@ -372,6 +373,8 @@ mod tests {
         let mut quota = Quota::new(MINUTE, 2, 100);
         let v4 = |key: usize| Source::V4(Ipv4Addr::from(key as u32));
         for key in 0..100 { quota.charge(0, &[(v4(key), 1)], 1); }
+        quota.charge(0, &[(v4(100), 1)], 1);
+        assert_eq!(quota.spent.len(), 100);
         assert!(quota.fits(0, &[(v4(0), 1)], 1));
         assert!(!quota.fits(0, &[(v4(100), 1)], 1));
         assert!(quota.fits(MINUTE, &[(v4(100), 1)], 1));
@@ -433,6 +436,32 @@ mod tests {
         assert!(admit(1 << 20).is_none());
         held.pop();
         assert!(admit(1 << 20).is_some());
+    }
+
+    #[tokio::test]
+    async fn refused_reads_track_no_sources_past_capacity() {
+        lmk_proto::clock::set(|| 0);
+        let (_dir, service) = service(Policy { sources: 2, ..Policy::default() });
+        let post = async |route: Route, from: &str, body: &[u8]| {
+            let admission = service.admit(from.parse().unwrap(), route, body.len()).unwrap();
+            service.post(route, &admission, body).await.unwrap()
+        };
+        let read = async |from: &str, body: &[u8]| -> Answer<Page> {
+            serde_json::from_slice(&post(Route::Read, from, body).await).unwrap()
+        };
+        assert!(matches!(read("2001:db8:0:1::1", b"{}").await, Answer::Refused { refusal: Refusal::Policy, .. }));
+        let valid = serde_json::to_vec(&Read { capability: [1; 32], after: 0 }).unwrap();
+        assert!(matches!(read("2001:db8:0:2::1", &valid).await, Answer::Refused { refusal: Refusal::Rate, .. }));
+        assert!(matches!(read("2001:db8:0:2::1", &valid).await, Answer::Refused { refusal: Refusal::Rate, .. }));
+        let heads = serde_json::to_vec(&Heads { logs: vec![] }).unwrap();
+        for i in 1..=10 {
+            let answer: Answer<Moved> = serde_json::from_slice(&post(Route::Heads, &format!("192.0.2.{i}"), &heads).await).unwrap();
+            assert!(matches!(answer, Answer::Refused { refusal: Refusal::Rate, .. }));
+        }
+        let budgets = service.0.budgets.lock().unwrap();
+        let tracked = sources("2001:db8:0:1::1".parse().unwrap());
+        assert_eq!((budgets.read_bytes.spent.len(), budgets.read_bytes.nets.values().sum::<u64>()), (2, 1));
+        assert!(budgets.read_bytes.spent[&tracked[1].0] > budgets.read_bytes.spent[&tracked[0].0]);
     }
 
     #[tokio::test]
