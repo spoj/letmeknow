@@ -20,6 +20,15 @@ fn offline_initialization_emits_only_the_durable_public_configuration() {
     drop(store);
 }
 
+#[test]
+fn refused_domain_leaves_no_state_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state");
+    assert!(ServeConfig::new("https://relay.example", &path).initialize().is_err());
+    assert!(!path.exists());
+    ServeConfig::new("relay.example", &path).initialize().unwrap();
+}
+
 #[tokio::test]
 async fn restart_rejects_missing_store_before_certificates_or_listeners() {
     let dir = tempfile::tempdir().unwrap();

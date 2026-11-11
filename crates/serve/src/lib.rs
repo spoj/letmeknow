@@ -117,6 +117,7 @@ impl ServeConfig {
     }
 
     pub fn initialize(&self) -> Result<group::Service> {
+        directory::check_domain(&self.domain())?;
         drop(Store::initialize(&self.state)?);
         self.service()
     }
