@@ -364,6 +364,28 @@ async fn a_refused_join_leaves_no_key_package() {
     alice.node.shutdown().await.unwrap();
 }
 
+/// A joiner's request whose secret names no invite is refused as unknown whatever else it holds, with no warning.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_secret_is_refused_whatever_the_request_carries() {
+    use lmk_proto::{Answer, peer::Join};
+    let relay = relay().await;
+    let mut alice = session(&relay).await;
+    let stranger = session(&relay).await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
+    let (id, url) = alice.node.address();
+    let peer = iroh::EndpointId::from_bytes(&id).unwrap();
+    let join = Join { secret: Bytes(vec![7; 16]), key_package: Bytes(b"not a KeyPackage".to_vec()) };
+    let answer = stranger.node.net().join(peer, vec![url], join).await.unwrap();
+    assert!(matches!(&answer, Answer::Refused { refused } if refused.contains("unknown, used or expired")), "{answer:?}");
+    while let Ok(event) = alice.events.try_recv() {
+        assert!(!matches!(event, Event::Warning { .. }), "{event:?}");
+    }
+    for session in [alice, stranger] {
+        session.node.shutdown().await.unwrap();
+    }
+}
+
 /// A member reached first that never answers keeps the joiner from no other member it dials meanwhile.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_silent_member_reached_first_holds_up_no_other() {

@@ -245,10 +245,10 @@ impl Inner {
     /// Answers a joiner's request, which brings an invite's secret.
     async fn admit_join(self: &Arc<Self>, join: Join) -> Result<Admitted> {
         let Join { secret, key_package } = join;
-        let joiner = key_package_leaf(&self.lock().provider, &key_package.0)?;
         let hash = Bytes(Sha256::digest(&secret.0).to_vec());
         let found = self.lock().groups.iter().find_map(|(gid, g)| Some((gid.clone(), g.rec.invites.iter().find(|rule| rule.hash == hash)?.clone())));
         let (gid, rule) = found.context(UNKNOWN)?;
+        let joiner = key_package_leaf(&self.lock().provider, &key_package.0)?;
         // A joiner the log shows added, whose answer was lost, asks again with the same KeyPackage: it is answered at once
         // if this session applied the Add, else once it caught up.
         let logged = self.lock().logged_commit(&gid, &key_package.0)?;
