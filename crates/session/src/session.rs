@@ -691,12 +691,12 @@ impl Session {
         Ok(())
     }
 
-    /// The message of this session's groups whose id begins with `id`.
+    /// The chat message of this session's groups whose id begins with `id`.
     fn find(&self, id: &str) -> Result<Message> {
         let node = &self.node;
         let mut found = Vec::new();
         for gid in node.groups() {
-            found.extend(node.messages(&gid.0)?.into_iter().filter(|m| !id.is_empty() && hex::encode(&m.id.0).starts_with(id)));
+            found.extend(node.messages(&gid.0)?.into_iter().filter(|m| m.payload["type"] == "message" && !id.is_empty() && hex::encode(&m.id.0).starts_with(id)));
         }
         match found.len() {
             1 => Ok(found.remove(0)),

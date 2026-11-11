@@ -309,6 +309,26 @@ fn send_answers_its_id_and_refuses_a_message_too_large() {
 }
 
 #[test]
+fn reply_to_finds_only_chat_messages() {
+    local(async {
+        let world = world("reply-chat").await;
+        let (alice, mut bob, _) = pair(&world).await;
+        let db = rusqlite::Connection::open(session_dir(&alice.home, "alice").unwrap().join("session.db")).unwrap();
+        db.busy_timeout(lmk_core::provider::BUSY).unwrap();
+        let raw: Vec<u8> = db
+            .query_row("SELECT value FROM lmk WHERE key >= ?1 AND key < ?2", [b"node/message/".as_slice(), b"node/message0".as_slice()], |row| row.get(0))
+            .unwrap();
+        let id: lmk_proto::Bytes = serde_json::from_value(serde_json::from_slice::<Value>(&raw).unwrap()["id"].clone()).unwrap();
+        let control = hex::encode(&id.0);
+        let refused = alice.cmd(&["send", "--reply-to", &control, "no"]).await.unwrap_err().to_string();
+        assert!(refused.contains("no message"), "{refused}");
+        let own = alice.cmd(&["send", "first"]).await.unwrap()["id"].as_str().unwrap().to_owned();
+        alice.cmd(&["send", "--reply-to", &own[..4], "--urgent", "second"]).await.unwrap();
+        assert_eq!(bob.expect("message").await["reply_to"], own);
+    });
+}
+
+#[test]
 fn an_attachment_arrives_as_a_private_file() {
     local(async {
         let world = world("attach").await;
