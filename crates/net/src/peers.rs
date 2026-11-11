@@ -726,7 +726,7 @@ impl Peers {
             .map(|(k, _)| *k)
             .collect();
         while self.conns.len() - close.len() > MAX_CONNECTIONS {
-            let Some(k) = self.conns.iter().filter(|(k, _)| !targeted.contains(*k) && !close.contains(*k)).min_by_key(|(_, c)| c.active).map(|(k, _)| *k) else {
+            let Some(k) = self.conns.iter().filter(|(k, _)| !targeted.contains(*k) && !close.contains(*k)).min_by_key(|(_, c)| (!c.served.is_empty(), c.active)).map(|(k, _)| *k) else {
                 break;
             };
             close.push(k);

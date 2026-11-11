@@ -424,6 +424,23 @@ fn over_128_connections_close_the_longest_idle_untargeted_one() {
     assert_eq!(closes(&p.poll(2_000)), vec![key(1)]);
 }
 
+/// Over 128 connections, untargeted ones that serve no group close before members, though newer.
+#[test]
+fn over_128_connections_close_strangers_before_members() {
+    let mut p = peers();
+    p.group(id(), own(1, &(1..=19).collect::<Vec<_>>()), 0);
+    let targets = p.targets(&id(), 0);
+    for k in &targets {
+        p.connect(*k, gs(), true, 10);
+    }
+    let member = (1..=19).map(key).find(|k| !targets.contains(k)).unwrap();
+    p.connect(member, gs(), false, 20);
+    for n in 0..=MAX_CONNECTIONS - p.connected().len() {
+        p.connect(key(101 + n as u8), BTreeSet::new(), false, 1_000 + n as u64);
+    }
+    assert_eq!(closes(&p.poll(2_000)), vec![key(101)]);
+}
+
 /// On connecting, a member sends the peer its own summary, and no other.
 #[test]
 fn connecting_sends_the_own_summary() {
