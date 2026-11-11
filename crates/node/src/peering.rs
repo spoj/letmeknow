@@ -22,6 +22,8 @@ use crate::{Epoch, G, Inner, Member, Node, Out, State, endpoint_id, get, now, pu
 
 /// How many summaries of memberships not known yet a group keeps.
 const UNVERIFIED: usize = 32;
+/// The largest signed intro taken, in bytes: several times one whose text is `MAX_INTRO` bytes.
+const SIGNED_INTRO: usize = 4096;
 /// How many hellos of groups it has not added yet this session keeps.
 const EARLY: usize = 32;
 
@@ -303,10 +305,13 @@ impl State {
         Ok(())
     }
 
-    /// Takes an intro any neighbour passed on, of at most `MAX_INTRO` bytes: checked against its membership and its
-    /// member's signature, and kept if newer, with the epoch it names as where its member is, if later than this session
-    /// knew. One of a membership this session does not know yet is kept a while.
+    /// Takes an intro any neighbour passed on, of at most `MAX_INTRO` bytes, and `SIGNED_INTRO` as signed: checked against
+    /// its membership and its member's signature, and kept if newer, with the epoch it names as where its member is, if
+    /// later than this session knew. One of a membership this session does not know yet is kept a while.
     pub(crate) fn intro(&mut self, gid: &[u8], signed: Signed) -> Result<()> {
+        if signed.body.0.len() + signed.sig.0.len() > SIGNED_INTRO {
+            return Ok(());
+        }
         let Ok(intro) = serde_json::from_slice::<Intro>(&signed.body.0) else { return Ok(()) };
         let g = self.group_mut(gid)?;
         if intro.group.0 != gid || intro.text.as_ref().is_some_and(|text| text.len() > MAX_INTRO) {

@@ -1060,14 +1060,14 @@ async fn an_intro_past_the_limit_is_neither_set_nor_taken() {
     let quiet_read = Arc::new(AtomicBool::new(true));
     let blocked = quiet_read.clone();
     let carol = stored_with(&relay, &carol_db, failing(relay.post(), move |route| route.ends_with("/read") && blocked.load(SeqCst))).await;
-    let sign_intro = |db: &Path, version: u64, text: String| {
+    let sign_intro = |db: &Path, version: u64, text: String, pad: usize| {
         let mut provider = SqliteProvider::open(db).unwrap();
         let mls = Mls::load(&provider).unwrap();
         let group = lmk_core::group::Group::load(&provider, &gid.0).unwrap();
         let joined = group.joined(mls.key()).unwrap();
         let shown = Shown { epoch: group.epoch(), capability: group.capability(&provider).unwrap() };
         let intro = Intro { group: gid.clone(), member: Bytes(mls.key().to_vec()), joined, version, shown, text: Some(text) };
-        let body = serde_json::to_vec(&intro).unwrap();
+        let body = [serde_json::to_vec(&intro).unwrap(), vec![b' '; pad]].concat();
         let sig = mls.sign(&[INTRO, &body].concat());
         drop(group);
         provider.close().unwrap();
@@ -1078,10 +1078,12 @@ async fn an_intro_past_the_limit_is_neither_set_nor_taken() {
     let base = lmk_node::now() + 1_000_000;
     let huge = "x".repeat(13 << 20);
     for signed in [
-        sign_intro(&bob_db, base, "b".repeat(MAX_INTRO + 1)),
-        sign_intro(&dave_db, base, "d".repeat(MAX_INTRO + 1)),
-        sign_intro(&bob_db, base + 1, huge.clone()),
-        sign_intro(&dave_db, base + 1, huge),
+        sign_intro(&bob_db, base, "b".repeat(MAX_INTRO + 1), 0),
+        sign_intro(&dave_db, base, "d".repeat(MAX_INTRO + 1), 0),
+        sign_intro(&bob_db, base + 1, huge.clone(), 0),
+        sign_intro(&dave_db, base + 1, huge, 0),
+        sign_intro(&bob_db, base + 2, "padded".into(), 13 << 20),
+        sign_intro(&dave_db, base + 2, "padded".into(), 13 << 20),
     ] {
         bob_hand.send(&Frame::Hello { groups: vec![At { group: gid.clone(), log: [0; 32], head: None, seen: Default::default(), intros: vec![signed], expired: vec![] }] }).await;
     }
