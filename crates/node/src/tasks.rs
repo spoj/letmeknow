@@ -26,7 +26,7 @@ impl Node {
         let relay: RelayUrl = relay_url(&config.home).parse()?;
         let endpoint = lmk_net::builder([relay]).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
         let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), home: config.home.clone(), device: None };
-        let clients = logs::Clients::new(config.post.clone());
+        let clients = logs::Clients::new(config.post.clone(), config.home.clone());
         let state = State::open(provider, leaf, &config.device)?;
         let (events, events_rx) = mpsc::unbounded_channel();
         let (work, work_rx) = mpsc::unbounded_channel();

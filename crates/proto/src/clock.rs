@@ -1,5 +1,5 @@
 //! The one clock behind every timestamp: the system's, unless a test set its own for this thread; and how far the
-//! membership service's clock is from it, for the times other members see.
+//! session's own membership service's clock is from it, for the times other members see.
 
 use std::cell::Cell;
 use std::sync::Mutex;
@@ -35,8 +35,8 @@ pub fn set(clock: fn() -> u64) {
     CLOCK.set(Some(clock));
 }
 
-/// Takes a reading of the membership service's clock: `service`, its time in its answer to a request sent at `sent`
-/// and answered at `received`, by this clock.
+/// Takes a reading of the session's own membership service's clock: `service`, its time in its answer to a request sent
+/// at `sent` and answered at `received`, by this clock.
 pub fn heard(sent: u64, received: u64, service: u64) {
     let trip = received.saturating_sub(sent);
     let offset = service as i64 - (sent + trip / 2) as i64;
@@ -47,8 +47,8 @@ pub fn heard(sent: u64, received: u64, service: u64) {
     }
 }
 
-/// Milliseconds since the Unix epoch by the membership service's clock, as far as heard: for the times other members
-/// see, such as when a message was sent.
+/// Milliseconds since the Unix epoch by the session's own membership service's clock, as far as heard: for the times
+/// other members see, such as when a message was sent.
 pub fn corrected() -> u64 {
     let offset = READING.lock().unwrap().map_or(0, |(_, offset, _)| offset);
     now().saturating_add_signed(offset)

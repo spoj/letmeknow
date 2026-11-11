@@ -48,7 +48,7 @@ impl Membership {
     }
 
     fn client(&self) -> ServeClient {
-        ServeClient::for_service(self.post(), &self.wire("membership.example")).unwrap()
+        ServeClient::for_service(self.post(), &self.wire("membership.example"), false).unwrap()
     }
 }
 
@@ -77,6 +77,23 @@ async fn appends_reads_and_heads_check_against_the_service_key() {
 }
 
 #[tokio::test]
+async fn only_a_client_that_sets_the_clock_records_head_times() {
+    let membership = Membership::new();
+    let lag = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 - 3_600_000;
+    clock::set(lag);
+    let capability = log(1);
+    let foreign = ServeClient::for_service(membership.post(), &membership.wire("foreign.example"), false).unwrap();
+    foreign.append(&capability, &[b"one".to_vec()]).await.unwrap();
+    foreign.read(&capability, &anchor(&membership.key, &capability)).await.unwrap();
+    foreign.heads(&[Known(capability, 0)]).await.unwrap();
+    assert_eq!(clock::corrected(), clock::now());
+
+    let own = ServeClient::for_service(membership.post(), &membership.wire("own.example"), true).unwrap();
+    own.heads(&[Known(capability, 0)]).await.unwrap();
+    assert!(clock::corrected().abs_diff(clock::now() + 3_600_000) < 5_000);
+}
+
+#[tokio::test]
 async fn heads_ask_256_logs_to_a_request_and_leave_unmoved_logs_out() {
     let membership = Membership::new();
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -88,7 +105,7 @@ async fn heads_ask_256_logs_to_a_request_and_leave_unmoved_logs_out() {
             post(domain, route, body)
         })
     };
-    let client = ServeClient::for_service(counting, &membership.wire("membership.example")).unwrap();
+    let client = ServeClient::for_service(counting, &membership.wire("membership.example"), false).unwrap();
     let client_for_appends = membership.client();
     client_for_appends.append(&log(7), &[b"x".to_vec()]).await.unwrap();
     let distinct = |i: u16| { let mut capability = [0; 32]; capability[..2].copy_from_slice(&i.to_be_bytes()); capability };
@@ -103,7 +120,7 @@ async fn heads_ask_256_logs_to_a_request_and_leave_unmoved_logs_out() {
 async fn a_head_signed_by_another_key_is_the_directorys_name() {
     let served = Membership::new();
     let other = Membership::new();
-    let wrong = ServeClient::for_service(served.post(), &other.wire("membership.example")).unwrap();
+    let wrong = ServeClient::for_service(served.post(), &other.wire("membership.example"), false).unwrap();
     let error = wrong.heads(&[Known(log(1), 5)]).await.unwrap_err();
     assert!(error.is::<WrongDirectory>(), "{error}");
 }
@@ -114,7 +131,7 @@ async fn a_refusal_acts_only_when_the_service_signed_it() {
     let request = serde_json::to_vec(&membership::Append { capability: log(1), entries: vec![Bytes(b"x".to_vec())] }).unwrap();
     let refused = |sig: [u8; 64]| serde_json::to_vec(&Answer::<()>::Refused { refusal: Refusal::Rate, sig: Bytes(sig.to_vec()) }).unwrap();
     let signed = membership.key.sign(&refusal_message(Refusal::Rate, &request)).to_bytes();
-    let client = |reply: Vec<u8>| ServeClient::for_service(answering(reply), &membership.wire("membership.example")).unwrap();
+    let client = |reply: Vec<u8>| ServeClient::for_service(answering(reply), &membership.wire("membership.example"), false).unwrap();
     let error = client(refused(signed)).append(&log(1), &[b"x".to_vec()]).await.unwrap_err();
     assert!(error.downcast_ref::<Refused>().is_some_and(|refused| refused.0 == "rate"), "{error}");
     let error = client(refused([9; 64])).append(&log(1), &[b"x".to_vec()]).await.unwrap_err();
@@ -150,7 +167,7 @@ async fn an_expiry_acts_only_when_the_service_signed_it() {
     let signed = |message: Vec<u8>| Bytes(membership.key.sign(&message).to_bytes().to_vec());
     let unsigned = Bytes(vec![9; 64]);
     let read = |sig: Bytes| serde_json::to_vec(&Answer::<Page>::Expired { sig }).unwrap();
-    let client = |reply: Vec<u8>| ServeClient::for_service(answering(reply), &membership.wire("membership.example")).unwrap();
+    let client = |reply: Vec<u8>| ServeClient::for_service(answering(reply), &membership.wire("membership.example"), false).unwrap();
     let error = client(read(unsigned.clone())).read(&capability, &anchored).await.unwrap_err();
     assert!(error.is::<Forged>(), "{error}");
     let error = client(read(signed(expiry_message(&other_reference)))).read(&capability, &anchored).await.unwrap_err();
@@ -178,7 +195,7 @@ async fn a_404_stops_the_client_and_echoes_no_text() {
             Box::pin(async move { reply })
         })
     };
-    let client = ServeClient::for_service(post, &membership.wire("membership.example")).unwrap();
+    let client = ServeClient::for_service(post, &membership.wire("membership.example"), false).unwrap();
     for _ in 0..2 {
         let error = client.heads(&[Known(log(1), 0)]).await.unwrap_err();
         assert!(error.is::<Unsupported>() && error.to_string() == "the membership service at membership.example runs another minor", "{error}");
@@ -208,7 +225,7 @@ async fn a_page_that_does_not_chain_to_the_anchor_is_refused() {
             Ok(serde_json::to_vec(&Answer::Ok(page))?)
         }) as BoxFuture<anyhow::Result<Vec<u8>>>
     });
-    let client = ServeClient::for_service(tampered, &membership.wire("membership.example")).unwrap();
+    let client = ServeClient::for_service(tampered, &membership.wire("membership.example"), false).unwrap();
     let error = client.read(&capability, &anchor(&membership.key, &capability)).await.unwrap_err();
     assert!(error.is::<InvalidProof>() || error.is::<Forged>(), "{error}");
 }
@@ -228,7 +245,7 @@ async fn concurrent_reads_fit_a_default_services_bytes_in_flight() {
             answered(&domain, 200, service.post(route, &admission, &body).await?)
         })
     });
-    let client = ServeClient::for_service(post, &membership.wire("membership.example")).unwrap();
+    let client = ServeClient::for_service(post, &membership.wire("membership.example"), false).unwrap();
     let key = membership.key.clone();
     let tasks: Vec<_> = (0..10).map(|i| {
         let (client, key) = (client.clone(), key.clone());
@@ -256,7 +273,7 @@ async fn at_most_three_requests_are_in_flight_to_a_service() {
             })
         })
     };
-    let client = ServeClient::for_service(slow, &membership.wire("membership.example")).unwrap();
+    let client = ServeClient::for_service(slow, &membership.wire("membership.example"), false).unwrap();
     let tasks: Vec<_> = (0..10).map(|i| {
         let client = client.clone();
         tokio::spawn(async move { client.heads(&[Known(log(i), 0)]).await })

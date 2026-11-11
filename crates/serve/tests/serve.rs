@@ -126,7 +126,7 @@ async fn serves_relay_and_membership_without_frontend() {
     let tls = CaTlsConfig::custom_roots([cert.clone()]).client_config(Arc::new(rustls::crypto::ring::default_provider())).unwrap();
     let https_post = lmk_membership::client::https(reqwest::Client::builder().tls_backend_preconfigured(tls).no_proxy().build().unwrap());
     let post: lmk_membership::client::Post = Arc::new(move |_: String, route, body| https_post(format!("localhost:{https}"), route, body));
-    let client = ServeClient::for_service(post, &service).unwrap();
+    let client = ServeClient::for_service(post, &service, false).unwrap();
     tokio::time::timeout(Duration::from_secs(10), client.append(&[7; 32], &[b"commit".to_vec()]))
         .await
         .unwrap()

@@ -56,7 +56,7 @@ const MEMBER_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct Config {
-    /// The domain of this session's own membership service, whose relay it lives on.
+    /// The domain of this session's own membership service, whose relay it lives on and which sets its clock.
     pub home: String,
     /// Posts to a membership service's routes, as the shell does over https.
     pub post: Post,
@@ -744,6 +744,85 @@ mod tests {
             }
             alice.shutdown().await.unwrap();
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_the_sessions_own_service_sets_its_clock() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use ed25519_dalek::SigningKey;
+        use lmk_proto::clock::corrected;
+        use lmk_proto::{head::{self, Head}, membership::{Answer, Append, Appended, Heads, Known, Moved, Page, Read}};
+
+        let relay = lmk_testing::relay().await;
+        let (own_key, other_key) = (SigningKey::from_bytes(&[7; 32]), SigningKey::from_bytes(&[8; 32]));
+        let service = |key: &SigningKey, domain: &str| Service::Serve {
+            key: Bytes(key.verifying_key().to_bytes().to_vec()),
+            domain: domain.into(),
+            rest: Default::default(),
+        };
+        let (own, foreign, wrong_home) = (
+            service(&own_key, &relay.domain),
+            service(&other_key, "foreign.example"),
+            service(&other_key, &relay.domain),
+        );
+        let own_shift = Arc::new(AtomicU64::new(3_600_000));
+        let home_domain = relay.domain.clone();
+        let (own_signing, other_signing, shift) = (own_key.clone(), other_key.clone(), own_shift.clone());
+        let post: Post = Arc::new(move |domain, route, body| {
+            let own_offset = shift.load(Ordering::Relaxed);
+            let is_home = domain == home_domain;
+            let signing = if is_home { own_signing.clone() } else { other_signing.clone() };
+            Box::pin(async move {
+                if is_home && own_offset > 0 {
+                    n0_future::time::sleep(Duration::from_millis(10)).await;
+                }
+                let time = now() + if is_home { own_offset } else { 6 * 86_400_000 };
+                let s = signing.verifying_key().to_bytes();
+                let reply = if route.ends_with("/append") {
+                    let append: Append = serde_json::from_slice(&body).unwrap();
+                    let id = head::reference(&s, &append.capability);
+                    let hash = append.entries.iter().fold(head::start(&s, &id), |h, e| head::next(&h, &e.0));
+                    serde_json::to_vec(&Answer::Ok(Appended { head: Head::sign(&signing, &id, append.entries.len() as u64, hash, time) })).unwrap()
+                } else if route.ends_with("/read") {
+                    let read: Read = serde_json::from_slice(&body).unwrap();
+                    let id = head::reference(&s, &read.capability);
+                    let head = Head::sign(&signing, &id, 0, head::start(&s, &id), time);
+                    serde_json::to_vec(&Answer::Ok(Page { after: read.after, entries: vec![], head })).unwrap()
+                } else {
+                    assert!(route.ends_with("/heads"));
+                    let heads: Heads = serde_json::from_slice(&body).unwrap();
+                    let id = head::reference(&s, &heads.logs[0].0);
+                    let head = Head::sign(&signing, &id, 0, head::start(&s, &id), time);
+                    serde_json::to_vec(&Answer::Ok(Moved { heads: vec![head], expired: vec![] })).unwrap()
+                };
+                Ok(reply)
+            })
+        });
+        let alice = node(&relay, post).await;
+        let group_on = |membership| alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership, admins: vec![], admitted: vec![] }).unwrap();
+
+        let foreign_gid = group_on(foreign.clone());
+        alice.read_group(&foreign_gid.0).await.unwrap();
+        let foreign_log = alice.log(&foreign_gid.0).unwrap();
+        let foreign_cap = alice.inner.lock().capability(&foreign_log.0).unwrap();
+        alice.inner.clients.client(&foreign).unwrap().append(&foreign_cap, &[b"x".to_vec()]).await.unwrap();
+        alice.inner.clients.client(&foreign).unwrap().heads(&[Known(foreign_cap, 1)]).await.unwrap();
+        assert!(corrected().abs_diff(now()) < 5_000, "a foreign service set the clock: {}", corrected() - now());
+
+        let wrong_gid = group_on(wrong_home.clone());
+        let wrong_log = alice.log(&wrong_gid.0).unwrap();
+        let wrong_cap = alice.inner.lock().capability(&wrong_log.0).unwrap();
+        assert!(alice.read_group(&wrong_gid.0).await.is_err());
+        assert!(alice.inner.clients.client(&wrong_home).unwrap().append(&wrong_cap, &[b"x".to_vec()]).await.is_err());
+        assert!(alice.inner.clients.client(&wrong_home).unwrap().heads(&[Known(wrong_cap, 1)]).await.is_err());
+        assert!(corrected().abs_diff(now()) < 5_000, "another key at the home domain set the clock: {}", corrected() - now());
+
+        let own_gid = group_on(own);
+        alice.read_group(&own_gid.0).await.unwrap();
+        assert!(corrected().abs_diff(now() + 3_600_000) < 5_000, "the own service sets the clock: {}", corrected() - now());
+        own_shift.store(0, Ordering::Relaxed);
+        alice.read_group(&own_gid.0).await.unwrap();
+        alice.shutdown().await.unwrap();
     }
 
     /// A group is handed to `Peers` as it is added, and its new members as their Add applies, before the next poll: a

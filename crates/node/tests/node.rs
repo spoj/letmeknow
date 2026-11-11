@@ -534,7 +534,7 @@ async fn a_session_updates_its_leaf_as_it_starts() {
     let capability = group.capability(&provider).unwrap();
     let cut = group.cut().to_vec();
     let commit = group.commit(&provider, &mls, Change { leaf: Some(old), cut, ..Change::default() }).unwrap();
-    ServeClient::for_service(relay.post(), &relay.service).unwrap().append(&capability, &[commit.entry]).await.unwrap();
+    ServeClient::for_service(relay.post(), &relay.service, false).unwrap().append(&capability, &[commit.entry]).await.unwrap();
     drop(provider);
     alice.node.read_group(&gid.0).await.unwrap();
     device(false).await.expect("Alice sees Bob's leaf name no device");
@@ -3291,7 +3291,7 @@ async fn a_commit_dated_ahead_is_waited_before_as_any_other() {
     let provider = SqliteProvider::open(&bob_db).unwrap();
     let mls = Mls::load(&provider).unwrap();
     let mut group = Group::load(&provider, &gid.0).unwrap();
-    let client = ServeClient::for_service(relay.post(), &relay.service).unwrap();
+    let client = ServeClient::for_service(relay.post(), &relay.service, false).unwrap();
     // Bob's cut, moved one past what he sent.
     let mut cut = group.cut().to_vec();
     let own = cut.iter_mut().find(|r| r.key.0 == mls.key()).unwrap();
@@ -3387,7 +3387,7 @@ async fn a_send_waits_for_a_commit_held_and_not_applied() {
     let provider = SqliteProvider::open(&bob_db).unwrap();
     let mls = Mls::load(&provider).unwrap();
     let mut group = Group::load(&provider, &gid.0).unwrap();
-    let client = ServeClient::for_service(relay.post(), &relay.service).unwrap();
+    let client = ServeClient::for_service(relay.post(), &relay.service, false).unwrap();
     let mut cut = group.cut().to_vec();
     let own = cut.iter_mut().find(|r| r.key.0 == mls.key()).unwrap();
     (own.seq, own.id, own.epoch) = (own.seq + 1, Bytes(vec![7; 32]), 2);

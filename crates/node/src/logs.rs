@@ -28,15 +28,16 @@ pub(crate) const NOT_FOLLOWED: &str = "this session does not follow that log";
 /// How long a send waits for the service: chat works while it is down.
 const SEND_WAIT: Duration = Duration::from_secs(5);
 
-/// One membership client per service, sharing the session's post.
+/// One membership client per service, sharing the session's post; only the home's service sets the clock.
 pub(crate) struct Clients {
     post: Post,
+    home: String,
     clients: Mutex<HashMap<String, ServeClient>>,
 }
 
 impl Clients {
-    pub fn new(post: Post) -> Self {
-        Clients { post, clients: Mutex::default() }
+    pub fn new(post: Post, home: String) -> Self {
+        Clients { post, home, clients: Mutex::default() }
     }
 
     pub fn client(&self, service: &Service) -> Result<ServeClient> {
@@ -45,7 +46,8 @@ impl Clients {
         if let Some(client) = clients.get(&name) {
             return Ok(client.clone());
         }
-        let client = ServeClient::for_service(self.post.clone(), service)?;
+        let own = matches!(service, Service::Serve { domain, .. } if *domain == self.home);
+        let client = ServeClient::for_service(self.post.clone(), service, own)?;
         clients.insert(name, client.clone());
         Ok(client)
     }
