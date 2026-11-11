@@ -201,7 +201,8 @@ impl Inner {
             if g.author(&r.key.0, r.joined).is_none() {
                 g.rec.authors.push(Author::new(r.key.clone(), r.joined, 0));
             }
-            // What a cut keeps of a membership was all sent before this session joined, or all after.
+            // A cut names only its last message's epoch; if an earlier one in it was sent before this session joined,
+            // opening the first sent since puts it behind `baseline`.
             if own.is_some_and(|own| r.epoch < own) {
                 g.before(&r.key.0, r.joined, r.seq);
             }

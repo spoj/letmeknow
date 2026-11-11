@@ -260,7 +260,7 @@ impl G {
     pub(crate) fn lacking(&self) -> Vec<Seqs> {
         let lacking = self.rec.keep.iter().filter_map(|kept| {
             let author = self.author(&kept.key.0, kept.joined)?;
-            author.seqs(&kept.seqs.difference(&author.held).difference(&author.lost))
+            author.seqs(&kept.seqs.difference(&Ranges::range(1, author.baseline)).difference(&author.held).difference(&author.lost))
         });
         lacking.collect()
     }

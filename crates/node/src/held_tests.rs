@@ -86,6 +86,71 @@ async fn a_prev_other_than_the_preceding_seq_warns_and_is_not_kept() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_message_before_a_join_in_a_later_cut_is_neither_lacking_nor_lost() {
+    let relay = lmk_testing::relay().await;
+    let config = |seed| Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[seed; 32]) };
+    let alice = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(1)).await.unwrap().0;
+    let bob = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(2)).await.unwrap().0;
+    let carol = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(3)).await.unwrap().0;
+    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+    let gid = alice.create(settings).unwrap();
+    bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    let tasks: Vec<_> = bob.inner.tasks.lock().unwrap().drain(..).collect();
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
+    alice.read_group(&gid.0).await.unwrap();
+    bob.read_group(&gid.0).await.unwrap();
+    let before = bob.inner.send(&mut bob.inner.lock(), &gid.0, &serde_json::json!({ "type": "message", "content": "before Carol" }), None).unwrap();
+
+    carol.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    for node in [&alice, &carol] {
+        let tasks: Vec<_> = node.inner.tasks.lock().unwrap().drain(..).collect();
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+    for node in [&alice, &bob, &carol] {
+        node.read_group(&gid.0).await.unwrap();
+    }
+
+    let after = bob.inner.send(&mut bob.inner.lock(), &gid.0, &serde_json::json!({ "type": "message", "content": "after Carol" }), None).unwrap();
+    let (first, second) = {
+        let st = bob.inner.lock();
+        let first = st.record(&gid.0, &before.0).unwrap().unwrap().sealing.unwrap().1.0;
+        let second = st.record(&gid.0, &after.0).unwrap().unwrap().sealing.unwrap().1.0;
+        (first, second)
+    };
+    alice.inner.take(&mut alice.inner.lock(), &gid.0, None, vec![first, second.clone()], false).unwrap();
+    alice.inner.commit(&gid.0, |_, _| Ok(Some(core::Change::default()))).await.unwrap();
+
+    carol.read_group(&gid.0).await.unwrap();
+    carol.inner.take(&mut carol.inner.lock(), &gid.0, None, vec![second], false).unwrap();
+    assert!(carol.message(&gid.0, &after.0).unwrap().is_some_and(|m| m.missing.is_empty()));
+
+    let lacking = carol.inner.lock().group(&gid.0).unwrap().lacking();
+    alice.inner.commit(&gid.0, |_, _| Ok(Some(core::Change::default()))).await.unwrap();
+    carol.read_group(&gid.0).await.unwrap();
+    let waited = carol.epoch(&gid.0).unwrap() < alice.epoch(&gid.0).unwrap();
+    {
+        let mut st = carol.inner.lock();
+        st.time += 200_000;
+        carol.inner.advance(&mut st, &gid.0).unwrap();
+    }
+    let lost = carol.inner.lock().group(&gid.0).unwrap().rec.lost.clone();
+    for node in [alice, bob, carol] {
+        node.shutdown().await.unwrap();
+    }
+    assert_eq!((lacking.is_empty(), waited, lost.is_empty()), (true, false, true), "lacking={lacking:?} waited={waited} lost={lost:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_ciphertext_past_the_window_opens_when_the_lowest_seq_moves() {
     let (alice, bob, gid, _) = members().await;
     let (id, ciphertext) = seal(&alice, &gid, WINDOW + 1, Some((Bytes(vec![0; 32]), 2)), "past the window");
