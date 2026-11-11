@@ -97,6 +97,28 @@ async fn an_unknown_frame_is_skipped() {
     a.net.shutdown().await.unwrap();
 }
 
+/// A frame larger than its reader takes is left out, so what is queued after it arrives and the connection stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frame_past_max_frame_is_left_out() {
+    let relay = relay().await;
+    let keys = keys(2);
+    let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
+    let mut a = node(&relay, keys[0].clone(), false).await;
+    let mut b = node(&relay, keys[1].clone(), true).await;
+    a.net.dial(members[1], vec![relay.url.clone()]).await.unwrap();
+    assert_eq!(a.until(|e| matches!(e, Event::Connected(..))).await, Event::Connected(members[1], true));
+    assert_eq!(b.until(|e| matches!(e, Event::Connected(..))).await, Event::Connected(members[0], false));
+    let oversized = Frame::Held { group: Bytes(G.to_vec()), items: vec![Bytes(vec![7; 25 << 20])], answers: None };
+    assert!(frame::encode(&oversized).len() - 4 > frame::MAX_FRAME as usize);
+    assert!(a.net.frame(members[1], oversized));
+    assert!(a.net.frame(members[1], want(1)));
+    assert_eq!(tokio::time::timeout(WAIT, b.events.recv()).await.unwrap(), Some(Event::Frame(members[0], want(1))));
+    assert!(b.net.frame(members[0], want(2)));
+    assert_eq!(tokio::time::timeout(WAIT, a.events.recv()).await.unwrap(), Some(Event::Frame(members[1], want(2))));
+    a.net.shutdown().await.unwrap();
+    b.net.shutdown().await.unwrap();
+}
+
 /// A connection is counted before it opens any stream, and one that only asks for admission is closed as a stranger.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_connection_without_a_peer_stream_is_counted_and_closed() {
