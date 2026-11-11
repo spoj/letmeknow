@@ -21,6 +21,14 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
+    match cli.command {
+        Command::Skill => {
+            print!("{}", letmeknow::SKILL);
+            return Ok(());
+        }
+        Command::Serve(serve) => return letmeknow::serve(serve).await,
+        _ => {}
+    }
     let device = device_dir(cli.home.as_deref())?;
     let home = home_dir(cli.home)?;
     match cli.command {
@@ -59,11 +67,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", serde_json::json!({ "fp": lmk_node::fp(&key), "key": hex::encode(key) }));
             Ok(())
         }
-        Command::Skill => {
-            print!("{}", letmeknow::SKILL);
-            Ok(())
-        }
-        Command::Serve(serve) => letmeknow::serve(serve).await,
+        Command::Skill | Command::Serve(_) => unreachable!(),
         Command::Request(request) => {
             let session = match cli.session {
                 Some(session) => session_named(&home, session)?,

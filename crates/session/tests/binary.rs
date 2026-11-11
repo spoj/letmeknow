@@ -109,6 +109,32 @@ fn the_binary_refuses_an_earlier_home_in_the_default_device_directory() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn the_binary_runs_skill_and_serve_with_an_earlier_home_in_the_default_device_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("letmeknow");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(home.join("format"), "4\n").unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_letmeknow"))
+            .args(args)
+            .env("XDG_DATA_HOME", dir.path())
+            .env_remove("LETMEKNOW_HOME")
+            .env_remove("LETMEKNOW_SESSION")
+            .output().unwrap()
+    };
+    let skill = run(&["skill"]);
+    assert!(skill.status.success(), "{}", String::from_utf8_lossy(&skill.stderr));
+    assert!(String::from_utf8(skill.stdout).unwrap().starts_with("---\nname: letmeknow"));
+    let state = dir.path().join("state");
+    let serve = run(&["serve", "--initialize", "--domain", "relay.example", "--state", state.to_str().unwrap()]);
+    assert!(serve.status.success(), "{}", String::from_utf8_lossy(&serve.stderr));
+    assert!(String::from_utf8(serve.stdout).unwrap().starts_with("membership: relay.example\nkey: "));
+    assert!(String::from_utf8(run(&["sessions"]).stderr).unwrap().contains("earlier letmeknow"));
+    assert!(!dir.path().join("letmeknow-v14").exists());
+}
+
 #[test]
 fn the_binary_reuses_the_device_key_in_an_explicit_current_home() {
     let dir = tempfile::tempdir().unwrap();
