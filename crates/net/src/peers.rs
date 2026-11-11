@@ -263,7 +263,7 @@ impl Peers {
             c.opened.extend(newly);
             self.changed.get_or_insert(now);
         }
-        if !served.is_empty() {
+        if !c.served.is_empty() {
             c.served_at = now;
         }
         c.sent.retain(|id, _| served.contains(id));

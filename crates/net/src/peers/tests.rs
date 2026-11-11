@@ -401,6 +401,18 @@ fn a_stranger_connection_closes_after_thirty_seconds() {
     assert_eq!(closes(&p.poll(STRANGER)), vec![key(50)]);
 }
 
+/// A connection that stops serving its last group closes 30 s after that, not after it connected.
+#[test]
+fn a_peer_removed_from_its_last_group_closes_thirty_seconds_later() {
+    let mut p = peers();
+    p.group(id(), own(1, &[1]), 0);
+    p.connect(key(1), gs(), false, 0);
+    p.poll(0);
+    p.served(&key(1), BTreeSet::new(), 40_000);
+    assert!(closes(&p.poll(40_000 + STRANGER - 1)).is_empty());
+    assert_eq!(closes(&p.poll(40_000 + STRANGER)), vec![key(1)]);
+}
+
 /// Over 128 connections, the longest-idle one that no group targets closes.
 #[test]
 fn over_128_connections_close_the_longest_idle_untargeted_one() {
