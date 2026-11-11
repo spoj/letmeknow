@@ -33,7 +33,7 @@ pub struct Config {
     pub dir: PathBuf,
     /// Where the key of the device it runs on is kept (`cli::device_dir`).
     pub device: PathBuf,
-    /// The domain of the membership service for groups this session creates.
+    /// The domain of the membership service for groups this session creates, and of the relay it lives on.
     pub membership: String,
     /// Whether it runs without a reader of its own: what concerns the agent goes to the reader attached, or waits for one.
     pub detached: bool,

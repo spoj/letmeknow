@@ -35,7 +35,7 @@ pub struct Cli {
 pub enum Command {
     /// Run the session process: log what arrives as NDJSON, and print what concerns this session
     Listen {
-        /// The domain of the membership service for groups this session creates
+        /// The domain of the membership service for groups this session creates, and of the relay it lives on in every group
         #[arg(long, env = "LETMEKNOW_MEMBERSHIP", default_value = lmk_proto::links::DOMAIN)]
         membership: String,
         /// Print only `ready`, and run on without a reader: what concerns this session waits for the one that attaches
