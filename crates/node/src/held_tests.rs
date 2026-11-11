@@ -203,7 +203,32 @@ async fn a_ciphertext_past_the_flood_bucket_opens_after_it_refills() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn unopened_ciphertexts_open_before_their_epochs_keys_go_despite_window_and_bucket() {
+async fn a_ciphertext_past_the_window_is_dropped_when_its_epochs_keys_go() {
+    let (alice, bob, gid, _) = members().await;
+    let (edge, past) = seal(&alice, &gid, WINDOW + 1, Some((Bytes(vec![0; 32]), 2)), "just past the window");
+    let (far, huge) = seal(&alice, &gid, 1 << 63, Some((Bytes(vec![0; 32]), 2)), "far past the window");
+    {
+        let mut st = bob.inner.lock();
+        st.time = crate::now();
+        for ciphertext in [past, huge] {
+            assert!(bob.inner.take_one(&mut st, &gid.0, None, ciphertext).unwrap().is_none());
+        }
+        assert_eq!(st.group(&gid.0).unwrap().unopened.len(), 2);
+        bob.inner.open_all(&mut st, &gid.0, 2).unwrap();
+        assert!(st.group(&gid.0).unwrap().unopened.is_empty());
+        st.time += HOLD_OFF + 1;
+        bob.inner.give_up(&mut st, &gid.0).unwrap();
+        assert!(st.record(&gid.0, &edge.0).unwrap().is_none());
+        assert!(st.record(&gid.0, &far.0).unwrap().is_none());
+        assert!(st.events.is_empty());
+    }
+    for node in [alice, bob] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unopened_ciphertexts_within_the_window_open_before_their_epochs_keys_go_despite_the_bucket() {
     let (alice, bob, gid, _) = members().await;
     let (id, ciphertext) = seal(&alice, &gid, WINDOW + 1, Some((Bytes(vec![0; 32]), 2)), "past the window");
     let (first, blocked) = seal(&alice, &gid, 1, None, "past the bucket");
