@@ -18,34 +18,34 @@ impl Inner {
     /// epoch's log, and reads the log until it is known whether it won its epoch; if another commit won, builds it
     /// again. Returns the epoch it ended; none once the change has no effect (`None`), and it commits nothing. An entry
     /// posted before, which the log may or may not have taken, as when the service's answer was lost, is posted again
-    /// first: only the service's refusal drops it.
+    /// first: only a refusal that will not pass drops it.
     pub(crate) async fn commit(&self, gid: &[u8], change: impl Fn(&State, &G) -> Result<Option<Change>>) -> Result<Option<u64>> {
         let lock = self.committing.lock().unwrap().entry(gid.to_vec()).or_default().clone();
         let _committing = lock.lock().await;
         let mut built = None;
         for _ in 0..COMMIT_TRIES {
             self.caught_up(gid).await?;
-            let (entry, service, capability, epoch) = {
+            let (entry, prior, service, capability, epoch) = {
                 let mut st = self.lock();
                 let st = &mut *st;
                 let g = st.group(gid)?;
                 let (service, capability, epoch) = (g.mls.settings().membership, st.capability(&g.rec.log.0)?, g.mls.epoch());
                 match g.mls.posted() {
-                    Some(posted) => (posted.to_vec(), service, capability, epoch),
+                    Some(posted) => (posted.to_vec(), true, service, capability, epoch),
                     None => {
                         let Some(mut change) = change(st, g)? else { return Ok(None) };
                         change.cut = st.cut_for(gid)?;
                         let g = st.groups.get_mut(gid).unwrap();
                         let commit = g.mls.commit(&st.provider, &st.session, change)?;
                         built = Some(commit.entry.clone());
-                        (commit.entry, service, capability, epoch)
+                        (commit.entry, false, service, capability, epoch)
                     }
                 }
             };
             match self.clients.client(&service)?.append(&capability, std::slice::from_ref(&entry)).await {
                 Ok(_) => {}
-                // A refusal that may pass keeps the entry posted, as an earlier attempt may have landed.
-                Err(error) if error.downcast_ref::<Refused>().is_some_and(|refused| matches!(refused.0.as_str(), "busy" | "rate" | "quota")) => return Err(error),
+                // A refusal that may pass keeps an entry posted before, as an earlier attempt may have landed.
+                Err(error) if prior && error.downcast_ref::<Refused>().is_some_and(|refused| matches!(refused.0.as_str(), "busy" | "rate" | "quota")) => return Err(error),
                 Err(error) if error.is::<Refused>() => {
                     let mut st = self.lock();
                     let st = &mut *st;

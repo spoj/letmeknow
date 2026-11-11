@@ -773,6 +773,85 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_commit_refused_for_now_stays_pending_only_if_posted_before() {
+        use std::collections::VecDeque;
+        use ed25519_dalek::Signer;
+        use lmk_membership::Refused;
+        use lmk_proto::membership::{Answer, Refusal, refusal_message};
+
+        enum Fault {
+            Refuse(Refusal),
+            Lost,
+        }
+
+        let relay = lmk_testing::relay().await;
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = lmk_membership::store::Store::initialize(&store_dir.path().join("s")).unwrap();
+        let service_key = store.key().clone();
+        let service = Service::Serve { key: Bytes(service_key.verifying_key().to_bytes().to_vec()), domain: relay.domain.clone(), rest: Default::default() };
+        let mem_svc = lmk_membership::service::Service::new(store, lmk_membership::service::Policy::default());
+        let faults: Arc<Mutex<VecDeque<Fault>>> = Arc::default();
+        let queued = faults.clone();
+        let post: Post = Arc::new(move |_, route, body| {
+            let mem_svc = mem_svc.clone();
+            let service_key = service_key.clone();
+            let fault = if route.ends_with("/append") { queued.lock().unwrap().pop_front() } else { None };
+            Box::pin(async move {
+                match fault {
+                    Some(Fault::Refuse(refusal)) => {
+                        let sig = Bytes(service_key.sign(&refusal_message(refusal, &body)).to_bytes().to_vec());
+                        Ok(serde_json::to_vec(&Answer::<()>::Refused { refusal, sig }).unwrap())
+                    }
+                    Some(Fault::Lost) => anyhow::bail!("lost append reply"),
+                    None => {
+                        let parsed = lmk_membership::service::Route::parse(route).unwrap();
+                        let adm = mem_svc.admit("127.0.0.1".parse().unwrap(), parsed, body.len()).unwrap();
+                        mem_svc.post(parsed, &adm, &body).await
+                    }
+                }
+            })
+        });
+        let alice = node(&relay, post.clone()).await;
+        let bob = node(&relay, post).await;
+        let gid = alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: service, admins: vec![], admitted: vec![] }).unwrap();
+
+        for (i, refusal) in [Refusal::Busy, Refusal::Rate, Refusal::Quota].into_iter().enumerate() {
+            faults.lock().unwrap().push_back(Fault::Refuse(refusal));
+            let error = alice.change_settings(&gid.0, |s| s.admitted.push(Bytes(vec![i as u8 + 1; 32]))).await.unwrap_err();
+            assert!(matches!(error.downcast_ref::<Refused>(), Some(Refused(code)) if code == refusal.code()), "{error:#}");
+            let st = alice.inner.lock();
+            assert!(st.group(&gid.0).unwrap().mls.posted().is_none(), "a fresh commit refused with {} is dropped", refusal.code());
+            assert!(Group::load(&st.provider, &gid.0).unwrap().posted().is_none());
+        }
+
+        let link = alice.invite(&gid.0, INVITE_VALID, None).await.unwrap();
+        faults.lock().unwrap().push_back(Fault::Refuse(Refusal::Rate));
+        let error = bob.join(&link).await.unwrap_err();
+        assert!(format!("{error:#}").contains("rate"), "{error:#}");
+        assert!(bob.groups().is_empty());
+
+        alice.change_settings(&gid.0, |s| s.admitted.push(Bytes(vec![5; 32]))).await.unwrap();
+        assert_eq!(alice.settings(&gid.0).unwrap().admitted, [Bytes(vec![5; 32])]);
+        assert!(!alice.members(&gid.0).unwrap().iter().any(|m| m.key == bob.key()));
+        assert_eq!(bob.join(&link).await.unwrap().0, gid);
+        bob.shutdown().await.unwrap();
+        alice.caught_up(&gid.0).await.unwrap();
+
+        faults.lock().unwrap().extend([Fault::Lost, Fault::Refuse(Refusal::Rate), Fault::Refuse(Refusal::Busy)]);
+        let error = alice.change_settings(&gid.0, |s| s.admitted.push(Bytes(vec![6; 32]))).await.unwrap_err();
+        assert!(matches!(error.downcast_ref::<Refused>(), Some(Refused(code)) if code == "rate"), "{error:#}");
+        let kept = alice.inner.lock().group(&gid.0).unwrap().mls.posted().expect("kept after a lost earlier try").to_vec();
+
+        let error = alice.change_settings(&gid.0, |s| s.admitted.push(Bytes(vec![7; 32]))).await.unwrap_err();
+        assert!(matches!(error.downcast_ref::<Refused>(), Some(Refused(code)) if code == "busy"), "{error:#}");
+        assert_eq!(alice.inner.lock().group(&gid.0).unwrap().mls.posted(), Some(kept.as_slice()));
+
+        alice.change_settings(&gid.0, |s| s.admitted.push(Bytes(vec![7; 32]))).await.unwrap();
+        assert_eq!(alice.settings(&gid.0).unwrap().admitted, [Bytes(vec![5; 32]), Bytes(vec![6; 32]), Bytes(vec![7; 32])]);
+        alice.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn only_the_sessions_own_service_sets_its_clock() {
         use std::sync::atomic::{AtomicU64, Ordering};
         use ed25519_dalek::SigningKey;
