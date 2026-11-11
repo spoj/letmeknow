@@ -453,6 +453,42 @@ fn a_message_taken_in_is_forgotten_after_h_with_its_attachments_copy() {
     });
 }
 
+#[test]
+fn a_group_the_node_forgot_before_the_session_published_is_let_go_as_it_starts() {
+    local(async {
+        let world = world("gone").await;
+        let (alice, mut bob, g1) = pair(&world).await;
+        let g2 = bob.cmd(&["invite"]).await.unwrap()["group"].as_str().unwrap().to_owned();
+        let file = world.root.path().join("token.txt");
+        std::fs::write(&file, "s3cret").unwrap();
+        alice.cmd(&["send", "--to", &bob.fp, "--attach", file.to_str().unwrap(), "the token"]).await.unwrap();
+        let message = bob.expect("message").await;
+        let path = PathBuf::from(message["attachment"]["path"].as_str().unwrap());
+        assert!(path.exists());
+        let db = session_dir(&bob.home, "bob").unwrap().join("session.db");
+        let taken = || rusqlite::Connection::open(&db).unwrap().query_row("SELECT count(*) FROM taken", [], |row| row.get::<_, i64>(0)).unwrap();
+        assert_eq!(taken(), 1);
+        bob.stop().await;
+
+        let (session, mut events) = world.open_session(world.config("bob", "bob")).await;
+        alice.cmd(&["remove", &bob.fp]).await.unwrap();
+        loop {
+            if matches!(tokio::time::timeout(WAIT, events.recv()).await.unwrap().unwrap(), lmk_node::Event::Removed { .. }) {
+                break;
+            }
+        }
+        session.shutdown().await;
+        drop(session);
+
+        let bob = world.start("bob").await;
+        assert_eq!(bob.cmd(&["groups"]).await.unwrap()["groups"][0]["group"], g2);
+        assert_eq!(crate::sessions(&bob.home).await.unwrap()["sessions"][0]["groups"], json!([g2]));
+        assert_eq!(taken(), 0);
+        assert!(!path.exists());
+        assert!(bob.log().iter().all(|line| !line.contains(&g1)));
+    });
+}
+
 /// `status` lists this session's sends that no other member holds yet, with a warning, until a member connected to it holds
 /// them.
 #[test]

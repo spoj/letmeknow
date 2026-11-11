@@ -87,7 +87,7 @@ impl Session {
         let held_seq = db.query_row("SELECT coalesce(max(seq), 0) FROM held", [], |row| row.get(0))?;
         let mut session = Self {
             db,
-            groups: node.groups(),
+            groups: Vec::new(),
             node,
             membership,
             joining: Rc::default(),
@@ -101,7 +101,10 @@ impl Session {
         };
         session.forget_old()?;
         session.held.set_modified(SystemTime::now())?;
-        session.write_groups();
+        match std::fs::read(session.config.dir.join("groups.json")) {
+            Ok(groups) => session.groups = serde_json::from_slice(&groups)?,
+            Err(_) => session.write_groups(),
+        }
         let me = session.node.key();
         for gid in session.node.groups() {
             // What was delivered and not shown, as when the session stopped before logging it or could not save its file.
