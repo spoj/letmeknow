@@ -101,20 +101,13 @@ impl Session {
         session.forget_old()?;
         session.held.set_modified(SystemTime::now())?;
         session.write_groups();
+        let me = session.node.key();
         for gid in session.node.groups() {
-            // What was delivered after the last message logged, as when the session stopped before logging it.
-            let (node, me) = (&session.node, session.node.key());
-            let mut unshown = Vec::new();
-            for message in node.messages(&gid.0)?.into_iter().rev() {
-                if node.shown(&gid.0, &message.id.0)? {
-                    break;
+            // What was delivered and not shown, as when the session stopped before logging it or could not save its file.
+            for message in session.node.messages(&gid.0)? {
+                if message.payload["type"] == "message" && message.sender.key != me && !session.node.shown(&gid.0, &message.id.0)? {
+                    session.received(&message)?;
                 }
-                if message.payload["type"] == "message" && message.sender.key != me {
-                    unshown.push(message);
-                }
-            }
-            for message in &unshown.into_iter().rev().collect::<Vec<_>>() {
-                session.received(message)?;
             }
         }
         Ok(session)

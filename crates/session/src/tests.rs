@@ -736,6 +736,41 @@ fn a_session_stops_once_it_cannot_print_and_logged_each_message_once() {
     });
 }
 
+/// A message whose attachment could not be saved warns and stays unshown while later messages are shown; started again,
+/// the session takes it in, without taking in what was shown again.
+#[test]
+fn a_message_whose_file_could_not_be_saved_is_taken_in_as_the_session_next_starts() {
+    local(async {
+        let world = world("retaken").await;
+        let (mut alice, bob, _) = pair(&world).await;
+        let blocked = session_dir(&alice.home, "alice").unwrap().join("attachments");
+        std::fs::write(&blocked, "").unwrap();
+        let file = world.root.path().join("token.txt");
+        std::fs::write(&file, "s3cret").unwrap();
+        bob.cmd(&["send", "--to", &alice.fp, "--attach", file.to_str().unwrap(), "first"]).await.unwrap();
+        alice.expect("warning").await;
+
+        std::fs::remove_file(&blocked).unwrap();
+        bob.cmd(&["send", "--to", &alice.fp, "second"]).await.unwrap();
+        assert_eq!(alice.expect("message").await["content"], "second");
+
+        alice.stop().await;
+        let mut alice = world.start("alice").await;
+        alice.cmd(&["groups"]).await.unwrap();
+        let logged: Vec<Value> = alice
+            .log()
+            .into_iter()
+            .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+            .filter(|e| e["type"] == "message")
+            .map(|e| e["content"].clone())
+            .collect();
+        assert_eq!(logged, ["second", "first"]);
+        let first = alice.expect("message").await;
+        assert_eq!(first["content"], "first");
+        assert_eq!(std::fs::read_to_string(first["attachment"]["path"].as_str().unwrap()).unwrap(), "s3cret");
+    });
+}
+
 /// `sessions` lists this machine's sessions, each with its fingerprint, its group ids and whether it runs. One that
 /// stopped in no group is gone.
 #[test]
