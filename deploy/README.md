@@ -7,7 +7,7 @@ Its domain, directory and public key are in deploy/backend.json; crates/proto/sr
 
 ## A release
 
-`deploy/release.sh X.Y.Z <notes file>` publishes the release, then prints two commands. The backend's takes the release run's artifacts and checks them against its tag and commit, and rebuilds nothing. A new minor (X.Y.0) also moves the `@letmeknow/cli@` pins in README.md, SKILL.md, site/index.html and AGENTS.md to it, in the release commit, and prints the pi-letmeknow `MINOR` and the claude-letmeknow pin to set by hand.
+`deploy/release.sh X.Y.Z <notes file>` publishes the release, and a release that failed after its tag is run again; it then prints two commands. The backend's takes the release run's artifacts and checks them against its tag and commit, and rebuilds nothing. A new minor (X.Y.0) also moves the `@letmeknow/cli@` pins in README.md, SKILL.md, site/index.html and AGENTS.md to it, in the release commit, and prints the pi-letmeknow `MINOR` and the claude-letmeknow pin to set by hand.
 
 1. Backend: `deploy/deploy.sh root@129.212.227.207 relay.letmeknow.dev spoj/letmeknow <run> vX.Y.Z <sha>` installs the Linux binary and systemd unit while the service runs, then enables and restarts it, and checks that `/health` reports the version and key, and that the live directory is deploy/backend.json's. A first start may still be getting its certificate: rerun the check with `deploy/check-backend.py deploy/backend.json vX.Y.Z`.
 2. Site: `gh workflow run pages.yml --repo spoj/letmeknow -f release_tag=vX.Y.Z` publishes the tag's `site/`; approve its `github-pages` deployment.

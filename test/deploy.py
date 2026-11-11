@@ -129,10 +129,13 @@ with tempfile.TemporaryDirectory(prefix="lmk-deploy-test-") as directory:
             assert calls.index(probes[0]) > max(i for i, call in enumerate(calls) if call[0] == "ssh")
         print(f"ok - {name}, deployment={ok}")
 
-# deploy/release.sh, from a clean main pushed to a bare origin: the commit carries the version and any pins, and the tag is pushed.
+# deploy/release.sh, from a clean main pushed to a bare origin: the commit carries the version and any pins, the tag is
+# pushed, and a run again after the tag makes no commit.
 RELEASE_MOCK = r"""
-import pathlib, sys
+import os, pathlib, sys
 name = pathlib.Path(sys.argv[0]).name
+if os.environ.get("MOCK_FAIL") == name:
+    sys.exit(1)
 if name == "gh" and sys.argv[1:3] == ["repo", "view"]:
     print("spoj/letmeknow")
 elif name == "gh" and sys.argv[1:3] == ["run", "list"]:
@@ -147,8 +150,8 @@ def git(*args, cwd):
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
 
 
-def release(tmp, before, version, mock_dir):
-    tmp = tmp / f"{before}-{version}"
+def release(tmp, before, version, mock_dir, fail_first=False):
+    tmp = tmp / f"{before}-{version}{'-rerun' if fail_first else ''}"
     tmp.mkdir()
     origin, work = tmp / "origin.git", tmp / "work"
     git("init", "-q", "--bare", "-b", "main", str(origin), cwd=tmp)
@@ -169,8 +172,15 @@ def release(tmp, before, version, mock_dir):
     notes = tmp / "notes.md"
     notes.write_text("notes\n")
     env = {**os.environ, "PATH": str(mock_dir) + os.pathsep + os.environ["PATH"]}
+    if fail_first:
+        failed = subprocess.run(["sh", "deploy/release.sh", version, str(notes)], cwd=work,
+                                env={**env, "MOCK_FAIL": "npm"}, capture_output=True, text=True, timeout=60)
+        assert failed.returncode != 0, (version, failed.stdout, failed.stderr)
     result = subprocess.run(["sh", "deploy/release.sh", version, str(notes)], cwd=work, env=env, capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, (version, result.stdout, result.stderr)
+    tagged = git("rev-parse", f"v{version}^{{commit}}", cwd=origin).strip()
+    assert git("rev-parse", "main", cwd=origin).strip() == tagged, version
+    assert f"v{version} {tagged}" in result.stdout, result.stdout
     minor = version.rsplit(".", 1)[0]
     patch = version.endswith(".0")
     pinned = minor if patch else before.rsplit(".", 1)[0]
@@ -180,7 +190,16 @@ def release(tmp, before, version, mock_dir):
     assert ("MINOR = \"" + minor + "\"" in result.stdout) == patch, result.stdout
     assert (f"@letmeknow/cli@{minor} in hooks/letmeknow.js" in result.stdout) == patch, result.stdout
     assert f"v{version}" in git("tag", cwd=origin).split(), version
-    print(f"ok - release {version} from {before}: pins at {pinned}")
+    if fail_first:
+        (work / "Cargo.toml").write_text(f'[workspace.package]\nversion = "{before}"\n')
+        git("commit", "-qam", "after", cwd=work)
+        after = git("rev-parse", "HEAD", cwd=work).strip()
+        refused = subprocess.run(["sh", "deploy/release.sh", version, str(notes)], cwd=work, env=env, capture_output=True, text=True, timeout=60)
+        assert refused.returncode != 0, (version, refused.stdout, refused.stderr)
+        assert git("status", "--porcelain", cwd=work) == "", git("status", "--porcelain", cwd=work)
+        assert git("rev-parse", "HEAD", cwd=work).strip() == after
+        assert git("rev-parse", "main", cwd=origin).strip() == tagged
+    print(f"ok - release {version} from {before}{' (run again)' if fail_first else ''}: pins at {pinned}")
 
 
 with tempfile.TemporaryDirectory(prefix="lmk-release-test-") as directory:
@@ -194,3 +213,5 @@ with tempfile.TemporaryDirectory(prefix="lmk-release-test-") as directory:
     release(tmp, "0.16.1", "0.17.0", mock_dir)
     release(tmp, "0.16.1", "0.16.2", mock_dir)
     release(tmp, "0.17.0", "0.17.0", mock_dir)
+    release(tmp, "0.16.1", "0.17.0", mock_dir, fail_first=True)
+    release(tmp, "0.16.1", "0.16.2", mock_dir, fail_first=True)

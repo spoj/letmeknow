@@ -10,18 +10,22 @@ cd "$(dirname "$0")/.."
 dirty=$(git status --porcelain)
 [ -z "$dirty" ] || { printf 'commit or stash your changes first:\n%s\n' "$dirty" >&2; exit 1; }
 [ -f "$notes" ] || { echo "no notes file $notes" >&2; exit 1; }
-sed -i "0,/^version = \".*\"/s//version = \"$version\"/" Cargo.toml
+tagged=$(git rev-parse -q --verify "refs/tags/v$version^{commit}" || true)
+[ -z "$tagged" ] || [ "$tagged" = "$(git rev-parse HEAD)" ] || { echo "v$version already names $tagged" >&2; exit 1; }
 minor=${version%.*}
-if [ "${version##*.}" = 0 ]; then
-  sed -i "s#@letmeknow/cli@[0-9]*\.[0-9]*#@letmeknow/cli@$minor#g" README.md SKILL.md site/index.html AGENTS.md
-fi
-cargo update -w --offline
-git commit -q --allow-empty -am "$version"
-sha=$(git rev-parse HEAD)
 repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+if [ -z "$tagged" ]; then
+  sed -i "0,/^version = \".*\"/s//version = \"$version\"/" Cargo.toml
+  if [ "${version##*.}" = 0 ]; then
+    sed -i "s#@letmeknow/cli@[0-9]*\.[0-9]*#@letmeknow/cli@$minor#g" README.md SKILL.md site/index.html AGENTS.md
+  fi
+  cargo update -w --offline
+  git commit -q --allow-empty -am "$version"
+  git tag -a "v$version" -m "letmeknow $version"
+fi
 git push -q origin main
-git tag -a "v$version" -m "letmeknow $version"
 git push -q origin "v$version"
+sha=$(git rev-parse HEAD)
 run=
 until [ -n "$run" ]; do
   sleep 5
