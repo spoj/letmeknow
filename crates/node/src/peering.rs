@@ -647,12 +647,13 @@ impl Node {
         st.save(gid)
     }
 
-    /// Whether this session's client showed a held message.
+    /// Whether this session's client showed a held message. One whose membership's record is gone counts as shown: a
+    /// home of 0.25.3 dropped the record of a membership that ended while it kept its messages.
     pub fn shown(&self, gid: &[u8], id: &[u8]) -> Result<bool> {
         let st = self.inner.lock();
         let Some(record) = st.record(gid, id)? else { return Ok(false) };
         let g = st.group(gid)?;
-        Ok(g.author(&record.header.author.0, record.header.joined).is_some_and(|a| a.shown.contains(record.header.seq)))
+        Ok(g.author(&record.header.author.0, record.header.joined).is_none_or(|a| a.shown.contains(record.header.seq)))
     }
 }
 

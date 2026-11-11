@@ -1072,6 +1072,27 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_message_whose_memberships_record_is_gone_counts_as_shown() {
+        let relay = lmk_testing::relay().await;
+        let (alice, bob) = (node(&relay, relay.post()).await, node(&relay, relay.post()).await);
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let gid = alice.create(settings).unwrap();
+        bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        let first = alice.send(&gid.0, &serde_json::json!({ "type": "message", "content": "hi" }), None).await.unwrap();
+        n0_future::time::timeout(Duration::from_secs(60), async {
+            while bob.message(&gid.0, &first.0).unwrap().is_none() {
+                n0_future::time::sleep(Duration::from_millis(50)).await;
+            }
+        }).await.unwrap();
+        assert!(!bob.shown(&gid.0, &first.0).unwrap());
+        bob.inner.lock().group_mut(&gid.0).unwrap().rec.authors.retain(|a| a.key != alice.key());
+        assert!(bob.shown(&gid.0, &first.0).unwrap());
+        for node in [alice, bob] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_rate_refused_send_keeps_the_next_messages_deps() {
         let relay = lmk_testing::relay().await;
         let (alice, bob) = (node(&relay, relay.post()).await, node(&relay, relay.post()).await);
