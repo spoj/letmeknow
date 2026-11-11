@@ -43,6 +43,40 @@ async fn frames_go_both_ways_in_order() {
     a.net.shutdown().await.unwrap();
 }
 
+/// Two peers that each queue more at once than a stream's window takes read while they write, so neither stalls.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_peers_writing_much_at_once_do_not_stall() {
+    let relay = relay().await;
+    let keys = keys(2);
+    let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
+    let mut a = node(&relay, keys[0].clone(), true).await;
+    let mut b = node(&relay, keys[1].clone(), true).await;
+    a.net.dial(members[1], vec![relay.url.clone()]).await.unwrap();
+    a.until(|e| matches!(e, Event::Connected(..))).await;
+    b.until(|e| matches!(e, Event::Connected(..))).await;
+    let big = Frame::Held { group: Bytes(G.to_vec()), items: vec![Bytes(vec![7; 10 << 20])], answers: None };
+    let (a_big, b_big) = (big.clone(), big.clone());
+    for (fa, fb) in [(want(1), want(1)), (want(2), want(2)), (a_big, b_big)] {
+        assert!(a.net.frame(members[1], fa));
+        assert!(b.net.frame(members[0], fb));
+    }
+    let frames = [want(1), want(2), big];
+    tokio::join!(
+        async {
+            for f in &frames {
+                assert!(matches!(a.until(|e| matches!(e, Event::Frame(..))).await, Event::Frame(from, got) if from == members[1] && &got == f));
+            }
+        },
+        async {
+            for f in &frames {
+                assert!(matches!(b.until(|e| matches!(e, Event::Frame(..))).await, Event::Frame(from, got) if from == members[0] && &got == f));
+            }
+        },
+    );
+    a.net.shutdown().await.unwrap();
+    b.net.shutdown().await.unwrap();
+}
+
 /// A frame this session does not know, as a newer letmeknow may send, is skipped, and the stream stays up.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unknown_frame_is_skipped() {

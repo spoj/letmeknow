@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use lmk_proto::{frame, peer::Frame};
-use n0_future::task::spawn;
 use n0_future::time::{Duration, timeout};
 use tokio::sync::mpsc;
 
@@ -19,39 +18,29 @@ const WRITE: Duration = Duration::from_secs(120);
 /// is closed, and what is queued for it goes.
 pub(crate) async fn run(inner: Arc<Inner>, conn: Connection, mut send: SendStream, mut recv: RecvStream, mut out: mpsc::UnboundedReceiver<Frame>) {
     let peer = conn.remote_id();
-    let (read, mut frames) = mpsc::channel(1);
-    spawn(async move {
+    let read = async {
         while let Ok(frame) = frame::read_known(&mut recv).await {
-            if read.send(frame).await.is_err() {
-                return;
-            }
+            inner.events.send(Event::Frame(peer, frame)).await?;
         }
-    });
-    let result = async {
-        loop {
-            tokio::select! {
-                frame = frames.recv() => match frame {
-                    Some(frame) => inner.events.send(Event::Frame(peer, frame)).await?,
-                    None => break,
-                },
-                frame = out.recv() => match frame {
-                    Some(frame) => {
-                        if let Some(frame) = inner.groups.admit(&peer, frame) {
-                            let bytes = frame::encode(&frame);
-                            let mut rest = bytes.as_slice();
-                            while !rest.is_empty() {
-                                let n = timeout(WRITE, send.write(rest)).await??;
-                                rest = &rest[n..];
-                            }
-                        }
-                    }
-                    None => break,
-                },
+        anyhow::Ok(())
+    };
+    let write = async {
+        while let Some(frame) = out.recv().await {
+            if let Some(frame) = inner.groups.admit(&peer, frame) {
+                let bytes = frame::encode(&frame);
+                let mut rest = bytes.as_slice();
+                while !rest.is_empty() {
+                    let n = timeout(WRITE, send.write(rest)).await??;
+                    rest = &rest[n..];
+                }
             }
         }
         anyhow::Ok(())
-    }
-    .await;
+    };
+    let result = tokio::select! {
+        r = read => r,
+        r = write => r,
+    };
     if let Err(e) = result {
         tracing::debug!("peer stream with {} ended: {e:#}", peer.fmt_short());
     }
