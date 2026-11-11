@@ -3300,6 +3300,39 @@ async fn only_an_admin_removes_or_admits_sessions_of_other_devices() {
     }
 }
 
+/// An invite names connected holders that are admins ahead of those that are not, so that an admin's invite still admits
+/// another device through an online admin behind three members that are no admins once the inviter stops.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_admins_invite_names_admin_holders_first() {
+    let relay = relay().await;
+    let mut alice = session_on(&relay, 1).await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    let mut others = Vec::new();
+    for seed in [2, 3, 4] {
+        let member = session_on(&relay, seed).await;
+        member.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+        others.push(member);
+    }
+    let admin = session_on(&relay, 1).await;
+    admin.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    eventually("all four members are connected to Alice", || alice.node.connected(&gid.0).unwrap().len() == 4).await;
+
+    let link = alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
+    alice.node.shutdown().await.unwrap();
+    let stranger = session_on(&relay, 5).await;
+    let joined = stranger.node.join(&link).await;
+    for member in others {
+        member.node.shutdown().await.unwrap();
+    }
+    let admin_addr = admin.node.address().0;
+    admin.node.shutdown().await.unwrap();
+    stranger.node.shutdown().await.unwrap();
+    assert_eq!(joined.unwrap(), (gid, admin_addr));
+    assert_eq!(link.members[1].0, admin_addr);
+}
+
 /// An admin admits a device; then a session of it joins through another, which is no admin, with no admin online, as a
 /// new session of a machine joins through another of it. A group keeps an admin.
 #[tokio::test(flavor = "multi_thread")]

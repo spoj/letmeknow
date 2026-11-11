@@ -42,7 +42,7 @@ const INVITER_FIRST: Duration = Duration::from_secs(3);
 impl Node {
     /// An invite into a group, valid for `valid` milliseconds: shared with the members as a held message, unless it is
     /// for one member (`to`), and a link that names this session and, when shared, up to three members connected to it
-    /// that hold it.
+    /// that hold it, admins first.
     pub async fn invite(&self, gid: &[u8], valid: u64, to: Option<&[u8]>) -> Result<Invite> {
         let secret: [u8; 16] = lmk_core::random();
         let hash = Bytes(Sha256::digest(secret).to_vec());
@@ -56,7 +56,7 @@ impl Node {
             g.rec.invites.push(Rule { hash: hash.clone(), expires, by, joined, to: to.clone() });
             st.save(gid)?;
         }
-        let holders = match to {
+        let mut holders = match to {
             Some(_) => {
                 self.inner.caught_up(gid).await?;
                 Vec::new()
@@ -86,7 +86,9 @@ impl Node {
             }
         };
         let st = self.inner.lock();
-        let Service::Serve { domain, .. } = st.group(gid)?.mls.settings().membership else { bail!("unsupported membership service") };
+        let g = st.group(gid)?;
+        let Service::Serve { domain, .. } = g.mls.settings().membership else { bail!("unsupported membership service") };
+        holders.sort_by_key(|member| !g.mls.admin(&member.key.0));
         let mut members = vec![(*self.inner.net().id().as_bytes(), self.inner.home.clone())];
         members.extend(holders.iter().filter_map(|member| Some((*endpoint_id(&member.iroh.0)?.as_bytes(), member.home.clone()))).take(LINK_MEMBERS));
         Ok(Invite { secret, domain, members })
