@@ -610,6 +610,23 @@ fn an_answer_cut_at_its_size_strikes_only_what_it_covered() {
     assert_eq!(wants(&p.poll(100)), vec![(key(1), vec![seqs(1, &[(2, 2)])])]);
 }
 
+/// An answer of `ANSWER` bytes strikes only what it names of the request, or the whole request if it names none of it.
+#[test]
+fn an_answer_at_its_size_strikes_only_what_was_asked() {
+    let mut p = both_hold();
+    assert_eq!(wants(&p.poll(0)), vec![(key(1), ask())]);
+    let unasked = vec![seqs(1, &[(9, 9)]), seqs(9, &[(1, 5)])];
+    p.frame(&key(1), &Frame::Held { group: id(), items: vec![Bytes(vec![0; ANSWER])], answers: Some(unasked) }, 100);
+    assert_eq!(wants(&p.poll(100)), vec![(key(2), ask())]);
+    assert_eq!(p.groups[&id()].struck, BTreeMap::from([((key(1), member(1)), Ranges::range(1, 2))]));
+
+    let mut p = both_hold();
+    p.poll(0);
+    let partial = vec![seqs(1, &[(1, 1), (9, 9)]), seqs(9, &[(1, 5)])];
+    p.frame(&key(1), &Frame::Held { group: id(), items: vec![Bytes(vec![0; ANSWER])], answers: Some(partial) }, 100);
+    assert_eq!(p.groups[&id()].struck, BTreeMap::from([((key(1), member(1)), Ranges::range(1, 1))]));
+}
+
 /// A peer that announced what this member wants is asked for it, though no summary shows it held, and is given
 /// `LARGE_TIMEOUT` to answer, as what it announced is large, before the next holder is asked.
 #[test]

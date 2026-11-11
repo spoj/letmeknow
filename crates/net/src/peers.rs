@@ -349,10 +349,10 @@ impl Peers {
                     && let Some(r) = g.request.take_if(|r| r.holder == *peer)
                     && r.epoch == g.own.epoch
                 {
-                    // An answer short of `ANSWER` bytes, or covering nothing, is all the holder has of what was asked.
-                    let whole = answers.is_empty() || items.iter().map(|item| item.0.len()).sum::<usize>() < ANSWER;
-                    let covered = if whole { r.asked } else { to_set(answers) };
-                    for (m, seqs) in covered {
+                    // An answer short of `ANSWER` bytes, or covering nothing asked, is all the holder has of what was asked.
+                    let covered = offer(&r.asked, &to_set(answers), &BTreeMap::new(), peer);
+                    let whole = covered.is_empty() || items.iter().map(|item| item.0.len()).sum::<usize>() < ANSWER;
+                    for (m, seqs) in if whole { r.asked } else { covered } {
                         let struck = g.struck.entry((*peer, m)).or_default();
                         *struck = struck.union(&seqs);
                     }
