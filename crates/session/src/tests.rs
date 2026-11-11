@@ -1057,6 +1057,35 @@ async fn stopped_sessions_that_have_not_run_for_28_days_are_deleted() {
     }
 }
 
+/// A session directory without `groups.json`, as when `listen` failed before opening, or a `.new-…` directory left by a
+/// crash, is left while recent, as it may be starting, and deleted once it has not run for 28 days.
+#[tokio::test]
+async fn unopened_session_directories_are_kept_while_recent_and_deleted_after_28_days() {
+    let home = tempfile::tempdir().unwrap();
+    let ago = |days: u64| SystemTime::now() - Duration::from_secs(days * 24 * 3600);
+    let starting = crate::new_session(home.path(), "Relay.example.com").unwrap();
+    let failed = crate::new_session(home.path(), "Relay.example.com").unwrap();
+    let making = home.path().join("sessions/.new-00000001");
+    let crashed = home.path().join("sessions/.new-00000002");
+    for dir in [&making, &crashed] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("session.db"), "").unwrap();
+    }
+    for (dir, days) in [(&starting, 27), (&failed, 28), (&making, 27), (&crashed, 28)] {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            std::fs::File::options().write(true).open(entry.path()).unwrap().set_modified(ago(days)).unwrap();
+        }
+    }
+    assert_eq!(crate::sessions(home.path()).await.unwrap()["sessions"].as_array().unwrap().len(), 2);
+    assert!(crate::delete_stopped(home.path().to_owned()).await.unwrap().is_empty());
+    assert!(starting.exists() && !starting.join("session.lock").exists());
+    assert!(!failed.exists());
+    assert!(making.exists() && !crashed.exists());
+    let listed = crate::sessions(home.path()).await.unwrap();
+    assert_eq!(listed["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["sessions"][0]["fp"], starting.file_name().unwrap().to_string_lossy().as_ref());
+}
+
 /// A stopped session that the group moved past while it was stopped, started again, catches up with the group before it
 /// invites, however long its reading takes: as a harness starts one again to bring a new session of its home into the
 /// group. A stopped session in no group that was not deleted as it stopped goes as the next one starts.

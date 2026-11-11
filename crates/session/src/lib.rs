@@ -310,9 +310,10 @@ pub fn new_session(home: &Path, membership: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// When a session last ran: when the last of its files changed. One that runs moves its lock's time each hour.
+/// When a session last ran: when the last of its files changed, or its directory if it has none. One that runs moves its
+/// lock's time each hour.
 fn last_ran(dir: &Path) -> Option<SystemTime> {
-    std::fs::read_dir(dir).ok()?.flatten().filter_map(|entry| entry.metadata().ok()?.modified().ok()).max()
+    std::fs::read_dir(dir).ok()?.flatten().filter_map(|entry| entry.metadata().ok()?.modified().ok()).max().or_else(|| dir.metadata().ok()?.modified().ok())
 }
 
 /// Deletes the home's stopped sessions in no group, as each would have as it stopped: those that found, started again to
@@ -324,10 +325,13 @@ async fn delete_stopped(home: PathBuf) -> Result<Vec<String>> {
     for entry in std::fs::read_dir(home.join("sessions"))?.flatten() {
         let dir = entry.path();
         let deleted = || -> Result<()> {
-            let Ok(groups) = std::fs::read(dir.join("groups.json")) else { return Ok(()) };
             let stale = last_ran(&dir).and_then(|at| at.elapsed().ok()).is_some_and(|idle| idle >= Duration::from_millis(STALE));
-            if !stale && !serde_json::from_slice::<Vec<String>>(&groups)?.is_empty() {
-                return Ok(());
+            if !stale {
+                // One without groups.json may be starting.
+                let Ok(groups) = std::fs::read(dir.join("groups.json")) else { return Ok(()) };
+                if !serde_json::from_slice::<Vec<String>>(&groups)?.is_empty() {
+                    return Ok(());
+                }
             }
             let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("session.lock"))?;
             if held.try_lock().is_ok() {
