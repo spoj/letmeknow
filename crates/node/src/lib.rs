@@ -701,6 +701,32 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_head_past_the_signed_range_is_refused() {
+        use ed25519_dalek::SigningKey;
+        use lmk_proto::head::{self, Head};
+
+        let relay = lmk_testing::relay().await;
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let service = Service::Serve { key: Bytes(key.verifying_key().to_bytes().to_vec()), domain: "foreign.example".into(), rest: Default::default() };
+        let alice = node(&relay, relay.post()).await;
+        let gid = alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: service, admins: vec![], admitted: vec![] }).unwrap();
+        let log = alice.log(&gid.0).unwrap();
+        let id: [u8; 32] = log.0.as_slice().try_into().unwrap();
+        let start = head::start(key.verifying_key().as_bytes(), &id);
+        let head = Head::sign(&key, &id, 1, head::next(&start, b"skipped"), u64::MAX);
+        let peer = SecretKey::from_bytes(&[8; 32]).public();
+        alice.inner.peer_event(lmk_net::Event::Connected(peer, false));
+        alice.inner.peer_event(lmk_net::Event::Frame(peer, Frame::Entries { log: log.clone(), entries: vec![Bytes(b"skipped".to_vec())], head }));
+        {
+            let st = alice.inner.lock();
+            st.capability(&id).unwrap();
+            assert_eq!(st.log(&id).unwrap().at, 0);
+            assert!(st.log(&id).unwrap().head.is_none());
+        }
+        alice.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_commit_refused_for_good_is_no_longer_pending() {
         use ed25519_dalek::{Signer, SigningKey};
         use lmk_membership::Refused;

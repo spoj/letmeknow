@@ -128,7 +128,7 @@ impl ServeClient {
         let body = json(&Append { capability: *capability, entries: entries.iter().cloned().map(Bytes).collect() })?;
         let appended: Appended = self.request("/membership/6/append", body, Some(head::reference(self.0.key.as_bytes(), capability))).await?;
         Frontier::empty(*self.0.key.as_bytes(), head::reference(self.0.key.as_bytes(), capability)).check(&appended.head, None)?;
-        record_time(self.0.sets_clock, sent, &appended.head)?;
+        self.heard(sent, &appended.head);
         Ok(appended)
     }
 
@@ -138,7 +138,7 @@ impl ServeClient {
         let body = json(&Read { capability: *capability, after: anchor.length() })?;
         let page: Page = self.request("/membership/6/read", body, Some(*anchor.log_ref())).await?;
         let page = anchor.verify_page(page)?;
-        record_time(self.0.sets_clock, sent, &page.head)?;
+        self.heard(sent, &page.head);
         Ok(page)
     }
 
@@ -155,7 +155,7 @@ impl ServeClient {
                     return Err(WrongDirectory(self.0.domain.clone()).into());
                 }
                 ensure!(chunk.iter().any(|Known(capability, _)| head::reference(self.0.key.as_bytes(), capability) == head.log_ref), WrongLog);
-                record_time(self.0.sets_clock, sent, &head)?;
+                self.heard(sent, &head);
                 moved.push(Ok(head));
             }
             for expiry in expired {
@@ -166,26 +166,14 @@ impl ServeClient {
         }
         Ok(moved)
     }
+
+    fn heard(&self, sent: u64, head: &Head) {
+        if self.0.sets_clock {
+            clock::heard(sent, clock::now(), head.time);
+        }
+    }
 }
 
 fn json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(value)?)
-}
-
-fn record_time(sets_clock: bool, sent: u64, head: &Head) -> Result<()> {
-    ensure!(head.time <= i64::MAX as u64, crate::InvalidProof);
-    if sets_clock {
-        clock::heard(sent, clock::now(), head.time);
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-#[test]
-fn unrepresentable_signed_time_cannot_overflow_the_shared_clock() {
-    let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
-    let head = Head::sign(&key, &[8; 32], 1, [9; 32], 1 << 63);
-    assert!(head.verify(&key.verifying_key()));
-    assert!(record_time(true, 0, &head).unwrap_err().is::<crate::InvalidProof>());
-    assert!(record_time(false, 0, &head).unwrap_err().is::<crate::InvalidProof>());
 }

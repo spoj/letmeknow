@@ -61,7 +61,8 @@ impl Head {
 
     pub fn verify(&self, key: &VerifyingKey) -> bool {
         let Ok(sig) = Signature::from_slice(&self.sig.0) else { return false };
-        key.verify_strict(&signed(key.as_bytes(), &self.log_ref, self.length, &self.hash, self.time), &sig).is_ok()
+        self.time <= i64::MAX as u64
+            && key.verify_strict(&signed(key.as_bytes(), &self.log_ref, self.length, &self.hash, self.time), &sig).is_ok()
     }
 }
 
@@ -88,6 +89,8 @@ mod tests {
         assert!(!head.verify(&SigningKey::from_bytes(&[8; 32]).verifying_key()));
         assert!(!Head { log_ref: c, ..head.clone() }.verify(&key.verifying_key()));
         assert!(!Head { length: 2, ..head.clone() }.verify(&key.verifying_key()));
+        assert!(Head::sign(&key, &d, 1, h, i64::MAX as u64).verify(&key.verifying_key()));
+        assert!(!Head::sign(&key, &d, 1, h, 1 << 63).verify(&key.verifying_key()));
         assert_eq!(serde_json::from_slice::<Head>(&serde_json::to_vec(&head).unwrap()).unwrap(), head);
     }
 }
