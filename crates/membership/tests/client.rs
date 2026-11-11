@@ -214,7 +214,33 @@ async fn a_page_that_does_not_chain_to_the_anchor_is_refused() {
 }
 
 #[tokio::test]
-async fn at_most_four_requests_are_in_flight_to_a_service() {
+async fn concurrent_reads_fit_a_default_services_bytes_in_flight() {
+    let membership = Membership::new();
+    let service = membership.service.clone();
+    let post: Post = Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| -> BoxFuture<anyhow::Result<Vec<u8>>> {
+        let service = service.clone();
+        Box::pin(async move {
+            let route = Route::parse(route).unwrap();
+            let Some(admission) = service.admit(IpAddr::from([127, 0, 0, 1]), route, body.len()) else {
+                return answered(&domain, 503, Vec::new());
+            };
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            answered(&domain, 200, service.post(route, &admission, &body).await?)
+        })
+    });
+    let client = ServeClient::for_service(post, &membership.wire("membership.example")).unwrap();
+    let key = membership.key.clone();
+    let tasks: Vec<_> = (0..10).map(|i| {
+        let (client, key) = (client.clone(), key.clone());
+        tokio::spawn(async move { client.read(&log(i), &anchor(&key, &log(i))).await })
+    }).collect();
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn at_most_three_requests_are_in_flight_to_a_service() {
     let membership = Membership::new();
     let post = membership.post();
     let (now, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
@@ -238,5 +264,5 @@ async fn at_most_four_requests_are_in_flight_to_a_service() {
     for task in tasks {
         task.await.unwrap().unwrap();
     }
-    assert_eq!(peak.load(Ordering::SeqCst), 4);
+    assert_eq!(peak.load(Ordering::SeqCst), 3);
 }

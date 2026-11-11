@@ -64,8 +64,9 @@ pub async fn directory(resolve: &Resolve, service: &Service) -> Result<Directory
     Ok(directory)
 }
 
-/// Requests in flight to one service: the service answers a request beyond its own limit at once with a 503.
-const IN_FLIGHT: usize = 4;
+/// Requests in flight to one service: three pages and their requests fit the 16 MiB a service takes in flight from one
+/// source by default, past which it answers at once with a 503.
+const IN_FLIGHT: usize = 3;
 
 #[derive(Clone)]
 pub struct ServeClient(Arc<Inner>);
