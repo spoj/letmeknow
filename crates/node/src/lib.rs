@@ -776,6 +776,65 @@ mod tests {
         }
     }
 
+    /// A member whose leaf names 32 bytes that are no Ed25519 point stays in the group and is not handed to `Peers`, so
+    /// neither the poll nor starting again dials it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_member_whose_leaf_key_is_no_iroh_key_stays_in_the_group_and_is_not_dialed() {
+        let relay = lmk_testing::relay().await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("alice.db");
+        let start = || async {
+            let config = Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[9; 32]) };
+            Node::start(SqliteProvider::open(&db).unwrap(), config).await.unwrap().0
+        };
+        let mut alice = start().await;
+        let bob = Node::start(
+            SqliteProvider::open(":memory:".as_ref()).unwrap(),
+            Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[8; 32]) },
+        )
+        .await
+        .unwrap()
+        .0;
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let gid = alice.create(settings).unwrap();
+        let bob_key = bob.key();
+        bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        assert!(!alice.admin(&gid.0, &bob_key.0).unwrap());
+        let bad = (0u8..=255).map(|b| [b; 32]).find(|k| EndpointId::from_bytes(k).is_err()).unwrap();
+        {
+            let mut st = bob.inner.lock();
+            let st = &mut *st;
+            let leaf = lmk_proto::group::Leaf { key: Bytes(bad.to_vec()), ..st.session.leaf.clone() };
+            st.session.set_leaf(&st.provider, leaf).unwrap();
+        }
+        bob.inner.merge(&gid.0).await.unwrap();
+        bob.shutdown().await.unwrap();
+        alice.read_group(&gid.0).await.unwrap();
+        for round in 0..2 {
+            if round == 1 {
+                alice = start().await;
+            }
+            n0_future::time::timeout(Duration::from_secs(10), async {
+                while {
+                    let st = alice.inner.lock();
+                    st.peers.next(st.time) == Some(st.time)
+                } {
+                    n0_future::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(alice.members(&gid.0).unwrap().iter().any(|m| m.key == bob_key && m.iroh.0 == bad));
+            {
+                let mut st = alice.inner.lock();
+                let now = st.tick();
+                st.peers.push(&gid);
+                assert!(!st.peers.poll(now).iter().any(|out| matches!(out, lmk_net::peers::Out::Dial(_))));
+            }
+            alice.shutdown().await.unwrap();
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_rate_refused_send_keeps_the_next_messages_deps() {
         let relay = lmk_testing::relay().await;

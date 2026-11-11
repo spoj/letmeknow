@@ -18,7 +18,7 @@ use lmk_proto::peer::{At, Frame, INTRO, Intro, SUMMARY, Seqs, Shown, Signed, Sum
 use n0_future::time::{Duration, timeout};
 use serde::{Deserialize, Serialize};
 
-use crate::{Epoch, G, Inner, Member, Node, Out, State, get, now, put};
+use crate::{Epoch, G, Inner, Member, Node, Out, State, endpoint_id, get, now, put};
 
 /// How many summaries of memberships not known yet a group keeps.
 const UNVERIFIED: usize = 32;
@@ -97,7 +97,7 @@ impl State {
         let intros = g.intros().map(|(intro, signed)| ((intro.member, intro.joined), (intro.version, signed.clone()))).collect();
         let expired = g.rec.epochs.iter().filter_map(|epoch| epoch.expired.clone()).collect();
         let members = g.mls.members().into_iter().filter(|m| m.key != me).filter_map(|m| {
-            let iroh = m.leaf.as_ref()?.key.0.as_slice().try_into().ok()?;
+            let iroh = *endpoint_id(&m.leaf.as_ref()?.key.0)?.as_bytes();
             Some(((Bytes(m.key.clone()), g.mls.joined(&m.key)?), iroh))
         });
         Own {
