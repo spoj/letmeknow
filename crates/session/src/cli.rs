@@ -391,6 +391,12 @@ pub async fn running_session(home: &Path) -> Result<String> {
 }
 
 pub async fn connect(endpoint: &Path) -> Result<(TcpStream, String)> {
+    ensure!(
+        endpoint.exists()
+            && std::fs::File::open(endpoint.with_file_name("session.lock"))
+                .is_ok_and(|held| matches!(held.try_lock_shared(), Err(std::fs::TryLockError::WouldBlock))),
+        "the session lock is not held"
+    );
     let endpoint: Endpoint = serde_json::from_slice(&std::fs::read(endpoint)?)?;
     Ok((TcpStream::connect(("127.0.0.1", endpoint.port)).await?, endpoint.token))
 }

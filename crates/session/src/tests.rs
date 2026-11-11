@@ -531,6 +531,8 @@ fn the_command_channel_drops_an_oversized_call_without_a_newline() {
     local(async {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let home = tempfile::tempdir().unwrap();
+        let held = std::fs::File::create(home.path().join("session.lock")).unwrap();
+        held.try_lock().unwrap();
         let endpoint = home.path().join("endpoint");
         let (inbound, mut requests) = mpsc::unbounded_channel();
         crate::cli::open_channel(&endpoint, inbound).await.unwrap();
@@ -568,6 +570,8 @@ fn the_command_channel_takes_a_twelve_mib_attachment_and_no_larger_call() {
     local(async {
         use base64::{Engine, engine::general_purpose::STANDARD as B64};
         let home = tempfile::tempdir().unwrap();
+        let held = std::fs::File::create(home.path().join("session.lock")).unwrap();
+        held.try_lock().unwrap();
         let endpoint = home.path().join("endpoint");
         let (inbound, mut requests) = mpsc::unbounded_channel();
         crate::cli::open_channel(&endpoint, inbound).await.unwrap();
@@ -602,6 +606,47 @@ fn a_session_starts_with_a_stale_endpoint_on_a_live_port() {
         let bob = world.start_in("alice", "bob").await;
         assert_eq!(bob.cmd(&["groups"]).await.unwrap(), json!({}));
         assert_eq!(alice.cmd(&["groups"]).await.unwrap(), json!({}));
+    });
+}
+
+#[test]
+fn a_stale_endpoint_on_a_live_port_is_not_connected_to() {
+    local(async {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let world = world("stale-connect").await;
+        let (mut alice, _bob, _) = pair(&world).await;
+        let detached = || Config { detached: true, ..world.config("alice", "alice") };
+        alice.stop().await;
+        let mut alice = world.launch(detached(), usize::MAX).await;
+        let (mut printed, reading) = attached(&alice);
+        assert_eq!(read(&mut printed).await["type"], "ready");
+
+        alice.stop().await;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::fs::write(detached().dir.join("endpoint"), serde_json::to_vec(&json!({ "port": port, "token": "other" })).unwrap()).unwrap();
+        let (taken_tx, mut taken) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let taken_tx = taken_tx.clone();
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let mut line = String::new();
+                    let _ = tokio::io::BufReader::new(r).read_line(&mut line).await;
+                    let _ = taken_tx.send(line);
+                    let _ = w.write_all(b"{\"error\":\"bad token\"}\n").await;
+                });
+            }
+        });
+
+        let secret = world.root.path().join("secret.txt");
+        std::fs::write(&secret, "secret-attachment").unwrap();
+        let error = alice.cmd(&["send", "--attach", secret.to_str().unwrap(), "secret-text"]).await.unwrap_err().to_string();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(taken.try_recv().is_err() && error.contains("not running") && !reading.is_finished(), "{error}");
+
+        let _alice = world.launch(detached(), usize::MAX).await;
+        assert_eq!(read(&mut printed).await["type"], "ready");
     });
 }
 
