@@ -156,7 +156,7 @@ impl Inner {
         }
     }
 
-    /// Forgets a removed group and reports removal once that step is durable, with this session's messages that no cut
+    /// Forgets a removed group and reports removal once that step is durable, with this session's chat messages that no cut
     /// kept, which its records still show.
     pub(crate) fn gone(&self, gid: &[u8], by: Option<Member>) {
         let mut st = self.lock();

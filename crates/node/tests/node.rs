@@ -3014,6 +3014,40 @@ async fn a_removed_member_is_told_which_of_its_messages_no_cut_kept() {
     dave.node.shutdown().await.unwrap();
 }
 
+/// `Removed`'s `not_kept` leaves out control messages, which are not the client's to send again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_member_is_not_told_its_control_messages_were_not_kept() {
+    let relay = relay().await;
+    let dir = folder("not-kept-control");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = |name: &str| dir.join(format!("{name}.db"));
+    let alice = stored(&relay, &db("alice")).await;
+    let dave = stored(&relay, &db("dave")).await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    dave.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    eventually("Alice has Dave's Add", || alice.node.members(&gid.0).unwrap().len() == 2).await;
+    let dave_key = dave.node.key();
+    alice.node.shutdown().await.unwrap();
+    drop(alice);
+
+    let one = dave.node.send(&gid.0, &message("one"), None).await.unwrap();
+    dave.node.leave(&gid.0).unwrap().unwrap();
+    dave.node.shutdown().await.unwrap();
+    drop(dave);
+
+    let alice = stored(&relay, &db("alice")).await;
+    assert!(alice.node.remove(&gid.0, from_ref(&dave_key)).await.unwrap());
+    alice.node.shutdown().await.unwrap();
+    let mut dave = stored(&relay, &db("dave")).await;
+    dave.node.read_group(&gid.0).await.unwrap();
+    let not_kept = dave.until(|e| match e {
+        Event::Removed { not_kept, .. } => Some(not_kept),
+        _ => None,
+    }).await;
+    assert_eq!(not_kept, [one]);
+    dave.node.shutdown().await.unwrap();
+}
+
 /// A member that delivered a removed member's last kept message still has it after the removal.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_holder_keeps_the_removed_members_last_kept_message() {

@@ -7,6 +7,7 @@ use iroh::EndpointId;
 use lmk_core::group::{FRAMING, MAX_MESSAGE};
 use lmk_net::peers::ANSWER;
 use lmk_proto::Bytes;
+use lmk_proto::group::{Control, type_of};
 use lmk_proto::held::{self, Header, Ref};
 use lmk_proto::peer::{Frame, Seqs, Summary};
 use lmk_proto::ranges::Ranges;
@@ -67,13 +68,17 @@ impl State {
         Ok(fetch)
     }
 
-    /// This session's messages of its latest membership of the group that no cut kept, by id.
+    /// This session's chat messages of its latest membership of the group that no cut kept, by id.
     pub(crate) fn not_kept(&self, gid: &[u8]) -> Result<Vec<Bytes>> {
         let me = self.me();
         let Some(mine) = self.group(gid)?.rec.authors.iter().filter(|a| a.key.0 == me).max_by_key(|a| a.joined) else { return Ok(Vec::new()) };
         let mut ids = Vec::new();
         for seq in mine.cut + 1..=mine.last() {
-            ids.extend(self.id_at(gid, me, mine.joined, seq)?);
+            if let Some(record) = self.record_at(gid, me, mine.joined, seq)?
+                && !Control::TYPES.contains(&type_of(&record.header.payload))
+            {
+                ids.push(record.id);
+            }
         }
         Ok(ids)
     }
@@ -110,7 +115,7 @@ impl Inner {
             }
             None => None,
         };
-        let control = lmk_proto::group::Control::TYPES.contains(&lmk_proto::group::type_of(payload));
+        let control = Control::TYPES.contains(&type_of(payload));
         let mut deps = if control { Vec::new() } else { st.deps(gid)? };
         if let Some(r) = reply_to.as_ref().filter(|r| r.key.0 != me || r.joined != joined) {
             match deps.iter_mut().find(|d| d.key == r.key && d.joined == r.joined) {

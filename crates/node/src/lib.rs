@@ -163,7 +163,7 @@ pub enum Event {
     },
     /// This session was removed, by `by` as it applied the commit, or else with no `by`: by a commit applied before it
     /// stopped, left the only member of a group it asked to leave, or away past its log's retention. The group is gone
-    /// from it, with its messages no cut kept: `not_kept`, by id.
+    /// from it, with its chat messages no cut kept: `not_kept`, by id.
     Removed {
         group: Bytes,
         by: Option<Member>,
