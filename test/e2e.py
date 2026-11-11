@@ -134,6 +134,18 @@ def serve():
     proc = subprocess.Popen(args, env=ENV, stdout=subprocess.PIPE, stderr=open(os.path.join(TMP, "serve.log"), "w"), text=True)
     domain = proc.stdout.readline().strip().removeprefix("membership: ")
     proc.stdout.readline()  # key: its public key, which the directory names
+    # serve prints its domain and key before it binds its HTTPS port.
+    deadline = time.time() + 30
+    while True:
+        try:
+            with socket.create_connection(("127.0.0.1", https), timeout=1):
+                break
+        except OSError:
+            if proc.poll() is not None or time.time() >= deadline:
+                proc.kill()
+                proc.wait()
+                sys.exit(f"serve did not listen on {https}")
+            time.sleep(0.05)
     ENV.update(LETMEKNOW_CA=cert, LETMEKNOW_MEMBERSHIP=domain)
     return proc
 
