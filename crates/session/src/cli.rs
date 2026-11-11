@@ -307,6 +307,8 @@ pub(crate) const MAX_CALL: u64 = (16 << 20) + (64 << 10);
 
 /// How often `attach` looks for its session again, once that stopped.
 const AGAIN: Duration = Duration::from_secs(1);
+/// How long accepting waits after it failed, as while the process is out of file descriptors.
+const ACCEPT: Duration = Duration::from_millis(100);
 
 /// Parses a command line.
 pub fn parse<T: Into<OsString> + Clone>(args: impl IntoIterator<Item = T>) -> Result<Cli, clap::Error> {
@@ -409,7 +411,11 @@ pub async fn open_channel(endpoint_path: &Path, inbound: mpsc::UnboundedSender<I
     let endpoint = Endpoint { port: listener.local_addr()?.port(), token: token.clone() };
     private_file(endpoint_path, &serde_json::to_vec(&endpoint)?)?;
     tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                tokio::time::sleep(ACCEPT).await;
+                continue;
+            };
             tokio::spawn(answer(stream, token.clone(), inbound.clone()));
         }
     });

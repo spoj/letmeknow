@@ -146,6 +146,45 @@ fn the_binary_reuses_the_device_key_in_an_explicit_current_home() {
     assert_eq!(first.stdout, again.stdout);
 }
 
+#[cfg(unix)]
+#[test]
+fn the_command_channel_recovers_after_running_out_of_file_descriptors() {
+    use std::io::{BufRead, Read, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let home = seeded_home(dir.path());
+    let mut listen = Command::new("sh")
+        .args(["-c", "ulimit -n 128 && exec \"$1\" --home \"$2\" listen --membership localhost:1", "sh", env!("CARGO_BIN_EXE_letmeknow"), home.to_str().unwrap()])
+        .env_remove("LETMEKNOW_SESSION")
+        .env("LETMEKNOW_REGISTRY", "http://127.0.0.1:1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(listen.stdout.take().unwrap());
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+    let fp = serde_json::from_str::<serde_json::Value>(&ready).unwrap()["fp"].as_str().unwrap().to_owned();
+    let endpoint: serde_json::Value = serde_json::from_slice(&std::fs::read(home.join("sessions").join(&fp).join("endpoint")).unwrap()).unwrap();
+    let port = endpoint["port"].as_u64().unwrap() as u16;
+
+    let mut held = Vec::new();
+    for _ in 0..160 {
+        let Ok(stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else { break };
+        held.push(stream);
+    }
+    if let Ok(mut probe) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+        probe.set_read_timeout(Some(std::time::Duration::from_millis(300))).unwrap();
+        let _ = probe.write_all(b"{}\n");
+        let _ = probe.read(&mut [0; 1]);
+    }
+    drop(held);
+
+    let groups = letmeknow(&home, &["--session", &fp, "groups"]);
+    listen.kill().unwrap();
+    listen.wait().unwrap();
+    assert!(groups.status.success(), "{}", String::from_utf8_lossy(&groups.stderr));
+}
+
 /// A session run with `listen --detached` prints `ready`, and runs on once its reader is gone; `attach` prints its `ready`
 /// as its reader, and another `attach` meanwhile fails.
 #[test]
