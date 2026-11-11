@@ -358,15 +358,14 @@ impl Session {
                 return;
             }
             Request::Remove { group, device, members } => {
-                let found = self.resolve(group).and_then(|gid| {
+                let gid = self.resolve(group);
+                let remove = async move {
+                    let gid = gid?;
+                    node.caught_up(&gid.0).await?;
                     let keys = match device {
                         Some(device) => on_device(&node, &gid, &device)?,
                         None => members.iter().map(|m| Ok(member_by_fp(&node, &gid, m)?.key)).collect::<Result<Vec<_>>>()?,
                     };
-                    Ok((keys, gid))
-                });
-                let remove = async move {
-                    let (keys, gid) = found?;
                     ensure!(!keys.contains(&node.key()), "to leave a group, use `leave`");
                     node.remove(&gid.0, &keys).await?;
                     Ok(json!({ "group": b64(&gid.0), "removed": keys.iter().map(|key| fp(&key.0)).collect::<Vec<_>>() }))

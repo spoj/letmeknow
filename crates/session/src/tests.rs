@@ -1123,6 +1123,49 @@ fn members_show_their_devices_and_remove_device_removes_a_devices_members() {
     });
 }
 
+/// An admin's session that was stopped while sessions joined catches up before `remove` names its members, by device or
+/// by fingerprint.
+#[test]
+fn a_stopped_admin_catches_up_before_remove_names_members() {
+    local(async {
+        let world = world("remove-caught-up").await;
+        let (mut alice, mut bob, group) = pair(&world).await;
+        let mut other = world.start_in("alice", "other").await;
+        other.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
+        let bobs = world.device("bob")["fp"].as_str().unwrap().to_owned();
+        let carols = hex::encode(crate::device(&world.root.path().join("carol")).unwrap().verifying_key().to_bytes());
+        alice.cmd(&["admitted", "add", &bobs[..8], &carols]).await.unwrap();
+        until(|| async { bob.cmd(&["admins"]).await.unwrap() }, |listed| listed["admitted"].as_array().unwrap().len() == 2).await;
+        until(|| async { other.cmd(&["admins"]).await.unwrap() }, |listed| listed["admitted"].as_array().unwrap().len() == 2).await;
+        let link1 = bob.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap().to_owned();
+        let link2 = bob.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap().to_owned();
+        alice.stop().await;
+        other.stop().await;
+
+        let (mut desk, mut carol) = (world.start_in("bob", "desk").await, world.start("carol").await);
+        let (join1, join2) = (["join", link1.as_str()], ["join", link2.as_str()]);
+        let (joined1, joined2) = tokio::join!(desk.cmd(&join1), carol.cmd(&join2));
+        joined1.unwrap();
+        joined2.unwrap();
+        bob.stop().await;
+        desk.stop().await;
+        carol.stop().await;
+
+        let mut alice = world.start("alice").await;
+        let removed = alice.cmd(&["remove", "--device", &bobs[..8]]).await.unwrap();
+        let removed: BTreeSet<&str> = removed["removed"].as_array().unwrap().iter().map(|fp| fp.as_str().unwrap()).collect();
+        assert_eq!(removed, BTreeSet::from([bob.fp.as_str(), desk.fp.as_str()]));
+        alice.stop().await;
+
+        let mut other = world.start_in("alice", "other").await;
+        assert_eq!(other.cmd(&["remove", &carol.fp[..8]]).await.unwrap()["removed"], json!([carol.fp]));
+        let members = other.cmd(&["members", "--all"]).await.unwrap();
+        let left: BTreeSet<&str> = members["members"].as_array().unwrap().iter().map(|m| m["fp"].as_str().unwrap()).collect();
+        assert_eq!(left, BTreeSet::from([alice.fp.as_str(), other.fp.as_str()]));
+        other.stop().await;
+    });
+}
+
 /// A group's founder and its device are its admins: `members` marks them, and `admins` and `groups` list them, with the
 /// admitted devices. A member that is no admin is told so as it removes, ends or changes them; it admits a session of an
 /// admitted device, not of another; an admin makes it an admin, and the group keeps one.
