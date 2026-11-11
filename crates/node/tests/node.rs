@@ -1018,6 +1018,83 @@ fn a_group_forgets_the_adds_of_members_gone_past_h() {
     });
 }
 
+/// An ended membership's record stays for H after it ended, even once nothing of it is left to serve or keep, so its
+/// delivered messages still count as shown and can be marked shown; past H, it goes with them.
+#[test]
+fn an_ended_memberships_messages_stay_shown_until_h() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let dir = folder("ended-author");
+        let (alice_db, carol_db) = (dir.join("alice.db"), dir.join("carol.db"));
+        let mut alice = stored(&relay, &alice_db).await;
+        let bob = session(&relay).await;
+        let carol = stored(&relay, &carol_db).await;
+        let gid = alice.node.create(Settings { carry: 2, ..settings(&relay) }).unwrap();
+        let spares = strangers(&mut alice, &gid, &relay, 2).await;
+        for joiner in [&bob, &carol] {
+            joiner.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+            alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+        }
+        let epoch = carol.node.epoch(&gid.0).unwrap();
+        eventually("Alice and Bob have Carol's update", || [&alice.node, &bob.node].iter().all(|n| n.epoch(&gid.0).unwrap() == epoch)).await;
+        carol.node.shutdown().await.unwrap();
+        drop(carol);
+
+        let m1 = bob.node.send(&gid.0, &message("shown"), None).await.unwrap();
+        let m2 = bob.node.send(&gid.0, &message("unshown"), None).await.unwrap();
+        for id in [&m1, &m2] {
+            alice.until(|e| matches!(&e, Event::Message(m) if &m.id == id).then_some(())).await;
+        }
+        alice.node.mark_shown(&gid.0, from_ref(&m1)).unwrap();
+        assert!(alice.node.shown(&gid.0, &m1.0).unwrap());
+        alice.node.shutdown().await.unwrap();
+        drop(alice);
+
+        // Carol moves the epoch, takes Bob's resealed messages, removes Bob keeping them in that later epoch, and moves
+        // on once more so Alice's record of Bob ends with nothing left to serve or keep.
+        let mut carol = stored(&relay, &carol_db).await;
+        carol.node.remove(&gid.0, &spares[..1]).await.unwrap();
+        for id in [&m1, &m2] {
+            carol.until(|e| matches!(&e, Event::Message(m) if &m.id == id).then_some(())).await;
+        }
+        let bob_key = bob.node.key();
+        carol.node.remove(&gid.0, from_ref(&bob_key)).await.unwrap();
+        carol.node.remove(&gid.0, &spares[1..]).await.unwrap();
+        let carol_epoch = carol.node.epoch(&gid.0).unwrap();
+        bob.node.shutdown().await.unwrap();
+        carol.node.shutdown().await.unwrap();
+
+        SHIFT.store(DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        let alice = stored(&relay, &alice_db).await;
+        alice.node.caught_up(&gid.0).await.unwrap();
+        eventually("Alice ran her duties and updated", || alice.node.epoch(&gid.0).unwrap() > carol_epoch).await;
+        assert!(alice.node.shown(&gid.0, &m1.0).unwrap(), "m1 stays shown within H");
+        alice.node.mark_shown(&gid.0, from_ref(&m2)).unwrap();
+        assert!(alice.node.shown(&gid.0, &m2.0).unwrap(), "m2 can still be marked shown within H");
+        alice.node.shutdown().await.unwrap();
+        drop(alice);
+
+        let has_bob = || {
+            let mut provider = SqliteProvider::open(&alice_db).unwrap();
+            let rec: Value = serde_json::from_slice(&provider.get(&[b"node/group/".as_slice(), &gid.0].concat()).unwrap().unwrap()).unwrap();
+            provider.close().unwrap();
+            rec["authors"].as_array().unwrap().iter().any(|a| a["key"] == json!(bob_key))
+        };
+        assert!(has_bob());
+
+        SHIFT.store(4 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        let alice = stored(&relay, &alice_db).await;
+        eventually("Bob's ended membership and messages expire past H", || {
+            alice.node.message(&gid.0, &m1.0).unwrap().is_none() && !has_bob()
+        }).await;
+        alice.node.shutdown().await.unwrap();
+    });
+}
+
 /// A member whose epoch's log its service let go is removed by the others, which hold the commits it missed: the next
 /// commit a member builds, its update once its message stirs it, asks the service about the logs members are behind in
 /// first.

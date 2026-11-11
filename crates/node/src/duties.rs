@@ -146,7 +146,7 @@ impl State {
         let rec = &mut self.group_mut(gid)?.rec;
         rec.first = first;
         let keep = rec.keep.clone();
-        rec.authors.retain(|a| !a.ended || !a.servable.is_empty() || a.held != a.delivered || keep.iter().any(|k| k.key == a.key && k.joined == a.joined));
+        rec.authors.retain(|a| !a.ended || a.ended_at >= before || !a.servable.is_empty() || a.held != a.delivered || keep.iter().any(|k| k.key == a.key && k.joined == a.joined));
         self.save(gid)
     }
 }

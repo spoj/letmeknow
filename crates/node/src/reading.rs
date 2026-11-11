@@ -192,6 +192,7 @@ impl Inner {
     /// before the next commit, the kept sealings frozen, the memberships that ended (their messages past their final
     /// cuts dropped, their leaves forgotten) and began.
     fn cuts(&self, st: &mut State, gid: &[u8], applied: &core::Applied, ending: u64) -> Result<()> {
+        let now = st.tick();
         let me = st.me().to_vec();
         let g = st.group_mut(gid)?;
         let own = g.mls.joined(&me).or_else(|| applied.cut.iter().find(|r| r.key.0 == me).map(|r| r.joined));
@@ -229,7 +230,7 @@ impl Inner {
         }
         let mut dropped = Vec::new();
         for author in g.rec.authors.iter_mut().filter(|a| !a.ended && !state.iter().any(|r| r.key == a.key && r.joined == a.joined)) {
-            author.ended = true;
+            (author.ended, author.ended_at) = (true, now);
             let past = author.held.difference(&author.delivered).difference(&Ranges::range(1, author.cut));
             for seq in past.iter() {
                 dropped.push((author.key.clone(), author.joined, seq));
