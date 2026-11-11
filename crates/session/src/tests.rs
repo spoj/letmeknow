@@ -943,6 +943,36 @@ fn a_membership_domain_is_checked_pinned_and_fetched() {
     });
 }
 
+/// Sessions starting at once in one home find neither `format`, written once, nor `membership.json` half written.
+#[test]
+fn sessions_starting_at_once_in_one_home_read_whole_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let network = crate::Network {
+        ca: iroh::tls::CaTlsConfig::embedded(),
+        resolve: Arc::new(|_| Box::pin(async { Ok(Directory { key: [1; 32] }) })),
+        post: Arc::new(|_, _, _| Box::pin(async { unreachable!() })),
+    };
+    std::thread::scope(|scope| {
+        for worker in 0..4 {
+            let (root, home, network) = (dir.path(), &home, &network);
+            scope.spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                for round in 0..200 {
+                    crate::own_format(&root.join(format!("fresh-{round}"))).unwrap();
+                    crate::own_format(home).unwrap();
+                    let domain = if worker == 0 { format!("d{round}.example") } else { "pinned.example".into() };
+                    rt.block_on(crate::own_directory(home, network, &domain)).unwrap();
+                }
+            });
+        }
+    });
+    let earlier = SystemTime::now() - Duration::from_secs(60);
+    std::fs::File::options().write(true).open(home.join("format")).unwrap().set_modified(earlier).unwrap();
+    crate::own_format(&home).unwrap();
+    assert_eq!(std::fs::metadata(home.join("format")).unwrap().modified().unwrap(), earlier);
+}
+
 /// A session's directory is fetched, and a copy of it answers while it is fresh, and where a fetch fails.
 #[tokio::test]
 async fn a_directory_is_cached_and_the_built_in_one_answers_for_letmeknow_dev() {

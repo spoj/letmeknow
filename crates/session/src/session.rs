@@ -131,9 +131,7 @@ impl Session {
 
     fn write_groups(&mut self) {
         let groups: Vec<String> = self.groups.iter().map(|gid| b64(&gid.0)).collect();
-        let path = self.config.dir.join("groups.json");
-        let new = path.with_extension("new");
-        if let Err(error) = private_file(&new, serde_json::to_string(&groups).expect("JSON").as_bytes()).and_then(|()| Ok(std::fs::rename(&new, &path)?)) {
+        if let Err(error) = private_file(&self.config.dir.join("groups.json"), serde_json::to_string(&groups).expect("JSON").as_bytes()) {
             self.warn(format!("writing this session's groups: {error:#}"));
         }
     }
@@ -278,9 +276,7 @@ impl Session {
                 kept.push('\n');
             }
         }
-        let new = path.with_extension("new");
-        private_file(&new, kept.as_bytes())?;
-        std::fs::rename(&new, &path)?;
+        private_file(&path, kept.as_bytes())?;
         let held: Vec<(i64, String)> =
             self.db.prepare("SELECT seq, line FROM held")?.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
         for (seq, line) in held {

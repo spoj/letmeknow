@@ -208,7 +208,7 @@ async fn own_directory(home: &Path, network: &Network, domain: &str) -> Result<D
         Some(pin) => ensure!(*pin == key, "the directory of {domain} names key {key}, but this home pinned {pin} at its first start"),
         None => {
             pinned.insert(domain.to_owned(), key);
-            std::fs::write(&pins, serde_json::to_vec(&pinned)?)?;
+            cli::private_file(&pins, &serde_json::to_vec(&pinned)?)?;
         }
     }
     Ok(directory)
@@ -285,7 +285,8 @@ fn own_format(home: &Path) -> Result<()> {
     let format = home.join("format");
     let found = std::fs::read_to_string(&format).ok().map(|found| found.trim().to_owned());
     match found.as_deref() {
-        Some("14") | None => {}
+        Some("14") => return Ok(()),
+        None => {}
         Some(newer) if newer.parse::<u32>().is_ok_and(|format| format > 14) => bail!(
             "{home} holds state that a newer letmeknow wrote (format {newer}), which this one cannot read: run the newest release, `npx -y @letmeknow/cli@latest --home {home} listen`, or use another --home for this one",
             home = home.display()
@@ -293,7 +294,7 @@ fn own_format(home: &Path) -> Result<()> {
         _ => bail!("{} holds the state of an earlier letmeknow, which this one cannot read: move it away, or use another --home", home.display()),
     }
     cli::private_dir(home)?;
-    Ok(std::fs::write(&format, "14\n")?)
+    cli::private_file(&format, b"14\n")
 }
 
 /// Makes a new session in `home`, living on the relay of `membership`, in a directory named by its fingerprint.

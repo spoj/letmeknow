@@ -561,17 +561,18 @@ pub fn private_dir(dir: &Path) -> Result<()> {
     Ok(std::fs::create_dir_all(dir)?)
 }
 
-#[cfg(unix)]
+/// Writes `contents` whole beside `path`, readable only by this user, and renames it into place.
 pub fn private_file(path: &Path, contents: &[u8]) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-    Ok(file.write_all(contents)?)
-}
-
-#[cfg(not(unix))]
-pub fn private_file(path: &Path, contents: &[u8]) -> Result<()> {
-    Ok(std::fs::write(path, contents)?)
+    let new = path.with_file_name(format!(".new-{:016x}", rand::random::<u64>()));
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&new)?.write_all(contents)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(&new, contents)?;
+    Ok(std::fs::rename(&new, path)?)
 }
 
 #[cfg(test)]
