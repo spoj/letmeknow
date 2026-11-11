@@ -81,6 +81,7 @@ impl Inner {
         g.waiting = true;
         let prior = g.mls.epoch().saturating_sub(1);
         self.open_all(st, gid, prior)?;
+        self.deliver_ready(st, gid)?;
         st.refresh(gid);
         let g = st.group(gid)?;
         let carried = time + days(g.mls.settings().carry) >= corrected();
@@ -129,6 +130,7 @@ impl Inner {
             st.group_mut(gid)?.rec.commits.push((ending, now));
         }
         self.cuts(st, gid, &applied, ending)?;
+        self.deliver_ready(st, gid)?;
         st.moved(gid, &applied, ended)?;
         if applied.own {
             st.present(gid)?;

@@ -228,6 +228,163 @@ async fn a_ciphertext_past_the_window_is_dropped_when_its_epochs_keys_go() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn messages_made_ready_as_a_commit_applies_deliver_at_once_and_leave_the_session_idle() {
+    let relay = lmk_testing::relay().await;
+    let dir = tempfile::tempdir().unwrap();
+    let carol_db = dir.path().join("carol.db");
+    let config = |seed| Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[seed; 32]) };
+    let alice = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(1)).await.unwrap().0;
+    let bob = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(2)).await.unwrap().0;
+    let carol = Node::start(SqliteProvider::open(&carol_db).unwrap(), config(3)).await.unwrap().0;
+    let dave = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(4)).await.unwrap().0;
+    let erin = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(5)).await.unwrap().0;
+    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+    let gid = alice.create(settings).unwrap();
+    for joiner in [&bob, &carol, &dave, &erin] {
+        joiner.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    }
+    for node in [&alice, &bob, &carol, &dave, &erin] {
+        let tasks: Vec<_> = node.inner.tasks.lock().unwrap().drain(..).collect();
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+    for node in [&alice, &bob, &carol, &dave, &erin] {
+        node.read_group(&gid.0).await.unwrap();
+    }
+
+    let msg = |text| serde_json::json!({ "type": "message", "content": text });
+    let sealing = |node: &Node, id: &Bytes| node.inner.lock().record(&gid.0, &id.0).unwrap().unwrap().sealing.unwrap().1.0;
+    let by_open = alice.inner.send(&mut alice.inner.lock(), &gid.0, &msg("from open_all"), None).unwrap();
+    let lost_msg = bob.inner.send(&mut bob.inner.lock(), &gid.0, &msg("lost"), None).unwrap();
+    let after_lost = bob.inner.send(&mut bob.inner.lock(), &gid.0, &msg("after lost"), None).unwrap();
+    alice.inner.take(&mut alice.inner.lock(), &gid.0, None, vec![sealing(&bob, &lost_msg)], false).unwrap();
+    {
+        let mut st = carol.inner.lock();
+        st.time = crate::now() + 600_000;
+        let at = st.time;
+        let joined = st.group(&gid.0).unwrap().mls.joined(&alice.key().0).unwrap();
+        st.group_mut(&gid.0).unwrap().buckets.insert((alice.key(), joined), Bucket { messages: 0.0, bytes: 0.0, at });
+        carol.inner.take(&mut st, &gid.0, None, vec![sealing(&alice, &by_open), sealing(&bob, &after_lost)], false).unwrap();
+        assert_eq!(st.group(&gid.0).unwrap().unopened.len(), 1);
+    }
+
+    alice.inner.commit(&gid.0, |_, _| Ok(Some(core::Change::default()))).await.unwrap();
+    for node in [&carol, &dave, &erin] {
+        node.read_group(&gid.0).await.unwrap();
+    }
+
+    let unkept_dave = dave.inner.send(&mut dave.inner.lock(), &gid.0, &msg("unkept"), None).unwrap();
+    erin.inner.take(&mut erin.inner.lock(), &gid.0, None, vec![sealing(&dave, &unkept_dave)], false).unwrap();
+    erin.mark_shown(&gid.0, std::slice::from_ref(&unkept_dave)).unwrap();
+    let after_ended = erin.inner.send(&mut erin.inner.lock(), &gid.0, &msg("after ended"), None).unwrap();
+    carol.inner.take(&mut carol.inner.lock(), &gid.0, None, vec![sealing(&erin, &after_ended)], false).unwrap();
+    for id in [&by_open, &after_lost, &after_ended] {
+        assert!(carol.message(&gid.0, &id.0).unwrap().is_none());
+    }
+
+    alice.remove(&gid.0, std::slice::from_ref(&dave.key())).await.unwrap();
+    carol.read_group(&gid.0).await.unwrap();
+    assert!(carol.message(&gid.0, &by_open.0).unwrap().is_some(), "open_all delivers while waiting");
+    assert!(carol.message(&gid.0, &after_lost.0).unwrap().is_none());
+    assert!(carol.message(&gid.0, &after_ended.0).unwrap().is_none());
+    {
+        let mut st = carol.inner.lock();
+        st.time += 200_000;
+        carol.inner.advance(&mut st, &gid.0).unwrap();
+    }
+    for id in [&by_open, &after_lost, &after_ended] {
+        assert!(carol.message(&gid.0, &id.0).unwrap().is_some());
+    }
+    for node in [alice, bob, carol, dave, erin] {
+        node.shutdown().await.unwrap();
+    }
+
+    let carol = Node::start(SqliteProvider::open(&carol_db).unwrap(), config(3)).await.unwrap().0;
+    for id in [&by_open, &after_lost, &after_ended] {
+        assert!(carol.message(&gid.0, &id.0).unwrap().is_some());
+    }
+    n0_future::time::timeout(n0_future::time::Duration::from_secs(30), async {
+        while carol.inner.lock().next_poll().is_some_and(|at| at <= crate::now() + 60_000) {
+            n0_future::time::sleep(n0_future::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("Carol goes idle");
+    carol.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_removing_this_session_delivers_what_became_ready_before_forgetting_the_group() {
+    let relay = lmk_testing::relay().await;
+    let config = |seed| Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[seed; 32]) };
+    let alice = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(1)).await.unwrap().0;
+    let bob = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(2)).await.unwrap().0;
+    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+    let gid = alice.create(settings).unwrap();
+    bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    let tasks: Vec<_> = bob.inner.tasks.lock().unwrap().drain(..).collect();
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
+    alice.read_group(&gid.0).await.unwrap();
+    bob.read_group(&gid.0).await.unwrap();
+
+    let msg = |text| serde_json::json!({ "type": "message", "content": text });
+    let sealing = |node: &Node, id: &Bytes| node.inner.lock().record(&gid.0, &id.0).unwrap().unwrap().sealing.unwrap().1.0;
+    let before_carol = alice.inner.send(&mut alice.inner.lock(), &gid.0, &msg("before Carol"), None).unwrap();
+    bob.inner.take(&mut bob.inner.lock(), &gid.0, None, vec![sealing(&alice, &before_carol)], false).unwrap();
+    bob.mark_shown(&gid.0, std::slice::from_ref(&before_carol)).unwrap();
+
+    let (carol, mut events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(3)).await.unwrap();
+    carol.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    let tasks: Vec<_> = alice.inner.tasks.lock().unwrap().drain(..).collect();
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
+    for node in [&alice, &bob, &carol] {
+        node.read_group(&gid.0).await.unwrap();
+    }
+    while events.try_recv().is_ok() {}
+
+    let farewell = bob.inner.send(&mut bob.inner.lock(), &gid.0, &msg("farewell"), None).unwrap();
+    {
+        let mut st = carol.inner.lock();
+        st.time = crate::now() + 600_000;
+        let at = st.time;
+        let joined = st.group(&gid.0).unwrap().mls.joined(&bob.key().0).unwrap();
+        st.group_mut(&gid.0).unwrap().buckets.insert((bob.key(), joined), Bucket { messages: 0.0, bytes: 0.0, at });
+        carol.inner.take(&mut st, &gid.0, None, vec![sealing(&bob, &farewell)], false).unwrap();
+        assert_eq!(st.group(&gid.0).unwrap().unopened.len(), 1);
+    }
+
+    alice.remove(&gid.0, std::slice::from_ref(&carol.key())).await.unwrap();
+    let _ = carol.read_group(&gid.0).await;
+    let mut delivered = Vec::new();
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await.unwrap().unwrap() {
+            Event::Message(m) => delivered.push(m.id),
+            Event::Removed { group, .. } if group == gid => break,
+            _ => {}
+        }
+    }
+    assert_eq!(delivered, [farewell]);
+    assert!(!carol.groups().contains(&gid));
+    for node in [alice, bob, carol] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn unopened_ciphertexts_within_the_window_open_before_their_epochs_keys_go_despite_the_bucket() {
     let (alice, bob, gid, _) = members().await;
     let (id, ciphertext) = seal(&alice, &gid, WINDOW + 1, Some((Bytes(vec![0; 32]), 2)), "past the window");

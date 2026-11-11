@@ -209,11 +209,11 @@ impl G {
         self.rec.authors.iter_mut().find(|a| a.key.0 == key && a.joined == joined)
     }
 
-    /// A message's deps on what was sent since the session with key `me` joined: an earlier one is not its to have, and
-    /// tells it nothing of the dep's author, whose word it is not.
-    pub(crate) fn deps<'a>(&self, h: &'a Header, me: &[u8]) -> impl Iterator<Item = &'a lmk_proto::held::Ref> + use<'a> {
-        let own = self.mls.joined(me);
-        h.deps.iter().filter(move |dep| own.is_none_or(|own| dep.epoch >= own))
+    /// A message's deps on what was sent since this session joined: an earlier one is not its to have, and tells it
+    /// nothing of the dep's author, whose word it is not.
+    pub(crate) fn deps<'a>(&self, h: &'a Header) -> impl Iterator<Item = &'a lmk_proto::held::Ref> + use<'a> {
+        let since = self.rec.since;
+        h.deps.iter().filter(move |dep| dep.epoch >= since)
     }
 
     /// The current membership of the member with key `key`.
@@ -538,7 +538,7 @@ impl Inner {
             g.before(&h.author.0, h.joined, h.seq - 1);
         }
         g.learn(&h.author.0, h.joined, h.seq.saturating_sub(1), now);
-        for dep in g.deps(&h, &me) {
+        for dep in g.deps(&h) {
             g.learn(&dep.key.0, dep.joined, dep.seq, now);
         }
         let author = g.author_mut(&h.author.0, h.joined).context("an author")?;
@@ -614,7 +614,7 @@ impl Inner {
                 let record = st.record_at(gid, &author.key.0, author.joined, seq)?.context("a held message without its record")?;
                 let reach = |dep: &lmk_proto::held::Ref, a: &Author| if record.released { dep.seq.min(a.evidence()) } else { dep.seq };
                 let met = |dep: &lmk_proto::held::Ref| g.author(&dep.key.0, dep.joined).is_none_or(|a| a.through(reach(dep, a)));
-                if g.deps(&record.header, st.me()).all(met) {
+                if g.deps(&record.header).all(met) {
                     ready = Some(record);
                     break;
                 }
@@ -631,7 +631,7 @@ impl Inner {
         let now = st.tick();
         let h = record.header.clone();
         let me = st.me().to_vec();
-        let mut requirements: Vec<(Bytes, u64, u64)> = st.group(gid)?.deps(&h, &me).map(|dep| (dep.key.clone(), dep.joined, dep.seq)).collect();
+        let mut requirements: Vec<(Bytes, u64, u64)> = st.group(gid)?.deps(&h).map(|dep| (dep.key.clone(), dep.joined, dep.seq)).collect();
         if h.seq > 1 {
             requirements.push((h.author.clone(), h.joined, h.seq - 1));
         }
@@ -684,7 +684,7 @@ impl Inner {
             if waited < HOLD_OFF {
                 continue;
             }
-            let mut requirements: Vec<(Bytes, u64, u64)> = g.deps(&record.header, st.me()).map(|dep| (dep.key.clone(), dep.joined, dep.seq)).collect();
+            let mut requirements: Vec<(Bytes, u64, u64)> = g.deps(&record.header).map(|dep| (dep.key.clone(), dep.joined, dep.seq)).collect();
             requirements.push((author.key.clone(), author.joined, seq - 1));
             for (key, joined, seq) in requirements {
                 let Some(required) = g.author(&key.0, joined) else { continue };
