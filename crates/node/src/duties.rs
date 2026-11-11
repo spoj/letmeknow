@@ -1,5 +1,5 @@
 //! A group's duties, each derived from committed records and idempotent: a pass runs at the log's head after each
-//! advance, at start, and at this session's next update, and one whose commit failed again after `RETRY`. It drops what
+//! advance, at start, and at this session's next update, and one that failed again after `RETRY`. It drops what
 //! the group kept past H, and commits at most once, with every Remove due (members whose `leave` the cut it builds
 //! keeps, and members left behind in an epoch whose log was let go, as the service answered, asked at most daily, or a
 //! neighbour passed on its answer; of a session that is no admin, only those leavers whose `leave` carries their
@@ -31,7 +31,7 @@ use crate::{G, Inner, State, Work, days, get, hex, now};
 
 /// How soon a pass runs again while an update waits for its fetch.
 const BLOCKED: u64 = 10_000;
-/// How soon a pass runs again after its read or commit failed, as while the service is down.
+/// How soon a pass runs again after it failed, as while the service is down.
 const RETRY: u64 = 10 * 60 * 1000;
 /// How often a member asks which members' logs their services let go, of those it does not know to be, at most, in
 /// milliseconds.
@@ -194,6 +194,7 @@ impl Inner {
                 if let Err(error) = inner.pass(&gid).await
                     && inner.lock().groups.contains_key(&gid)
                 {
+                    inner.time(&gid, now() + RETRY);
                     inner.warn(Some(&gid), format!("{error:#}"));
                 }
                 let mut passing = inner.passing.lock().unwrap();
@@ -265,20 +266,14 @@ impl Inner {
         if !commit {
             return Ok(());
         }
-        let committed = async {
-            let asked = self.lock().group(gid)?.rec.evicted;
-            if now() >= asked + EVICT {
-                self.ask_behind(gid).await?;
-                let mut st = self.lock();
-                st.group_mut(gid)?.rec.evicted = now();
-                st.save(gid)?;
-            }
-            self.commit(gid, due).await
-        };
-        if let Err(error) = committed.await {
-            self.time(gid, now() + RETRY);
-            return Err(error);
+        let asked = self.lock().group(gid)?.rec.evicted;
+        if now() >= asked + EVICT {
+            self.ask_behind(gid).await?;
+            let mut st = self.lock();
+            st.group_mut(gid)?.rec.evicted = now();
+            st.save(gid)?;
         }
+        self.commit(gid, due).await?;
         Ok(())
     }
 
@@ -394,6 +389,49 @@ mod tests {
         for node in nodes {
             node.shutdown().await.unwrap();
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_pass_is_timed_again_after_retry() {
+        use crate::{Config, Event, Node};
+        use lmk_core::provider::SqliteProvider;
+        use lmk_proto::group::{PROTOCOL, Settings, UPDATE};
+
+        let relay = lmk_testing::relay().await;
+        let config = Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[9; 32]) };
+        let (alice, mut events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap();
+        for task in alice.inner.tasks.lock().unwrap().drain(..) {
+            task.abort();
+        }
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let gid = alice.create(settings).unwrap();
+        {
+            let mut st = alice.inner.lock();
+            let g = st.group_mut(&gid.0).unwrap();
+            (g.rec.stirred, g.rec.updated) = (true, 0);
+        }
+        alice.inner.merge(&gid.0).await.unwrap();
+        while events.try_recv().is_ok() {}
+        for lost in [true, false] {
+            alice.inner.timers.lock().unwrap().clear();
+            {
+                let mut st = alice.inner.lock();
+                let g = st.group_mut(&gid.0).unwrap();
+                while g.sending.take(0, 1.0, u64::MAX) {}
+                g.rec.lost = if lost { vec![seqs(b"other", 0, &[1])] } else { Vec::new() };
+                (g.rec.present, g.rec.passed) = (0, 0);
+                st.save(&gid.0).unwrap();
+            }
+            alice.inner.duties(&gid.0);
+            let warn = n0_future::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap().unwrap();
+            assert!(matches!(&warn, Event::Warning { group: Some(group), text } if *group == gid && text.starts_with("rate:")), "{warn:?}");
+            let due = alice.inner.timers.lock().unwrap().get(&gid.0).copied();
+            assert!(due.is_some_and(|due| due.abs_diff(now() + RETRY) < 5_000), "lost={lost}: {due:?}");
+            while alice.inner.passing.lock().unwrap().contains_key(&gid.0) {
+                sleep(Duration::from_millis(1)).await;
+            }
+        }
+        alice.shutdown().await.unwrap();
     }
 
     #[test]
