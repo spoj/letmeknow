@@ -7,6 +7,7 @@ use lmk_node::{Event, Member, Message, Node, RECENT, Seen, fp};
 use lmk_proto::Bytes;
 use lmk_proto::group::{Attachment, ChatMessage, PROTOCOL, Service, Settings, UPDATE};
 use lmk_proto::links::Invite;
+use lmk_proto::peer::MAX_INTRO;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -310,7 +311,7 @@ impl Session {
             Request::Groups { group } => self.list_groups(group),
             Request::Intro { group, text } => self.resolve(group).and_then(|gid| {
                 let intro = text.filter(|text| !text.is_empty());
-                ensure!(intro.as_ref().is_none_or(|text| text.len() <= INTRO), "an intro is at most {INTRO} bytes");
+                ensure!(intro.as_ref().is_none_or(|text| text.len() <= MAX_INTRO), "an intro is at most {MAX_INTRO} bytes");
                 node.set_intro(&gid.0, intro.clone())?;
                 Ok(json!({ "group": b64(&gid.0), "intro": intro }))
             }),
@@ -822,9 +823,6 @@ fn describe_key(me: &Bytes, members: &[Member], key: &Bytes) -> Value {
         None => json!({ "fp": fp(&key.0) }),
     }
 }
-
-/// The longest intro, in bytes.
-const INTRO: usize = 280;
 
 /// A group's members as `members` and `join` list them: this session, and those seen in the last `RECENT`, with how long
 /// ago, each with its intro and device, and whether it is an admin; only a count of the others, unless `all`.

@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use iroh::{EndpointId, RelayUrl};
 use lmk_membership::Contradiction;
 use lmk_net::Groups;
@@ -14,7 +14,7 @@ use lmk_net::peers::{self, Own};
 use lmk_proto::Bytes;
 use lmk_proto::directory::relay_url;
 use lmk_proto::head::Head;
-use lmk_proto::peer::{At, Frame, INTRO, Intro, SUMMARY, Seqs, Shown, Signed, Summary};
+use lmk_proto::peer::{At, Frame, INTRO, Intro, MAX_INTRO, SUMMARY, Seqs, Shown, Signed, Summary};
 use n0_future::time::{Duration, timeout};
 use serde::{Deserialize, Serialize};
 
@@ -303,13 +303,13 @@ impl State {
         Ok(())
     }
 
-    /// Takes an intro any neighbour passed on: checked against its membership and its member's signature, and kept if
-    /// newer, with the epoch it names as where its member is, if later than this session knew. One of a membership this
-    /// session does not know yet is kept a while.
+    /// Takes an intro any neighbour passed on, of at most `MAX_INTRO` bytes: checked against its membership and its
+    /// member's signature, and kept if newer, with the epoch it names as where its member is, if later than this session
+    /// knew. One of a membership this session does not know yet is kept a while.
     pub(crate) fn intro(&mut self, gid: &[u8], signed: Signed) -> Result<()> {
         let Ok(intro) = serde_json::from_slice::<Intro>(&signed.body.0) else { return Ok(()) };
         let g = self.group_mut(gid)?;
-        if intro.group.0 != gid {
+        if intro.group.0 != gid || intro.text.as_ref().is_some_and(|text| text.len() > MAX_INTRO) {
             return Ok(());
         }
         if g.mls.joined(&intro.member.0) != Some(intro.joined) {
@@ -347,6 +347,7 @@ impl State {
 
     /// Signs what this session says of itself to the group, and the epoch it is in, for its neighbours to pass on.
     pub(crate) fn introduce(&mut self, gid: &[u8], text: Option<String>) -> Result<()> {
+        ensure!(text.as_ref().is_none_or(|text| text.len() <= MAX_INTRO), "an intro is at most {MAX_INTRO} bytes");
         let (me, now) = (self.me().to_vec(), self.tick());
         let g = self.group(gid)?;
         let last = g.intros().find(|(intro, _)| intro.member.0 == me).map_or(0, |(intro, _)| intro.version);

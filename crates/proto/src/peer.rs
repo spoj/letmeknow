@@ -104,6 +104,9 @@ pub struct Summary {
     pub sealed: Vec<Seqs>,
 }
 
+/// The longest intro, in bytes.
+pub const MAX_INTRO: usize = 280;
+
 /// What a member says of itself to a group, as it signs it: any member passes it on, and the highest version wins.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Intro {

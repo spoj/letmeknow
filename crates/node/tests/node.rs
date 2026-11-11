@@ -1021,6 +1021,89 @@ fn a_joiner_removes_a_member_away_since_before_it_joined_by_its_intro() {
     });
 }
 
+/// A member's intro is at most `MAX_INTRO` bytes: `set_intro` refuses a longer one, and a neighbour's `hello` carrying
+/// a longer one is neither taken nor kept for a membership not known yet, so that large intros neither stay nor push a
+/// `hello` past `MAX_FRAME`. One of `MAX_INTRO` bytes is taken and passed on.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_intro_past_the_limit_is_neither_set_nor_taken() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use lmk_proto::peer::{At, INTRO, Intro, MAX_INTRO, Shown};
+    let relay = relay().await;
+    let dir = folder("intro-limit");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (bob_db, carol_db, dave_db) = (dir.join("bob.db"), dir.join("carol.db"), dir.join("dave.db"));
+    let alice = session(&relay).await;
+    let alice_key = alice.node.key();
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    let own_over = alice.node.set_intro(&gid.0, Some("a".repeat(MAX_INTRO + 1))).is_err();
+    alice.node.set_intro(&gid.0, Some("a".repeat(MAX_INTRO))).unwrap();
+
+    let bob = stored(&relay, &bob_db).await;
+    bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, Some(&bob.node.key().0)).await.unwrap()).await.unwrap();
+    eventually("Bob holds Alice's 280-byte intro", || bob.node.intros(&gid.0).unwrap().get(&alice_key).map(String::len) == Some(MAX_INTRO)).await;
+    let carol = stored(&relay, &carol_db).await;
+    carol.node.join(&alice.node.invite(&gid.0, INVITE_VALID, Some(&carol.node.key().0)).await.unwrap()).await.unwrap();
+    eventually("Carol holds Alice's intro", || carol.node.intros(&gid.0).unwrap().contains_key(&alice_key)).await;
+    let carol_epoch = carol.node.epoch(&gid.0).unwrap();
+    carol.node.shutdown().await.unwrap();
+    drop(carol);
+
+    let dave = stored(&relay, &dave_db).await;
+    dave.node.join(&alice.node.invite(&gid.0, INVITE_VALID, Some(&dave.node.key().0)).await.unwrap()).await.unwrap();
+    assert!(dave.node.epoch(&gid.0).unwrap() > carol_epoch);
+    for s in [alice, bob, dave] {
+        s.node.shutdown().await.unwrap();
+    }
+
+    // Carol starts before reading Dave's Add: Bob's hand sends an oversized intro of Bob's (known membership) and one
+    // of Dave's (`early_intros`).
+    let quiet_read = Arc::new(AtomicBool::new(true));
+    let blocked = quiet_read.clone();
+    let carol = stored_with(&relay, &carol_db, failing(relay.post(), move |route| route.ends_with("/read") && blocked.load(SeqCst))).await;
+    let sign_intro = |db: &Path, version: u64, text: String| {
+        let mut provider = SqliteProvider::open(db).unwrap();
+        let mls = Mls::load(&provider).unwrap();
+        let group = lmk_core::group::Group::load(&provider, &gid.0).unwrap();
+        let joined = group.joined(mls.key()).unwrap();
+        let shown = Shown { epoch: group.epoch(), capability: group.capability(&provider).unwrap() };
+        let intro = Intro { group: gid.clone(), member: Bytes(mls.key().to_vec()), joined, version, shown, text: Some(text) };
+        let body = serde_json::to_vec(&intro).unwrap();
+        let sig = mls.sign(&[INTRO, &body].concat());
+        drop(group);
+        provider.close().unwrap();
+        Signed { body: Bytes(body), sig: Bytes(sig) }
+    };
+    let (bob_iroh, _) = member_of(&bob_db);
+    let mut bob_hand = hand(&relay, bob_iroh, &carol.node).await;
+    let base = lmk_node::now() + 1_000_000;
+    let huge = "x".repeat(13 << 20);
+    for signed in [
+        sign_intro(&bob_db, base, "b".repeat(MAX_INTRO + 1)),
+        sign_intro(&dave_db, base, "d".repeat(MAX_INTRO + 1)),
+        sign_intro(&bob_db, base + 1, huge.clone()),
+        sign_intro(&dave_db, base + 1, huge),
+    ] {
+        bob_hand.send(&Frame::Hello { groups: vec![At { group: gid.clone(), log: [0; 32], head: None, seen: Default::default(), intros: vec![signed], expired: vec![] }] }).await;
+    }
+    bob_hand.settle(&gid).await;
+    bob_hand._endpoint.close().await;
+
+    quiet_read.store(false, SeqCst);
+    carol.node.read_group(&gid.0).await.unwrap();
+    eventually("Carol applied Dave's Add", || carol.node.members(&gid.0).unwrap().len() == 4).await;
+    let held = carol.node.intros(&gid.0).unwrap();
+    assert!(own_over && held.keys().collect::<Vec<_>>() == [&alice_key], "own_over={own_over}, held={:?}", held.keys().collect::<Vec<_>>());
+
+    let mut erin = session(&relay).await;
+    erin.node.join(&carol.node.invite(&gid.0, INVITE_VALID, Some(&erin.node.key().0)).await.unwrap()).await.unwrap();
+    eventually("Erin holds Alice's 280-byte intro", || erin.node.intros(&gid.0).unwrap().get(&alice_key).map(String::len) == Some(MAX_INTRO)).await;
+    carol.node.send(&gid.0, &message("reachable"), None).await.unwrap();
+    assert_eq!(erin.until(|e| match e { Event::Message(m) => Some(m.payload["content"].clone()), _ => None }).await, "reachable");
+    for s in [carol, erin] {
+        s.node.shutdown().await.unwrap();
+    }
+}
+
 /// Each member's leaf names the device that certified it, which its members and joiners see.
 #[tokio::test(flavor = "multi_thread")]
 async fn members_see_the_devices_their_leaves_name() {
