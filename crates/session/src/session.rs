@@ -676,8 +676,8 @@ impl Session {
         item
     }
 
-    /// Marks a delivered message shown, as logged. Its text is then deleted from the node, unless it is this session's
-    /// own, which it keeps to send again.
+    /// Marks a delivered message shown, as logged. Its text and attachment are then deleted from the node, unless it is
+    /// this session's own, which it keeps to send again.
     fn show(&self, gid: &Bytes, id: &[u8]) -> Result<()> {
         let node = &self.node;
         // Gone when the session left the group meanwhile, with what was waiting to print.
@@ -686,6 +686,7 @@ impl Session {
         if message.payload["type"] == "message" && message.sender.key != node.key() {
             let mut payload = message.payload;
             payload["content"] = json!("");
+            payload.as_object_mut().expect("an object").remove("attachment");
             node.redact(&gid.0, id, payload)?;
         }
         Ok(())

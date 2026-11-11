@@ -378,6 +378,28 @@ fn text_logged_stays_only_in_the_log_until_the_group_is_left() {
 }
 
 #[test]
+fn a_shown_messages_attachment_stays_only_in_its_file() {
+    local(async {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let world = world("scrub-attach").await;
+        let (mut alice, mut bob, _) = pair(&world).await;
+        let secret = "the vault key is 9-apricot-71";
+        let encoded = URL_SAFE_NO_PAD.encode(secret);
+        let file = world.root.path().join("cred.key");
+        std::fs::write(&file, secret).unwrap();
+        bob.cmd(&["send", "--to", &alice.fp, "--attach", file.to_str().unwrap(), "the key"]).await.unwrap();
+        let message = alice.expect("message").await;
+        assert_eq!(std::fs::read_to_string(message["attachment"]["path"].as_str().unwrap()).unwrap(), secret);
+        alice.cmd(&["send", "--reply-to", message["id"].as_str().unwrap(), "got it"]).await.unwrap();
+        assert_eq!(bob.expect("message").await["content"], "got it");
+        let dir = session_dir(&alice.home, "alice").unwrap();
+        assert_eq!(holding(&dir, &encoded), Vec::<PathBuf>::new());
+        assert_eq!(holding(&dir, secret), Vec::<PathBuf>::new());
+        assert!(!holding(&session_dir(&bob.home, "bob").unwrap(), &encoded).is_empty(), "its sender's own stays whole");
+    });
+}
+
+#[test]
 fn a_leaving_member_is_removed_by_another() {
     local(async {
         let world = world("leave").await;
