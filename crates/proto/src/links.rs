@@ -14,7 +14,7 @@ pub const DOMAIN: &str = "relay.letmeknow.dev";
 /// letmeknow.dev's membership service key, hex. Its routes are at `DOMAIN`.
 pub const MEMBERSHIP_KEY: &str = "4b0be3befd0c240033aa446df4d24b69ff758fa93593123e525c98f7c46ae046";
 
-/// `https://letmeknow.dev/i#14.<secret>.<domain>.<group>.<by>.<joined>.<member>[.<member>...]`, every field after the
+/// `https://letmeknow.dev/i#15.<secret>.<domain>.<group>.<by>.<joined>.<member>[.<member>...]`, every field after the
 /// version in unpadded base64url: the domain is the group's service's; the group is the one it admits to, `by` the
 /// session key of the member that made it, and `joined` the epoch that member's membership began in, 8 bytes
 /// big-endian; and each member is its iroh key, then its own service's domain unless that is the group's.
@@ -32,7 +32,7 @@ pub struct Invite {
 impl Invite {
     pub fn link(&self) -> String {
         let fields = [self.secret.as_slice(), self.domain.as_bytes(), &self.group, &self.by, &self.joined.to_be_bytes()];
-        let mut link = format!("{INVITE_PREFIX}14.{}", fields.map(|field| URL_SAFE_NO_PAD.encode(field)).join("."));
+        let mut link = format!("{INVITE_PREFIX}15.{}", fields.map(|field| URL_SAFE_NO_PAD.encode(field)).join("."));
         for (key, home) in &self.members {
             let home = if *home == self.domain { "" } else { home.as_str() };
             link.push('.');
@@ -66,7 +66,7 @@ impl Invite {
         };
         let fragment = link.split_once('#').context("an invite link has a part after #")?.1;
         let mut fields = fragment.split('.');
-        ensure!(fields.next() == Some("14"), "this invite link is from another version of letmeknow");
+        ensure!(fields.next() == Some("15"), "this invite link is from another version of letmeknow");
         let secret = URL_SAFE_NO_PAD.decode(fields.next().context("no secret")?)?.try_into().ok().context("a secret is 16 bytes")?;
         let domain = String::from_utf8(URL_SAFE_NO_PAD.decode(fields.next().context("no domain")?)?)?;
         directory::check_domain(&domain)?;
@@ -109,11 +109,11 @@ mod tests {
         let elsewhere = |home: &[u8]| format!("{unnamed}.{}", URL_SAFE_NO_PAD.encode([[1; 32].as_slice(), home].concat()));
         assert!(Invite::parse(&elsewhere(b"Other.example")).is_err(), "a member's domain is canonical");
         assert!(Invite::parse(&elsewhere(&[0xff])).is_err());
-        assert!(Invite::parse("https://letmeknow.dev/i#14.AA.AA").is_err());
+        assert!(Invite::parse("https://letmeknow.dev/i#15.AA.AA").is_err());
         assert!(Invite::parse(unnamed).unwrap_err().to_string().contains("names a member"));
         let link = Invite { domain: "relay.example".into(), members, ..invite }.link();
-        assert!(Invite::parse(&link.replacen("#14.", "#13.", 1)).unwrap_err().to_string().contains("another version"));
-        assert!(Invite::parse(&link.replacen("#14.", "#15.", 1)).unwrap_err().to_string().contains("another version"));
+        assert!(Invite::parse(&link.replacen("#15.", "#14.", 1)).unwrap_err().to_string().contains("another version"));
+        assert!(Invite::parse(&link.replacen("#15.", "#16.", 1)).unwrap_err().to_string().contains("another version"));
     }
 
     /// A link that a mail gateway's URL Defense v3 rewrote parses as the invite it wraps.
@@ -121,7 +121,7 @@ mod tests {
     fn invite_unwraps_url_defense_v3() {
         let invite = Invite { secret: [2; 16], domain: "relay.example".into(), group: [4; 16], by: [5; 32], joined: 6, members: vec![([1; 32], "relay.example".into())] };
         let link = invite.link();
-        for (rewritten, replaced) in [(link.replace('#', "*"), "#"), (link.replace("#14", "**B"), "#14"), (link.replace("i#", "**A"), "i#")] {
+        for (rewritten, replaced) in [(link.replace('#', "*"), "#"), (link.replace("#15", "**B"), "#15"), (link.replace("i#", "**A"), "i#")] {
             let wrapped = format!("https://urldefense.com/v3/__{rewritten}__;{}!!recipient!signature$", URL_SAFE_NO_PAD.encode(replaced));
             assert_eq!(Invite::parse(&wrapped).unwrap(), invite, "{wrapped}");
         }

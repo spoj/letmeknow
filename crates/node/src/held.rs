@@ -45,8 +45,7 @@ pub(crate) struct Author {
     /// Its seqs up to here are kept: its final cut once it ended.
     pub cut: u64,
     pub ended: bool,
-    /// When it ended here, in milliseconds. A record kept since 0.25.3 or earlier has 0.
-    #[serde(default)]
+    /// When it ended here, in milliseconds.
     pub ended_at: u64,
     /// The highest seq this session knows it has.
     pub known: u64,

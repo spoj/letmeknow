@@ -338,7 +338,7 @@ pub fn device_dir(home: Option<&Path>) -> Result<PathBuf> {
 pub fn home_dir(home: Option<PathBuf>) -> Result<PathBuf> {
     match home {
         Some(home) => Ok(home),
-        None => Ok(dirs::data_local_dir().context("no local data directory")?.join("letmeknow-v14")),
+        None => Ok(dirs::data_local_dir().context("no local data directory")?.join("letmeknow-v15")),
     }
 }
 

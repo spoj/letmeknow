@@ -240,7 +240,7 @@ async fn pair(world: &World) -> (Agent, Agent, String) {
     assert_eq!(keys(&invite), keys(&json!({ "link": 0, "group": 0, "expires": 0, "via": 0 })));
     assert_eq!(invite["via"], json!(["you"]));
     let link = invite["link"].as_str().unwrap();
-    assert!(link.starts_with("https://letmeknow.dev/i#14."));
+    assert!(link.starts_with("https://letmeknow.dev/i#15."));
     let joined = bob.cmd(&["join", link]).await.unwrap();
     assert_eq!(joined["group"], invite["group"]);
     assert_eq!(joined["members"].as_array().unwrap().len() + joined["offline"].as_u64().unwrap_or(0) as usize, 2);
@@ -955,7 +955,7 @@ fn messages_not_for_a_session_are_logged_in_order_and_print_not() {
 fn a_home_of_another_format_is_refused() {
     local(async {
         let world = world("format").await;
-        for (format, names) in [("13", "an earlier letmeknow"), ("15", "a newer letmeknow")] {
+        for (format, names) in [("14", "an earlier letmeknow"), ("16", "a newer letmeknow")] {
             let home = world.root.path().join(format!("format-{format}"));
             std::fs::create_dir_all(&home).unwrap();
             std::fs::write(home.join("format"), format!("{format}\n")).unwrap();
