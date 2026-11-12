@@ -90,12 +90,13 @@ impl Log {
     /// Whether this session has not seen the log alive for `STALE`: past that, the service may have forgotten that it
     /// let the log go, so only new entries show it alive, and it is never appended to.
     pub fn stale(&self) -> bool {
-        corrected() > self.stale_at()
+        corrected() > self.at.max(self.since) + STALE
     }
 
-    /// When the log turns stale unless this session sees it alive first, in milliseconds.
+    /// When the log turns stale unless this session sees it alive first, in milliseconds by this session's own clock, which
+    /// its timers run on: `at` and `since` are by its service's.
     pub fn stale_at(&self) -> u64 {
-        self.at.max(self.since) + STALE
+        crate::now() + (self.at.max(self.since) + STALE).saturating_sub(corrected())
     }
 
     /// How far the log is authenticated, for the membership client.

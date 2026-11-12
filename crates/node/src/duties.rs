@@ -448,6 +448,37 @@ mod tests {
         alice.shutdown().await.unwrap();
     }
 
+    /// The pass for when a group's log turns stale, by its service's clock, is timed by this session's own clock, which
+    /// timers run on: with the service's a day behind, a day later than by this session's, not at a moment when a read
+    /// would still find the log alive.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_pass_for_a_log_turning_stale_is_timed_by_the_sessions_own_clock() {
+        use crate::{Config, Node};
+        use lmk_core::provider::SqliteProvider;
+        use lmk_proto::clock::heard;
+        use lmk_proto::group::{PROTOCOL, Settings, UPDATE};
+        use lmk_proto::membership::STALE;
+
+        let relay = lmk_testing::relay().await;
+        let config = Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[9; 32]) };
+        let alice = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0;
+        for task in alice.inner.tasks.lock().unwrap().drain(..) {
+            task.abort();
+        }
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let gid = alice.create(settings).unwrap();
+        heard(now(), now(), now() - days(1));
+        alice.inner.pass(&gid.0).await.unwrap();
+        let stale = {
+            let st = alice.inner.lock();
+            let log = st.log(&st.group(&gid.0).unwrap().rec.log.0).unwrap();
+            log.at.max(log.since) + STALE
+        };
+        let due = alice.inner.timers.lock().unwrap().get(&gid.0).copied();
+        assert!(due.is_some_and(|due| due.abs_diff(stale + days(1)) < 5_000), "{due:?}, stale at {stale} by the service's clock");
+        alice.shutdown().await.unwrap();
+    }
+
     /// A joiner removes no one for falling behind in its first `EVICT`, by when it holds each member's newest intro.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_joiner_removes_no_one_for_falling_behind_in_its_first_evict() {
