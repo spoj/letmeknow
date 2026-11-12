@@ -823,7 +823,7 @@ async fn a_joiner_reads_whole_the_members_its_link_names_while_it_joins() {
     let (refuse, refusing) = tokio::sync::watch::channel(false);
     let fake = std::sync::Arc::new(Fake(refusing));
     let (member, mut events) = Net::spawn(endpoint, fake.clone(), fake).await.unwrap();
-    let link = Invite { secret: [7; 16], domain: relay.domain.clone(), group: [1; 16], by: [1; 32], joined: 0, members: vec![(*member.id().as_bytes(), relay.domain.clone())] };
+    let link = Invite { secret: [7; 16], domain: relay.domain.clone(), key: [1; 32], group: [1; 16], by: [1; 32], joined: 0, members: vec![(*member.id().as_bytes(), relay.domain.clone())] };
     let joining = n0_future::task::spawn({
         let bob = bob.clone();
         async move { bob.join(&link).await }

@@ -338,7 +338,7 @@ fn welcome_must_use_the_intended_package_and_checkpoint_failure_restores_it() {
     let b = &w.m[1];
     let before = b.provider.rows();
     b.provider.savepoint().unwrap();
-    let error = Group::join(&b.provider, &entry, &admission, &intended_ref, &group_of(&entry), DOMAIN).err().unwrap();
+    let error = Group::join(&b.provider, &entry, &admission, &intended_ref, &group_of(&entry), DOMAIN, &key()).err().unwrap();
     assert!(error.to_string().contains("another KeyPackage"), "{error}");
     b.provider.rollback_to().unwrap();
     assert_eq!(b.provider.rows(), before);
@@ -354,13 +354,13 @@ fn welcome_must_use_the_intended_package_and_checkpoint_failure_restores_it() {
     assert_eq!(b.provider.rows(), before);
 
     b.provider.savepoint().unwrap();
-    let joined = Group::join(&b.provider, &entry, &admission, &other_ref, &group_of(&entry), DOMAIN).unwrap();
+    let joined = Group::join(&b.provider, &entry, &admission, &other_ref, &group_of(&entry), DOMAIN, &key()).unwrap();
     assert_eq!(joined.members().len(), 2);
     assert_ne!(b.provider.rows(), before);
     drop(joined);
     b.provider.rollback_to().unwrap();
     assert_eq!(b.provider.rows(), before, "a bad node checkpoint restores the successfully consumed package and group writes");
-    assert!(Group::join(&b.provider, &entry, &admission, &other_ref, &group_of(&entry), DOMAIN).is_ok());
+    assert!(Group::join(&b.provider, &entry, &admission, &other_ref, &group_of(&entry), DOMAIN, &key()).is_ok());
 }
 
 #[test]
@@ -388,9 +388,9 @@ fn a_multi_package_welcome_cannot_select_another_saved_package() {
     assert!(parsed.secrets().iter().any(|secret| secret.new_member().as_slice() == intended));
     let b = &w.m[1];
     let before = b.provider.rows();
-    assert!(Group::join(&b.provider, &entry, &admission, intended, &group_of(&entry), DOMAIN).err().unwrap().to_string().contains("another KeyPackage"));
+    assert!(Group::join(&b.provider, &entry, &admission, intended, &group_of(&entry), DOMAIN, &key()).err().unwrap().to_string().contains("another KeyPackage"));
     assert_eq!(b.provider.rows(), before);
-    assert!(Group::join(&b.provider, &entry, &admission, &first, &group_of(&entry), DOMAIN).is_ok());
+    assert!(Group::join(&b.provider, &entry, &admission, &first, &group_of(&entry), DOMAIN, &key()).is_ok());
 }
 
 #[test]
@@ -438,9 +438,9 @@ fn identical_leaf_and_signature_keys_are_not_package_identity() {
     assert_eq!(a.group.as_ref().unwrap().added().last().unwrap().key_package_ref, r2);
     let b = &w.m[1];
     let before = b.provider.rows();
-    assert!(Group::join(&b.provider, &inner, &admission, &r1, &group_of(&inner), DOMAIN).err().unwrap().to_string().contains("another KeyPackage"));
+    assert!(Group::join(&b.provider, &inner, &admission, &r1, &group_of(&inner), DOMAIN, &key()).err().unwrap().to_string().contains("another KeyPackage"));
     assert_eq!(b.provider.rows(), before);
-    let joined = Group::join(&b.provider, &inner, &admission, &r2, &group_of(&inner), DOMAIN).unwrap();
+    let joined = Group::join(&b.provider, &inner, &admission, &r2, &group_of(&inner), DOMAIN, &key()).unwrap();
     assert_eq!(joined.capability(&b.provider).unwrap(), a.group.as_ref().unwrap().capability(&a.provider).unwrap());
 }
 
@@ -466,7 +466,7 @@ fn last_resort_packages_do_not_bypass_exact_welcome_matching() {
     let admission = commit.admission.clone().unwrap();
     let b = &w.m[1];
     let before = b.provider.rows();
-    assert!(Group::join(&b.provider, &entry, &admission, &intended_ref, &group_of(&entry), DOMAIN).err().unwrap().to_string().contains("another KeyPackage"));
+    assert!(Group::join(&b.provider, &entry, &admission, &intended_ref, &group_of(&entry), DOMAIN, &key()).err().unwrap().to_string().contains("another KeyPackage"));
     assert_eq!(b.provider.rows(), before);
     b.provider.savepoint().unwrap();
     let MlsMessageBodyIn::Welcome(parsed) = parse::<MlsMessageIn>(&admission.welcome).unwrap().extract() else { panic!() };
@@ -475,7 +475,7 @@ fn last_resort_packages_do_not_bypass_exact_welcome_matching() {
     assert_eq!(b.provider.rows(), before, "last resort leaves the saved package present, so consumption is not an identity test");
     drop(builder);
     b.provider.rollback_to().unwrap();
-    assert!(Group::join(&b.provider, &entry, &admission, &reference, &group_of(&entry), DOMAIN).is_ok());
+    assert!(Group::join(&b.provider, &entry, &admission, &reference, &group_of(&entry), DOMAIN, &key()).is_ok());
 }
 
 #[test]
@@ -520,12 +520,12 @@ fn unsupported_welcome_authority_rolls_back_consumption() {
     let admission = Admission { welcome, cut, sig };
     let b = &w.m[1];
     let before = b.provider.rows();
-    assert!(Group::join(&b.provider, &entry, &admission, &reference, &group_of(&entry), DOMAIN).err().unwrap().to_string().contains("unsupported membership service authority"));
+    assert!(Group::join(&b.provider, &entry, &admission, &reference, &group_of(&entry), DOMAIN, &key()).err().unwrap().to_string().contains("unsupported membership service authority"));
     assert_eq!(b.provider.rows(), before);
 }
 
-/// A Welcome into another group than the joiner's link names, or into that group on another service, is refused, and its
-/// package's consumption rolled back.
+/// A Welcome into another group than the joiner's link names, or into that group on another service, by its domain or its
+/// key, is refused, and its package's consumption rolled back.
 #[test]
 fn a_welcome_into_another_group_or_service_than_the_links_rolls_back_consumption() {
     let mut w = World::new(&["A", "B"]);
@@ -540,12 +540,14 @@ fn a_welcome_into_another_group_or_service_than_the_links_rolls_back_consumption
     let gid: [u8; 16] = w.m[0].g().id().try_into().unwrap();
     let b = &w.m[1];
     let before = b.provider.rows();
-    for (group, domain, refusal) in [([0; 16], DOMAIN, "another group"), (gid, "other.example", "another service")] {
-        let error = Group::join(&b.provider, &entry, &admission, &reference, &group, domain).err().unwrap();
+    let other = ed25519_dalek::SigningKey::from_bytes(&[2; 32]).verifying_key().to_bytes();
+    let links = [([0; 16], DOMAIN, key(), "another group"), (gid, "other.example", key(), "another service"), (gid, DOMAIN, other, "another service")];
+    for (group, domain, service, refusal) in links {
+        let error = Group::join(&b.provider, &entry, &admission, &reference, &group, domain, &service).err().unwrap();
         assert!(error.to_string().contains(refusal), "{error}");
         assert_eq!(b.provider.rows(), before);
     }
-    assert!(Group::join(&b.provider, &entry, &admission, &reference, &gid, DOMAIN).is_ok());
+    assert!(Group::join(&b.provider, &entry, &admission, &reference, &gid, DOMAIN, &key()).is_ok());
 }
 
 #[test]
@@ -565,7 +567,7 @@ fn sqlite_welcome_rollback_keeps_both_packages_across_restart() {
     let id = a.g().id().to_vec();
     b.provider.begin().unwrap();
     b.provider.savepoint().unwrap();
-    assert!(Group::join(&b.provider, &entry, &admission, &refs[0].as_slice().try_into().unwrap(), &group_of(&entry), DOMAIN).err().unwrap().to_string().contains("another KeyPackage"));
+    assert!(Group::join(&b.provider, &entry, &admission, &refs[0].as_slice().try_into().unwrap(), &group_of(&entry), DOMAIN, &key()).err().unwrap().to_string().contains("another KeyPackage"));
     b.provider.rollback_to().unwrap();
     b.provider.commit().unwrap();
     drop(b);
@@ -578,7 +580,7 @@ fn sqlite_welcome_rollback_keeps_both_packages_across_restart() {
     assert!(provider.get(&state_key(&id)).unwrap().is_none());
     provider.begin().unwrap();
     provider.savepoint().unwrap();
-    let joined = Group::join(&provider, &entry, &admission, &refs[1].as_slice().try_into().unwrap(), &group_of(&entry), DOMAIN).unwrap();
+    let joined = Group::join(&provider, &entry, &admission, &refs[1].as_slice().try_into().unwrap(), &group_of(&entry), DOMAIN, &key()).unwrap();
     drop(joined);
     provider.rollback_to().unwrap();
     provider.commit().unwrap();
@@ -590,7 +592,7 @@ fn sqlite_welcome_rollback_keeps_both_packages_across_restart() {
     }
     assert!(MlsGroup::load(provider.storage(), &GroupId::from_slice(&id)).unwrap().is_none());
     assert!(provider.get(&state_key(&id)).unwrap().is_none());
-    let joined = Group::join(&provider, &entry, &admission, &refs[1].as_slice().try_into().unwrap(), &group_of(&entry), DOMAIN).unwrap();
+    let joined = Group::join(&provider, &entry, &admission, &refs[1].as_slice().try_into().unwrap(), &group_of(&entry), DOMAIN, &key()).unwrap();
     assert_eq!(joined.members().len(), 2);
     drop((provider, joined));
     std::fs::remove_dir_all(dir).unwrap();

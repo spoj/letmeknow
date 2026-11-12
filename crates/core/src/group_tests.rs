@@ -9,11 +9,16 @@ use sha2::{Digest, Sha256};
 
 /// A membership service at `domain`, for logs no test reaches.
 pub(crate) fn service(domain: &str) -> Service {
-    Service::Serve { key: ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key().to_bytes().into(), domain: domain.into(), rest: Default::default() }
+    Service::Serve { key: key().into(), domain: domain.into(), rest: Default::default() }
 }
 
 /// The domain of the service tests' groups are on.
 const DOMAIN: &str = "lmk.example";
+
+/// The key of the service tests' groups are on.
+fn key() -> [u8; 32] {
+    ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key().to_bytes()
+}
 
 pub(crate) fn settings() -> Settings {
     Settings { protocol: PROTOCOL, carry: 7, update: lmk_proto::group::UPDATE, membership: service(DOMAIN), admins: vec![], admitted: vec![] }
@@ -161,7 +166,7 @@ impl Member {
     /// posted at `pos`.
     pub fn join(&mut self, entry: &[u8], admission: &Admission, pos: usize, package: &[u8]) {
         let reference = key_package_reference(&self.provider, package).unwrap();
-        self.group = Some(Group::join(&self.provider, entry, admission, &reference, &group_of(entry), DOMAIN).unwrap());
+        self.group = Some(Group::join(&self.provider, entry, admission, &reference, &group_of(entry), DOMAIN, &key()).unwrap());
         self.pos = pos;
     }
 }
@@ -236,7 +241,7 @@ fn refused(m: &mut Member, change: Change) -> String {
 /// The refusal `Group::join` gives an entry and its Welcome for `package`, which must be refused.
 fn join_error(m: &Member, entry: &[u8], admission: &Admission, package: &[u8]) -> String {
     let reference = key_package_reference(&m.provider, package).unwrap();
-    Group::join(&m.provider, entry, admission, &reference, &group_of(entry), DOMAIN).err().expect("refused").to_string()
+    Group::join(&m.provider, entry, admission, &reference, &group_of(entry), DOMAIN, &key()).err().expect("refused").to_string()
 }
 
 /// The entry of `cut` for the member with `key`.
@@ -759,7 +764,7 @@ fn another_protocol_is_refused_at_join() {
     let sig = a.session.signer.sign(&welcome_signed(&entry, &serde_json::to_vec(&cut).unwrap(), &welcome)).unwrap();
     let admission = Admission { welcome, cut, sig };
     group.mls.merge_pending_commit(&a.provider).unwrap();
-    let error = Group::join(&w.m[1].provider, &entry, &admission, &reference, &group_of(&entry), DOMAIN).err().unwrap();
+    let error = Group::join(&w.m[1].provider, &entry, &admission, &reference, &group_of(&entry), DOMAIN, &key()).err().unwrap();
     assert!(error.to_string().contains(&format!("protocol {}", PROTOCOL + 1)), "{error}");
 }
 

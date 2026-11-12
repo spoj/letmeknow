@@ -89,11 +89,11 @@ impl Node {
         };
         let st = self.inner.lock();
         let g = st.group(gid)?;
-        let Service::Serve { domain, .. } = g.mls.settings().membership else { bail!("unsupported membership service") };
+        let Service::Serve { domain, key, .. } = g.mls.settings().membership else { bail!("unsupported membership service") };
         holders.sort_by_key(|member| !g.mls.admin(&member.key.0));
         let mut members = vec![(*self.inner.net().id().as_bytes(), self.inner.home.clone())];
         members.extend(holders.iter().filter_map(|member| Some((*endpoint_id(&member.iroh.0)?.as_bytes(), member.home.clone()))).take(LINK_MEMBERS));
-        Ok(Invite { secret, domain, group: gid.try_into()?, by: by.0.as_slice().try_into()?, joined, members })
+        Ok(Invite { secret, domain, key: key.0.as_slice().try_into()?, group: gid.try_into()?, by: by.0.as_slice().try_into()?, joined, members })
     }
 
     /// Joins through an invite link: asks the members it names in turn, as each is reached, and reads their frames whole
@@ -212,7 +212,7 @@ impl Inner {
             let st = &mut *st;
             let admission = lmk_core::group::Admission { welcome: admitted.welcome.0, cut: admitted.cut, sig: admitted.sig.0 };
             let package = key_package_reference(&st.provider, key_package)?;
-            let mls = Group::join(&st.provider, &admitted.commit.0, &admission, &package, &link.group, &link.domain)?;
+            let mls = Group::join(&st.provider, &admitted.commit.0, &admission, &package, &link.group, &link.domain, &link.key)?;
             ensure!(!st.groups.contains_key(mls.id()), "this session is in that group already");
             // Its Add had no update path: its first update, due at once, merges its leaf into the tree (`merge`).
             st.add_group(mls, Rec { stirred: true, ..Rec::default() })?

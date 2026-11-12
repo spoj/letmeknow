@@ -428,14 +428,14 @@ impl Group {
         Ok(group)
     }
 
-    /// Joins the group `gid` of the service at `domain`, as an invite link names them, by the admission that admitted this
-    /// session to the commit entry it came with, whose signatures it checks against the Welcome's sender, its committer,
-    /// and whose cut is where it starts: the cut state of the members it names, none this session, each past seq 0 by its
-    /// member's proof of a sealing from before the new epoch, and every other at seq 0 of the new epoch. Every leaf of the
-    /// group is proven (`proven`), and names an iroh key no other names; its settings hold keys each in its one form
-    /// (`is_key`). OpenMLS consumes a package during `build_from_welcome`, before `into_group`, so an error here rolls
-    /// back this call's writes, the package's consumption included.
-    pub fn join(provider: &SqliteProvider, entry: &[u8], admission: &Admission, expected_package: &[u8; 32], gid: &[u8; 16], domain: &str) -> Result<Self> {
+    /// Joins the group `gid` of the service at `domain` whose key is `key`, as an invite link names them, by the admission
+    /// that admitted this session to the commit entry it came with, whose signatures it checks against the Welcome's
+    /// sender, its committer, and whose cut is where it starts: the cut state of the members it names, none this session,
+    /// each past seq 0 by its member's proof of a sealing from before the new epoch, and every other at seq 0 of the new
+    /// epoch. Every leaf of the group is proven (`proven`), and names an iroh key no other names; its settings hold keys
+    /// each in its one form (`is_key`). OpenMLS consumes a package during `build_from_welcome`, before `into_group`, so an
+    /// error here rolls back this call's writes, the package's consumption included.
+    pub fn join(provider: &SqliteProvider, entry: &[u8], admission: &Admission, expected_package: &[u8; 32], gid: &[u8; 16], domain: &str, key: &[u8; 32]) -> Result<Self> {
         let Entry { commit, sig } = Entry::parse(entry)?;
         let Admission { welcome: welcome_bytes, cut: ended, sig: welcome_sig } = admission;
         let MlsMessageBodyIn::Welcome(welcome) = parse::<MlsMessageIn>(welcome_bytes)?.extract() else {
@@ -462,7 +462,7 @@ impl Group {
             ensure!(settings.admins.iter().chain(&settings.admitted).all(|key| is_key(&key.0)), "a group whose settings hold a key that is neither Ed25519 nor compressed P-256");
             ensure!(staged.group_context().group_id().as_slice() == gid, "a Welcome into another group than the link names");
             ensure!(
-                matches!(&settings.membership, Service::Serve { domain: theirs, .. } if theirs == domain),
+                matches!(&settings.membership, Service::Serve { domain: theirs, key: their_key, .. } if theirs == domain && their_key.0 == key),
                 "a Welcome into a group of another service than the link names"
             );
             let mls = staged.into_group(provider)?;

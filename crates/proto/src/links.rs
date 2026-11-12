@@ -14,14 +14,15 @@ pub const DOMAIN: &str = "relay.letmeknow.dev";
 /// letmeknow.dev's membership service key, hex. Its routes are at `DOMAIN`.
 pub const MEMBERSHIP_KEY: &str = "4b0be3befd0c240033aa446df4d24b69ff758fa93593123e525c98f7c46ae046";
 
-/// `https://letmeknow.dev/i#15.<secret>.<domain>.<group>.<by>.<joined>.<member>[.<member>...]`, every field after the
-/// version in unpadded base64url: the domain is the group's service's; the group is the one it admits to, `by` the
-/// session key of the member that made it, and `joined` the epoch that member's membership began in, 8 bytes
+/// `https://letmeknow.dev/i#15.<secret>.<domain>.<key>.<group>.<by>.<joined>.<member>[.<member>...]`, every field after
+/// the version in unpadded base64url: the domain and key are the group's service's; the group is the one it admits to,
+/// `by` the session key of the member that made it, and `joined` the epoch that member's membership began in, 8 bytes
 /// big-endian; and each member is its iroh key, then its own service's domain unless that is the group's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Invite {
     pub secret: [u8; 16],
     pub domain: String,
+    pub key: [u8; 32],
     pub group: [u8; 16],
     pub by: [u8; 32],
     pub joined: u64,
@@ -31,7 +32,7 @@ pub struct Invite {
 
 impl Invite {
     pub fn link(&self) -> String {
-        let fields = [self.secret.as_slice(), self.domain.as_bytes(), &self.group, &self.by, &self.joined.to_be_bytes()];
+        let fields = [self.secret.as_slice(), self.domain.as_bytes(), &self.key, &self.group, &self.by, &self.joined.to_be_bytes()];
         let mut link = format!("{INVITE_PREFIX}15.{}", fields.map(|field| URL_SAFE_NO_PAD.encode(field)).join("."));
         for (key, home) in &self.members {
             let home = if *home == self.domain { "" } else { home.as_str() };
@@ -70,6 +71,7 @@ impl Invite {
         let secret = URL_SAFE_NO_PAD.decode(fields.next().context("no secret")?)?.try_into().ok().context("a secret is 16 bytes")?;
         let domain = String::from_utf8(URL_SAFE_NO_PAD.decode(fields.next().context("no domain")?)?)?;
         directory::check_domain(&domain)?;
+        let key = URL_SAFE_NO_PAD.decode(fields.next().context("no service key")?)?.try_into().ok().context("a service key is 32 bytes")?;
         let group = URL_SAFE_NO_PAD.decode(fields.next().context("no group")?)?.try_into().ok().context("a group is 16 bytes")?;
         let by = URL_SAFE_NO_PAD.decode(fields.next().context("no inviter")?)?.try_into().ok().context("an inviter's key is 32 bytes")?;
         let joined = URL_SAFE_NO_PAD.decode(fields.next().context("no inviter's epoch")?)?.try_into().ok().context("an inviter's epoch is 8 bytes")?;
@@ -82,7 +84,7 @@ impl Invite {
         };
         let members = fields.map(member).collect::<Result<Vec<_>>>()?;
         ensure!(!members.is_empty(), "an invite link names a member");
-        Ok(Invite { secret, domain, group, by, joined: u64::from_be_bytes(joined), members })
+        Ok(Invite { secret, domain, key, group, by, joined: u64::from_be_bytes(joined), members })
     }
 }
 
@@ -101,9 +103,9 @@ mod tests {
     #[test]
     fn invite_round_trip() {
         let members = vec![([1; 32], "relay.example:8443".to_owned()), ([3; 32], "other.example".into())];
-        let invite = Invite { secret: [2; 16], domain: "relay.example:8443".into(), group: [4; 16], by: [5; 32], joined: 6, members: members.clone() };
+        let invite = Invite { secret: [2; 16], domain: "relay.example:8443".into(), key: [8; 32], group: [4; 16], by: [5; 32], joined: 6, members: members.clone() };
         assert_eq!(Invite::parse(&invite.link()).unwrap(), invite);
-        assert_eq!(invite.link().split('#').nth(1).unwrap().split('.').nth(6).unwrap(), URL_SAFE_NO_PAD.encode([1; 32]), "a member at the group's service names no domain");
+        assert_eq!(invite.link().split('#').nth(1).unwrap().split('.').nth(7).unwrap(), URL_SAFE_NO_PAD.encode([1; 32]), "a member at the group's service names no domain");
         let alone = Invite { domain: "relay.example".into(), members: vec![members[0].clone()], ..invite.clone() }.link();
         let unnamed = alone.rsplit_once('.').unwrap().0;
         let elsewhere = |home: &[u8]| format!("{unnamed}.{}", URL_SAFE_NO_PAD.encode([[1; 32].as_slice(), home].concat()));
@@ -119,7 +121,7 @@ mod tests {
     /// A link that a mail gateway's URL Defense v3 rewrote parses as the invite it wraps.
     #[test]
     fn invite_unwraps_url_defense_v3() {
-        let invite = Invite { secret: [2; 16], domain: "relay.example".into(), group: [4; 16], by: [5; 32], joined: 6, members: vec![([1; 32], "relay.example".into())] };
+        let invite = Invite { secret: [2; 16], domain: "relay.example".into(), key: [8; 32], group: [4; 16], by: [5; 32], joined: 6, members: vec![([1; 32], "relay.example".into())] };
         let link = invite.link();
         for (rewritten, replaced) in [(link.replace('#', "*"), "#"), (link.replace("#15", "**B"), "#15"), (link.replace("i#", "**A"), "i#")] {
             let wrapped = format!("https://urldefense.com/v3/__{rewritten}__;{}!!recipient!signature$", URL_SAFE_NO_PAD.encode(replaced));
@@ -132,7 +134,7 @@ mod tests {
 
     #[test]
     fn invite_refuses_a_domain_that_is_not_canonical() {
-        let link = |domain: &str| Invite { secret: [2; 16], domain: domain.into(), group: [4; 16], by: [5; 32], joined: 6, members: vec![([1; 32], domain.into())] }.link();
+        let link = |domain: &str| Invite { secret: [2; 16], domain: domain.into(), key: [8; 32], group: [4; 16], by: [5; 32], joined: 6, members: vec![([1; 32], domain.into())] }.link();
         assert!(Invite::parse(&link("relay.example")).is_ok());
         for domain in ["Relay.example", "relay.example:443", "relay.example.", "u@relay.example", "127.0.0.1:8443", "relay.example/x"] {
             assert!(Invite::parse(&link(domain)).is_err(), "{domain}");
