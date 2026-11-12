@@ -509,6 +509,22 @@ fn a_group_the_node_forgot_before_the_session_published_is_let_go_as_it_starts()
     });
 }
 
+/// A session in a group stays, though its `groups.json` says it is in none: whether it is in no group is read from its
+/// database, under its lock, as it stops and as the next session starts.
+#[test]
+fn a_session_in_a_group_stays_though_its_groups_json_says_none() {
+    local(async {
+        let world = world("stale-groups").await;
+        let (mut alice, _bob, _) = pair(&world).await;
+        let dir = session_dir(&alice.home, "alice").unwrap();
+        std::fs::write(dir.join("groups.json"), "[]").unwrap();
+        alice.stop().await;
+        assert!(dir.exists(), "a session in a group is kept as it stops");
+        crate::delete_stopped(alice.home.clone()).await.unwrap();
+        assert!(dir.exists(), "a stopped session in a group is kept as the next one starts");
+    });
+}
+
 /// `status` lists this session's sends that no other member holds yet, with a warning, until a member connected to it holds
 /// them.
 #[test]
@@ -1097,11 +1113,15 @@ async fn lookups_during_a_fetch_do_not_start_another() {
 async fn stopped_sessions_that_have_not_run_for_28_days_are_deleted() {
     let home = tempfile::tempdir().unwrap();
     let ago = |days: u64| SystemTime::now() - Duration::from_secs(days * 24 * 3600);
-    for (name, days, log_days, groups) in [("old", 28, 28, r#"["group"]"#), ("recent", 27, 27, r#"["group"]"#), ("logged", 40, 1, r#"["group"]"#), ("running", 29, 29, r#"["group"]"#), ("empty", 0, 0, "[]")] {
+    for (name, days, log_days, groups) in [("old", 28, 28, r#"["AAAA"]"#), ("recent", 27, 27, r#"["AAAA"]"#), ("logged", 40, 1, r#"["AAAA"]"#), ("running", 29, 29, r#"["AAAA"]"#), ("empty", 0, 0, "[]")] {
         let dir = session_dir(home.path(), name).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         for (file, days) in [("groups.json", days), ("session.db", days), ("session.lock", days), ("log.jsonl", log_days)] {
-            std::fs::write(dir.join(file), if file == "groups.json" { groups } else { "" }).unwrap();
+            if file == "session.db" {
+                lmk_core::provider::SqliteProvider::open(&dir.join(file)).unwrap().put(b"node/groups", groups.as_bytes()).unwrap();
+            } else {
+                std::fs::write(dir.join(file), if file == "groups.json" { groups } else { "" }).unwrap();
+            }
             std::fs::File::options().write(true).open(dir.join(file)).unwrap().set_modified(ago(days)).unwrap();
         }
     }

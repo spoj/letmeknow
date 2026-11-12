@@ -62,6 +62,11 @@ pub fn create(provider: &SqliteProvider, home: &str) -> Result<Bytes> {
     Ok(Bytes(Session::create(provider, leaf)?.key().to_vec()))
 }
 
+/// The groups the session in `provider` is in, as its node saved them.
+pub fn groups(provider: &SqliteProvider) -> Result<Vec<Bytes>> {
+    Ok(get::<Vec<Bytes>>(provider, b"node/groups")?.unwrap_or_default())
+}
+
 impl State {
     /// The session in `provider`, created on first use, with its leaf as `leaf`, certified by `device`; its logs and
     /// groups.

@@ -246,7 +246,7 @@ pub async fn listen(
     session.start(delete_stopped(home.to_owned()));
     session::run(session, queue, events, print, shutdown).await?;
     // A session that stops in no group leaves nothing behind.
-    if serde_json::from_slice::<Vec<String>>(&std::fs::read(dir.join("groups.json"))?)?.is_empty() {
+    if lmk_node::groups(&SqliteProvider::open(&dir.join("session.db"))?)?.is_empty() {
         std::fs::remove_dir_all(&dir)?;
     }
     Ok(())
@@ -316,25 +316,23 @@ fn last_ran(dir: &Path) -> Option<SystemTime> {
     std::fs::read_dir(dir).ok()?.flatten().filter_map(|entry| entry.metadata().ok()?.modified().ok()).max().or_else(|| dir.metadata().ok()?.modified().ok())
 }
 
-/// Deletes the home's stopped sessions in no group, as each would have as it stopped: those that found, started again to
-/// invite a new session, that they were removed while stopped. And those that have not run for `STALE`, whatever their
-/// groups: one that started would take its groups' logs as let go, and leave them. Answers what it warns of: one not
-/// deleted, as when Windows finds a file of it open, is tried again as the next session starts.
+/// Deletes the home's stopped sessions in no group, as each would have as it stopped, by its database read under its
+/// lock: those that found, started again to invite a new session, that they were removed while stopped. And those that
+/// have not run for `STALE`, whatever their groups: one that started would take its groups' logs as let go, and leave
+/// them. Answers what it warns of: one not deleted, as when Windows finds a file of it open, is tried again as the next
+/// session starts.
 async fn delete_stopped(home: PathBuf) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
     for entry in std::fs::read_dir(home.join("sessions"))?.flatten() {
         let dir = entry.path();
         let deleted = || -> Result<()> {
             let stale = last_ran(&dir).and_then(|at| at.elapsed().ok()).is_some_and(|idle| idle >= Duration::from_millis(STALE));
-            if !stale {
-                // One without groups.json may be starting.
-                let Ok(groups) = std::fs::read(dir.join("groups.json")) else { return Ok(()) };
-                if !serde_json::from_slice::<Vec<String>>(&groups)?.is_empty() {
-                    return Ok(());
-                }
+            // One without groups.json may be starting.
+            if !stale && !dir.join("groups.json").exists() {
+                return Ok(());
             }
             let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("session.lock"))?;
-            if held.try_lock().is_ok() {
+            if held.try_lock().is_ok() && (stale || lmk_node::groups(&SqliteProvider::open(&dir.join("session.db"))?)?.is_empty()) {
                 drop(held);
                 std::fs::remove_dir_all(&dir)?;
             }
