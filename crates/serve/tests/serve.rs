@@ -135,7 +135,7 @@ async fn serves_relay_and_membership_without_frontend() {
     let key: [u8; 32] = key.0.as_slice().try_into().unwrap();
     let page = client.read(&[7; 32], &lmk_membership::Frontier::empty(key, lmk_proto::head::reference(&key, &[7; 32]))).await.unwrap();
     assert_eq!(page.entries[0].0, b"commit");
-    let heads = client.heads(&[lmk_proto::membership::Known([7; 32], 0)]).await.unwrap();
+    let heads = client.heads(&[[7; 32]]).await.unwrap();
     let head = heads[0].as_ref().unwrap();
     assert_eq!((head.length, head.hash), (page.head.length, page.head.hash));
 

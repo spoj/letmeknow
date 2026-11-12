@@ -21,7 +21,8 @@ pub struct Expired(pub [u8; 32]);
 #[error("the membership service at {0} runs another minor")]
 pub struct Unsupported(pub String);
 
-/// A head the domain's service signed with another key than the group's: the domain's name.
+/// The domain's service signs with another key than the group's, as a reply that key did not sign, or a directory naming
+/// another, shows: the domain's name.
 #[derive(Debug, thiserror::Error)]
-#[error("the directory of {0} names another key than the service")]
+#[error("the membership service at {0} signs with another key than the group's")]
 pub struct WrongDirectory(pub String);

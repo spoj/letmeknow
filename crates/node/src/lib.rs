@@ -867,7 +867,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         use ed25519_dalek::SigningKey;
         use lmk_proto::clock::corrected;
-        use lmk_proto::{head::{self, Head}, membership::{Answer, Append, Appended, Heads, Known, Moved, Page, Read}};
+        use lmk_proto::{head::{self, Head}, membership::{Answer, Append, Appended, Heads, Moved, Page, Read}};
 
         let relay = lmk_testing::relay().await;
         let (own_key, other_key) = (SigningKey::from_bytes(&[7; 32]), SigningKey::from_bytes(&[8; 32]));
@@ -922,7 +922,7 @@ mod tests {
         let foreign_log = alice.log(&foreign_gid.0).unwrap();
         let foreign_cap = alice.inner.lock().capability(&foreign_log.0).unwrap();
         alice.inner.clients.client(&foreign).unwrap().append(&foreign_cap, &[b"x".to_vec()]).await.unwrap();
-        alice.inner.clients.client(&foreign).unwrap().heads(&[Known(foreign_cap, 1)]).await.unwrap();
+        alice.inner.clients.client(&foreign).unwrap().heads(&[foreign_cap]).await.unwrap();
         assert!(corrected().abs_diff(now()) < 5_000, "a foreign service set the clock: {}", corrected() - now());
 
         let wrong_gid = group_on(wrong_home.clone());
@@ -930,7 +930,7 @@ mod tests {
         let wrong_cap = alice.inner.lock().capability(&wrong_log.0).unwrap();
         assert!(alice.read_group(&wrong_gid.0).await.is_err());
         assert!(alice.inner.clients.client(&wrong_home).unwrap().append(&wrong_cap, &[b"x".to_vec()]).await.is_err());
-        assert!(alice.inner.clients.client(&wrong_home).unwrap().heads(&[Known(wrong_cap, 1)]).await.is_err());
+        assert!(alice.inner.clients.client(&wrong_home).unwrap().heads(&[wrong_cap]).await.is_err());
         assert!(corrected().abs_diff(now()) < 5_000, "another key at the home domain set the clock: {}", corrected() - now());
 
         let own_gid = group_on(own);

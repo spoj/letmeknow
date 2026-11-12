@@ -1,6 +1,6 @@
 //! A client of the membership service's HTTPS routes, with caller-owned trust anchors, never a shared history cache. What
-//! a route answers is checked here: pages and heads against the service's key, and refusals and expiries, which count
-//! only when signed.
+//! a route answers is checked here against the service's key: pages, heads, refusals and expiries count only when it
+//! signed them, and a reply it did not sign is `WrongDirectory`.
 
 use std::sync::{Arc, OnceLock};
 
@@ -14,7 +14,7 @@ use n0_future::boxed::BoxFuture;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::Semaphore;
 
-use crate::{Expired, Forged, Frontier, Refused, Unsupported, WrongDirectory, WrongLog};
+use crate::{Expired, Frontier, Refused, Unsupported, WrongDirectory, WrongLog};
 
 /// Resolves a domain to the directory its service publishes.
 pub type Resolve = Arc<dyn Fn(String) -> BoxFuture<Result<Directory>> + Send + Sync>;
@@ -107,13 +107,13 @@ impl ServeClient {
         match serde_json::from_slice::<Answer<T>>(&reply).map_err(|_| anyhow!("an invalid membership reply"))? {
             Answer::Ok(value) => Ok(value),
             Answer::Refused { refusal, sig } => {
-                let sig = Signature::from_slice(&sig.0).map_err(|_| Forged)?;
-                ensure!(self.0.key.verify_strict(&refusal_message(refusal, &body), &sig).is_ok(), Forged);
+                let signed = Signature::from_slice(&sig.0).is_ok_and(|sig| self.0.key.verify_strict(&refusal_message(refusal, &body), &sig).is_ok());
+                ensure!(signed, WrongDirectory(self.0.domain.clone()));
                 Err(Refused(refusal.code().into()).into())
             }
             Answer::Expired { sig } => {
                 let Some(log_ref) = log_ref else { bail!("an invalid membership reply") };
-                ensure!(Expiry { log_ref, sig }.verify(&self.0.key), Forged);
+                ensure!(Expiry { log_ref, sig }.verify(&self.0.key), WrongDirectory(self.0.domain.clone()));
                 Err(Expired(log_ref).into())
             }
         }
@@ -127,6 +127,7 @@ impl ServeClient {
         let sent = clock::now();
         let body = json(&Append { capability: *capability, entries: entries.iter().cloned().map(Bytes).collect() })?;
         let appended: Appended = self.request("/membership/6/append", body, Some(head::reference(self.0.key.as_bytes(), capability))).await?;
+        ensure!(appended.head.verify(&self.0.key), WrongDirectory(self.0.domain.clone()));
         Frontier::empty(*self.0.key.as_bytes(), head::reference(self.0.key.as_bytes(), capability)).check(&appended.head, None)?;
         self.heard(sent, &appended.head);
         Ok(appended)
@@ -137,34 +138,33 @@ impl ServeClient {
         let sent = clock::now();
         let body = json(&Read { capability: *capability, after: anchor.length() })?;
         let page: Page = self.request("/membership/6/read", body, Some(*anchor.log_ref())).await?;
+        ensure!(page.head.verify(&self.0.key), WrongDirectory(self.0.domain.clone()));
         let page = anchor.verify_page(page)?;
         self.heard(sent, &page.head);
         Ok(page)
     }
 
-    /// The heads of the logs whose length differs from the one given, and the expiries of the logs gone, from one request
-    /// per `HEAD_LOGS` logs. A log missing from the answer is unchanged at the time of the request. An expiry the service
-    /// did not sign, or of a log the request did not name, is ignored.
-    pub async fn heads(&self, logs: &[Known]) -> Result<Vec<Result<Head, Expiry>>> {
-        let mut moved = Vec::new();
-        for chunk in logs.chunks(membership::HEAD_LOGS) {
+    /// The head of each log, or its expiry once the service let it go, in the order asked, from one request per
+    /// `HEAD_LOGS` logs. Each is asked at a length no log has, so that the service answers every one, signed: one with no
+    /// answer the service's key signed is `WrongDirectory`.
+    pub async fn heads(&self, capabilities: &[[u8; 32]]) -> Result<Vec<Result<Head, Expiry>>> {
+        let mut answers = Vec::new();
+        for chunk in capabilities.chunks(membership::HEAD_LOGS) {
             let sent = clock::now();
-            let Moved { heads, expired } = self.request("/membership/6/heads", json(&Heads { logs: chunk.to_vec() })?, None).await?;
-            for head in heads {
-                if !head.verify(&self.0.key) {
-                    return Err(WrongDirectory(self.0.domain.clone()).into());
+            let logs = chunk.iter().map(|capability| Known(*capability, u64::MAX)).collect();
+            let Moved { heads, expired } = self.request("/membership/6/heads", json(&Heads { logs })?, None).await?;
+            for capability in chunk {
+                let log_ref = head::reference(self.0.key.as_bytes(), capability);
+                if let Some(head) = heads.iter().find(|head| head.log_ref == log_ref && head.verify(&self.0.key)) {
+                    self.heard(sent, head);
+                    answers.push(Ok(head.clone()));
+                    continue;
                 }
-                ensure!(chunk.iter().any(|Known(capability, _)| head::reference(self.0.key.as_bytes(), capability) == head.log_ref), WrongLog);
-                self.heard(sent, &head);
-                moved.push(Ok(head));
-            }
-            for expiry in expired {
-                if expiry.verify(&self.0.key) && chunk.iter().any(|Known(capability, _)| head::reference(self.0.key.as_bytes(), capability) == expiry.log_ref) {
-                    moved.push(Err(expiry));
-                }
+                let expiry = expired.iter().find(|expiry| expiry.log_ref == log_ref && expiry.verify(&self.0.key));
+                answers.push(Err(expiry.cloned().ok_or_else(|| WrongDirectory(self.0.domain.clone()))?));
             }
         }
-        Ok(moved)
+        Ok(answers)
     }
 
     fn heard(&self, sent: u64, head: &Head) {

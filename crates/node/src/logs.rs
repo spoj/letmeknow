@@ -16,7 +16,7 @@ use lmk_net::peers::WAIT;
 use lmk_proto::Bytes;
 use lmk_proto::group::Service;
 use lmk_proto::head::{self, Head};
-use lmk_proto::membership::{Expiry, Known, STALE};
+use lmk_proto::membership::{Expiry, STALE};
 use lmk_proto::clock::corrected;
 use n0_future::time::{Duration, timeout};
 use serde::{Deserialize, Serialize};
@@ -264,15 +264,14 @@ impl Inner {
     /// it, through each epoch a commit moves it to. Fails when the log counts as let go. Within `STALE`, a service that
     /// does not answer within `SEND_WAIT` holds nothing back: chat goes on while it is down.
     pub(crate) async fn refresh(self: &Arc<Self>, gid: &[u8]) -> Result<()> {
-        let (id, service, known) = {
+        let (id, service, capability, held) = {
             let st = self.lock();
             let id = st.group(gid)?.rec.log.0.clone();
-            (id.clone(), st.log(&id)?.service.clone(), Known(st.capability(&id)?, st.log(&id)?.length()))
+            (id.clone(), st.log(&id)?.service.clone(), st.capability(&id)?, st.log(&id)?.length())
         };
-        let sent = corrected();
         let current_stale = |st: &State| st.group(gid).and_then(|g| st.log(&g.rec.log.0)).is_ok_and(Log::stale);
-        let answer = match timeout(SEND_WAIT, async { self.clients.client(&service)?.heads(&[known]).await }).await {
-            Ok(Ok(answer)) => answer,
+        let answer = match timeout(SEND_WAIT, async { self.clients.client(&service)?.heads(&[capability]).await }).await {
+            Ok(Ok(mut answers)) => answers.remove(0),
             Ok(Err(error)) => {
                 self.report(&error);
                 if current_stale(&self.lock()) {
@@ -288,13 +287,13 @@ impl Inner {
             }
         };
         let stale = self.lock().log(&id).is_ok_and(Log::stale);
-        match answer.into_iter().next() {
-            Some(Ok(head)) if !stale || head.length > known.1 => {
-                self.caught_up(gid).await.map_err(|e| if e.is::<Expired>() { SendError::LetGo.into() } else { e })
-            }
-            None if !stale => {
-                self.lock().read_as_of(&id, sent)?;
+        match answer {
+            Ok(head) if head.length == held && !stale => {
+                self.lock().read_as_of(&id, head.time)?;
                 if self.lock().at_head(gid) { Ok(()) } else { self.caught_up(gid).await }
+            }
+            Ok(head) if !stale || head.length > held => {
+                self.caught_up(gid).await.map_err(|e| if e.is::<Expired>() { SendError::LetGo.into() } else { e })
             }
             _ => self.lapse(&mut self.lock(), &id).and(Err(SendError::LetGo.into())),
         }
@@ -315,20 +314,20 @@ impl Inner {
         self.lock().take_expiries(gid, &gone).map(drop)
     }
 
-    /// The expiries of the logs among `logs`, each a service and a capability, that their services let go. They are asked
-    /// for heads with no length, so each answers its expiry or its head, and only expiries are taken.
+    /// The expiries of the logs among `logs`, each a service and a capability, that their services let go. Each answers
+    /// each log's expiry or its head, and only expiries are taken.
     pub(crate) async fn let_go(&self, logs: Vec<(Service, [u8; 32])>) -> Vec<Expiry> {
-        let mut services: Vec<(Service, Vec<Known>)> = Vec::new();
+        let mut services: Vec<(Service, Vec<[u8; 32]>)> = Vec::new();
         for (service, capability) in logs {
             match services.iter_mut().find(|(s, _)| *s == service) {
-                Some((_, known)) => known.push(Known(capability, 0)),
-                None => services.push((service, vec![Known(capability, 0)])),
+                Some((_, capabilities)) => capabilities.push(capability),
+                None => services.push((service, vec![capability])),
             }
         }
         let mut gone = Vec::new();
-        for (service, known) in services {
+        for (service, capabilities) in services {
             let answers = match self.clients.client(&service) {
-                Ok(client) => client.heads(&known).await,
+                Ok(client) => client.heads(&capabilities).await,
                 Err(error) => Err(error),
             };
             match answers {

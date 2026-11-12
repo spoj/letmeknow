@@ -153,7 +153,7 @@ pub struct Read {
     pub after: u64,
 }
 
-/// A log, and the length its requester holds.
+/// A log, and a length: the service answers with the log's head where it holds another.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Known(#[serde(with = "fixed32")] pub [u8; 32], pub u64);
 

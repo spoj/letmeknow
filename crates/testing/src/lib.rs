@@ -18,13 +18,11 @@ use iroh_relay::KeyCache;
 use iroh_relay::server::http_server::{BytesBody, HyperError, RelayServiceWithNotify};
 use iroh_relay::server::streams::MaybeTlsStream;
 use iroh_relay::server::{AllowAll, Handlers, Metrics, RelayService};
-use lmk_membership::client::{Post, Resolve, ServeClient, https};
+use lmk_membership::client::{Post, Resolve, https};
 use lmk_membership::service::{Policy, Route, Service as Membership};
 use lmk_membership::store::Store;
 use lmk_proto::Bytes;
 use lmk_proto::directory::{Directory, relay_url};
-use lmk_proto::head::Head;
-use lmk_proto::membership::Known;
 use lmk_proto::group::Service;
 use lmk_proto::membership::MAX_BODY;
 use n0_future::boxed::BoxFuture;
@@ -233,11 +231,6 @@ async fn answer(membership: Membership, peer: IpAddr, req: Request<Incoming>) ->
         _ => (StatusCode::NOT_FOUND, b"not found".to_vec()),
     };
     Ok(Response::builder().status(status).body(Box::new(Full::new(Body::from(body))) as BytesBody).unwrap())
-}
-
-/// The head of a log, which a heads request answers whatever length it names, as no log has `u64::MAX` entries.
-pub async fn head(client: &ServeClient, capability: &[u8; 32]) -> Head {
-    client.heads(&[Known(*capability, u64::MAX)]).await.unwrap().remove(0).unwrap()
 }
 
 /// Limits no test's traffic: no test counts its appends.
