@@ -218,10 +218,10 @@ struct Rec {
     stirred: bool,
     /// When this session last asked which members' logs their services let go, in milliseconds.
     evicted: u64,
-    /// The latest epoch this session's own commit or message showed it in, and when the group moved past it: while
-    /// it is behind, a `present` is due `PRESENT` after that.
+    /// The latest epoch this session's own commit or message showed it in, and when it last did: while it is behind, a
+    /// `present` is due `PRESENT` after that.
     present: u64,
-    passed: u64,
+    presented: u64,
     /// The seqs this session lost and has not told the group of yet.
     lost: Vec<Seqs>,
     /// The memberships this session knows of in the group: the current ones, and those ended within H.
@@ -301,9 +301,11 @@ pub(crate) struct G {
     seen: VecDeque<[u8; 32]>,
     /// Seqs that came to be known lately, and when: not asked for until `HOLD_OFF` passed.
     fresh: Vec<(Bytes, u64, lmk_proto::ranges::Ranges, u64)>,
-    /// When reading began its last wait before a commit, and that commit's position. The commits made before then, which
-    /// this session missed while away, share that wait: it waits once for them all, not once for each epoch it missed.
-    reading: Option<(u64, u64)>,
+    /// The wait of the run of commits reading is in: when it began, moved on by the time between them; and the position
+    /// of the commit last judged, and when, which is when it applied once reading is past it. A commit held within
+    /// `HEAR` of the one before it applying continues the run: the commits this session missed while away wait once for
+    /// them all, not once for each epoch.
+    reading: Option<(u64, u64, u64)>,
     /// Reading waits before a commit that deletes the keys of an epoch whose kept messages this session lacks.
     waiting: bool,
     /// The seqs an update waits to fetch before it commits, and when it first waited, in this epoch.

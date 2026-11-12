@@ -1,19 +1,20 @@
 //! Reading a group's logs of commits strictly in order, each epoch's from the commit that moved the group to it, its
 //! entries after that epoch's first valid commit passed over. A commit deletes the keys of the epoch before the current
 //! one, whose messages the last commit kept: before it applies, this session waits for those it lacks as
-//! `Peers::wait` decides, unless the commit was made more than H ago, and what it still lacks then is lost to it. The
-//! commits made before a wait began, which it missed while away, share that wait.
+//! `Peers::wait` decides, whatever the commit's age, and what it still lacks then is lost to it. A commit held within
+//! `HEAR` of the one before it applying shares that one's wait, the time between them not counted: the commits this
+//! session missed while away, which arrive in a run, wait once.
 //! Applying a commit moves the cuts: what they kept, and the memberships that ended and began.
 
 use anyhow::{Context, Result};
 use lmk_core::group::{self as core, Verdict};
+use lmk_net::peers::HEAR;
 use lmk_proto::Bytes;
-use lmk_proto::clock::corrected;
 use lmk_proto::peer::{Admitted, Frame, Seqs};
 use lmk_proto::ranges::Ranges;
 
 use crate::held::Author;
-use crate::{Epoch, Event, Inner, Lost, LostOf, Out, State, Work, days, put};
+use crate::{Epoch, Event, Inner, Lost, LostOf, Out, State, Work, put};
 
 /// How many of a group's last logs a commit tells the connected members it removes.
 const TOLD: usize = 8;
@@ -61,42 +62,40 @@ impl Inner {
                 self.work.send(Work::Gone(gid.to_vec())).ok();
                 return Ok(false);
             }
-            // Its time is its committer's word: one dated ahead counts as made now.
-            Verdict::Commit { removes, time } => return self.apply(st, gid, position, entry, removes, time.min(corrected())),
+            Verdict::Commit { removes } => return self.apply(st, gid, position, entry, removes),
         }
         st.group_mut(gid)?.rec.position = position;
         Ok(true)
     }
 
-    /// Whether the commit at `position`, made at `time`, may apply now: while this session lacks messages the last
-    /// commit kept, which it deletes the keys of, it waits as `Peers::wait` decides, asking for them meanwhile; not for a
-    /// commit made more than H ago, whose kept messages no member carries any more.
-    fn cleared(&self, st: &mut State, gid: &[u8], position: u64, time: u64) -> Result<bool> {
+    /// Whether the commit at `position` may apply now: while this session lacks messages the last commit kept, which it
+    /// deletes the keys of, it waits as `Peers::wait` decides, asking for them meanwhile.
+    fn cleared(&self, st: &mut State, gid: &[u8], position: u64) -> Result<bool> {
         let now = st.tick();
         let g = st.group_mut(gid)?;
         let read = match g.reading {
-            Some((read, at)) if at == position || time < read => read,
-            _ => g.reading.insert((now, position)).0,
+            Some((read, at, _)) if at == position => read,
+            Some((read, _, applied)) if now < applied + HEAR => read + (now - applied),
+            _ => now,
         };
         g.waiting = true;
         let prior = g.mls.epoch().saturating_sub(1);
         self.open_all(st, gid, prior)?;
         self.deliver_ready(st, gid)?;
         st.refresh(gid);
-        let g = st.group(gid)?;
-        let carried = time + days(g.mls.settings().carry) >= corrected();
-        let lacking = if carried { g.lacking() } else { Vec::new() };
+        let lacking = st.group(gid)?.lacking();
         let waiting = st.peers.wait(&Bytes(gid.to_vec()), &lacking, read, now);
         if waiting {
             tracing::debug!("waiting at position {position} for {} memberships' kept messages", lacking.len());
         }
-        st.group_mut(gid)?.waiting = waiting;
+        let g = st.group_mut(gid)?;
+        (g.waiting, g.reading) = (waiting, Some((read, position, now)));
         Ok(!waiting)
     }
 
     /// Applies the commit at `position`, unless it waits (`cleared`); false if it waits, or removed this session.
-    fn apply(&self, st: &mut State, gid: &[u8], position: u64, entry: &[u8], removes: bool, time: u64) -> Result<bool> {
-        if !self.cleared(st, gid, position, time)? {
+    fn apply(&self, st: &mut State, gid: &[u8], position: u64, entry: &[u8], removes: bool) -> Result<bool> {
+        if !self.cleared(st, gid, position)? {
             return Ok(false);
         }
         let now = st.tick();
@@ -122,8 +121,6 @@ impl Inner {
             if applied.updated {
                 (g.rec.updated, g.rec.stirred) = (now, false);
             }
-        } else if g.rec.present == ending {
-            g.rec.passed = time;
         }
         if let Some(core::Admission { welcome, cut, sig }) = applied.admission.take() {
             put(&st.provider, &commit_key(gid, ending), &Admitted { commit: Bytes(inner), welcome: Bytes(welcome), cut, sig: Bytes(sig) })?;

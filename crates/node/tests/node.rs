@@ -1445,9 +1445,9 @@ fn payload_types(db: &Path, gid: &Bytes) -> Vec<(Bytes, String)> {
     }).collect()
 }
 
-/// A member that showed itself in no epoch since the group moved past the last one it did sends a `present` two days
-/// later, while online: the others see it in the current epoch, so their evictions spare it once the log of that last
-/// one is let go.
+/// A member that showed itself in no epoch since the group moved past the last one it did sends a `present`, while
+/// online, once two days have passed since it showed itself: the others see it in the current epoch, so their evictions
+/// spare it once the log of that last one is let go.
 #[test]
 fn an_idle_member_shows_itself_present_before_its_epochs_log_goes() {
     static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2021,11 +2021,11 @@ fn shifted() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// A member catching up does not wait for what a commit made more than H ago kept: Carol, back 8 days later with no
-/// holder of Bob's kept message online, is told it lost at once rather than after `HEAR`. Every thread of the runtime,
-/// the service's included, reads the shifted clock.
+/// A member catching up waits for what a commit kept whatever the commit's age: Carol, back 8 days later with no holder
+/// of Bob's kept message online, is told it lost after `HEAR`. Every thread of the runtime, the service's included,
+/// reads the shifted clock.
 #[test]
-fn catching_up_waits_for_nothing_a_commit_older_than_h_kept() {
+fn catching_up_waits_for_what_a_commit_kept_whatever_its_age() {
     let runtime = tokio::runtime::Builder::new_multi_thread().on_thread_start(|| lmk_proto::clock::set(shifted)).enable_all().build().unwrap();
     runtime.block_on(catching_up());
 }
@@ -2065,7 +2065,7 @@ async fn catching_up() {
         Event::Lost(lost) => Some(lost),
         _ => None,
     }).await;
-    assert!(started.elapsed() < Duration::from_millis(lmk_net::peers::HEAR), "took {:?}", started.elapsed());
+    assert!(started.elapsed() >= Duration::from_millis(lmk_net::peers::HEAR), "took {:?}", started.elapsed());
     assert_eq!((lost.messages[0].from.key.clone(), lost.messages[0].seqs.clone()), (bob_key, vec![1]));
     carol.node.shutdown().await.unwrap();
 }
@@ -3907,19 +3907,16 @@ async fn a_member_that_is_no_admin_removes_a_leaver_by_its_leave() {
     }
 }
 
-/// A commit's time is its committer's word. A member's commit dated years ahead, after one whose cut keeps a message no
-/// one holds, is waited before as any other: once, for `HEAR`.
+/// A commit carries no time. A member's commit made with its clock at 0, after one whose cut keeps a message no one
+/// holds, is waited before as any other: for `HEAR`.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_commit_dated_ahead_is_waited_before_as_any_other() {
+async fn a_commit_made_with_the_clock_at_0_is_waited_before_as_any_other() {
     use lmk_core::group::{Change, Group, Session as Mls};
     fn real() -> u64 {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
     }
-    fn ahead() -> u64 {
-        real() + 50 * 365 * 86_400_000
-    }
     let relay = relay().await;
-    let dir = folder("ahead");
+    let dir = folder("zero");
     std::fs::create_dir_all(&dir).unwrap();
     let bob_db = dir.join("bob.db");
     let alice = session(&relay).await;
@@ -3943,7 +3940,7 @@ async fn a_commit_dated_ahead_is_waited_before_as_any_other() {
     client.append(&capability, from_ref(&first.entry)).await.unwrap();
     group.apply(&provider, &first.entry).unwrap();
     let capability = group.capability(&provider).unwrap();
-    lmk_proto::clock::set(ahead);
+    lmk_proto::clock::set(|| 0);
     let cut = group.cut().to_vec();
     let second = group.commit(&provider, &mls, Change { cut, ..Change::default() }).unwrap();
     lmk_proto::clock::set(real);
@@ -3951,8 +3948,10 @@ async fn a_commit_dated_ahead_is_waited_before_as_any_other() {
     drop(group);
     drop(provider);
 
+    let started = std::time::Instant::now();
     alice.node.read_group(&gid.0).await.unwrap();
-    eventually("Alice applies the commit dated ahead", || alice.node.epoch(&gid.0).unwrap() == 4).await;
+    eventually("Alice applies the commit made at 0", || alice.node.epoch(&gid.0).unwrap() == 4).await;
+    assert!(started.elapsed() >= Duration::from_millis(lmk_net::peers::HEAR), "took {:?}", started.elapsed());
     alice.node.shutdown().await.unwrap();
 }
 

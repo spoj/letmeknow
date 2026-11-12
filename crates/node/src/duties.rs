@@ -36,9 +36,9 @@ const RETRY: u64 = 10 * 60 * 1000;
 /// How often a member asks which members' logs their services let go, of those it does not know to be, at most, in
 /// milliseconds.
 const EVICT: u64 = 24 * 3600 * 1000;
-/// How long after the group moved past the last epoch this session showed itself in, by a commit or message of its own,
-/// it sends a `present`: after the updates a message stirs, and well before the services let that epoch's log go, a
-/// week after.
+/// How long after this session last showed itself, by a commit or message of its own, it sends a `present`, once the
+/// group moved past the epoch it showed itself in: after the updates a message stirs, and well before the services let
+/// that epoch's log go, a week after the group moved past it.
 pub(crate) const PRESENT: u64 = 2 * 24 * 3600 * 1000;
 
 /// T, in milliseconds, for a group of `members` whose settings name `update` seconds: that, times the members past 24
@@ -249,11 +249,11 @@ impl Inner {
             }
             let g = st.group(gid)?;
             let behind = g.rec.present < g.mls.epoch();
-            if behind && tick >= g.rec.passed + PRESENT {
+            if behind && tick >= g.rec.presented + PRESENT {
                 self.send(&mut st, gid, &serde_json::to_value(Control::Present)?, None)?;
             }
             let g = st.group(gid)?;
-            let present = if g.rec.present < g.mls.epoch() { g.rec.passed + PRESENT } else { u64::MAX };
+            let present = if g.rec.present < g.mls.epoch() { g.rec.presented + PRESENT } else { u64::MAX };
             let next = if g.rec.stirred { next(g, st.me()) } else { u64::MAX }.min(present);
             let pending = due(&st, g)?;
             // A pass that removes commits at once.
@@ -426,7 +426,7 @@ mod tests {
                 let g = st.group_mut(&gid.0).unwrap();
                 while g.sending.take(0, 1.0, u64::MAX) {}
                 g.rec.lost = if lost { vec![seqs(b"other", 0, &[1])] } else { Vec::new() };
-                (g.rec.present, g.rec.passed) = (0, 0);
+                (g.rec.present, g.rec.presented) = (0, 0);
                 st.save(&gid.0).unwrap();
             }
             alice.inner.duties(&gid.0);

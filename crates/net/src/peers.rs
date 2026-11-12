@@ -401,7 +401,7 @@ impl Peers {
 
     /// Whether to wait before applying a commit that deletes the keys of an epoch, given the seqs of that epoch the
     /// member lacks (kept ones of the epoch the commit ends): not once the holders were tried. `read` is when the node
-    /// began waiting, for this commit or, as it was made before then, for an earlier one.
+    /// began waiting, for this commit or for the earlier ones whose wait it shares.
     pub fn wait(&mut self, group: &Bytes, lacking: &[Seqs], read: u64, now: u64) -> bool {
         let lack = to_set(lacking);
         let since = read.max(self.online);

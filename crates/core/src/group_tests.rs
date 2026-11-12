@@ -353,18 +353,6 @@ fn commit_race() {
 }
 
 #[test]
-fn a_commit_carries_when_its_committer_made_it() {
-    let mut w = World::new(&["A", "B"]);
-    w.found(0, &[1]);
-    lmk_proto::clock::set(|| 1_700_000_000_000);
-    let cut = w.m[0].cut();
-    let commit = w.m[0].commit(Change { cut, ..Change::default() });
-    w.post(commit.entry);
-    let read = w.read(&[0, 1]);
-    assert!(read.iter().all(|read| matches!(read[0].0, Verdict::Commit { time: 1_700_000_000_000, .. })));
-}
-
-#[test]
 fn junk_is_skipped() {
     let mut w = World::new(&["A", "B", "C", "D", "X"]);
     w.found(0, &[1, 2, 3]);

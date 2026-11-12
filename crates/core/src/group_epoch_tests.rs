@@ -226,7 +226,7 @@ fn staged_oversize_and_malformed_builds_restore_everything() {
     a.cancel();
     let group = a.group.as_mut().unwrap();
     group.mls.set_aad(b"transient AAD before a failed build".to_vec());
-    group.state.aad = Aad { invite: Some([3; 32].into()), time: 1, ..Aad::default() };
+    group.state.aad = Aad { invite: Some([3; 32].into()), ..Aad::default() };
     group.save(&a.provider).unwrap();
     let before = a.provider.rows();
     let before_state = serde_json::to_vec(&group.state).unwrap();

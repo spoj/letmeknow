@@ -5,7 +5,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use chacha20poly1305::{XChaCha20Poly1305, aead::{Aead, KeyInit, Payload}};
 use lmk_proto::Bytes;
-use lmk_proto::clock::{corrected, now};
+use lmk_proto::clock::now;
 use lmk_proto::entry::{Entry, signed, welcome_signed};
 use lmk_proto::group::{Device, LEAF_EXTENSION, LEAVE, Leaf, PROTOCOL, SETTINGS_EXTENSION, Service, Settings};
 use lmk_proto::held::{self, Claim, Header, Ref};
@@ -198,7 +198,7 @@ pub struct Change {
 }
 
 /// A commit's authenticated data, inside its sealed entry: the invite the member it adds came in by, the leaves of
-/// members it removes, the entries of the cut state it moves, and when it was made, by the committer's corrected clock.
+/// members it removes, and the entries of the cut state it moves.
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Aad {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -207,8 +207,6 @@ struct Aad {
     left: Vec<Bytes>,
     #[serde(default)]
     moved: Vec<Ref>,
-    #[serde(default)]
-    time: u64,
 }
 
 /// A commit's sealed wire entry, and for an Add the Welcome that admits its joiner.
@@ -277,8 +275,6 @@ pub enum Verdict {
     Commit {
         /// It removes this session.
         removes: bool,
-        /// When its committer made it, by its corrected clock.
-        time: u64,
     },
     /// A commit from this session's own leaf, signed with its key, that this session did not make: its state was copied.
     Copied,
@@ -636,7 +632,7 @@ impl Group {
             g.mls.clear_pending_commit(provider.storage())?;
             let adds = change.add.iter().map(|bytes| key_package_in(provider, bytes)).collect::<Result<Vec<_>>>()?;
             let moved = change.cut.iter().filter(|r| !g.state.cut.contains(r)).cloned().collect();
-            let aad = Aad { invite: change.invite, left: change.left, moved, time: corrected() };
+            let aad = Aad { invite: change.invite, left: change.left, moved };
             g.mls.set_aad(serde_json::to_vec(&aad)?);
             let mut parameters = LeafNodeParameters::builder();
             if let Some(leaf) = &change.leaf {
@@ -706,7 +702,7 @@ impl Group {
                 self.save(provider)?;
                 return Ok(Verdict::Skipped { reason: error.to_string() });
             }
-            return Ok(Verdict::Commit { removes: false, time: self.state.aad.time });
+            return Ok(Verdict::Commit { removes: false });
         }
         match Entry::parse(&entry) {
             Err(error) => Ok(skipped(error)),
@@ -714,7 +710,7 @@ impl Group {
                 let staged = self.guarded(provider, |_| false, |g| g.stage(provider, &commit, &sig));
                 Ok(match staged {
                     Ok(Staged::Copied) => Verdict::Copied,
-                    Ok(Staged::Commit(staged, _, aad)) => Verdict::Commit { removes: staged.self_removed(), time: aad.time },
+                    Ok(Staged::Commit(staged, _, _)) => Verdict::Commit { removes: staged.self_removed() },
                     Err(error) => skipped(error),
                 })
             }

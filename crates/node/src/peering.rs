@@ -338,12 +338,12 @@ impl State {
         self.save(gid)
     }
 
-    /// Records that this session's own commit or message showed it in the group's current epoch, and signs its intro
-    /// again if that names an earlier one.
+    /// Records that this session's own commit or message showed it in the group's current epoch, now, and signs its
+    /// intro again if that names an earlier one.
     pub(crate) fn present(&mut self, gid: &[u8]) -> Result<()> {
-        let me = self.me().to_vec();
+        let (me, now) = (self.me().to_vec(), self.tick());
         let g = self.group_mut(gid)?;
-        g.rec.present = g.mls.epoch();
+        (g.rec.present, g.rec.presented) = (g.mls.epoch(), now);
         let own = g.intros().find(|(intro, _)| intro.member.0 == me).map(|(intro, _)| intro);
         if own.as_ref().is_some_and(|intro| intro.shown.epoch == g.rec.present) {
             return Ok(());
