@@ -48,7 +48,7 @@ pub const STRANGER: u64 = 30_000;
 pub const MAX_CONNECTIONS: usize = 128;
 /// From when a wait starts until it gives up.
 pub const WAIT: u64 = 120_000;
-/// From when a wait starts, or its group's first neighbour connected, whichever is later, how long it holds though no
+/// From when a wait starts, or its group's latest neighbour connected, whichever is later, how long it holds though no
 /// summary shows a holder: a member hears its neighbours' summaries within it.
 pub const HEAR: u64 = 15_000;
 pub const DIALS: usize = 4;
@@ -106,7 +106,7 @@ pub struct Peers {
     groups: BTreeMap<Bytes, Group>,
     conns: BTreeMap<Key, Conn>,
     backoff: BTreeMap<Key, Backoff>,
-    /// Peers with a `Dial` in flight.
+    /// Peers with a `Dial` in flight: until it fails, or their connection is taken.
     dialing: BTreeSet<Key>,
 }
 
@@ -246,6 +246,7 @@ impl Peers {
             self.changed.get_or_insert(now);
         }
         self.backoff.remove(&peer);
+        self.dialing.remove(&peer);
         let conn = Conn { dialed, connected: now, served_at: now, active: now, hello: true, opened: served.clone(), served, sent: BTreeMap::new(), theirs: BTreeMap::new(), told: BTreeMap::new(), introduced: BTreeMap::new(), expired: BTreeMap::new(), has: BTreeMap::new() };
         self.conns.insert(peer, conn);
     }
@@ -308,17 +309,16 @@ impl Peers {
         self.conns.get(peer).is_some_and(|c| c.served.contains(group))
     }
 
-    /// A dial `Out::Dial` asked for has ended. A failed one backs off, and its groups dial their next targets.
-    pub fn dialed(&mut self, peer: &Key, ok: bool, now: u64) {
+    /// A dial `Out::Dial` asked for failed: it backs off, and its groups dial their next targets. One that succeeded ends
+    /// as its connection is taken (`connect`), which may come after the dial returns.
+    pub fn failed(&mut self, peer: &Key, now: u64) {
         self.dialing.remove(peer);
-        if !ok {
-            let b = self.backoff.entry(*peer).or_default();
-            b.failures += 1;
-            b.until = now + (BACKOFF << (b.failures - 1).min(6)).min(MAX_BACKOFF);
-            b.failed = now;
-            let of: Vec<Bytes> = self.groups.iter().filter(|(_, g)| g.own.members.iter().any(|(_, k)| k == peer)).map(|(id, _)| id.clone()).collect();
-            self.dial.extend(of);
-        }
+        let b = self.backoff.entry(*peer).or_default();
+        b.failures += 1;
+        b.until = now + (BACKOFF << (b.failures - 1).min(6)).min(MAX_BACKOFF);
+        b.failed = now;
+        let of: Vec<Bytes> = self.groups.iter().filter(|(_, g)| g.own.members.iter().any(|(_, k)| k == peer)).map(|(id, _)| id.clone()).collect();
+        self.dial.extend(of);
     }
 
     /// Directed traffic on the connection: a want, an answer, files, admission, state.
@@ -429,7 +429,7 @@ impl Peers {
     /// waiting, for this commit or for the earlier ones whose wait it shares.
     pub fn wait(&mut self, group: &Bytes, lacking: &[Seqs], read: u64, now: u64) -> bool {
         let lack = to_set(lacking);
-        let met = self.conns.values().filter(|c| c.served.contains(group)).map(|c| c.connected).min().unwrap_or(read);
+        let met = self.conns.values().filter(|c| c.served.contains(group)).map(|c| c.connected).max().unwrap_or(read);
         let first = |k: &Key| self.dialing.contains(k) && self.backoff.get(k).is_none_or(|b| b.failed < read);
         let dialing = self.dial.contains(group) || self.groups[group].own.members.iter().any(|(_, k)| first(k));
         let untried = !lack.is_empty() && now < read + WAIT && (now < read.max(met) + HEAR || dialing || self.holder(group, lacking, now));

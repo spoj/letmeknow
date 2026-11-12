@@ -173,18 +173,18 @@ impl Inner {
     }
 
 
-    /// Dials a member at the relay its leaves name, and tells `Peers` how it went.
+    /// Dials a member at the relay its leaves name, and tells `Peers` if that failed: a connection made goes to it as its
+    /// `Connected`, which ends the dial there.
     fn dial(self: &Arc<Self>, peer: EndpointId) {
         let relays = self.lock().relays_of(&peer);
         let inner = self.clone();
         spawn(async move {
-            let dialed = inner.net().dial(peer, relays).await;
-            if let Err(error) = &dialed {
+            if let Err(error) = inner.net().dial(peer, relays).await {
                 tracing::debug!("dialing {}: {error:#}", peer.fmt_short());
+                let mut st = inner.lock();
+                let now = st.tick();
+                st.peers.failed(peer.as_bytes(), now);
             }
-            let mut st = inner.lock();
-            let now = st.tick();
-            st.peers.dialed(peer.as_bytes(), dialed.is_ok(), now);
         });
     }
 

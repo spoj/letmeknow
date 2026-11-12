@@ -113,7 +113,6 @@ fn a_full_mesh_dials_every_member_four_at_a_time() {
     let first = dials(&p.poll(0));
     assert_eq!(first.len(), DIALS);
     for k in &first {
-        p.dialed(k, true, 0);
         p.connect(*k, gs(), true, 0);
     }
     assert_eq!(p.next(0), Some(0), "the rest are due once dials end");
@@ -153,19 +152,19 @@ fn a_push_dials_again_past_the_backoff_and_a_connection_clears_it() {
     let mut p = peers();
     p.group(id(), own(1, &[1]), 0);
     assert_eq!(dials(&p.poll(0)), vec![key(1)]);
-    p.dialed(&key(1), false, 0);
+    p.failed(&key(1), 0);
     assert!(dials(&p.poll(1)).is_empty(), "backing off");
     p.poll(DEBOUNCE);
     assert_eq!(p.next(DEBOUNCE), None, "idle");
     assert!(dials(&p.poll(10_000)).is_empty(), "no redial");
     p.push(&id());
     assert_eq!(dials(&p.poll(10_000)), vec![key(1)]);
-    p.dialed(&key(1), false, 10_000);
+    p.failed(&key(1), 10_000);
     p.push(&id());
     assert!(dials(&p.poll(20_000)).is_empty());
     p.push(&id());
     assert_eq!(dials(&p.poll(30_000)), vec![key(1)]);
-    p.dialed(&key(1), false, 30_000);
+    p.failed(&key(1), 30_000);
     p.connect(key(1), gs(), false, 35_000);
     p.disconnect(&key(1), 36_000);
     p.push(&id());
@@ -179,12 +178,11 @@ fn a_failed_dial_dials_the_next_target() {
     p.group(id(), own(1, &(1..=19).collect::<Vec<_>>()), 0);
     let targets = p.targets(&id(), 0);
     for k in dials(&p.poll(0)) {
-        p.dialed(&k, true, 0);
         p.connect(k, gs(), true, 0);
     }
     let second = dials(&p.poll(1));
     assert_eq!(second.len(), K - DIALS);
-    p.dialed(&second[0], false, 1);
+    p.failed(&second[0], 1);
     let next = dials(&p.poll(2));
     assert_eq!(next.len(), 1);
     assert!(!targets.contains(&next[0]));
@@ -245,7 +243,7 @@ fn a_failed_dial_outweighs_the_sightings_before_it() {
     p.connect(a, gs(), false, 0);
     p.frame(&a, &telling(&[(far, 0)]), 0);
     assert!(p.targets(&id(), 0).contains(&far));
-    p.dialed(&far, false, 5_000);
+    p.failed(&far, 5_000);
     assert!(!p.targets(&id(), 20_000).contains(&far), "past its backoff");
     p.frame(&a, &telling(&[(far, 0)]), 20_000);
     assert!(p.targets(&id(), 20_000).contains(&far));
@@ -258,22 +256,17 @@ fn news_of_a_member_in_backoff_is_dialed_when_the_backoff_ends() {
     let mut p = peers();
     p.group(id(), own(1, &(1..=19).collect::<Vec<_>>()), 0);
     let r = ranked();
-    let (a, b, far) = (r[18], r[17], r[16]);
-    p.connect(a, gs(), false, 0);
-    p.connect(b, gs(), false, 0);
-    p.dialed(&far, false, 5_000);
+    let (a, b, c, far) = (r[18], r[17], r[15], r[16]);
+    // Three neighbours, so that the dials to the other targets, still in flight at 15 s, are one short of `DIALS`.
+    for k in [a, b, c] {
+        p.connect(k, gs(), false, 0);
+    }
+    p.failed(&far, 5_000);
     p.frame(&a, &telling(&[(far, 0)]), 10_000);
-    let dial = |p: &mut Peers, now| {
-        let out = dials(&p.poll(now));
-        for k in &out {
-            p.dialed(k, true, now);
-        }
-        out
-    };
-    assert!(!dial(&mut p, 10_000).contains(&far), "backing off");
-    assert!(dial(&mut p, 14_999).is_empty(), "still backing off");
+    assert!(!dials(&p.poll(10_000)).contains(&far), "backing off");
+    assert!(dials(&p.poll(14_999)).is_empty(), "still backing off");
     assert_eq!(p.next(14_999), Some(15_000), "poll is next due as the backoff ends");
-    assert!(dial(&mut p, 15_000).contains(&far), "dialed once the backoff ends");
+    assert!(dials(&p.poll(15_000)).contains(&far), "dialed once the backoff ends");
 }
 
 /// A `hello` tells a neighbour each sighting once, and again only once it is `RETELL` fresher.
@@ -848,10 +841,10 @@ fn wait_loses_once_every_holder_is_struck() {
     assert!(!p.wait(&id(), &lacking, 0, HEAR));
 }
 
-/// A wait holds `HEAR` after its group's first neighbour connected though no summary shows a holder yet: a member back
+/// A wait holds `HEAR` after its group's latest neighbour connected though no summary shows a holder yet: a member back
 /// online hears the summaries that show them within it.
 #[test]
-fn a_wait_holds_for_summaries_after_its_first_neighbour_connects() {
+fn a_wait_holds_for_summaries_after_a_neighbour_connects() {
     let mut p = peers();
     p.group(id(), own(1, &[1]), 0);
     let lacking = vec![seqs(1, &[(5, 5)])];
@@ -861,7 +854,7 @@ fn a_wait_holds_for_summaries_after_its_first_neighbour_connects() {
     p.summary(&id(), heard(1, 1, 1_500, lacking.clone()), false);
     assert!(p.wait(&id(), &lacking, 0, 1_000 + HEAR), "a holder is untried");
     p.disconnect(&key(1), 1_000 + HEAR);
-    p.dialed(&key(1), false, 1_000 + HEAR);
+    p.failed(&key(1), 1_000 + HEAR);
     p.poll(1_000 + HEAR);
     assert!(!p.wait(&id(), &lacking, 0, 1_000 + HEAR));
 }
@@ -876,15 +869,35 @@ fn a_wait_holds_while_its_group_dials_members_not_tried() {
     assert!(p.wait(&id(), &lacking, 0, 0));
     assert_eq!(dials(&p.poll(0)).len(), 2);
     assert!(p.wait(&id(), &lacking, 0, HEAR), "its dials are in flight");
-    p.dialed(&key(1), false, 30_000);
+    p.failed(&key(1), 30_000);
     assert!(p.wait(&id(), &lacking, 0, 30_000), "a failed dial has the group dial again");
     p.poll(30_000);
-    p.dialed(&key(2), false, 31_000);
+    p.failed(&key(2), 31_000);
     p.poll(31_000);
     assert!(!p.wait(&id(), &lacking, 0, 31_000));
     p.push(&id());
     assert_eq!(dials(&p.poll(41_000)).len(), 2);
     assert!(!p.wait(&id(), &lacking, 0, 41_000), "it tried both since it began");
+}
+
+/// A wait holds `HEAR` after its group's latest neighbour connected, and a dial until its connection is taken: a member
+/// whose late dial reaches a holder, its first neighbour holding nothing, hears that holder's summary before it gives
+/// up.
+#[test]
+fn a_wait_holds_for_the_summary_of_a_holder_a_late_dial_reaches() {
+    let mut p = peers();
+    p.group(id(), own(1, &[1, 2, 3]), 0);
+    let lacking = vec![seqs(1, &[(5, 5)])];
+    p.connect(key(1), gs(), false, 0);
+    assert!(p.wait(&id(), &lacking, 0, 0));
+    assert_eq!(dials(&p.poll(0)).len(), 2);
+    p.failed(&key(2), 32_000);
+    p.poll(32_000);
+    assert!(p.wait(&id(), &lacking, 0, 40_000), "the dial to 3 succeeded, its connection not taken yet");
+    p.connect(key(3), gs(), true, 40_000);
+    assert!(p.wait(&id(), &lacking, 0, 40_000 + HEAR - 1), "3's summary may yet come");
+    p.summary(&id(), heard(3, 1, 41_000, lacking.clone()), false);
+    assert!(p.wait(&id(), &lacking, 0, 40_000 + HEAR), "3 holds what is lacking");
 }
 
 /// A wait gives up two minutes after the commit was read, even with an untried holder.
@@ -921,7 +934,7 @@ fn a_holder_past_its_backoff_is_dialed_when_the_wait_starts() {
     p.group(id(), own(1, &[1]), 0);
     let lacking = vec![seqs(1, &[(5, 5)])];
     p.summary(&id(), heard(1, 1, 0, lacking.clone()), false);
-    p.dialed(&key(1), false, HEAR - 1);
+    p.failed(&key(1), HEAR - 1);
     p.poll(HEAR);
     assert!(!p.wait(&id(), &lacking, 0, HEAR), "backing off");
     assert!(p.wait(&id(), &lacking, 31_000, 31_000));
@@ -1046,10 +1059,11 @@ impl Sim {
                 }
             }
             Ev::Dialed { from, to, ok } => {
-                if ok && !self.links.contains(&pair(from, to)) {
+                if !ok {
+                    self.peers[from].failed(&key(to as u8), self.now);
+                } else if !self.links.contains(&pair(from, to)) {
                     self.connect(from, to);
                 }
-                self.peers[from].dialed(&key(to as u8), ok, self.now);
             }
         }
     }
