@@ -395,7 +395,8 @@ pub(crate) struct State {
     early_hellos: Vec<(EndpointId, At)>,
     /// The links of the joins in flight: the members they name are read whole (`Groups::serves`).
     joins: Vec<Invite>,
-    /// Entries of logs not followed yet, with the peers that sent them, at most `TOLD`: taken once the log is followed.
+    /// Logs not followed yet, each whole and of at most a page, as the service of one of this session's groups signed it,
+    /// with the peers that sent them, at most `TOLD`: taken once the log is followed.
     early_entries: Vec<(EndpointId, Bytes, Vec<Bytes>, Head)>,
     /// The latest time a step saw, in milliseconds: `Peers` takes no time from before.
     time: u64,

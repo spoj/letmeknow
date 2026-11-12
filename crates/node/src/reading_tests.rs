@@ -83,6 +83,45 @@ async fn a_removed_member_two_commits_behind_learns_it() {
     assert!(removed, "Bob dropped the removing Entries frame while waiting at the prior commit and never learned he was removed");
 }
 
+/// Entries of a log this session does not follow yet wait only as a whole log, with entries and within a page, that its
+/// service signed: nothing else waits, so nothing else displaces what does.
+#[tokio::test(flavor = "multi_thread")]
+async fn early_entries_wait_only_as_a_whole_signed_log_within_a_page() {
+    use lmk_membership::client::ServeClient;
+    use lmk_proto::head::Head;
+    use lmk_proto::membership::{APPEND_ROWS, PAGE_ROWS};
+
+    let relay = lmk_testing::relay().await;
+    let config = Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[9; 32]) };
+    let alice = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0;
+    alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] }).unwrap();
+    let client = ServeClient::for_service(relay.post(), &relay.service, false).unwrap();
+    let frame = |entries: &[Vec<u8>], head: &Head| Frame::Entries { log: Bytes(head.log_ref.to_vec()), entries: entries.iter().cloned().map(Bytes).collect(), head: head.clone() };
+    let kept = [b"kept".to_vec()];
+    let kept_head = client.append(&[1; 32], &kept).await.unwrap().head;
+    let rows: Vec<Vec<u8>> = (0..=PAGE_ROWS as u64).map(|row| row.to_be_bytes().to_vec()).collect();
+    let mut long_head = None;
+    for chunk in rows.chunks(APPEND_ROWS) {
+        long_head = Some(client.append(&[2; 32], chunk).await.unwrap().head);
+    }
+    let empty_head = client.heads(&[[3; 32]]).await.unwrap().remove(0).unwrap();
+    let unsigned = |log: u8| Head { log_ref: [log; 32], length: 0, hash: [0; 32], time: 0, sig: Bytes(vec![0; 64]) };
+    let junk = [
+        frame(&rows, &long_head.unwrap()),
+        frame(&[], &empty_head),
+        frame(&[b"forged".to_vec()], &kept_head),
+    ];
+    let peer = iroh::SecretKey::from_bytes(&[8; 32]).public();
+    alice.inner.peer_event(lmk_net::Event::Connected(peer, false));
+    alice.inner.peer_event(lmk_net::Event::Frame(peer, frame(&kept, &kept_head)));
+    for junk in junk.into_iter().chain((10..20).map(|log| frame(&vec![Vec::new(); 1000], &unsigned(log)))) {
+        alice.inner.peer_event(lmk_net::Event::Frame(peer, junk));
+    }
+    let early: Vec<Head> = alice.inner.lock().early_entries.iter().map(|(_, _, _, head)| head.clone()).collect();
+    alice.shutdown().await.unwrap();
+    assert_eq!(early, [kept_head]);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_commits_membership_events_come_in_the_step_that_applies_it_before_the_next_epochs_messages() {
     let relay = lmk_testing::relay().await;

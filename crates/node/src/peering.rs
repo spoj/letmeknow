@@ -8,18 +8,20 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
 use iroh::{EndpointId, RelayUrl};
-use lmk_membership::Contradiction;
+use ed25519_dalek::VerifyingKey;
+use lmk_membership::{Contradiction, Frontier};
 use lmk_net::Groups;
 use lmk_net::peers::{self, Own};
 use lmk_proto::Bytes;
 use lmk_proto::directory::relay_url;
 use lmk_proto::head::Head;
+use lmk_proto::membership::Page;
 use lmk_proto::peer::{At, Frame, INTRO, Intro, MAX_INTRO, SUMMARY, Seqs, Shown, Signed, Summary};
 use n0_future::time::{Duration, timeout};
 use serde::{Deserialize, Serialize};
 
 use crate::reading::TOLD;
-use crate::{Epoch, G, Inner, Member, Node, Out, State, Work, get, now, put};
+use crate::{Epoch, G, Inner, Member, Node, Out, State, Work, get, logs, now, put};
 
 /// How many summaries of memberships not known yet a group keeps.
 const UNVERIFIED: usize = 32;
@@ -552,9 +554,15 @@ impl Inner {
         }
         if let Frame::Entries { log, entries, head } = frame {
             if log.0 == head.log_ref && !st.logs.contains_key(&log.0) {
-                st.early_entries.push((peer, log, entries, head));
-                let excess = st.early_entries.len().saturating_sub(TOLD);
-                st.early_entries.drain(..excess);
+                // It waits only as a whole log, of at most a page, that the service of one of this session's groups signed, as
+                // a member that removed this session sends it: nothing else displaces it.
+                let signed = |g: &G| logs::authority(&g.mls.settings().membership).ok().filter(|service| VerifyingKey::from_bytes(service).is_ok_and(|key| head.verify(&key)));
+                let service = st.groups.values().find_map(signed).filter(|_| !entries.is_empty());
+                if let Some(Ok(Page { entries, head, .. })) = service.map(|service| Frontier::empty(service, head.log_ref).verify_page(Page { after: 0, entries, head })) {
+                    st.early_entries.push((peer, log, entries, head));
+                    let excess = st.early_entries.len().saturating_sub(TOLD);
+                    st.early_entries.drain(..excess);
+                }
             } else if log.0 == head.log_ref && self.vouched(st, &head, &peer) {
                 self.take_entries(st, &log.0, head.length.saturating_sub(entries.len() as u64), entries, head)?;
             }
