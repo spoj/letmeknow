@@ -323,8 +323,9 @@ pub(crate) struct G {
     fetch: Option<(Vec<Seqs>, u64)>,
     /// Summaries of memberships this session does not know yet, as a joiner's before its Add applies here.
     unverified: Vec<(EndpointId, Signed)>,
-    /// Intros of memberships this session does not know yet, or naming an epoch it has not reached.
-    early_intros: Vec<Signed>,
+    /// Intros of memberships this session does not know yet, or naming an epoch it has not reached, each as its member
+    /// signed it: by membership, its latest, with its version.
+    early_intros: BTreeMap<(Bytes, u64), (u64, Signed)>,
     /// This session's summary changed since it was signed.
     changed: bool,
 }
@@ -344,7 +345,7 @@ impl G {
             waiting: false,
             fetch: None,
             unverified: Vec::new(),
-            early_intros: Vec::new(),
+            early_intros: BTreeMap::new(),
             changed: true,
         }
     }
@@ -974,6 +975,70 @@ mod tests {
         assert!(st.peers.summary(&gid, heard, false));
         drop(st);
         for node in [bob, carol] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    /// An intro of a membership not known yet, or naming an epoch not reached yet, waits only once its member's signature
+    /// holds, and only its membership's latest; those of memberships not known take at most 32 places, which a known
+    /// member's does not share: no flood keeps a member's intro from waiting until its epoch comes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_early_intro_waits_signed_its_memberships_latest_apart_from_unknown_ones() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use lmk_proto::peer::{INTRO, Intro, Shown};
+
+        let relay = lmk_testing::relay().await;
+        let (alice, bob) = (node(&relay, relay.post()).await, node(&relay, relay.post()).await);
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let gid = alice.create(settings).unwrap();
+        bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        let epoch = bob.epoch(&gid.0).unwrap();
+        n0_future::time::timeout(Duration::from_secs(60), async {
+            while alice.epoch(&gid.0).unwrap() < epoch {
+                n0_future::time::sleep(Duration::from_millis(50)).await;
+            }
+        }).await.unwrap();
+        // Bob takes no frames, and reads no further, while Alice moves the group on and signs her intros in its next epoch.
+        for task in bob.inner.tasks.lock().unwrap().drain(..) {
+            task.abort();
+        }
+        let device = Bytes(SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes().to_vec());
+        alice.change_settings(&gid.0, |settings| settings.admitted.push(device.clone())).await.unwrap();
+        let alice_key = alice.key();
+        let own = || alice.inner.lock().group(&gid.0).unwrap().intros().find(|(intro, _)| intro.member == alice_key).unwrap().1.clone();
+        let first = own();
+        alice.set_intro(&gid.0, Some("newer".into())).unwrap();
+        let newer = own();
+        let unknown = |seed: u8, version: u64| {
+            let key = SigningKey::from_bytes(&[seed; 32]);
+            let shown = Shown { epoch: epoch + 1, capability: [0; 32] };
+            let intro = Intro { group: gid.clone(), member: Bytes(key.verifying_key().to_bytes().to_vec()), joined: epoch + 1, version, shown, text: None };
+            let body = serde_json::to_vec(&intro).unwrap();
+            Signed { sig: Bytes(key.sign(&[INTRO, &body].concat()).to_bytes().to_vec()), body: Bytes(body) }
+        };
+        let mut st = bob.inner.lock();
+        let forged = Signed { sig: Bytes(st.session.sign(&[INTRO, &first.body.0].concat())), body: first.body.clone() };
+        let waiting = |st: &State| st.group(&gid.0).unwrap().early_intros.len();
+        for version in 1..=40 {
+            st.intro(&gid.0, unknown(1, version)).unwrap();
+        }
+        assert_eq!(waiting(&st), 1, "a membership's latest intro waits in place of its earlier ones");
+        for seed in 2..=40 {
+            st.intro(&gid.0, unknown(seed, 1)).unwrap();
+        }
+        assert_eq!(waiting(&st), 32, "those of memberships not known take at most 32 places");
+        for _ in 0..32 {
+            st.intro(&gid.0, forged.clone()).unwrap();
+        }
+        assert_eq!(waiting(&st), 32, "an intro its member did not sign does not wait");
+        for signed in [first, newer] {
+            st.intro(&gid.0, signed).unwrap();
+        }
+        assert_eq!(waiting(&st), 33, "a known member's intro waits apart");
+        drop(st);
+        bob.read_group(&gid.0).await.unwrap();
+        assert_eq!(bob.intros(&gid.0).unwrap().get(&alice_key).map(String::as_str), Some("newer"));
+        for node in [alice, bob] {
             node.shutdown().await.unwrap();
         }
     }

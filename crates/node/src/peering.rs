@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::reading::TOLD;
 use crate::{Epoch, G, Inner, Member, Node, Out, State, Work, get, logs, now, put};
 
-/// How many summaries of memberships not known yet a group keeps.
+/// How many summaries, and intros, of memberships not known yet a group keeps.
 const UNVERIFIED: usize = 32;
 /// The largest signed intro taken, in bytes: several times one whose text is `MAX_INTRO` bytes.
 const SIGNED_INTRO: usize = 4096;
@@ -301,7 +301,7 @@ impl State {
         for (peer, signed) in unverified {
             self.summary(gid, peer, signed)?;
         }
-        for signed in std::mem::take(&mut self.group_mut(gid)?.early_intros) {
+        for (_, signed) in std::mem::take(&mut self.group_mut(gid)?.early_intros).into_values() {
             self.intro(gid, signed)?;
         }
         Ok(())
@@ -310,8 +310,9 @@ impl State {
     /// Takes an intro any neighbour passed on, of at most `MAX_INTRO` bytes, and `SIGNED_INTRO` as signed: checked against
     /// its membership and its member's signature, and kept if newer, with the epoch it names, from its member's joining
     /// on, as where its member is, if later than this session knew. The capability it names of that epoch's log is this
-    /// session's own where it holds one, and else its member's claim alone. One of a membership this session does not
-    /// know yet, or naming an epoch it has not reached, is kept a while.
+    /// session's own where it holds one, and else its member's claim alone. One its member signed, of a membership this
+    /// session does not know yet or naming an epoch it has not reached, waits in place of its membership's earlier one:
+    /// those of memberships not known take at most `UNVERIFIED` places, which a known member's does not share.
     pub(crate) fn intro(&mut self, gid: &[u8], signed: Signed) -> Result<()> {
         if signed.body.0.len() + signed.sig.0.len() > SIGNED_INTRO {
             return Ok(());
@@ -322,15 +323,19 @@ impl State {
         if intro.group.0 != gid || intro.text.as_ref().is_some_and(|text| text.len() > MAX_INTRO) || epoch < intro.joined {
             return Ok(());
         }
-        let known = g.mls.joined(&intro.member.0) == Some(intro.joined);
-        if !known || epoch > g.mls.epoch() {
-            if (known || intro.joined > g.mls.epoch()) && g.early_intros.len() < UNVERIFIED {
-                g.early_intros.push(signed);
-            }
-            return Ok(());
-        }
         let newer = g.intros().all(|(held, _)| held.member != intro.member || held.joined != intro.joined || held.version < intro.version);
         if !newer || !lmk_core::group::verify(&intro.member.0, INTRO, &signed.body.0, &signed.sig.0) {
+            return Ok(());
+        }
+        let known = g.mls.joined(&intro.member.0) == Some(intro.joined);
+        if !known || epoch > g.mls.epoch() {
+            let membership = (intro.member.clone(), intro.joined);
+            let waiting = g.early_intros.get(&membership).map(|(version, _)| *version);
+            let unknown = g.early_intros.keys().filter(|(key, joined)| g.mls.joined(&key.0) != Some(*joined)).count();
+            let room = known || intro.joined > g.mls.epoch() && (waiting.is_some() || unknown < UNVERIFIED);
+            if room && waiting.is_none_or(|version| version < intro.version) {
+                g.early_intros.insert(membership, (intro.version, signed));
+            }
             return Ok(());
         }
         let g = self.group(gid)?;
