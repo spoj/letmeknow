@@ -249,8 +249,9 @@ struct Rec {
     /// message, a summary in the current epoch, or the epoch its intro names. One it knows none of is taken to be at
     /// `since`.
     members: Vec<(Bytes, u64)>,
-    /// The epoch this session joined in.
+    /// The epoch this session joined in, and when, in milliseconds.
     since: u64,
+    joined_at: u64,
     /// The epochs behind the current one that members are at, each with its log's capability and service: this session's
     /// own, and members' claims.
     epochs: Vec<Epoch>,
@@ -349,8 +350,12 @@ impl G {
     }
 
     /// The record of the epoch behind the current one that the member with key `key` is in, if this session holds one: its
-    /// own, or that member's claim.
+    /// own, or that member's claim. None in this session's first `EVICT` in the group: it removes no one for falling
+    /// behind before it holds each member's newest intro.
     fn behind(&self, key: &[u8]) -> Option<&Epoch> {
+        if now() < self.rec.joined_at + duties::EVICT {
+            return None;
+        }
         let at = self.at_epoch(key);
         self.rec.epochs.iter().find(|epoch| epoch.epoch == at && epoch.member.as_ref().is_none_or(|member| member.0 == key))
     }
@@ -558,7 +563,7 @@ impl State {
     fn add_group(&mut self, mls: Group, mut rec: Rec) -> Result<Vec<u8>> {
         let gid = mls.id().to_vec();
         let base = rec.position;
-        (rec.resealed, rec.since) = (mls.epoch(), mls.epoch());
+        (rec.resealed, rec.since, rec.joined_at) = (mls.epoch(), mls.epoch(), now());
         rec.authors = mls.cut().iter().map(|r| Author::new(r.key.clone(), r.joined, r.seq)).collect();
         self.groups.insert(gid.clone(), G::new(mls, rec));
         self.next_log(&gid, base)?;

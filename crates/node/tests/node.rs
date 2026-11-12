@@ -1181,8 +1181,9 @@ fn a_joiner_removes_a_member_away_since_before_it_joined_by_its_intro() {
 
 /// An intro counts for its own member only. A joiner keeps the capability an intro names for an epoch before it joined,
 /// which it cannot check, as that member's claim alone: Mallory's intro naming the epoch Bob is in, with a log the service
-/// let go, leaves Mallory behind and Bob in. An intro naming an epoch ahead of the joiner's waits, and one naming another
-/// capability than the joiner's own of its epoch, or an epoch before its member joined, is not taken.
+/// let go, leaves Bob in, and Mallory behind, removed a day after the joiner joined. An intro naming an epoch ahead of
+/// the joiner's waits, and one naming another capability than the joiner's own of its epoch, or an epoch before its
+/// member joined, is not taken.
 #[test]
 fn an_intro_counts_for_its_own_member_only() {
     use lmk_proto::membership::{Expiry, Known};
@@ -1228,7 +1229,7 @@ fn an_intro_counts_for_its_own_member_only() {
         };
 
         // Carol hears Mallory's claim and the expiry of its log, then Bob's intro, before her group is added.
-        let mut carol = stored(&relay, &dir.join("carol.db")).await;
+        let carol = stored(&relay, &dir.join("carol.db")).await;
         let mut bob_hand = hand(&relay, member_of(&bob_db).0, &carol.node).await;
         let claim = Shown { epoch: bob_shown.epoch, capability: gone };
         bob_hand.send(&hello(&mallory, mallory_joined, base, claim, "mallory", vec![expiry])).await;
@@ -1248,6 +1249,9 @@ fn an_intro_counts_for_its_own_member_only() {
         bob_hand.settle(&gid).await;
         assert_eq!(carol.node.intros(&gid.0).unwrap().get(&bob_key).map(String::as_str), Some("bob"), "none of Bob's later intros is taken");
 
+        carol.node.shutdown().await.unwrap();
+        SHIFT.fetch_add(DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        let mut carol = stored(&relay, &dir.join("carol.db")).await;
         let left = carol.until(|e| match e {
             Event::Left { member, .. } => Some(member.key),
             _ => None,
@@ -1382,7 +1386,7 @@ fn expired_epochs(db: &Path, gid: &Bytes) -> Vec<u64> {
 
 /// A joiner takes from its admitter the expiries it holds. Alice, no longer an admin, passes on Bob's expiry without her
 /// duties removing him before Carol's Add, and can append nothing past it. Carol, the admin, can ask the service nothing,
-/// keeps the expiry, and started again removes Bob, whose epoch's log was let go.
+/// keeps the expiry, and started again a day after she joined removes Bob, whose epoch's log was let go.
 #[test]
 fn a_joiner_takes_the_expiries_its_admitter_holds() {
     static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1439,6 +1443,7 @@ fn a_joiner_takes_the_expiries_its_admitter_holds() {
             session.node.shutdown().await.unwrap();
         }
 
+        SHIFT.fetch_add(DAY_MS, std::sync::atomic::Ordering::Relaxed);
         let mut carol = stored_with(&relay, &carol_db, failing(relay.post(), |route| route.ends_with("/heads"))).await;
         let by = carol.until(|e| match e {
             Event::Left { member, by, .. } if member.key == bob_key => Some(by),
