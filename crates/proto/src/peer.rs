@@ -56,8 +56,8 @@ pub struct At {
     /// Members' signed intros the sender holds and has not told the receiver, each as its member signed it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intros: Vec<Signed>,
-    /// Expiries of logs of the group's earlier epochs, as their service signed them, that the sender holds and has not
-    /// told the receiver.
+    /// Expiries of logs of the group's earlier epochs, as their service signed them, that a sender of 0.26.0 holds and has
+    /// not told the receiver: this version sends none, and ignores those it is told.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expired: Vec<Expiry>,
 }

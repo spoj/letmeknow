@@ -511,10 +511,6 @@ impl Inner {
         };
         let h = opened.header;
         let id = opened.id;
-        // Its sealing shows its author in that epoch, for its log's retention.
-        if h.author.0 != st.me() && st.group(gid)?.mls.joined(&h.author.0) == Some(h.joined) {
-            st.at(gid, &h.author.0, opened.epoch)?;
-        }
         match st.id_at(gid, &h.author.0, h.joined, h.seq)? {
             Some(held) if held.0 == id => {
                 let mut record = st.record(gid, &id)?.context("a held message without its record")?;

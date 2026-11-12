@@ -8,7 +8,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, ensure};
-use ed25519_dalek::VerifyingKey;
 use lmk_core::provider::SqliteProvider;
 use lmk_membership::client::{Post, ServeClient};
 use lmk_membership::{Contradiction, Expired, Frontier, Refused, Unsupported, WrongDirectory};
@@ -16,12 +15,12 @@ use lmk_net::peers::WAIT;
 use lmk_proto::Bytes;
 use lmk_proto::group::Service;
 use lmk_proto::head::{self, Head};
-use lmk_proto::membership::{Expiry, STALE};
+use lmk_proto::membership::STALE;
 use lmk_proto::clock::corrected;
 use n0_future::time::{Duration, timeout};
 use serde::{Deserialize, Serialize};
 
-use crate::{Epoch, Inner, SendError, State, Work, get, hex, put};
+use crate::{Inner, SendError, State, Work, get, hex, put};
 
 pub(crate) const NOT_FOLLOWED: &str = "this session does not follow that log";
 
@@ -106,18 +105,6 @@ impl Log {
             Some(head) => Frontier::from_head(service, id, head.clone()),
             None => Ok(Frontier::empty(service, id)),
         }
-    }
-}
-
-impl Epoch {
-    /// The reference of the epoch's log at its service.
-    pub(crate) fn reference(&self) -> Result<[u8; 32]> {
-        Ok(head::reference(&authority(&self.service)?, &self.capability))
-    }
-
-    /// Whether this session knows its log let go.
-    pub(crate) fn gone(&self) -> bool {
-        self.expired.is_some() || self.forgotten
     }
 }
 
@@ -231,28 +218,6 @@ impl State {
         logs
     }
 
-    /// Takes expiries of logs of the group's earlier epochs, asked of their services or told by a neighbour, and the
-    /// references of logs `forgotten`, that their services answered this session's own ask with a head of length 0
-    /// (`let_go`): each expiry its service signed, and each forgotten log, of an epoch a member is in, leaves the
-    /// members in that epoch behind, or the member whose claim it is.
-    pub(crate) fn take_expiries(&mut self, gid: &[u8], expiries: &[Expiry], forgotten: &[[u8; 32]]) -> Result<bool> {
-        let g = self.group_mut(gid)?;
-        let key = VerifyingKey::from_bytes(&authority(&g.mls.settings().membership)?)?;
-        let mut taken = false;
-        for epoch in g.rec.epochs.iter_mut().filter(|epoch| epoch.expired.is_none()) {
-            let reference = epoch.reference()?;
-            if let Some(expiry) = expiries.iter().find(|expiry| expiry.log_ref == reference && expiry.verify(&key)) {
-                (epoch.expired, taken) = (Some(expiry.clone()), true);
-            } else if forgotten.contains(&reference) {
-                (epoch.forgotten, taken) = (true, true);
-            }
-        }
-        if taken {
-            self.save(gid)?;
-        }
-        Ok(taken)
-    }
-
     /// Drops a group's earlier logs read longer than `before`.
     pub(crate) fn drop_earlier(&mut self, gid: &[u8], before: u64) -> Result<()> {
         let mut logs = self.group_logs(gid);
@@ -306,54 +271,6 @@ impl Inner {
             }
             _ => self.lapse(&mut self.lock(), &id).and(Err(SendError::LetGo.into())),
         }
-    }
-
-    /// Asks the services whether the logs the group's members are behind in were let go, but those known to be.
-    pub(crate) async fn ask_behind(self: &Arc<Self>, gid: &[u8]) -> Result<()> {
-        let asked: Vec<Epoch> = {
-            let st = self.lock();
-            let g = st.group(gid)?;
-            g.rec.epochs.iter().filter(|e| e.epoch < g.mls.epoch() && !e.gone()).cloned().collect()
-        };
-        if asked.is_empty() {
-            return Ok(());
-        }
-        let (expiries, forgotten) = self.let_go(asked.iter().map(|epoch| (epoch.service.clone(), epoch.capability)).collect()).await;
-        self.lock().take_expiries(gid, &expiries, &forgotten).map(drop)
-    }
-
-    /// Of the logs among `logs`, each a service and a capability of an epoch behind the group's current one, those their
-    /// services let go: the expiries of those they answer so, and the references of those they answer with a head of
-    /// length 0. Such a log held the commit that ended its epoch, so it holds nothing once its service forgot it,
-    /// `EXPIRED_DAYS` after it let it go.
-    pub(crate) async fn let_go(&self, logs: Vec<(Service, [u8; 32])>) -> (Vec<Expiry>, Vec<[u8; 32]>) {
-        let mut services: Vec<(Service, Vec<[u8; 32]>)> = Vec::new();
-        for (service, capability) in logs {
-            match services.iter_mut().find(|(s, _)| *s == service) {
-                Some((_, capabilities)) => capabilities.push(capability),
-                None => services.push((service, vec![capability])),
-            }
-        }
-        let (mut expiries, mut forgotten) = (Vec::new(), Vec::new());
-        for (service, capabilities) in services {
-            let answers = match self.clients.client(&service) {
-                Ok(client) => client.heads(&capabilities).await,
-                Err(error) => Err(error),
-            };
-            match answers {
-                Ok(answers) => {
-                    for answer in answers {
-                        match answer {
-                            Ok(head) if head.length == 0 => forgotten.push(head.log_ref),
-                            Ok(_) => {}
-                            Err(expiry) => expiries.push(expiry),
-                        }
-                    }
-                }
-                Err(error) => self.report(&error),
-            }
-        }
-        (expiries, forgotten)
     }
 
     /// Warns once of what the service answered that it is not the group's, or runs another minor. Other failures are

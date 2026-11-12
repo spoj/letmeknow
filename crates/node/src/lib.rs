@@ -29,10 +29,9 @@ use lmk_core::provider::SqliteProvider;
 use lmk_membership::client::Post;
 use lmk_net::peers::Peers;
 use lmk_net::Net;
-use lmk_proto::group::{Device, Service};
+use lmk_proto::group::Device;
 use lmk_proto::head::Head;
 use lmk_proto::links::Invite;
-use lmk_proto::membership::Expiry;
 use lmk_proto::peer::{At, Frame, Seqs, Signed};
 use lmk_proto::Bytes;
 use n0_future::task::{JoinHandle, spawn};
@@ -218,8 +217,6 @@ struct Rec {
     /// The group delivered a message or changed its members since this session's leaf was last updated: an update is
     /// due once T passed.
     stirred: bool,
-    /// When this session last asked which members' logs their services let go, in milliseconds.
-    evicted: u64,
     /// The latest epoch this session's own commit or message showed it in, and when it last did: while it is behind, a
     /// `present` is due `PRESENT` after that.
     present: u64,
@@ -245,35 +242,8 @@ struct Rec {
     commits: Vec<(u64, u64)>,
     /// The epoch this session's messages past its cut were last sealed again in.
     resealed: u64,
-    /// The latest epoch each other member showed itself in, as far as this session knows: by its Add or latest commit, a
-    /// message, a summary in the current epoch, or the epoch its intro names. One it knows none of is taken to be at
-    /// `since`.
-    members: Vec<(Bytes, u64)>,
     /// The epoch this session joined in.
     since: u64,
-    /// The epochs behind the current one that members are at, each with its log's capability and service: this session's
-    /// own, and members' claims.
-    epochs: Vec<Epoch>,
-}
-
-/// An epoch behind a group's current one, with its log's capability and service: a member still in it reads that log.
-#[derive(Clone, Serialize, Deserialize)]
-struct Epoch {
-    epoch: u64,
-    capability: [u8; 32],
-    service: Service,
-    /// The member whose intro named it, where this session holds no capability of its own of that epoch: it counts for
-    /// that member alone.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    member: Option<Bytes>,
-    /// The service's expiry of its log, once this session asked or a neighbour told it: the members in it are left
-    /// behind.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    expired: Option<Expiry>,
-    /// The service answered this session's own ask with a head of length 0: its log held the commit that ended the
-    /// epoch, so the service let it go and forgot it, and the members in it are left behind. No neighbour shows that, as
-    /// a member could keep such a head from before that commit.
-    forgotten: bool,
 }
 
 /// An invite, as its inviter shared it with the group, or kept for one member.
@@ -322,8 +292,8 @@ pub(crate) struct G {
     fetch: Option<(Vec<Seqs>, u64)>,
     /// Summaries of memberships this session does not know yet, as a joiner's before its Add applies here.
     unverified: Vec<(EndpointId, Signed)>,
-    /// Intros of memberships this session does not know yet, or naming an epoch it has not reached, each as its member
-    /// signed it: by membership, its latest, with its version.
+    /// Intros of memberships this session does not know yet, each as its member signed it: by membership, its latest,
+    /// with its version.
     early_intros: BTreeMap<(Bytes, u64), (u64, Signed)>,
     /// This session's summary changed since it was signed.
     changed: bool,
@@ -347,11 +317,6 @@ impl G {
             early_intros: BTreeMap::new(),
             changed: true,
         }
-    }
-
-    /// The epoch the other member with key `key` is in, as far as this session knows (`Rec::members`).
-    fn at_epoch(&self, key: &[u8]) -> u64 {
-        self.rec.members.iter().find(|(member, _)| member.0 == key).map_or(self.rec.since, |(_, epoch)| *epoch)
     }
 
     /// The seq of the `leave` of the current membership of the member with key `key`, if it asked to leave, and the leave
@@ -574,9 +539,6 @@ impl State {
         for signed in early.iter().flat_map(|(_, at)| at.intros.clone()) {
             self.intro(&gid, signed)?;
         }
-        for (_, at) in &early {
-            self.take_expiries(&gid, &at.expired, &[])?;
-        }
         self.refresh(&gid);
         for (peer, at) in early {
             self.peers.frame(peer.as_bytes(), &Frame::Hello { groups: vec![at] }, now);
@@ -638,7 +600,7 @@ pub fn fp(key: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lmk_proto::group::{PROTOCOL, Settings, UPDATE};
+    use lmk_proto::group::{PROTOCOL, Service, Settings, UPDATE};
     use lmk_testing::Relay;
 
     async fn node(relay: &Relay, post: Post) -> Node {
@@ -967,11 +929,11 @@ mod tests {
         }
     }
 
-    /// An intro of a membership not known yet, or naming an epoch not reached yet, waits only once its member's signature
-    /// holds, and only its membership's latest; those of memberships not known take at most 32 places, which a known
-    /// member's does not share: no flood keeps a member's intro from waiting until its epoch comes.
+    /// An intro of a membership not known yet waits only once its member's signature holds, and only its membership's
+    /// latest, in at most 32 places; a known member's is kept at once, even one naming an epoch not reached yet: no flood
+    /// keeps a member's intro from its members.
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_early_intro_waits_signed_its_memberships_latest_apart_from_unknown_ones() {
+    async fn an_unknown_memberships_intro_waits_signed_and_a_known_members_is_kept_whatever_its_epoch() {
         use ed25519_dalek::{Signer, SigningKey};
         use lmk_proto::peer::{INTRO, Intro, Shown};
 
@@ -1022,10 +984,9 @@ mod tests {
         for signed in [first, newer] {
             st.intro(&gid.0, signed).unwrap();
         }
-        assert_eq!(waiting(&st), 33, "a known member's intro waits apart");
+        assert_eq!(waiting(&st), 32, "a known member's intro does not wait");
         drop(st);
-        bob.read_group(&gid.0).await.unwrap();
-        assert_eq!(bob.intros(&gid.0).unwrap().get(&alice_key).map(String::as_str), Some("newer"));
+        assert_eq!(bob.intros(&gid.0).unwrap().get(&alice_key).map(String::as_str), Some("newer"), "though it names an epoch Bob has not reached");
         for node in [alice, bob] {
             node.shutdown().await.unwrap();
         }

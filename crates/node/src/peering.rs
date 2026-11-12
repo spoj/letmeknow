@@ -21,7 +21,7 @@ use n0_future::time::{Duration, timeout};
 use serde::{Deserialize, Serialize};
 
 use crate::reading::TOLD;
-use crate::{Epoch, G, Inner, Member, Node, Out, State, Work, get, logs, now, put};
+use crate::{G, Inner, Member, Node, Out, State, get, logs, now, put};
 
 /// How many summaries, and intros, of memberships not known yet a group keeps.
 const UNVERIFIED: usize = 32;
@@ -98,7 +98,6 @@ impl State {
         let g = self.groups.get_mut(gid).unwrap();
         let (wanted, stale) = g.wanted(now, &me);
         let intros = g.intros().map(|(intro, signed)| ((intro.member, intro.joined), (intro.version, signed.clone()))).collect();
-        let expired = g.rec.epochs.iter().filter_map(|epoch| epoch.expired.clone()).collect();
         let members = g.mls.members().into_iter().filter(|m| m.key != me).filter_map(|m| {
             let iroh = m.leaf.key.0.as_slice().try_into().expect("a proven leaf names an iroh key");
             Some(((Bytes(m.key.clone()), g.mls.joined(&m.key)?), iroh))
@@ -113,7 +112,6 @@ impl State {
             wanted,
             stale,
             intros,
-            expired,
         }
     }
 
@@ -277,9 +275,6 @@ impl State {
         if !self.peers.summary(&group, heard, false) {
             return Ok(());
         }
-        if summary.epoch == self.group(gid)?.mls.epoch() {
-            self.at(gid, &summary.member.0, summary.epoch)?;
-        }
         put(&self.provider, &heard_key(gid, &summary.member.0, summary.joined), &Saved { signed, at: now })?;
         let g = self.groups.get_mut(gid).unwrap();
         let membership = (summary.member.clone(), summary.joined);
@@ -294,8 +289,7 @@ impl State {
         self.save(gid)
     }
 
-    /// Takes again the summaries and intros kept until a commit made their memberships known, or reached the epochs their
-    /// intros name.
+    /// Takes again the summaries and intros kept until a commit made their memberships known.
     pub(crate) fn reverify(&mut self, gid: &[u8]) -> Result<()> {
         let unverified = std::mem::take(&mut self.group_mut(gid)?.unverified);
         for (peer, signed) in unverified {
@@ -308,52 +302,32 @@ impl State {
     }
 
     /// Takes an intro any neighbour passed on, of at most `MAX_INTRO` bytes, and `SIGNED_INTRO` as signed: checked against
-    /// its membership and its member's signature, and kept if newer, with the epoch it names, from its member's joining
-    /// on, as where its member is, if later than this session knew. The capability it names of that epoch's log is this
-    /// session's own where it holds one, and else its member's claim alone. One its member signed, of a membership this
-    /// session does not know yet or naming an epoch it has not reached, waits in place of its membership's earlier one:
-    /// those of memberships not known take at most `UNVERIFIED` places, which a known member's does not share.
+    /// its membership and its member's signature, and kept if newer, whatever epoch it names. One its member signed, of a
+    /// membership this session does not know yet that began after its epoch, waits in place of its membership's earlier
+    /// one, in at most `UNVERIFIED` places.
     pub(crate) fn intro(&mut self, gid: &[u8], signed: Signed) -> Result<()> {
         if signed.body.0.len() + signed.sig.0.len() > SIGNED_INTRO {
             return Ok(());
         }
         let Ok(intro) = serde_json::from_slice::<Intro>(&signed.body.0) else { return Ok(()) };
-        let Shown { epoch, capability } = intro.shown;
         let g = self.group_mut(gid)?;
-        if intro.group.0 != gid || intro.text.as_ref().is_some_and(|text| text.len() > MAX_INTRO) || epoch < intro.joined {
+        if intro.group.0 != gid || intro.text.as_ref().is_some_and(|text| text.len() > MAX_INTRO) {
             return Ok(());
         }
         let newer = g.intros().all(|(held, _)| held.member != intro.member || held.joined != intro.joined || held.version < intro.version);
         if !newer || !lmk_core::group::verify(&intro.member.0, INTRO, &signed.body.0, &signed.sig.0) {
             return Ok(());
         }
-        let known = g.mls.joined(&intro.member.0) == Some(intro.joined);
-        if !known || epoch > g.mls.epoch() {
+        if g.mls.joined(&intro.member.0) != Some(intro.joined) {
             let membership = (intro.member.clone(), intro.joined);
             let waiting = g.early_intros.get(&membership).map(|(version, _)| *version);
-            let unknown = g.early_intros.keys().filter(|(key, joined)| g.mls.joined(&key.0) != Some(*joined)).count();
-            let room = known || intro.joined > g.mls.epoch() && (waiting.is_some() || unknown < UNVERIFIED);
+            let room = intro.joined > g.mls.epoch() && (waiting.is_some() || g.early_intros.len() < UNVERIFIED);
             if room && waiting.is_none_or(|version| version < intro.version) {
                 g.early_intros.insert(membership, (intro.version, signed));
             }
             return Ok(());
         }
-        let g = self.group(gid)?;
-        let own = if epoch == g.mls.epoch() {
-            Some(g.mls.capability(&self.provider)?)
-        } else {
-            g.rec.epochs.iter().find(|e| e.epoch == epoch && e.member.is_none()).map(|e| e.capability)
-        };
-        if own.is_some_and(|own| own != capability) {
-            return Ok(());
-        }
-        self.group_mut(gid)?.keep_intro(&intro, signed);
-        self.at(gid, &intro.member.0, epoch)?;
-        let g = self.group_mut(gid)?;
-        let claimed = g.rec.epochs.iter().any(|e| e.epoch == epoch && e.member.as_ref() == Some(&intro.member));
-        if own.is_none() && !claimed && g.at_epoch(&intro.member.0) == epoch {
-            g.rec.epochs.push(Epoch { epoch, capability, service: g.mls.settings().membership, member: Some(intro.member), expired: None, forgotten: false });
-        }
+        g.keep_intro(&intro, signed);
         self.save(gid)
     }
 
@@ -545,9 +519,6 @@ impl Inner {
                 }
                 for signed in at.intros.clone() {
                     st.intro(&at.group.0, signed)?;
-                }
-                if st.take_expiries(&at.group.0, &at.expired, &[])? {
-                    self.work.send(Work::Duties(at.group.0.clone())).ok();
                 }
                 st.refresh(&at.group.0);
             }

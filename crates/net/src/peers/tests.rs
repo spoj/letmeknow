@@ -32,7 +32,6 @@ fn own(epoch: u64, members: &[u8]) -> Own {
         wanted: vec![],
         stale: vec![],
         intros: BTreeMap::new(),
-        expired: vec![],
     }
 }
 
@@ -316,49 +315,6 @@ fn an_intro_is_told_once_to_each_neighbour_that_did_not_tell_it() {
     p.group(id(), own(1, &[1, 2]), 4_000);
     p.connect(key(1), gs(), false, 4_000);
     assert_eq!(intros(&p.poll(4_000))[&key(1)], vec![], "a removed member's intro goes no further");
-}
-
-/// A `hello` tells a neighbour each expiry once, as soon as it is held, and none the neighbour told; a neighbour connected
-/// again is told them all again.
-#[test]
-fn an_expiry_is_told_once_to_each_neighbour_that_did_not_tell_it() {
-    let mut p = peers();
-    let members: Vec<u8> = (1..=2).collect();
-    p.group(id(), own(1, &members), 0);
-    p.connect(key(1), gs(), false, 0);
-    p.connect(key(2), gs(), false, 0);
-    p.poll(0);
-    let expiry = |n: u8| Expiry { log_ref: [n; 32], sig: Bytes(vec![n; 64]) };
-    let with = |expired: Vec<Expiry>| Own { expired, ..own(1, &members) };
-    let expired = |out: &[Out]| -> BTreeMap<Key, Vec<Expiry>> {
-        out.iter().filter_map(|o| match o {
-            Out::Frame(k, Frame::Hello { groups }) => Some((*k, groups[0].expired.clone())),
-            _ => None,
-        }).collect()
-    };
-    p.group(id(), with(vec![expiry(1)]), 10);
-    let hello = Frame::Hello { groups: vec![At { group: id(), log: [7; 32], head: None, seen: BTreeMap::new(), intros: vec![], expired: vec![expiry(1)] }] };
-    p.frame(&key(1), &hello, 10);
-    let out = expired(&p.poll(10 + DEBOUNCE));
-    assert_eq!(out[&key(2)], vec![expiry(1)]);
-    assert_eq!(out[&key(1)], vec![], "not back to the neighbour that told it");
-    p.group(id(), with(vec![expiry(1), expiry(2)]), 2_000);
-    let out = expired(&p.poll(2_000 + DEBOUNCE));
-    assert_eq!((&out[&key(1)], &out[&key(2)]), (&vec![expiry(2)], &vec![expiry(2)]));
-    p.connect(key(1), gs(), false, 4_000);
-    assert_eq!(expired(&p.poll(4_000))[&key(1)], vec![expiry(1), expiry(2)]);
-}
-
-/// A `hello` keeps the expiries of logs this member holds, and no others.
-#[test]
-fn a_hello_keeps_only_the_expiries_of_logs_this_member_holds() {
-    let mut p = peers();
-    let expiry = |n: u8| Expiry { log_ref: [n; 32], sig: Bytes(vec![n; 64]) };
-    p.group(id(), Own { expired: vec![expiry(1)], ..own(2, &[1]) }, 0);
-    p.connect(key(1), gs(), false, 0);
-    let at = At { group: id(), log: [7; 32], head: None, seen: BTreeMap::new(), intros: vec![], expired: vec![expiry(1), expiry(2)] };
-    p.frame(&key(1), &Frame::Hello { groups: vec![at] }, 0);
-    assert_eq!(p.conns[&key(1)].expired[&id()], BTreeSet::from([[1; 32]]));
 }
 
 /// A `have` keeps the positions of the group's current memberships only, and a membership that ends is dropped.
@@ -1104,7 +1060,7 @@ fn twelve_members_converge_through_loss_and_reconnection() {
     let mut sim = Sim { now: 0, chaos: true, rng: Rng(0x9e37_79b9_7f4a_7c15), peers: Vec::new(), versions: vec![0; N], links: BTreeSet::new(), queue: BTreeMap::new(), sent: 0, offline: BTreeSet::new(), offline_dials: vec![0; N] };
     for i in 0..N {
         let members = (0..N).filter(|&j| j != i).map(|j| ((Bytes(vec![j as u8]), 0), key(j as u8))).collect();
-        let own = Own { me: (Bytes(vec![i as u8]), 0), epoch: 1, log: [1; 32], head: None, earlier: vec![], members, wanted: vec![], stale: vec![], intros: BTreeMap::new(), expired: vec![] };
+        let own = Own { me: (Bytes(vec![i as u8]), 0), epoch: 1, log: [1; 32], head: None, earlier: vec![], members, wanted: vec![], stale: vec![], intros: BTreeMap::new() };
         sim.peers.push(Peers::new(key(i as u8)));
         sim.peers[i].group(id(), own, 0);
     }
@@ -1182,7 +1138,7 @@ fn members_online_in_a_mostly_offline_group_find_each_other() {
     let mut sim = Sim { now: 0, chaos: false, rng: Rng(0x2545_f491_4f6c_dd1d), peers: Vec::new(), versions: vec![0; MEMBERS], links: BTreeSet::new(), queue: BTreeMap::new(), sent: 0, offline, offline_dials: vec![0; MEMBERS] };
     for i in 0..MEMBERS {
         let members = (0..MEMBERS).filter(|&j| j != i).map(|j| ((Bytes(vec![j as u8]), 0), key(j as u8))).collect();
-        let own = Own { me: (Bytes(vec![i as u8]), 0), epoch: 1, log: [1; 32], head: None, earlier: vec![], members, wanted: vec![], stale: vec![], intros: BTreeMap::new(), expired: vec![] };
+        let own = Own { me: (Bytes(vec![i as u8]), 0), epoch: 1, log: [1; 32], head: None, earlier: vec![], members, wanted: vec![], stale: vec![], intros: BTreeMap::new() };
         sim.peers.push(Peers::new(key(i as u8)));
         sim.peers[i].group(id(), own, 0);
     }

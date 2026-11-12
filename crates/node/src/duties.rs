@@ -32,12 +32,9 @@ use crate::{G, Inner, State, Work, days, get, hex, now};
 const BLOCKED: u64 = 10_000;
 /// How soon a pass runs again after it failed, as while the service is down.
 const RETRY: u64 = 10 * 60 * 1000;
-/// How often a member asks which members' logs their services let go, of those it does not know to be, at most, in
-/// milliseconds.
-pub(crate) const EVICT: u64 = 24 * 3600 * 1000;
 /// How long after this session last showed itself, by a commit or message of its own, it sends a `present`, once the
 /// group moved past the epoch it showed itself in: after the updates a message stirs, and well before the services let
-/// that epoch's log go, a week after the group moved past it.
+/// that epoch's log go, a week after the group moved past it, and sessions of 0.26.0 remove the members in it.
 pub(crate) const PRESENT: u64 = 2 * 24 * 3600 * 1000;
 
 /// T, in milliseconds, for a group of `members` whose settings name `update` seconds: that, times the members past 24
@@ -271,13 +268,6 @@ impl Inner {
         self.time(gid, next);
         if !commit {
             return Ok(());
-        }
-        let asked = self.lock().group(gid)?.rec.evicted;
-        if now() >= asked + EVICT {
-            self.ask_behind(gid).await?;
-            let mut st = self.lock();
-            st.group_mut(gid)?.rec.evicted = now();
-            st.save(gid)?;
         }
         self.commit(gid, due).await?;
         Ok(())
