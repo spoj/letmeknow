@@ -24,7 +24,8 @@ use crate::{Event, G, Inner, Lost, LostOf, Member, Message, Rule, State, Work, g
 /// How far past a membership's lowest wanted seq ciphertexts are opened as they come: openmls opens none more than
 /// 1,000 behind the newest it opened of a sender.
 const WINDOW: u64 = 500;
-/// The bytes of ciphertexts a group keeps unopened, of its epoch and the next.
+/// The bytes of ciphertexts a group keeps unopened of its epoch, and apart, of the next: each of those once, and at
+/// most `MAX_MESSAGE` of them from each peer.
 const UNOPENED: usize = 2 * MAX_MESSAGE;
 /// How many hashes of ciphertexts taken are remembered.
 const SEEN: usize = 8192;
@@ -247,7 +248,7 @@ impl G {
     pub(crate) fn wanted(&mut self, now: u64, me: &[u8]) -> (Vec<Seqs>, Vec<Seqs>) {
         self.fresh.retain(|(_, _, _, at)| now < at + HOLD_OFF);
         let epoch = self.mls.epoch();
-        let room = self.early.iter().map(|(_, c)| c.len()).chain(self.unopened.values().map(|(_, c)| c.len())).sum::<usize>() + ANSWER + MAX_MESSAGE <= UNOPENED;
+        let room = self.unopened.values().map(|(_, c)| c.len()).sum::<usize>() + ANSWER + MAX_MESSAGE <= UNOPENED;
         let (mut wanted, mut stale) = (Vec::new(), Vec::new());
         for author in &self.rec.authors {
             let ended: Ranges = match author.key.0 == me {
@@ -424,14 +425,16 @@ impl Inner {
         }
         let Ok(claim) = core::claim(gid, &ciphertext) else { return Ok(None) };
         let (epoch, current) = (claim.sealed, g.mls.epoch());
-        let room = |g: &G, freed: usize| g.early.iter().map(|(_, c)| c.len()).chain(g.unopened.values().map(|(_, c)| c.len())).sum::<usize>() + ciphertext.len() <= UNOPENED + freed;
         if let Some(peer) = from.filter(|_| epoch > current) {
             st.peers.behind(peer.as_bytes());
         }
         let g = st.group_mut(gid)?;
         if epoch == current + 1 {
+            let sent = |by: Option<EndpointId>| g.early.iter().filter(|(peer, _)| by.is_none_or(|by| *peer == by)).map(|(_, c)| c.len()).sum::<usize>();
             if let Some(peer) = from
-                && room(g, 0)
+                && !g.early.iter().any(|(_, c)| *c == ciphertext)
+                && sent(Some(peer)) + ciphertext.len() <= MAX_MESSAGE
+                && sent(None) + ciphertext.len() <= UNOPENED
             {
                 g.early.push((peer, ciphertext));
             }
@@ -450,7 +453,8 @@ impl Inner {
         if !taken {
             let claim = (claim.key, claim.joined, claim.seq);
             let replaced = g.unopened.get(&claim).map(|(sealed, c)| (*sealed, c.len()));
-            if replaced.is_none_or(|(sealed, _)| sealed < epoch) && room(g, replaced.map_or(0, |(_, size)| size)) {
+            let room = g.unopened.values().map(|(_, c)| c.len()).sum::<usize>() + ciphertext.len() <= UNOPENED + replaced.map_or(0, |(_, size)| size);
+            if room && replaced.is_none_or(|(sealed, _)| sealed < epoch) {
                 remember(&mut g.seen, hash);
                 g.unopened.insert(claim, (epoch, ciphertext));
             } else if let Some(peer) = from {

@@ -348,6 +348,54 @@ async fn a_session_short_of_room_asks_only_what_opens_as_it_comes() {
     }
 }
 
+/// Sealings of the next epoch are kept once each, at most `MAX_MESSAGE` of them from each peer and `UNOPENED` in all,
+/// apart from what waits unopened: one peer's leave room for another's, and all of them for this epoch's.
+#[tokio::test(flavor = "multi_thread")]
+async fn next_epoch_sealings_are_kept_once_within_a_bound_per_peer_and_leave_this_epochs_room() {
+    let relay = lmk_testing::relay().await;
+    let config = |seed| Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[seed; 32]) };
+    let bob = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(1)).await.unwrap().0;
+    let alice = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(2)).await.unwrap().0;
+    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+    let gid = bob.create(settings).unwrap();
+    alice.join(&bob.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    for node in [&alice, &bob] {
+        let tasks: Vec<_> = node.inner.tasks.lock().unwrap().drain(..).collect();
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+    for node in [&bob, &alice] {
+        node.read_group(&gid.0).await.unwrap();
+    }
+    let (alice_key, me) = (alice.key(), bob.key());
+    let (_, past) = seal(&alice, &gid, WINDOW + 1, Some((Bytes(vec![0; 32]), 2)), &"p".repeat(PUSH));
+    alice.inner.commit(&gid.0, |_, _| Ok(Some(core::Change::default()))).await.unwrap();
+    let half = "x".repeat(MAX_MESSAGE / 2 - 4096);
+    let next: Vec<Vec<u8>> = (1..=5).map(|seq| seal(&alice, &gid, seq, (seq > 1).then(|| (Bytes(vec![0; 32]), 2)), &half).1).collect();
+    let [p, q, r] = [1, 2, 3].map(|n| iroh::SecretKey::from_bytes(&[n; 32]).public());
+    {
+        let mut st = bob.inner.lock();
+        for (peer, i) in [(p, 0), (p, 0), (q, 0), (p, 1), (p, 2), (q, 2), (q, 3), (r, 4)] {
+            assert!(bob.inner.take_one(&mut st, &gid.0, Some(peer), next[i].clone()).unwrap().is_none());
+        }
+        let kept: Vec<_> = st.group(&gid.0).unwrap().early.iter().map(|(peer, c)| (*peer, next.iter().position(|n| n == c).unwrap())).collect();
+        assert_eq!(kept, [(p, 0), (p, 1), (q, 2), (q, 3)]);
+        let now = st.tick();
+        let g = st.group_mut(&gid.0).unwrap();
+        g.author_mut(&alice_key.0, 1).unwrap().known = 2 * WINDOW;
+        assert_eq!(g.wanted(now, &me.0).0, vec![Seqs { key: alice_key.clone(), joined: 1, seqs: Ranges::range(1, 2 * WINDOW) }]);
+        assert!(bob.inner.take_one(&mut st, &gid.0, Some(p), past).unwrap().is_none());
+        assert!(st.group(&gid.0).unwrap().unopened.contains_key(&(alice_key, 1, WINDOW + 1)));
+    }
+    for node in [alice, bob] {
+        node.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_answer_dropped_for_want_of_room_leaves_its_holder_to_ask_again() {
     let (alice, bob, gid, _) = members().await;
