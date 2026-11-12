@@ -2240,13 +2240,14 @@ async fn back_with_no_holder(test: &str, missed: usize) -> (Duration, Vec<u64>) 
     (took, lost)
 }
 
-/// A member back from a while away waits `HEAR` once for the kept messages it lacks, not once for each commit it missed.
+/// A member back from a while away waits once for the kept messages it lacks, not once for each commit it missed: while
+/// it dials the members it has not tried, here six absent ones, four at a time, each for about 30 s.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_member_catching_up_waits_once_for_all_the_commits_it_missed() {
     let (took, lost) = back_with_no_holder("wait-once", 4).await;
     assert_eq!(lost, vec![1, 2, 3]);
     let hear = Duration::from_millis(lmk_net::peers::HEAR);
-    assert!(took >= hear && took < 2 * hear, "took {took:?}");
+    assert!(took >= 2 * hear && took < Duration::from_millis(lmk_net::peers::WAIT), "took {took:?}");
 }
 
 /// `remove_others` removes every other member in one commit: the group is then its committer's alone.

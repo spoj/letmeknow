@@ -178,7 +178,7 @@ async fn a_connection_without_a_peer_stream_is_counted_and_closed() {
     let conn = joiner.connect(iroh::EndpointAddr::new(keys[0].public()).with_relay_url(relay.url.clone()), frame::ALPN).await.unwrap();
     let connected = tokio::time::timeout(WAIT, member.events.recv()).await.expect("the connection was counted").unwrap();
     assert_eq!(connected, Event::Connected(keys[1].public(), false));
-    let mut peers = Peers::new(0, *keys[0].public().as_bytes());
+    let mut peers = Peers::new(*keys[0].public().as_bytes());
     peers.connect(*keys[1].public().as_bytes(), Default::default(), false, 0);
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
     frame::write(&mut send, &frame::Open { stream: frame::Stream::Admission }).await.unwrap();

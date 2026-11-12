@@ -86,7 +86,7 @@ impl State {
             let rec: Rec = get(&provider, &rec_key(&gid.0))?.context("a group without its record")?;
             groups.insert(gid.0, G::new(mls, rec));
         }
-        let peers = Peers::new(now(), *iroh_key(&provider)?.public().as_bytes());
+        let peers = Peers::new(*iroh_key(&provider)?.public().as_bytes());
         let mut state = State {
             provider,
             out: Vec::new(),

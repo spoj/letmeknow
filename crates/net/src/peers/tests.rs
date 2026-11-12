@@ -37,7 +37,7 @@ fn own(epoch: u64, members: &[u8]) -> Own {
 }
 
 fn peers() -> Peers {
-    Peers::new(0, key(100))
+    Peers::new(key(100))
 }
 
 /// Member `n`'s summary of version `version`, signed and heard at `time`, holding `held`.
@@ -848,20 +848,43 @@ fn wait_loses_once_every_holder_is_struck() {
     assert!(!p.wait(&id(), &lacking, 0, HEAR));
 }
 
-/// A wait holds `HEAR` after the member came online though no summary shows a holder yet: a member back from offline
-/// hears the summaries that show them within it.
+/// A wait holds `HEAR` after its group's first neighbour connected though no summary shows a holder yet: a member back
+/// online hears the summaries that show them within it.
 #[test]
-fn a_wait_holds_for_summaries_after_coming_online() {
+fn a_wait_holds_for_summaries_after_its_first_neighbour_connects() {
     let mut p = peers();
     p.group(id(), own(1, &[1]), 0);
     let lacking = vec![seqs(1, &[(5, 5)])];
     p.connect(key(1), gs(), false, 1_000);
-    assert!(p.wait(&id(), &lacking, 0, 1_000));
+    p.poll(1_000);
+    assert!(p.wait(&id(), &lacking, 0, 1_000 + HEAR - 1));
     p.summary(&id(), heard(1, 1, 1_500, lacking.clone()), false);
     assert!(p.wait(&id(), &lacking, 0, 1_000 + HEAR), "a holder is untried");
     p.disconnect(&key(1), 1_000 + HEAR);
     p.dialed(&key(1), false, 1_000 + HEAR);
+    p.poll(1_000 + HEAR);
     assert!(!p.wait(&id(), &lacking, 0, 1_000 + HEAR));
+}
+
+/// A wait holds past `HEAR` while its group dials members it has not tried since it began: a member back online whose
+/// first targets are offline reaches others, whose summaries may show holders.
+#[test]
+fn a_wait_holds_while_its_group_dials_members_not_tried() {
+    let mut p = peers();
+    p.group(id(), own(1, &[1, 2]), 0);
+    let lacking = vec![seqs(1, &[(5, 5)])];
+    assert!(p.wait(&id(), &lacking, 0, 0));
+    assert_eq!(dials(&p.poll(0)).len(), 2);
+    assert!(p.wait(&id(), &lacking, 0, HEAR), "its dials are in flight");
+    p.dialed(&key(1), false, 30_000);
+    assert!(p.wait(&id(), &lacking, 0, 30_000), "a failed dial has the group dial again");
+    p.poll(30_000);
+    p.dialed(&key(2), false, 31_000);
+    p.poll(31_000);
+    assert!(!p.wait(&id(), &lacking, 0, 31_000));
+    p.push(&id());
+    assert_eq!(dials(&p.poll(41_000)).len(), 2);
+    assert!(!p.wait(&id(), &lacking, 0, 41_000), "it tried both since it began");
 }
 
 /// A wait gives up two minutes after the commit was read, even with an untried holder.
@@ -876,6 +899,21 @@ fn wait_gives_up_two_minutes_after_the_commit_was_read() {
     assert!(!p.wait(&id(), &lacking, 0, WAIT));
 }
 
+/// A wait gives up two minutes after it began, however its neighbours come and go.
+#[test]
+fn a_wait_gives_up_two_minutes_after_it_began_however_its_neighbours_come_and_go() {
+    let mut p = peers();
+    p.group(id(), own(1, &[1]), 0);
+    let lacking = vec![seqs(1, &[(5, 5)])];
+    for at in (0..WAIT).step_by(10_000) {
+        p.connect(key(1), gs(), false, at);
+        assert!(p.wait(&id(), &lacking, 0, at));
+        p.disconnect(&key(1), at + 100);
+    }
+    p.connect(key(1), gs(), false, WAIT);
+    assert!(!p.wait(&id(), &lacking, 0, WAIT));
+}
+
 /// A holder whose backoff has ended is untried again: a wait that starts then dials it.
 #[test]
 fn a_holder_past_its_backoff_is_dialed_when_the_wait_starts() {
@@ -884,6 +922,7 @@ fn a_holder_past_its_backoff_is_dialed_when_the_wait_starts() {
     let lacking = vec![seqs(1, &[(5, 5)])];
     p.summary(&id(), heard(1, 1, 0, lacking.clone()), false);
     p.dialed(&key(1), false, HEAR - 1);
+    p.poll(HEAR);
     assert!(!p.wait(&id(), &lacking, 0, HEAR), "backing off");
     assert!(p.wait(&id(), &lacking, 31_000, 31_000));
     assert_eq!(dials(&p.poll(31_000)), vec![key(1)]);
@@ -1038,7 +1077,7 @@ fn twelve_members_converge_through_loss_and_reconnection() {
     for i in 0..N {
         let members = (0..N).filter(|&j| j != i).map(|j| ((Bytes(vec![j as u8]), 0), key(j as u8))).collect();
         let own = Own { me: (Bytes(vec![i as u8]), 0), epoch: 1, log: [1; 32], head: None, earlier: vec![], members, wanted: vec![], stale: vec![], intros: BTreeMap::new(), expired: vec![] };
-        sim.peers.push(Peers::new(0, key(i as u8)));
+        sim.peers.push(Peers::new(key(i as u8)));
         sim.peers[i].group(id(), own, 0);
     }
     for i in 0..N {
@@ -1116,7 +1155,7 @@ fn members_online_in_a_mostly_offline_group_find_each_other() {
     for i in 0..MEMBERS {
         let members = (0..MEMBERS).filter(|&j| j != i).map(|j| ((Bytes(vec![j as u8]), 0), key(j as u8))).collect();
         let own = Own { me: (Bytes(vec![i as u8]), 0), epoch: 1, log: [1; 32], head: None, earlier: vec![], members, wanted: vec![], stale: vec![], intros: BTreeMap::new(), expired: vec![] };
-        sim.peers.push(Peers::new(0, key(i as u8)));
+        sim.peers.push(Peers::new(key(i as u8)));
         sim.peers[i].group(id(), own, 0);
     }
     for i in 0..ONLINE {

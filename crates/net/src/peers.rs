@@ -46,10 +46,10 @@ pub const BUSY: u64 = 250;
 pub const IDLE: u64 = 300_000;
 pub const STRANGER: u64 = 30_000;
 pub const MAX_CONNECTIONS: usize = 128;
-/// From when a wait starts, or the member came online, whichever is later, until it gives up.
+/// From when a wait starts until it gives up.
 pub const WAIT: u64 = 120_000;
-/// From then, how long a wait holds though no summary shows a holder: a member back online hears its neighbours'
-/// summaries within it.
+/// From when a wait starts, or its group's first neighbour connected, whichever is later, how long it holds though no
+/// summary shows a holder: a member hears its neighbours' summaries within it.
 pub const HEAR: u64 = 15_000;
 pub const DIALS: usize = 4;
 
@@ -97,8 +97,6 @@ pub struct Heard {
 
 pub struct Peers {
     me: Key,
-    /// When the member last went from no connections to one.
-    online: u64,
     /// When a change to a `hello` arose, unsent.
     changed: Option<u64>,
     /// The groups whose targets are dialed at the next poll.
@@ -138,6 +136,7 @@ struct Request {
 
 struct Conn {
     dialed: bool,
+    connected: u64,
     served: BTreeSet<Bytes>,
     /// When it last served a group, or connected.
     served_at: u64,
@@ -171,11 +170,10 @@ struct Backoff {
 }
 
 impl Peers {
-    /// For a member, with iroh key `me`, that came online `now`.
-    pub fn new(now: u64, me: Key) -> Self {
+    /// For a member with iroh key `me`.
+    pub fn new(me: Key) -> Self {
         Self {
             me,
-            online: now,
             changed: None,
             dial: BTreeSet::new(),
             retry: BTreeMap::new(),
@@ -244,14 +242,11 @@ impl Peers {
     /// those groups are told of it.
     pub fn connect(&mut self, peer: Key, served: BTreeSet<Bytes>, dialed: bool, now: u64) {
         self.disconnect(&peer, now);
-        if self.conns.is_empty() {
-            self.online = now;
-        }
         if !served.is_empty() {
             self.changed.get_or_insert(now);
         }
         self.backoff.remove(&peer);
-        let conn = Conn { dialed, served_at: now, active: now, hello: true, opened: served.clone(), served, sent: BTreeMap::new(), theirs: BTreeMap::new(), told: BTreeMap::new(), introduced: BTreeMap::new(), expired: BTreeMap::new(), has: BTreeMap::new() };
+        let conn = Conn { dialed, connected: now, served_at: now, active: now, hello: true, opened: served.clone(), served, sent: BTreeMap::new(), theirs: BTreeMap::new(), told: BTreeMap::new(), introduced: BTreeMap::new(), expired: BTreeMap::new(), has: BTreeMap::new() };
         self.conns.insert(peer, conn);
     }
 
@@ -429,12 +424,15 @@ impl Peers {
     }
 
     /// Whether to wait before applying a commit that deletes the keys of an epoch, given the seqs of that epoch the
-    /// member lacks (kept ones of the epoch the commit ends): not once the holders were tried. `read` is when the node
-    /// began waiting, for this commit or, as it was made before then, for an earlier one.
+    /// member lacks (kept ones of the epoch the commit ends): not once the holders were tried, `HEAR` passed and the
+    /// group dials no member it has not tried since `read`, nor `WAIT` after `read`. `read` is when the node began
+    /// waiting, for this commit or, as it was made before then, for an earlier one.
     pub fn wait(&mut self, group: &Bytes, lacking: &[Seqs], read: u64, now: u64) -> bool {
         let lack = to_set(lacking);
-        let since = read.max(self.online);
-        let untried = !lack.is_empty() && now < since + WAIT && (now < since + HEAR || self.holder(group, lacking, now));
+        let met = self.conns.values().filter(|c| c.served.contains(group)).map(|c| c.connected).min().unwrap_or(read);
+        let first = |k: &Key| self.dialing.contains(k) && self.backoff.get(k).is_none_or(|b| b.failed < read);
+        let dialing = self.dial.contains(group) || self.groups[group].own.members.iter().any(|(_, k)| first(k));
+        let untried = !lack.is_empty() && now < read + WAIT && (now < read.max(met) + HEAR || dialing || self.holder(group, lacking, now));
         self.groups.get_mut(group).expect("a group of ours").waiting = if untried { lack } else { Set::new() };
         untried
     }
