@@ -208,6 +208,35 @@ async fn stalled_handshakes_are_dropped() {
     server.abort();
 }
 
+/// An upgrade to /relay that never authenticates is dropped, as a stalled handshake is.
+#[tokio::test(flavor = "multi_thread")]
+async fn stalled_relay_upgrades_are_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let (config, cert) = configure(&state);
+    let https = config.https_port;
+    let server = tokio::spawn(serve(config));
+    wait_for_https(https).await;
+
+    let mut tls = tls_connect("127.0.0.1", https, &cert).await;
+    let upgrade = concat!(
+        "GET /relay HTTP/1.1\r\n",
+        "Host: localhost\r\n",
+        "Connection: Upgrade\r\n",
+        "Upgrade: websocket\r\n",
+        "Sec-WebSocket-Version: 13\r\n",
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+        "Sec-WebSocket-Protocol: iroh-relay-v2\r\n\r\n",
+    );
+    tls.write_all(upgrade.as_bytes()).await.unwrap();
+    let mut head = [0u8; 256];
+    let n = tls.read(&mut head).await.unwrap();
+    assert!(String::from_utf8_lossy(&head[..n]).starts_with("HTTP/1.1 101"), "{:?}", &head[..n]);
+    let mut rest = Vec::new();
+    assert!(timeout(Duration::from_secs(14), tls.read_to_end(&mut rest)).await.is_ok(), "an upgraded /relay connection that never authenticates was kept open");
+    server.abort();
+}
+
 /// A connection to port 80 that sends no request is dropped, as a stalled handshake is.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_silent_connection_to_port_80_is_dropped() {

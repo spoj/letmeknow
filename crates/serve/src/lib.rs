@@ -3,7 +3,7 @@
 use std::{
     convert::Infallible,
     future::Future,
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, Shutdown, SocketAddr},
     num::NonZeroU32,
     path::PathBuf,
     pin::Pin,
@@ -36,14 +36,15 @@ use lmk_proto::{directory::{self, Directory}, group, membership::MAX_BODY};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use socket2::{Domain, Socket, Type};
 use tokio::{
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::{Notify, watch},
     time::{Instant, sleep, sleep_until, timeout},
 };
 use tokio_rustls_acme::{AcmeConfig, caches::DirCache};
 use tokio_stream::StreamExt;
 
-/// How long a connection has for its TLS handshake, and one to port 80 for its request's headers.
+/// How long a connection has for its TLS handshake, for its request's headers on port 80, and for an upgraded /relay
+/// connection to authenticate.
 const HANDSHAKE: Duration = Duration::from_secs(10);
 /// How long accepting waits after it failed, as while the process is out of file descriptors: the connections it has
 /// go on.
@@ -206,6 +207,9 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
         };
         let (tls, relay, health, directory, membership) = (tls.clone(), relay.clone(), health.clone(), directory.clone(), membership.clone());
         tokio::spawn(async move {
+            let Ok(socket) = tcp.into_std() else { return };
+            let Ok(kill) = socket.try_clone() else { return };
+            let Ok(tcp) = TcpStream::from_std(socket) else { return };
             let stream = timeout(HANDSHAKE, async move {
                 match &*tls {
                     Tls::Files(acceptor) => acceptor.accept(tcp).await.ok(),
@@ -217,8 +221,11 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
             }).await.ok().flatten();
             let Some(stream) = stream else { return };
             let (drain, mut draining) = watch::channel(None);
+            let established = Arc::new(Notify::new());
             let site = Site {
-                relay: RelayServiceWithNotify::new(relay, Arc::new(Notify::new())),
+                relay: RelayServiceWithNotify::new(relay, established.clone()),
+                established,
+                socket: Arc::new(kill),
                 health,
                 directory,
                 membership,
@@ -313,6 +320,10 @@ async fn redirect(listener: TcpListener, base: String) {
 /// WebSocket upgrades at /relay are cookie-free; iroh authenticates the peers.
 struct Site {
     relay: RelayServiceWithNotify,
+    /// Notified once an upgraded /relay connection is registered with the relay.
+    established: Arc<Notify>,
+    /// Shut down if an upgraded /relay connection is not established within `HANDSHAKE`.
+    socket: Arc<std::net::TcpStream>,
     /// This release's version and the service's public key, which rollouts compare with the release they install.
     health: Bytes,
     /// The directory at `/.well-known/letmeknow.json`.
@@ -391,7 +402,21 @@ impl HyperService<Request<Incoming>> for Site {
             return Box::pin(async move { answer_membership(route, service, peer, drain, req).await.map_err(Into::into) });
         }
         match req.uri().path() {
-            "/relay" => return Box::pin(self.relay.call(req)),
+            "/relay" => {
+                let (established, socket) = (self.established.clone().notified_owned(), self.socket.clone());
+                let response = self.relay.call(req);
+                return Box::pin(async move {
+                    let response = response.await;
+                    if matches!(&response, Ok(res) if res.status() == StatusCode::SWITCHING_PROTOCOLS) {
+                        tokio::spawn(async move {
+                            if timeout(HANDSHAKE, established).await.is_err() {
+                                let _ = socket.shutdown(Shutdown::Both);
+                            }
+                        });
+                    }
+                    response
+                });
+            }
             "/ping" => return Box::pin(std::future::ready(respond(StatusCode::OK).body(body("")).map_err(Into::into))),
             "/.well-known/letmeknow.json" => return Box::pin(std::future::ready(json(self.directory.clone()).map_err(Into::into))),
             "/health" => return Box::pin(std::future::ready(json(self.health.clone()).map_err(Into::into))),
