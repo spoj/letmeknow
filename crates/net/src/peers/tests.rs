@@ -373,6 +373,20 @@ fn a_have_keeps_only_the_current_memberships() {
     assert!(p.conns[&key(1)].has[&id()].is_empty());
 }
 
+/// A `have` keeps of each membership the peer's latest announcement of it, and none of more than `ANNOUNCED` ranges: what
+/// a member announces grows nothing kept of it.
+#[test]
+fn a_have_keeps_of_each_membership_its_latest_announcement_within_bounds() {
+    let mut p = peers();
+    p.group(id(), own(1, &[1, 2]), 0);
+    p.connect(key(1), gs(), false, 0);
+    p.frame(&key(1), &Frame::Have { group: id(), held: vec![seqs(1, &[(1, 1)]), seqs(2, &[(1, 1)])] }, 0);
+    p.frame(&key(1), &Frame::Have { group: id(), held: vec![seqs(1, &[(3, 3)])] }, 0);
+    let fragmented: Vec<(u64, u64)> = (0..=ANNOUNCED as u64).map(|n| (2 * n + 3, 2 * n + 3)).collect();
+    p.frame(&key(1), &Frame::Have { group: id(), held: vec![seqs(2, &fragmented)] }, 0);
+    assert_eq!(p.conns[&key(1)].has[&id()], BTreeMap::from([(member(1), Ranges::range(3, 3)), (member(2), Ranges::range(1, 1))]));
+}
+
 /// Sightings count only of current members, from neighbours the group is served to, and for `RECENT`.
 #[test]
 fn sightings_count_of_members_from_neighbours_of_the_group_for_recent() {

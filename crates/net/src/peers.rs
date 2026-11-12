@@ -33,6 +33,8 @@ pub const TIMEOUT: u64 = 10_000;
 /// 1 MiB a second, shared.
 pub const LARGE_TIMEOUT: u64 = 120_000;
 pub const ANSWER: usize = 1 << 20;
+/// The most ranges of a membership's seqs a peer's announcement is kept with.
+const ANNOUNCED: usize = 512;
 pub const K: usize = 6;
 const MESH: usize = 7;
 pub const BACKOFF: u64 = 10_000;
@@ -157,7 +159,7 @@ struct Conn {
     introduced: BTreeMap<Bytes, BTreeMap<Membership, u64>>,
     /// Per group, the logs whose expiries the peer told or was told.
     expired: BTreeMap<Bytes, BTreeSet<[u8; 32]>>,
-    /// Per group, the held messages the peer announced it holds.
+    /// Per group, the held messages the peer announced it holds: of each membership, as it last announced them.
     has: BTreeMap<Bytes, Set>,
 }
 
@@ -376,9 +378,8 @@ impl Peers {
             Frame::Want { .. } => c.active = now,
             Frame::Have { group, held } if c.served.contains(group) => {
                 let own = &self.groups[group].own;
-                let held: Set = to_set(held).into_iter().filter(|(m, _)| is_current(own, m)).collect();
-                let has = c.has.entry(group.clone()).or_default();
-                *has = union(mem::take(has), &held);
+                let held = to_set(held).into_iter().filter(|(m, seqs)| is_current(own, m) && seqs.ranges().len() <= ANNOUNCED);
+                c.has.entry(group.clone()).or_default().extend(held);
             }
             _ => {}
         }
