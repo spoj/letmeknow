@@ -139,8 +139,9 @@ pub struct Signed {
 }
 
 /// A joiner's request, the one frame it writes on an `admission` stream: the invite its link names, by the group, the
-/// session key of the member that made it and the epoch that member's membership began in, and its secret; and the
-/// joiner's KeyPackage. The member answers with an `Answer<Admitted>`.
+/// session key of the member that made it and the epoch that member's membership began in, and its secret; the joiner's
+/// KeyPackage; and, if the joiner left the group by itself, its leave of that membership (`Control::Leave`'s `sig`), by
+/// which the member removes it first if its key is a member still. The member answers with an `Answer<Admitted>`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Join {
     pub group: Bytes,
@@ -148,6 +149,8 @@ pub struct Join {
     pub joined: u64,
     pub secret: Bytes,
     pub key_package: Bytes,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leave: Option<Bytes>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,7 +187,13 @@ mod tests {
         let text = serde_json::to_string(&at).unwrap();
         assert!(text.ends_with(r#""head":null,"seen":{"Ag":5}}"#), "{text}");
         assert_eq!(serde_json::from_str::<At>(&text).unwrap(), at);
-        let join = Join { group: Bytes(vec![4]), by: Bytes(vec![5]), joined: 6, secret: Bytes(vec![2]), key_package: Bytes(vec![3]) };
-        assert_eq!(serde_json::to_string(&join).unwrap(), r#"{"group":"BA","by":"BQ","joined":6,"secret":"Ag","key_package":"Aw"}"#);
+        let join = Join { group: Bytes(vec![4]), by: Bytes(vec![5]), joined: 6, secret: Bytes(vec![2]), key_package: Bytes(vec![3]), leave: None };
+        let text = r#"{"group":"BA","by":"BQ","joined":6,"secret":"Ag","key_package":"Aw"}"#;
+        assert_eq!(serde_json::to_string(&join).unwrap(), text);
+        assert_eq!(serde_json::from_str::<Join>(text).unwrap(), join, "a Join with no leave, as 0.26.0 sends");
+        let leaving = Join { leave: Some(Bytes(vec![7])), ..join };
+        let text = serde_json::to_string(&leaving).unwrap();
+        assert!(text.ends_with(r#","key_package":"Aw","leave":"Bw"}"#), "{text}");
+        assert_eq!(serde_json::from_str::<Join>(&text).unwrap(), leaving);
     }
 }

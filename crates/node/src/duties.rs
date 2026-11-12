@@ -355,7 +355,7 @@ mod tests {
         let (alice, bob) = (&nodes[0], &nodes[1]);
         let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
         let gid = alice.create(settings).unwrap();
-        bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
         let own = alice.send(&gid.0, &json!({ "type": "message", "content": "unkept" }), None).await.unwrap();
         let old = bob.send(&gid.0, &json!({ "type": "message", "content": "old" }), None).await.unwrap();
         let recent = bob.send(&gid.0, &json!({ "type": "message", "content": "recent" }), None).await.unwrap();
@@ -501,7 +501,7 @@ mod tests {
         let (alice, bob) = (&nodes[0], &nodes[1]);
         let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
         let gid = alice.create(settings).unwrap();
-        bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
         for task in bob.inner.tasks.lock().unwrap().drain(..) {
             task.abort();
         }
@@ -550,7 +550,7 @@ mod tests {
         let (alice, bob) = (&nodes[0], &nodes[1]);
         let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
         let gid = alice.create(settings).unwrap();
-        bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
         let epoch = bob.epoch(&gid.0).unwrap();
         n0_future::time::timeout(Duration::from_secs(60), async {
             while alice.epoch(&gid.0).unwrap() < epoch {
@@ -566,7 +566,7 @@ mod tests {
             let st = bob.inner.lock();
             Bytes(st.session.key_package(&st.provider).unwrap())
         };
-        let join = Join { group: gid.clone(), by: Bytes(link.by.to_vec()), joined: link.joined, secret: Bytes(link.secret.to_vec()), key_package };
+        let join = Join { group: gid.clone(), by: Bytes(link.by.to_vec()), joined: link.joined, secret: Bytes(link.secret.to_vec()), key_package, leave: None };
         let joined = {
             let mut st = alice.inner.lock();
             let g = st.group_mut(&gid.0).unwrap();

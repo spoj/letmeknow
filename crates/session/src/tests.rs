@@ -544,6 +544,31 @@ fn a_session_out_of_a_group_by_itself_keeps_its_leave() {
     });
 }
 
+/// A session out of a group by itself, its key a member still, joins it again: it brings its leave of that membership, kept
+/// on its machine, by which the member that admits it removes it first.
+#[test]
+fn a_session_out_of_a_group_by_itself_joins_it_again_by_its_leave() {
+    local(async {
+        let world = world("rejoin").await;
+        let (mut alice, mut bob, group) = pair(&world).await;
+        bob.stop().await;
+        // Bob's node forgets the group, as one whose log was let go does, and his leave is kept.
+        let db = lmk_core::provider::SqliteProvider::open(&session_dir(&bob.home, "bob").unwrap().join("session.db")).unwrap();
+        for leave in lmk_node::leaves(&db).unwrap() {
+            crate::keep_leave(&bob.home.join("leaves"), &leave).unwrap();
+            lmk_core::group::Group::load(&db, &leave.group.0).unwrap().delete(&db).unwrap();
+        }
+        db.put(b"node/groups", b"[]").unwrap();
+        db.put(b"node/logs", b"[]").unwrap();
+        drop(db);
+        let bob = world.start("bob").await;
+        let link = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap().to_owned();
+        bob.cmd(&["join", &link]).await.unwrap();
+        let left = alice.told(&["left"]).await;
+        assert_eq!((&left["member"], &left["by"]), (&json!(bob.fp), &json!("you")));
+    });
+}
+
 /// `status` lists this session's sends that no other member holds yet, with a warning, until a member connected to it holds
 /// them.
 #[test]
@@ -1747,7 +1772,7 @@ fn a_chat_message_with_a_malformed_to_and_attachment_shows_without_them() {
         let device = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
         let config = lmk_node::Config { home: world.domain.clone(), post: world.network.post.clone(), ca: world.network.ca.clone(), device };
         let (mallory, _events) = lmk_node::Node::start(lmk_core::provider::SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap();
-        let (gid, _) = mallory.join(&lmk_proto::links::Invite::parse(invite["link"].as_str().unwrap()).unwrap()).await.unwrap();
+        let (gid, _) = mallory.join(&lmk_proto::links::Invite::parse(invite["link"].as_str().unwrap()).unwrap(), None).await.unwrap();
         mallory.send(&gid.0, &json!({ "type": "message", "content": "hi", "to": "all", "attachment": { "name": 7 } }), None).await.unwrap();
         let message = alice.told(&["message"]).await;
         assert_eq!((message["content"].as_str(), message.get("to"), message.get("attachment")), (Some("hi"), None, None));

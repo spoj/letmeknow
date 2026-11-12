@@ -66,7 +66,8 @@ pub struct Session {
     forget_at: Instant,
     /// The groups as last written to `groups.json`.
     groups: Vec<Bytes>,
-    /// The machine's leaves, which its sessions hand their nodes: `leaves` in the home this session's directory is in.
+    /// The machine's leaves, which its sessions hand their nodes, and bring as they join a group they left by themselves:
+    /// `leaves` in the home this session's directory is in.
     leaves: PathBuf,
     config: Config,
     /// What waits to be logged, and whether it also prints.
@@ -390,8 +391,8 @@ impl Session {
                 return;
             }
             Request::Join { link } => {
-                let joining = self.joining.clone();
-                _ = self.running.spawn_local(async move { Answered(join(&node, &joining, &link).await, Some(reply)) });
+                let (joining, leaves) = (self.joining.clone(), self.leaves.clone());
+                _ = self.running.spawn_local(async move { Answered(join(&node, &joining, &leaves, &link).await, Some(reply)) });
                 return;
             }
             Request::Remove { group, device, members } => {
@@ -764,12 +765,20 @@ impl Session {
 }
 
 /// Joins a group through an invite link, unless a join by the same link is under way: the node shares one KeyPackage
-/// per invite.
-async fn join(node: &Node, joining: &RefCell<HashSet<Vec<u8>>>, link: &str) -> Result<Value> {
+/// per invite. It brings its latest leave of the group in the machine's `leaves`, kept as it left the group by itself.
+async fn join(node: &Node, joining: &RefCell<HashSet<Vec<u8>>>, leaves: &Path, link: &str) -> Result<Value> {
     let invite = Invite::parse(link.trim())?;
     let key = invite.secret.to_vec();
     ensure!(joining.borrow_mut().insert(key.clone()), "this session is joining that already: wait for that join to end");
-    let joined = node.join(&invite).await;
+    // One is deleted meanwhile as another session found its membership ended, or is being written.
+    let leave = std::fs::read_dir(leaves)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| serde_json::from_slice::<lmk_node::Leave>(&std::fs::read(entry.path()).ok()?).ok())
+        .filter(|leave| leave.group.0 == invite.group && leave.key == node.key())
+        .max_by_key(|leave| leave.joined);
+    let joined = node.join(&invite, leave.map(|leave| leave.sig)).await;
     joining.borrow_mut().remove(&key);
     listed_members(node, &joined?.0, false)
 }

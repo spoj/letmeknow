@@ -11,7 +11,7 @@ async fn members() -> (Node, Node, Bytes, UnboundedReceiver<Event>) {
     let (bob, mut events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap();
     let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
     let gid = bob.create(settings).unwrap();
-    alice.join(&bob.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    alice.join(&bob.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
     for node in [&alice, &bob] {
         let tasks: Vec<_> = node.inner.tasks.lock().unwrap().drain(..).collect();
         for task in &tasks {
@@ -94,7 +94,7 @@ async fn a_message_before_a_join_in_a_later_cut_is_neither_lacking_nor_lost() {
     let carol = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(3)).await.unwrap().0;
     let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
     let gid = alice.create(settings).unwrap();
-    bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
     let tasks: Vec<_> = bob.inner.tasks.lock().unwrap().drain(..).collect();
     for task in &tasks {
         task.abort();
@@ -106,7 +106,7 @@ async fn a_message_before_a_join_in_a_later_cut_is_neither_lacking_nor_lost() {
     bob.read_group(&gid.0).await.unwrap();
     let before = bob.inner.send(&mut bob.inner.lock(), &gid.0, &serde_json::json!({ "type": "message", "content": "before Carol" }), None).unwrap();
 
-    carol.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    carol.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
     for node in [&alice, &carol] {
         let tasks: Vec<_> = node.inner.tasks.lock().unwrap().drain(..).collect();
         for task in &tasks {
@@ -358,7 +358,7 @@ async fn next_epoch_sealings_are_kept_once_within_a_bound_per_peer_and_leave_thi
     let alice = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(2)).await.unwrap().0;
     let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
     let gid = bob.create(settings).unwrap();
-    alice.join(&bob.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    alice.join(&bob.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
     for node in [&alice, &bob] {
         let tasks: Vec<_> = node.inner.tasks.lock().unwrap().drain(..).collect();
         for task in &tasks {
@@ -469,7 +469,7 @@ async fn three() -> (Node, Node, Node, Bytes) {
     let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
     let gid = bob.create(settings).unwrap();
     for joiner in [&alice, &carol] {
-        joiner.join(&bob.invite(&gid.0, INVITE_VALID, Some(&joiner.key().0)).await.unwrap()).await.unwrap();
+        joiner.join(&bob.invite(&gid.0, INVITE_VALID, Some(&joiner.key().0)).await.unwrap(), None).await.unwrap();
     }
     for node in [&bob, &alice, &carol] {
         let tasks: Vec<_> = node.inner.tasks.lock().unwrap().drain(..).collect();
@@ -582,7 +582,7 @@ async fn messages_made_ready_as_a_commit_applies_deliver_at_once_and_leave_the_s
     let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
     let gid = alice.create(settings).unwrap();
     for joiner in [&bob, &carol, &dave, &erin] {
-        joiner.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        joiner.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
     }
     for node in [&alice, &bob, &carol, &dave, &erin] {
         let tasks: Vec<_> = node.inner.tasks.lock().unwrap().drain(..).collect();
@@ -666,7 +666,7 @@ async fn a_commit_removing_this_session_delivers_what_became_ready_before_forget
     let bob = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(2)).await.unwrap().0;
     let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
     let gid = alice.create(settings).unwrap();
-    bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
     let tasks: Vec<_> = bob.inner.tasks.lock().unwrap().drain(..).collect();
     for task in &tasks {
         task.abort();
@@ -684,7 +684,7 @@ async fn a_commit_removing_this_session_delivers_what_became_ready_before_forget
     bob.mark_shown(&gid.0, std::slice::from_ref(&before_carol)).unwrap();
 
     let (carol, mut events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(3)).await.unwrap();
-    carol.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    carol.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
     let tasks: Vec<_> = alice.inner.tasks.lock().unwrap().drain(..).collect();
     for task in &tasks {
         task.abort();
@@ -826,7 +826,7 @@ async fn a_joiner_reads_whole_the_members_its_link_names_while_it_joins() {
     let link = Invite { secret: [7; 16], domain: relay.domain.clone(), key: [1; 32], group: [1; 16], by: [1; 32], joined: 0, members: vec![(*member.id().as_bytes(), relay.domain.clone())] };
     let joining = n0_future::task::spawn({
         let bob = bob.clone();
-        async move { bob.join(&link).await }
+        async move { bob.join(&link, None).await }
     });
     let timeout = n0_future::time::Duration::from_secs(20);
     n0_future::time::timeout(timeout, async { while !matches!(events.recv().await, Some(lmk_net::Event::Connected(..))) {} })

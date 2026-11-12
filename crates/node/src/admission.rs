@@ -97,9 +97,11 @@ impl Node {
     }
 
     /// Joins through an invite link: asks the members it names in turn, as each is reached, and reads their frames whole
-    /// meanwhile, as an admitter's first hello, which comes before the Welcome, holds every intro of the group. Returns
-    /// the group, and the iroh key of the member that admitted this session.
-    pub async fn join(&self, link: &Invite) -> Result<(Bytes, [u8; 32])> {
+    /// meanwhile, as an admitter's first hello, which comes before the Welcome, holds every intro of the group. With
+    /// `leave`, this session's leave of the group (`Group::leave`) as it left it by itself, by which a member removes its
+    /// membership first if it is a member still. Returns the group, and the iroh key of the member that admitted this
+    /// session.
+    pub async fn join(&self, link: &Invite, leave: Option<Bytes>) -> Result<(Bytes, [u8; 32])> {
         // Each member is dialed at the relay of its own service.
         let member = |(key, home): &([u8; 32], String)| -> Result<(EndpointId, Vec<RelayUrl>)> { Ok((EndpointId::from_bytes(key)?, vec![relay_url(home).parse()?])) };
         let members = link.members.iter().map(member).collect::<Result<Vec<_>>>()?;
@@ -118,7 +120,7 @@ impl Node {
                 }
             };
             st.joins.push(link.clone());
-            Join { group: Bytes(link.group.to_vec()), by: Bytes(link.by.to_vec()), joined: link.joined, secret, key_package }
+            Join { group: Bytes(link.group.to_vec()), by: Bytes(link.by.to_vec()), joined: link.joined, secret, key_package, leave }
         };
         // Each dial is a task of its own, so it goes on, and times out, while a member reached earlier is asked.
         let inviter_first = Instant::now() + INVITER_FIRST;
@@ -250,9 +252,10 @@ fn admits(g: &G, me: &[u8], (joiner, leaf): &(Vec<u8>, Leaf), rule: &Rule) -> Re
 
 impl Inner {
     /// Answers a joiner's request by the rule of the invite it names: in its group, of its inviter's membership, with the
-    /// hash its secret gives.
+    /// hash its secret gives. A joiner whose key is a member, and which brings that membership's leave, is removed by it
+    /// first, in a commit of its own, built only while that membership stands: a commit may not add a key it removes.
     async fn admit_join(self: &Arc<Self>, join: Join) -> Result<Admitted> {
-        let Join { group, by, joined, secret, key_package } = join;
+        let Join { group, by, joined, secret, key_package, leave } = join;
         let gid = group.0;
         let invited = Invited::new(by, joined, &secret.0);
         let hash = invited.hash(&gid);
@@ -271,6 +274,13 @@ impl Inner {
             return self.admitted(&gid, epoch);
         }
         self.remove_lapsed(&gid, &joiner.0).await?;
+        if let Some(sig) = &leave {
+            let remove = |_: &State, g: &G| {
+                let left = g.mls.left(&joiner.0, &sig.0);
+                Ok(g.mls.members().into_iter().find(|m| m.key == joiner.0 && left).map(|m| Change { remove: vec![m.index], left: vec![sig.clone()], ..Change::default() }))
+            };
+            self.commit(&gid, remove).await?;
+        }
         {
             let st = self.lock();
             admits(st.group(&gid)?, st.me(), &joiner, &rule)?;

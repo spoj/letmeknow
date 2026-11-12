@@ -40,8 +40,8 @@ async fn a_removed_member_two_commits_behind_learns_it() {
     let bob = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config.clone()).await.unwrap().0;
     let spare = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0;
     let gid = alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] }).unwrap();
-    bob.join(&alice.invite(&gid.0, INVITE_VALID, Some(&bob.key().0)).await.unwrap()).await.unwrap();
-    spare.join(&alice.invite(&gid.0, INVITE_VALID, Some(&spare.key().0)).await.unwrap()).await.unwrap();
+    bob.join(&alice.invite(&gid.0, INVITE_VALID, Some(&bob.key().0)).await.unwrap(), None).await.unwrap();
+    spare.join(&alice.invite(&gid.0, INVITE_VALID, Some(&spare.key().0)).await.unwrap(), None).await.unwrap();
     let (alice_key, bob_key, spare_key) = (alice.key(), bob.key(), spare.key());
     spare.shutdown().await.unwrap();
     alice.read_group(&gid.0).await.unwrap();
@@ -133,7 +133,7 @@ async fn a_commits_membership_events_come_in_the_step_that_applies_it_before_the
     let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
     let gid = alice.create(settings).unwrap();
     for joiner in [&bob, &carol] {
-        joiner.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        joiner.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
     }
     for node in [&alice, &bob, &carol] {
         let tasks: Vec<_> = node.inner.tasks.lock().unwrap().drain(..).collect();
