@@ -1228,12 +1228,17 @@ fn an_intro_counts_for_its_own_member_only() {
             Frame::Hello { groups: vec![At { group: gid.clone(), log: [0; 32], head: None, seen: Default::default(), intros, expired }] }
         };
 
-        // Carol hears Mallory's claim and the expiry of its log, then Bob's intro, before her group is added.
+        // Carol hears Mallory's claim and the expiry of its log, and Bob's intro, in the one early hello she keeps.
         let carol = stored(&relay, &dir.join("carol.db")).await;
         let mut bob_hand = hand(&relay, member_of(&bob_db).0, &carol.node).await;
         let claim = Shown { epoch: bob_shown.epoch, capability: gone };
-        bob_hand.send(&hello(&mallory, mallory_joined, base, claim, "mallory", vec![expiry])).await;
-        bob_hand.send(&hello(&bob, bob_joined, base, bob_shown.clone(), "bob", vec![])).await;
+        let (Frame::Hello { groups: mut both }, Frame::Hello { groups: bobs }) =
+            (hello(&mallory, mallory_joined, base, claim, "mallory", vec![expiry]), hello(&bob, bob_joined, base, bob_shown.clone(), "bob", vec![]))
+        else {
+            unreachable!()
+        };
+        both[0].intros.extend(bobs.into_iter().flat_map(|at| at.intros));
+        bob_hand.send(&Frame::Hello { groups: both }).await;
         bob_hand.settle(&gid).await;
         carol.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
         assert!(carol.node.members(&gid.0).unwrap().iter().any(|m| m.key == bob_key), "Mallory's claim left Bob in");
