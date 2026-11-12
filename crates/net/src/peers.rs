@@ -27,9 +27,10 @@ pub type Membership = (Bytes, u64);
 type Set = BTreeMap<Membership, Ranges>;
 
 pub const DEBOUNCE: u64 = 1_000;
+/// How long a request waits for its answer while no bytes come from its holder.
 pub const TIMEOUT: u64 = 10_000;
-/// How long a request for messages its holder announced waits for the answer: one may be 16 MiB, through a relay that
-/// passes 1 MiB a second, shared.
+/// How long a request waits for its answer at most, while bytes come: one may be 16 MiB, through a relay that passes
+/// 1 MiB a second, shared.
 pub const LARGE_TIMEOUT: u64 = 120_000;
 pub const ANSWER: usize = 1 << 20;
 pub const K: usize = 6;
@@ -129,7 +130,9 @@ struct Request {
     asked: Set,
     /// The epoch it was made in: once this member is in a later one, its answer or silence strikes nothing.
     epoch: u64,
-    /// When it times out: `TIMEOUT` after it was made, or `LARGE_TIMEOUT` if it asks for what the holder announced.
+    made: u64,
+    /// When it times out: `TIMEOUT` after it was made or bytes last came from its holder, and `LARGE_TIMEOUT` after it
+    /// was made at the latest.
     until: u64,
 }
 
@@ -327,6 +330,13 @@ impl Peers {
     pub fn used(&mut self, peer: &Key, now: u64) {
         if let Some(c) = self.conns.get_mut(peer) {
             c.active = now;
+        }
+    }
+
+    /// Bytes came from the peer: a request to it waits on, as they may be its answer.
+    pub fn arriving(&mut self, peer: &Key, now: u64) {
+        for r in self.groups.values_mut().filter_map(|g| g.request.as_mut()).filter(|r| r.holder == *peer) {
+            r.until = (now + TIMEOUT).min(r.made + LARGE_TIMEOUT);
         }
     }
 
@@ -710,11 +720,8 @@ impl Peers {
             if let Some((holder, asked)) = request {
                 let asked: Set = asked.into_iter().map(|(m, r)| (m, r.iter().take(512).collect::<Ranges>())).collect();
                 let wants = to_seqs(&asked);
-                let c = self.conns.get_mut(&holder).expect("a connected holder");
-                c.active = now;
-                let announced = c.has.get(&id).is_some_and(|has| !offer(&asked, has, &BTreeMap::new(), &holder).is_empty());
-                let until = now + if announced { LARGE_TIMEOUT } else { TIMEOUT };
-                self.groups.get_mut(&id).expect("a group of ours").request = Some(Request { holder, asked, epoch, until });
+                self.conns.get_mut(&holder).expect("a connected holder").active = now;
+                self.groups.get_mut(&id).expect("a group of ours").request = Some(Request { holder, asked, epoch, made: now, until: now + TIMEOUT });
                 out.push(Out::Frame(holder, Frame::Want { group: id, epoch, wants }));
             }
         }

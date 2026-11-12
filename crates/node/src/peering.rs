@@ -503,7 +503,7 @@ impl Inner {
         Ok(())
     }
 
-    /// A connection, a disconnection or a frame from a peer, each in a step of its own.
+    /// A connection, a disconnection, bytes coming or a frame from a peer, each in a step of its own.
     pub(crate) fn peer_event(self: &Arc<Self>, event: lmk_net::Event) {
         let mut st = self.lock();
         let now = st.tick();
@@ -516,6 +516,7 @@ impl Inner {
                 st.peers.disconnect(peer.as_bytes(), now);
                 st.early_hellos.retain(|(early, _)| *early != peer);
             }
+            lmk_net::Event::Arriving(peer) => st.peers.arriving(peer.as_bytes(), now),
             lmk_net::Event::Frame(peer, frame) if st.peers.is_connected(peer.as_bytes()) => {
                 if let Err(error) = self.frame(&mut st, peer, frame) {
                     self.warn(None, format!("a frame from {}: {error:#}", peer.fmt_short()));

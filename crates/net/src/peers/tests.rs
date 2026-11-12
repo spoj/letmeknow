@@ -693,10 +693,9 @@ fn an_answer_at_its_size_strikes_only_what_was_asked() {
     assert_eq!(p.groups[&id()].struck, BTreeMap::from([((key(1), member(1)), Ranges::range(1, 1))]));
 }
 
-/// A peer that announced what this member wants is asked for it, though no summary shows it held, and is given
-/// `LARGE_TIMEOUT` to answer, as what it announced is large, before the next holder is asked.
+/// A peer that announced what this member wants is asked for it, though no summary shows it held.
 #[test]
-fn an_announcer_is_asked_and_given_long_to_answer() {
+fn an_announcer_is_asked() {
     let mut p = peers();
     let mut o = own(1, &[1, 2]);
     o.wanted = ask();
@@ -707,8 +706,6 @@ fn an_announcer_is_asked_and_given_long_to_answer() {
     p.frame(&key(1), &Frame::Have { group: id(), held: ask() }, 0);
     p.summary(&id(), heard(2, 1, 0, ask()), false);
     assert_eq!(wants(&p.poll(0)), vec![(key(1), ask())]);
-    assert!(wants(&p.poll(LARGE_TIMEOUT - 1)).is_empty());
-    assert_eq!(wants(&p.poll(LARGE_TIMEOUT)), vec![(key(2), ask())]);
 }
 
 /// What a peer announced holds for its connection only: a new one starts with nothing announced.
@@ -723,13 +720,26 @@ fn an_announcement_ends_with_its_connection() {
     assert!(!p.holder(&id(), &ask(), 10));
 }
 
-/// A request times out 10 s after it was made, however busy the connection is with other frames.
+/// A request times out once no bytes came from its holder for `TIMEOUT`, as an answer of 16 MiB through a relay that
+/// passes 1 MiB a second comes for longer, and `LARGE_TIMEOUT` after it was made however they come.
 #[test]
-fn a_request_times_out_though_the_holder_sends_other_frames() {
+fn a_request_times_out_once_bytes_stop_coming_from_its_holder() {
     let mut p = both_hold();
     p.poll(0);
-    p.frame(&key(1), &Frame::Hello { groups: vec![] }, TIMEOUT - 1);
-    assert_eq!(wants(&p.poll(TIMEOUT)), vec![(key(2), ask())]);
+    for at in (1_000..=20_000).step_by(1_000) {
+        p.arriving(&key(1), at);
+        assert!(wants(&p.poll(at)).is_empty());
+    }
+    assert!(wants(&p.poll(20_000 + TIMEOUT - 1)).is_empty());
+    assert_eq!(wants(&p.poll(20_000 + TIMEOUT)), vec![(key(2), ask())]);
+
+    let mut p = both_hold();
+    p.poll(0);
+    for at in (1_000..LARGE_TIMEOUT).step_by(1_000) {
+        p.arriving(&key(1), at);
+        assert!(wants(&p.poll(at)).is_empty());
+    }
+    assert_eq!(wants(&p.poll(LARGE_TIMEOUT)), vec![(key(2), ask())]);
 }
 
 /// The commit wait dials holders four at a time, those that hold the lowest lacking seq first.

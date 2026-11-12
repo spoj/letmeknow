@@ -100,6 +100,30 @@ async fn an_unknown_frame_is_skipped() {
     a.net.shutdown().await.unwrap();
 }
 
+/// Bytes that come on a peer's stream are told before their frame is whole, which through a slow relay takes long.
+#[tokio::test(flavor = "multi_thread")]
+async fn bytes_coming_are_told_before_their_frame_is_whole() {
+    let relay = relay().await;
+    let keys = keys(2);
+    let mut a = node(&relay, keys[0].clone(), false).await;
+    let peer = lmk_net::builder([relay.url.clone()]).secret_key(keys[1].clone()).ca_tls_config(iroh::tls::CaTlsConfig::custom_roots([relay.cert.clone()]));
+    let peer = peer.bind().await.unwrap();
+    let conn = peer.connect(iroh::EndpointAddr::new(keys[0].public()).with_relay_url(relay.url.clone()), frame::ALPN).await.unwrap();
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    frame::write(&mut send, &frame::Open { stream: frame::Stream::Peer }).await.unwrap();
+    frame::write(&mut send, &want(1)).await.unwrap();
+    let from = keys[1].public();
+    assert_eq!(a.until(|e| matches!(e, Event::Frame(..))).await, Event::Frame(from, want(1)));
+    let bytes = frame::encode(&want(2));
+    send.write_all(&bytes[..8]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    send.write_all(&bytes[8..16]).await.unwrap();
+    assert_eq!(a.until(|e| matches!(e, Event::Arriving(..))).await, Event::Arriving(from));
+    send.write_all(&bytes[16..]).await.unwrap();
+    assert_eq!(a.until(|e| matches!(e, Event::Frame(..))).await, Event::Frame(from, want(2)));
+    a.net.shutdown().await.unwrap();
+}
+
 /// A frame larger than its reader takes is left out, so what is queued after it arrives and the connection stays.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_frame_past_max_frame_is_left_out() {
@@ -115,9 +139,9 @@ async fn a_frame_past_max_frame_is_left_out() {
     assert!(frame::encode(&oversized).len() - 4 > frame::MAX_FRAME as usize);
     assert!(a.net.frame(members[1], oversized));
     assert!(a.net.frame(members[1], want(1)));
-    assert_eq!(tokio::time::timeout(WAIT, b.events.recv()).await.unwrap(), Some(Event::Frame(members[0], want(1))));
+    assert_eq!(b.until(|e| matches!(e, Event::Frame(..))).await, Event::Frame(members[0], want(1)));
     assert!(b.net.frame(members[0], want(2)));
-    assert_eq!(tokio::time::timeout(WAIT, a.events.recv()).await.unwrap(), Some(Event::Frame(members[1], want(2))));
+    assert_eq!(a.until(|e| matches!(e, Event::Frame(..))).await, Event::Frame(members[1], want(2)));
     a.net.shutdown().await.unwrap();
     b.net.shutdown().await.unwrap();
 }

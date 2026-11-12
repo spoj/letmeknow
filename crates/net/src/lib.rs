@@ -52,6 +52,8 @@ pub enum Event {
     /// A connection to the peer registered, replacing any other; true when this side dialed it.
     Connected(EndpointId, bool),
     Disconnected(EndpointId),
+    /// Bytes came on the peer's stream, told about once a second while they come, as a large frame takes long.
+    Arriving(EndpointId),
     /// A frame on the peer's stream.
     Frame(EndpointId, Frame),
 }
