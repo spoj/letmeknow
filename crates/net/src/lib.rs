@@ -186,6 +186,9 @@ impl Inner {
         let (me, peer) = (self.endpoint.id(), conn.remote_id());
         let dialer = if dialed { me } else { peer };
         let (out, rx) = mpsc::unbounded_channel();
+        // Room for `Connected` is had before the link is kept, so that a caller dropped while waiting leaves no link
+        // `Peers` was not told of.
+        let told = self.events.reserve().await.ok()?;
         {
             let mut links = self.links.lock().unwrap();
             match links.get(&peer).filter(|old| old.conn.close_reason().is_none()) {
@@ -198,7 +201,7 @@ impl Inner {
             }
             links.insert(peer, Link { conn: conn.clone(), dialer, out });
         }
-        self.events.send(Event::Connected(peer, dialed)).await.ok();
+        told.send(Event::Connected(peer, dialed));
         Some(rx)
     }
 
