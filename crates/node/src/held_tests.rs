@@ -412,3 +412,38 @@ async fn unopened_ciphertexts_within_the_window_open_before_their_epochs_keys_go
         node.shutdown().await.unwrap();
     }
 }
+
+/// A stranger's hello of groups this session has not added is kept only as its latest, and dropped as it disconnects.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_strangers_early_hello_is_its_latest_and_goes_when_it_disconnects() {
+    use lmk_proto::{frame, peer::At};
+    let relay = lmk_testing::relay().await;
+    let config = Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[1; 32]) };
+    let bob = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0;
+    let stranger = relay.endpoint(iroh::SecretKey::from_bytes(&[99; 32])).await;
+    let conn = stranger.connect(iroh::EndpointAddr::new(bob.net().id()).with_relay_url(relay.url.clone()), frame::ALPN).await.unwrap();
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    frame::write(&mut send, &frame::Open { stream: frame::Stream::Peer }).await.unwrap();
+    let hello = |group: u8| Frame::Hello { groups: vec![At { group: Bytes(vec![group; 16]), log: [0; 32], head: None, seen: BTreeMap::new(), intros: vec![], expired: vec![] }] };
+    frame::write(&mut send, &hello(1)).await.unwrap();
+    frame::write(&mut send, &hello(2)).await.unwrap();
+    let timeout = n0_future::time::Duration::from_secs(5);
+    n0_future::time::timeout(timeout, async {
+        while !bob.inner.lock().early_hellos.iter().any(|(_, at)| at.group.0 == [2; 16]) {
+            n0_future::time::sleep(n0_future::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Bob read the stranger's second hello");
+    assert_eq!(bob.inner.lock().early_hellos.len(), 1);
+    conn.close(0u32.into(), b"bye");
+    stranger.close().await;
+    n0_future::time::timeout(timeout, async {
+        while !bob.inner.lock().early_hellos.is_empty() {
+            n0_future::time::sleep(n0_future::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the stranger's hello went with it");
+    bob.shutdown().await.unwrap();
+}

@@ -416,6 +416,9 @@ async fn an_invalid_admission_counts_as_a_refusal_and_asks_the_next_member() {
         fn admit(&self, _: &iroh::EndpointId, _: Frame) -> Option<Frame> {
             None
         }
+        fn serves(&self, _: &iroh::EndpointId) -> bool {
+            false
+        }
     }
     struct BadAdmit;
     impl Admit for BadAdmit {
@@ -2229,7 +2232,7 @@ impl Hand {
     async fn until<T>(&mut self, mut pick: impl FnMut(Frame) -> Option<T>) -> T {
         tokio::time::timeout(WAIT, async {
             loop {
-                if let Some(found) = pick(frame::read_known(&mut self.recv).await.unwrap()) {
+                if let Some(found) = pick(frame::read_known(&mut self.recv, frame::MAX_FRAME).await.unwrap()) {
                     return found;
                 }
             }

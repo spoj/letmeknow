@@ -373,7 +373,8 @@ pub(crate) struct State {
     gate: bool,
     /// The current step is the poll's own: its end wakes no poll.
     quiet: bool,
-    /// Hellos of groups not added yet, with the peers that sent them: taken once the group is.
+    /// The latest hello of each connected peer that named groups not added yet: taken once the group is, and dropped
+    /// as the peer disconnects.
     early_hellos: Vec<(EndpointId, At)>,
     /// Entries of logs not followed yet, with the peers that sent them, at most `TOLD`: taken once the log is followed.
     early_entries: Vec<(EndpointId, Bytes, Vec<Bytes>, Head)>,

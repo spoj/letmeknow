@@ -15,11 +15,14 @@ const WRITE: Duration = Duration::from_secs(120);
 
 /// Runs the connection's one peer stream; the connection closes with it. The peer's frames are read one at a time, as
 /// the node takes them: a peer that sends faster than that waits. One that reads nothing of what it is sent for `WRITE`
-/// is closed, and what is queued for it goes; a frame larger than its reader takes is left out.
+/// is closed, and what is queued for it goes; a frame larger than its reader takes is left out. A peer that serves no
+/// group is read up to `MAX_ASK` a frame, and one larger closes the connection.
 pub(crate) async fn run(inner: Arc<Inner>, conn: Connection, mut send: SendStream, mut recv: RecvStream, mut out: mpsc::UnboundedReceiver<Frame>) {
     let peer = conn.remote_id();
     let read = async {
-        while let Ok(frame) = frame::read_known(&mut recv).await {
+        loop {
+            let max = if inner.groups.serves(&peer) { frame::MAX_FRAME } else { frame::MAX_ASK };
+            let Ok(frame) = frame::read_known(&mut recv, max).await else { break };
             inner.events.send(Event::Frame(peer, frame)).await?;
         }
         anyhow::Ok(())

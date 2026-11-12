@@ -45,10 +45,10 @@ pub async fn read_within<T: DeserializeOwned, R: AsyncRead + Unpin>(r: &mut R, m
     Ok(serde_json::from_slice(&read_body(r, max).await?)?)
 }
 
-/// Reads frames until one parses as `T`, skipping those that do not, such as a newer letmeknow's.
-pub async fn read_known<T: DeserializeOwned, R: AsyncRead + Unpin>(r: &mut R) -> Result<T> {
+/// Reads frames of at most `max` bytes until one parses as `T`, skipping those that do not, such as a newer letmeknow's.
+pub async fn read_known<T: DeserializeOwned, R: AsyncRead + Unpin>(r: &mut R, max: u32) -> Result<T> {
     loop {
-        if let Ok(value) = serde_json::from_slice(&read_body(r, MAX_FRAME).await?) {
+        if let Ok(value) = serde_json::from_slice(&read_body(r, max).await?) {
             return Ok(value);
         }
     }
@@ -79,7 +79,7 @@ mod tests {
     async fn read_known_skips_what_does_not_parse() {
         let mut buf = encode(&serde_json::json!({"stream": "newer"}));
         buf.extend(encode(&Open { stream: Stream::Admission }));
-        let open: Open = read_known(&mut buf.as_slice()).await.unwrap();
+        let open: Open = read_known(&mut buf.as_slice(), MAX_FRAME).await.unwrap();
         assert_eq!(open.stream, Stream::Admission);
     }
 }

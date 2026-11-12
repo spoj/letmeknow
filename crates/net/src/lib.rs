@@ -37,6 +37,8 @@ const ASK: Duration = Duration::from_secs(30);
 pub trait Groups: Send + Sync + 'static {
     /// What of a frame goes to `peer` as it is written, by the gate as it is then: none if nothing.
     fn admit(&self, peer: &EndpointId, frame: Frame) -> Option<Frame>;
+    /// Whether the gate serves `peer` any group: a peer that serves none has its frames read up to `MAX_ASK`.
+    fn serves(&self, peer: &EndpointId) -> bool;
 }
 
 /// A member's decision on a joiner's request; it may commit an Add before it answers.

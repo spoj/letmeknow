@@ -25,8 +25,6 @@ use crate::{Epoch, G, Inner, Member, Node, Out, State, Work, endpoint_id, get, n
 const UNVERIFIED: usize = 32;
 /// The largest signed intro taken, in bytes: several times one whose text is `MAX_INTRO` bytes.
 const SIGNED_INTRO: usize = 4096;
-/// How many hellos of groups it has not added yet this session keeps.
-const EARLY: usize = 32;
 
 /// A member's latest summary of a group: what it holds, and when it was signed, at most when it came.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -502,6 +500,7 @@ impl Inner {
             }
             lmk_net::Event::Disconnected(peer) => {
                 st.peers.disconnect(peer.as_bytes(), now);
+                st.early_hellos.retain(|(early, _)| *early != peer);
             }
             lmk_net::Event::Frame(peer, frame) if st.peers.is_connected(peer.as_bytes()) => {
                 if let Err(error) = self.frame(&mut st, peer, frame) {
@@ -533,9 +532,8 @@ impl Inner {
             }
             st.peers.frame(&key, &Frame::Hello { groups }, now);
             // A joiner's admitter says where it is as it applies the Add, which may be before the Welcome adds the group here.
+            st.early_hellos.retain(|(early, _)| *early != peer);
             st.early_hellos.extend(early.into_iter().map(|at| (peer, at)));
-            let excess = st.early_hellos.len().saturating_sub(EARLY);
-            st.early_hellos.drain(..excess);
             return Ok(());
         }
         if let Frame::Entries { log, entries, head } = frame {
@@ -665,5 +663,10 @@ impl Node {
 impl Groups for Inner {
     fn admit(&self, peer: &EndpointId, frame: Frame) -> Option<Frame> {
         self.lock().admissible(peer, frame)
+    }
+
+    fn serves(&self, peer: &EndpointId) -> bool {
+        let st = self.lock();
+        st.groups.keys().any(|gid| st.serves(gid, peer))
     }
 }

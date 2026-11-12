@@ -65,13 +65,18 @@ pub struct Node {
 
 /// A node on `relay`; with `relay_only`, reached only through it.
 pub async fn node(relay: &Relay, key: SecretKey, relay_only: bool) -> Node {
+    node_with(relay, key, relay_only, Arc::new(Fake)).await
+}
+
+/// A node on `relay` whose group logic is `groups`; with `relay_only`, reached only through it.
+pub async fn node_with(relay: &Relay, key: SecretKey, relay_only: bool, groups: Arc<dyn Groups>) -> Node {
     let mut builder = lmk_net::builder([relay.url.clone()]).secret_key(key).ca_tls_config(CaTlsConfig::custom_roots([relay.cert.clone()]));
     if relay_only {
         builder = builder.clear_ip_transports();
     }
     let endpoint = builder.bind().await.unwrap();
     tokio::time::timeout(WAIT, endpoint.online()).await.expect("online");
-    let (net, events) = Net::spawn(endpoint, Arc::new(Fake), Arc::new(Inviter)).await.unwrap();
+    let (net, events) = Net::spawn(endpoint, groups, Arc::new(Inviter)).await.unwrap();
     Node { net, events }
 }
 
@@ -126,5 +131,22 @@ pub struct Fake;
 impl Groups for Fake {
     fn admit(&self, _: &EndpointId, frame: Frame) -> Option<Frame> {
         Some(frame)
+    }
+
+    fn serves(&self, _: &EndpointId) -> bool {
+        true
+    }
+}
+
+/// Lets every frame go, and serves no peer a group.
+pub struct NoGroups;
+
+impl Groups for NoGroups {
+    fn admit(&self, _: &EndpointId, frame: Frame) -> Option<Frame> {
+        Some(frame)
+    }
+
+    fn serves(&self, _: &EndpointId) -> bool {
+        false
     }
 }

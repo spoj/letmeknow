@@ -1,6 +1,9 @@
 mod common;
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use common::*;
 use lmk_net::Event;
@@ -115,6 +118,25 @@ async fn a_frame_past_max_frame_is_left_out() {
     assert_eq!(tokio::time::timeout(WAIT, b.events.recv()).await.unwrap(), Some(Event::Frame(members[0], want(1))));
     assert!(b.net.frame(members[0], want(2)));
     assert_eq!(tokio::time::timeout(WAIT, a.events.recv()).await.unwrap(), Some(Event::Frame(members[1], want(2))));
+    a.net.shutdown().await.unwrap();
+    b.net.shutdown().await.unwrap();
+}
+
+/// A frame past `MAX_ASK` from a peer that serves no group is not read: the connection closes with it, as it is a stranger's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frame_past_max_ask_from_a_peer_served_no_group_closes_the_connection() {
+    let relay = relay().await;
+    let keys = keys(2);
+    let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
+    let mut a = node(&relay, keys[0].clone(), false).await;
+    let mut b = node_with(&relay, keys[1].clone(), true, Arc::new(NoGroups)).await;
+    a.net.dial(members[1], vec![relay.url.clone()]).await.unwrap();
+    a.until(|e| matches!(e, Event::Connected(..))).await;
+    b.until(|e| matches!(e, Event::Connected(..))).await;
+    let large = Frame::Held { group: Bytes(G.to_vec()), items: vec![Bytes(vec![7; 100 << 10])], answers: None };
+    assert!(frame::encode(&large).len() - 4 > frame::MAX_ASK as usize);
+    assert!(a.net.frame(members[1], large));
+    assert_eq!(b.until(|e| matches!(e, Event::Frame(..) | Event::Disconnected(..))).await, Event::Disconnected(members[0]));
     a.net.shutdown().await.unwrap();
     b.net.shutdown().await.unwrap();
 }
