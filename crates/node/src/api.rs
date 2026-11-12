@@ -242,11 +242,6 @@ impl Node {
         self.inner.caught_up(gid).await
     }
 
-    /// Asks the services whether the logs the group's members are behind in were let go, as a commit does first.
-    pub async fn ask_behind(&self, gid: &[u8]) -> Result<()> {
-        self.inner.ask_behind(gid).await
-    }
-
     /// The reference of a group's current log, its epoch's, at its membership service.
     pub fn log(&self, gid: &[u8]) -> Result<Bytes> {
         Ok(self.inner.lock().group(gid)?.rec.log.clone())

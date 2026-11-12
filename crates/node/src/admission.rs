@@ -273,7 +273,6 @@ impl Inner {
         if let Some(epoch) = logged {
             return self.admitted(&gid, epoch);
         }
-        self.remove_lapsed(&gid, &joiner.0).await?;
         if let Some(sig) = &leave {
             let remove = |_: &State, g: &G| {
                 let left = g.mls.left(&joiner.0, &sig.0);
@@ -296,33 +295,6 @@ impl Inner {
             }
             admitted => admitted,
         }
-    }
-
-    /// Removes the member whose key a joiner brings, in a commit of its own, as an admin from `EVICT` after it joined, if the
-    /// log of the epoch it is in was let go, as known or as its service answers: a member that was out past the retention,
-    /// and not yet removed, must go before its key is added. Each build of the commit removes it only while that membership
-    /// is still behind in an epoch let go: it may have shown itself since, or been replaced.
-    async fn remove_lapsed(self: &Arc<Self>, gid: &[u8], key: &[u8]) -> Result<()> {
-        let judged = {
-            let st = self.lock();
-            let g = st.group(gid)?;
-            let joined = g.mls.joined(key).filter(|_| g.mls.admin(st.me()));
-            joined.zip(g.behind(key).cloned())
-        };
-        let Some((joined, epoch)) = judged else { return Ok(()) };
-        if !epoch.gone() {
-            let (expiries, forgotten) = self.let_go(vec![(epoch.service.clone(), epoch.capability)]).await;
-            if expiries.is_empty() && forgotten.is_empty() {
-                return Ok(());
-            }
-            self.lock().take_expiries(gid, &expiries, &forgotten)?;
-        }
-        let remove = |_: &State, g: &G| {
-            let lapsed = g.mls.joined(key) == Some(joined) && g.behind(key).is_some_and(|epoch| epoch.gone());
-            Ok(g.mls.members().into_iter().find(|m| m.key == key && lapsed).map(|m| Change { remove: vec![m.index], ..Change::default() }))
-        };
-        self.commit(gid, remove).await?;
-        Ok(())
     }
 
     /// Commits the Add, carrying the invite the joiner came in by, and answers with its commit entry. Each build of the

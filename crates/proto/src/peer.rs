@@ -56,8 +56,8 @@ pub struct At {
     /// Members' signed intros the sender holds and has not told the receiver, each as its member signed it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intros: Vec<Signed>,
-    /// Expiries of logs of the group's earlier epochs, as their service signed them, that the sender holds and has not
-    /// told the receiver.
+    /// Expiries of logs of the group's earlier epochs, as their service signed them, that a sender of 0.26.0 holds and has
+    /// not told the receiver: this version sends none, and ignores those it is told.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expired: Vec<Expiry>,
 }
@@ -122,8 +122,8 @@ pub struct Intro {
     pub text: Option<String>,
 }
 
-/// The epoch a member was in as it signed its intro, and the capability of that epoch's log: a member that joined since
-/// asks the service by it whether the log was let go, and removes the member once it was.
+/// The epoch a member was in as it signed its intro, and the capability of that epoch's log: a session of 0.26.0 that
+/// joined since asks the service by it whether the log was let go, and removes the member once it was.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Shown {
     pub epoch: u64,

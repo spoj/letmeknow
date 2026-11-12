@@ -15,7 +15,7 @@ use lmk_proto::peer::{Admitted, Frame, Seqs};
 use lmk_proto::ranges::Ranges;
 
 use crate::held::Author;
-use crate::{Epoch, Event, Inner, Lost, LostOf, Member, Out, State, Work, put};
+use crate::{Event, Inner, Lost, LostOf, Member, Out, State, Work, put};
 
 /// How many of a group's last logs a commit tells the connected members it removes.
 pub(crate) const TOLD: usize = 8;
@@ -107,7 +107,6 @@ impl Inner {
         self.lose(st, gid)?;
         let g = st.groups.get_mut(gid).unwrap();
         let inner = g.mls.open_entry(&st.provider, entry)?;
-        let ended = Epoch { epoch: ending, capability: g.mls.capability(&st.provider)?, service: g.mls.settings().membership, member: None, expired: None, forgotten: false };
         let mut applied = g.mls.apply(&st.provider, entry)?;
         let current = g.mls.epoch();
         g.fetch = None;
@@ -128,7 +127,6 @@ impl Inner {
         }
         self.cuts(st, gid, &applied, ending)?;
         self.deliver_ready(st, gid)?;
-        st.moved(gid, &applied, ended)?;
         if applied.own {
             st.present(gid)?;
         }
@@ -268,37 +266,6 @@ impl Inner {
                 }
             }
         }
-        Ok(())
-    }
-}
-
-impl State {
-    /// Records that the member with key `key` is at `epoch`, unless this session knows it is past it.
-    pub(crate) fn at(&mut self, gid: &[u8], key: &[u8], epoch: u64) -> Result<()> {
-        let g = self.group_mut(gid)?;
-        match g.rec.members.iter_mut().find(|(member, _)| member.0 == key) {
-            Some((_, at)) => *at = (*at).max(epoch),
-            None => g.rec.members.push((Bytes(key.to_vec()), epoch)),
-        }
-        Ok(())
-    }
-
-    /// Moves what this session knows of its members' epochs as a commit applied: the committer and the members it added
-    /// are in the epoch it began; the removed are forgotten; the epoch it ended, like each earlier one, keeps its log's
-    /// capability while a member is in it, and a member's claim of an epoch is kept while that member is in it.
-    fn moved(&mut self, gid: &[u8], applied: &core::Applied, ended: Epoch) -> Result<()> {
-        let me = self.me().to_vec();
-        let current = self.group(gid)?.mls.epoch();
-        let members = self.group(gid)?.mls.members();
-        let committer = members.iter().find(|m| m.index == applied.by).map(|m| m.key.clone());
-        for key in committer.into_iter().chain(applied.added.iter().map(|m| m.key.clone())).filter(|key| *key != me) {
-            self.at(gid, &key, current)?;
-        }
-        let g = self.group_mut(gid)?;
-        g.rec.members.retain(|(key, _)| members.iter().any(|m| m.key == key.0));
-        g.rec.epochs.push(ended);
-        let at: Vec<(&[u8], u64)> = members.iter().filter(|m| m.key != me).map(|m| (m.key.as_slice(), g.at_epoch(&m.key))).collect();
-        g.rec.epochs.retain(|e| at.iter().any(|(key, at)| *at == e.epoch && e.member.as_ref().is_none_or(|member| member.0 == *key)));
         Ok(())
     }
 }
