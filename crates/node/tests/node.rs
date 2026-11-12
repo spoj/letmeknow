@@ -319,11 +319,9 @@ async fn any_member_admits_an_invite_once() {
     }
 
     // An expired one too.
-    let secret = [7u8; 16];
-    let expired = json!({ "type": "invite", "hash": Bytes(Sha256::digest(secret).to_vec()), "expires": lmk_node::now() - 1 });
-    bob.node.send(&gid.0, &expired, None).await.unwrap();
+    let expired = bob.node.invite(&gid.0, 0, None).await.unwrap();
     eventually("Alice holds the expired invite", || alice.node.messages(&gid.0).unwrap().iter().any(|m| m.payload["type"] == "invite")).await;
-    let expired = Invite { secret, members: vec![link.members[0].clone()], ..link.clone() };
+    let expired = Invite { members: vec![link.members[0].clone()], ..expired };
     assert!(format!("{:#}", erin.node.join(&expired).await.unwrap_err()).contains("unknown, used or expired"));
 
     // With the inviter offline, another member it named admits the joiner.
@@ -375,7 +373,7 @@ async fn an_unknown_secret_is_refused_whatever_the_request_carries() {
     alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
     let (id, url) = alice.node.address();
     let peer = iroh::EndpointId::from_bytes(&id).unwrap();
-    let join = Join { secret: Bytes(vec![7; 16]), key_package: Bytes(b"not a KeyPackage".to_vec()) };
+    let join = Join { group: gid.clone(), by: alice.node.key(), joined: 0, secret: Bytes(vec![7; 16]), key_package: Bytes(b"not a KeyPackage".to_vec()) };
     let answer = stranger.node.net().join(peer, vec![url], join).await.unwrap();
     assert!(matches!(&answer, Answer::Refused { refused } if refused.contains("unknown, used or expired")), "{answer:?}");
     while let Ok(event) = alice.events.try_recv() {
@@ -461,6 +459,59 @@ async fn an_invalid_admission_counts_as_a_refusal_and_asks_the_next_member() {
     alice.node.shutdown().await.unwrap();
 }
 
+/// A Welcome into another group than the link's counts as that member's refusal: the join asks the next member, which
+/// admits it into the link's group. The member asked first answers with Mallory's Add of the joiner into her group.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_welcome_into_another_group_than_the_links_counts_as_a_refusal() {
+    use lmk_net::{Admit, Groups, Net};
+    use lmk_proto::{Answer, links::Invite, peer::{Admitted, Join}};
+
+    struct NoGroups;
+    impl Groups for NoGroups {
+        fn admit(&self, _: &iroh::EndpointId, _: Frame) -> Option<Frame> {
+            None
+        }
+        fn serves(&self, _: &iroh::EndpointId) -> bool {
+            false
+        }
+    }
+    /// Answers with what Mallory answers the joiner's KeyPackage brought by `join`, through `net`.
+    struct Elsewhere {
+        net: Net,
+        mallory: (iroh::EndpointId, iroh::RelayUrl),
+        join: Join,
+    }
+    impl Admit for Elsewhere {
+        fn join(&self, _: iroh::EndpointId, join: Join) -> n0_future::boxed::BoxFuture<Answer<Admitted>> {
+            let (net, (peer, url), join) = (self.net.clone(), self.mallory.clone(), Join { key_package: join.key_package, ..self.join.clone() });
+            Box::pin(async move { net.join(peer, vec![url], join).await.unwrap() })
+        }
+    }
+
+    let relay = relay().await;
+    let (alice, mallory, carol, dave) = (session(&relay).await, session(&relay).await, session(&relay).await, session(&relay).await);
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    let elsewhere = mallory.node.create(settings(&relay)).unwrap();
+    let link = alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
+    let theirs = mallory.node.invite(&elsewhere.0, INVITE_VALID, None).await.unwrap();
+    let join = Join { group: Bytes(theirs.group.to_vec()), by: Bytes(theirs.by.to_vec()), joined: theirs.joined, secret: Bytes(theirs.secret.to_vec()), key_package: Bytes::default() };
+    let (id, url) = mallory.node.address();
+    let admit = Elsewhere { net: carol.node.net().clone(), mallory: (iroh::EndpointId::from_bytes(&id).unwrap(), url), join };
+    let endpoint = lmk_net::builder([relay.url.clone()]).ca_tls_config(relay.ca()).bind().await.unwrap();
+    let (bad, _rx) = Net::spawn(endpoint, Arc::new(NoGroups), Arc::new(admit)).await.unwrap();
+    bad.dial(dave.node.net().id(), vec![relay.url.clone()]).await.unwrap();
+    eventually("the bad peer is connected", || dave.node.net().connected().contains(&bad.id())).await;
+
+    let both = Invite { members: vec![(*bad.id().as_bytes(), relay.domain.clone()), link.members[0].clone()], ..link.clone() };
+    let (joined, by) = dave.node.join(&both).await.unwrap();
+    assert_eq!((joined, by), (gid.clone(), link.members[0].0));
+    assert_eq!(dave.node.groups(), vec![gid]);
+    bad.shutdown().await.unwrap();
+    for session in [alice, mallory, carol, dave] {
+        session.node.shutdown().await.unwrap();
+    }
+}
+
 /// An invite dies when its inviter leaves the group, removed or by `leave`, even if it returns with the same key.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_invite_dies_when_its_inviter_leaves() {
@@ -501,29 +552,79 @@ async fn an_invite_dies_when_its_inviter_leaves() {
     alice.node.shutdown().await.unwrap();
 }
 
-/// An invite kept since 0.25.2 or earlier, which names no epoch of its inviter's membership, still admits.
+/// A member's copy of another's invite keeps no member from admitting by the invite, even one that opens the copy first:
+/// it keeps a rule for each inviter, and admits the invite's joiner by the inviter's. Mallory copies Alice's invite as
+/// hers, expired; Bob, back while both are stopped, takes the copy first from Mallory's hand.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_invite_kept_without_its_inviters_epoch_admits() {
+async fn a_members_copy_of_an_invite_keeps_no_member_from_admitting_by_it() {
+    use lmk_proto::links::Invite;
     let relay = relay().await;
-    let dir = folder("kept-invites");
-    let db = dir.join("alice.db");
-    let alice = stored(&relay, &db).await;
-    let bob = session(&relay).await;
+    let dir = folder("copied-invite");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = |name: &str| dir.join(format!("{name}.db"));
+    let mut alice = session(&relay).await;
+    let bob = stored(&relay, &db("bob")).await;
+    let mallory = stored(&relay, &db("mallory")).await;
     let gid = alice.node.create(settings(&relay)).unwrap();
+    for joiner in [&bob, &mallory] {
+        joiner.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    }
+    bob.node.shutdown().await.unwrap();
+    drop(bob);
+
+    let alice_key = alice.node.key();
     let link = alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
-    alice.node.shutdown().await.unwrap();
-    drop(alice);
+    let invite = || mallory.node.messages(&gid.0).unwrap().into_iter().find(|m| m.sender.key == alice_key && m.payload["type"] == "invite");
+    eventually("Mallory holds Alice's invite", || invite().is_some()).await;
+    let original = invite().unwrap();
+    let copy = mallory.node.send(&gid.0, &json!({ "type": "invite", "hash": original.payload["hash"], "expires": 0 }), None).await.unwrap();
+    for session in [alice, mallory] {
+        session.node.shutdown().await.unwrap();
+    }
 
-    let mut provider = SqliteProvider::open(&db).unwrap();
-    let key = [b"node/group/".as_slice(), &gid.0].concat();
-    let mut rec: Value = serde_json::from_slice(&provider.get(&key).unwrap().unwrap()).unwrap();
-    assert!(rec["invites"][0].as_object_mut().unwrap().remove("joined").is_some());
-    provider.put(&key, &serde_json::to_vec(&rec).unwrap()).unwrap();
-    provider.close().unwrap();
+    let bob = stored(&relay, &db("bob")).await;
+    bob.node.read_group(&gid.0).await.unwrap();
+    let mut hand = hand(&relay, member_of(&db("mallory")).0, &bob.node).await;
+    let items = [&copy, &original.id].map(|id| sealed(&db("mallory"), &gid, id).1).to_vec();
+    hand.send(&Frame::Held { group: gid.clone(), items, answers: None }).await;
+    hand.settle(&gid).await;
+    let dave = session(&relay).await;
+    let ask_bob = Invite { members: vec![(bob.node.address().0, relay.domain.clone())], ..link };
+    assert_eq!(dave.node.join(&ask_bob).await.unwrap().0, gid);
+    for session in [bob, dave] {
+        session.node.shutdown().await.unwrap();
+    }
+}
 
-    let alice = stored(&relay, &db).await;
-    assert_eq!(bob.node.join(&link).await.unwrap().0, gid);
-    for session in [alice, bob] {
+/// A member's copy of an invite, in another group its inviter is in, draws no joiner there: the inviter admits the joiner
+/// into the group the link names. Mallory's group sorts before Alice's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_members_copy_of_an_invite_in_another_group_draws_no_joiner_there() {
+    use lmk_proto::links::Invite;
+    let relay = relay().await;
+    let mut alice = session(&relay).await;
+    let mut mallory = session(&relay).await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    mallory.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    let trap = std::iter::repeat_with(|| mallory.node.create(settings(&relay)).unwrap()).find(|trap| *trap < gid).unwrap();
+    alice.node.join(&mallory.node.invite(&trap.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    mallory.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+
+    let (alice_key, mallory_key) = (alice.node.key(), mallory.node.key());
+    let link = alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
+    let invite = || mallory.node.messages(&gid.0).unwrap().into_iter().find(|m| m.sender.key == alice_key && m.payload["type"] == "invite");
+    eventually("Mallory holds Alice's invite", || invite().is_some()).await;
+    let original = invite().unwrap();
+    let copy = json!({ "type": "invite", "hash": original.payload["hash"], "expires": original.payload["expires"] });
+    mallory.node.send(&trap.0, &copy, None).await.unwrap();
+    eventually("Alice holds Mallory's copy", || alice.node.messages(&trap.0).unwrap().iter().any(|m| m.sender.key == mallory_key && m.payload["type"] == "invite")).await;
+
+    let dave = session(&relay).await;
+    let ask_alice = Invite { members: vec![link.members[0].clone()], ..link };
+    assert_eq!(dave.node.join(&ask_alice).await.unwrap().0, gid);
+    for session in [alice, mallory, dave] {
         session.node.shutdown().await.unwrap();
     }
 }
@@ -1599,9 +1700,9 @@ fn payload_types(db: &Path, gid: &Bytes) -> Vec<(Bytes, String)> {
     }).collect()
 }
 
-/// A member that showed itself in no epoch since the group moved past the last one it did sends a `present` two days
-/// later, while online: the others see it in the current epoch, so their evictions spare it once the log of that last
-/// one is let go.
+/// A member that showed itself in no epoch since the group moved past the last one it did sends a `present`, while
+/// online, once two days have passed since it showed itself: the others see it in the current epoch, so their evictions
+/// spare it once the log of that last one is let go.
 #[test]
 fn an_idle_member_shows_itself_present_before_its_epochs_log_goes() {
     static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2263,11 +2364,11 @@ fn shifted() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// A member catching up does not wait for what a commit made more than H ago kept: Carol, back 8 days later with no
-/// holder of Bob's kept message online, is told it lost at once rather than after `HEAR`. Every thread of the runtime,
-/// the service's included, reads the shifted clock.
+/// A member catching up waits for what a commit kept whatever the commit's age: Carol, back 8 days later with no holder
+/// of Bob's kept message online, is told it lost after `HEAR`. Every thread of the runtime, the service's included,
+/// reads the shifted clock.
 #[test]
-fn catching_up_waits_for_nothing_a_commit_older_than_h_kept() {
+fn catching_up_waits_for_what_a_commit_kept_whatever_its_age() {
     let runtime = tokio::runtime::Builder::new_multi_thread().on_thread_start(|| lmk_proto::clock::set(shifted)).enable_all().build().unwrap();
     runtime.block_on(catching_up());
 }
@@ -2307,7 +2408,7 @@ async fn catching_up() {
         Event::Lost(lost) => Some(lost),
         _ => None,
     }).await;
-    assert!(started.elapsed() < Duration::from_millis(lmk_net::peers::HEAR), "took {:?}", started.elapsed());
+    assert!(started.elapsed() >= Duration::from_millis(lmk_net::peers::HEAR), "took {:?}", started.elapsed());
     assert_eq!((lost.messages[0].from.key.clone(), lost.messages[0].seqs.clone()), (bob_key, vec![1]));
     carol.node.shutdown().await.unwrap();
 }
@@ -4196,19 +4297,16 @@ async fn a_member_that_is_no_admin_removes_a_leaver_by_its_leave() {
     }
 }
 
-/// A commit's time is its committer's word. A member's commit dated years ahead, after one whose cut keeps a message no
-/// one holds, is waited before as any other: once, for `HEAR`.
+/// A commit carries no time. A member's commit made with its clock at 0, after one whose cut keeps a message no one
+/// holds, is waited before as any other: for `HEAR`.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_commit_dated_ahead_is_waited_before_as_any_other() {
-    use lmk_core::group::{Change, Group, Session as Mls};
+async fn a_commit_made_with_the_clock_at_0_is_waited_before_as_any_other() {
+    use lmk_core::group::{Change, Group, Session as Mls, claim};
     fn real() -> u64 {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
     }
-    fn ahead() -> u64 {
-        real() + 50 * 365 * 86_400_000
-    }
     let relay = relay().await;
-    let dir = folder("ahead");
+    let dir = folder("zero");
     std::fs::create_dir_all(&dir).unwrap();
     let bob_db = dir.join("bob.db");
     let alice = session(&relay).await;
@@ -4223,16 +4321,17 @@ async fn a_commit_dated_ahead_is_waited_before_as_any_other() {
     let mls = Mls::load(&provider).unwrap();
     let mut group = Group::load(&provider, &gid.0).unwrap();
     let client = ServeClient::for_service(relay.post(), &relay.service, false).unwrap();
-    // Bob's cut, moved one past what he sent.
+    // Bob's cut, moved to a message he sealed and sent no one.
     let mut cut = group.cut().to_vec();
     let own = cut.iter_mut().find(|r| r.key.0 == mls.key()).unwrap();
-    (own.seq, own.id, own.epoch) = (own.seq + 1, Bytes(vec![7; 32]), 2);
+    let header = lmk_proto::held::Header { group: gid.clone(), author: own.key.clone(), joined: own.joined, seq: own.seq + 1, epoch: group.epoch(), prev: None, deps: vec![], reply_to: None, payload: message("held by no one") };
+    *own = claim(&gid.0, &group.seal(&provider, &mls, &header.encode()).unwrap()).unwrap();
     let capability = group.capability(&provider).unwrap();
     let first = group.commit(&provider, &mls, Change { cut, ..Change::default() }).unwrap();
     client.append(&capability, from_ref(&first.entry)).await.unwrap();
     group.apply(&provider, &first.entry).unwrap();
     let capability = group.capability(&provider).unwrap();
-    lmk_proto::clock::set(ahead);
+    lmk_proto::clock::set(|| 0);
     let cut = group.cut().to_vec();
     let second = group.commit(&provider, &mls, Change { cut, ..Change::default() }).unwrap();
     lmk_proto::clock::set(real);
@@ -4240,8 +4339,10 @@ async fn a_commit_dated_ahead_is_waited_before_as_any_other() {
     drop(group);
     drop(provider);
 
+    let started = std::time::Instant::now();
     alice.node.read_group(&gid.0).await.unwrap();
-    eventually("Alice applies the commit dated ahead", || alice.node.epoch(&gid.0).unwrap() == 4).await;
+    eventually("Alice applies the commit made at 0", || alice.node.epoch(&gid.0).unwrap() == 4).await;
+    assert!(started.elapsed() >= Duration::from_millis(lmk_net::peers::HEAR), "took {:?}", started.elapsed());
     alice.node.shutdown().await.unwrap();
 }
 
@@ -4301,7 +4402,7 @@ async fn a_dep_on_what_came_before_a_member_joined_tells_it_nothing_of_the_deps_
 /// it sends is sealed past that commit, which may remove a member.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_send_waits_for_a_commit_held_and_not_applied() {
-    use lmk_core::group::{Change, Group, Session as Mls};
+    use lmk_core::group::{Change, Group, Session as Mls, claim};
     let relay = relay().await;
     let dir = folder("held-commit");
     std::fs::create_dir_all(&dir).unwrap();
@@ -4314,14 +4415,16 @@ async fn a_send_waits_for_a_commit_held_and_not_applied() {
     bob.shutdown().await.unwrap();
     drop(bob);
 
-    // Bob's cut, moved one past what he sent, then another commit of his: Alice waits before it for what no one holds.
+    // Bob's cut, moved to a message he sealed and sent no one, then another commit of his: Alice waits before it for
+    // what no one holds.
     let provider = SqliteProvider::open(&bob_db).unwrap();
     let mls = Mls::load(&provider).unwrap();
     let mut group = Group::load(&provider, &gid.0).unwrap();
     let client = ServeClient::for_service(relay.post(), &relay.service, false).unwrap();
     let mut cut = group.cut().to_vec();
     let own = cut.iter_mut().find(|r| r.key.0 == mls.key()).unwrap();
-    (own.seq, own.id, own.epoch) = (own.seq + 1, Bytes(vec![7; 32]), 2);
+    let header = lmk_proto::held::Header { group: gid.clone(), author: own.key.clone(), joined: own.joined, seq: own.seq + 1, epoch: group.epoch(), prev: None, deps: vec![], reply_to: None, payload: message("held by no one") };
+    *own = claim(&gid.0, &group.seal(&provider, &mls, &header.encode()).unwrap()).unwrap();
     let capability = group.capability(&provider).unwrap();
     let first = group.commit(&provider, &mls, Change { cut, ..Change::default() }).unwrap();
     client.append(&capability, from_ref(&first.entry)).await.unwrap();

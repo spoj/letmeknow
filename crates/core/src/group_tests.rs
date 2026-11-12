@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::provider::SqliteProvider;
-use lmk_proto::group::{ChatMessage, Service};
+use lmk_proto::group::{ChatMessage, Device, Service};
 use std::path::Path;
 use sha2::{Digest, Sha256};
 
@@ -12,13 +12,24 @@ pub(crate) fn service(domain: &str) -> Service {
     Service::Serve { key: ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key().to_bytes().into(), domain: domain.into(), rest: Default::default() }
 }
 
+/// The domain of the service tests' groups are on.
+const DOMAIN: &str = "lmk.example";
+
 pub(crate) fn settings() -> Settings {
-    Settings { protocol: PROTOCOL, carry: 7, update: lmk_proto::group::UPDATE, membership: service("lmk.example"), admins: vec![], admitted: vec![] }
+    Settings { protocol: PROTOCOL, carry: 7, update: lmk_proto::group::UPDATE, membership: service(DOMAIN), admins: vec![], admitted: vec![] }
 }
 
-/// A leaf naming no device.
-pub(crate) fn leaf(name: &str) -> Leaf {
-    Leaf { key: Bytes(name.as_bytes().to_vec()), home: "lmk.example".into(), device: None }
+/// The iroh key of the session named `name`.
+fn iroh(name: &str) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&Sha256::digest(name).into())
+}
+
+/// The leaf of the session with key `session`, by the iroh key of `name`, which proves it, naming no device.
+pub(crate) fn leaf(name: &str, session: &[u8]) -> Leaf {
+    use ed25519_dalek::Signer as _;
+    let iroh = iroh(name);
+    let proof = iroh.sign(&[LEAF, session].concat()).to_bytes().to_vec();
+    Leaf { key: Bytes(iroh.verifying_key().to_bytes().to_vec()), proof: Bytes(proof), home: DOMAIN.into(), device: None }
 }
 
 /// A device key, by a byte of its seed: the 0th is every test member's, unless it moves (`Member::on`).
@@ -30,7 +41,16 @@ fn key_of(device: &ed25519_dalek::SigningKey) -> Bytes {
     Bytes(device.verifying_key().to_bytes().to_vec())
 }
 
-const INVITE: [u8; 32] = [7; 32];
+/// The invite tests' Adds carry, which only a node checks against its rules.
+fn invite() -> Invited {
+    Invited { by: Bytes(vec![7; 32]), joined: 0, secret: Bytes(vec![7; 16]) }
+}
+
+/// The group a commit entry is of, as a link names it.
+fn group_of(entry: &[u8]) -> [u8; 16] {
+    let MlsMessageBodyIn::PrivateMessage(message) = parse::<MlsMessageIn>(&Entry::parse(entry).unwrap().commit).unwrap().extract() else { panic!() };
+    message.group_id().as_slice().try_into().unwrap()
+}
 
 /// An entry as a member read it: its verdict, and for a commit what applying it did.
 type Read = (Verdict, Option<Applied>);
@@ -49,7 +69,7 @@ pub(crate) struct Member {
 impl Member {
     /// A member on device 0, as all are by default: the founder's device makes them all admins.
     pub fn new(provider: SqliteProvider, name: &str) -> Self {
-        let session = Session::create(&provider, leaf(name)).unwrap();
+        let session = Session::create(&provider, |session| leaf(name, session)).unwrap();
         let mut member = Member { provider, session, group: None, pos: 0, sent: Vec::new() };
         member.on(Some(&device(0)));
         member
@@ -67,7 +87,7 @@ impl Member {
         self.group.as_mut().unwrap()
     }
 
-    pub fn cut(&self) -> Vec<Ref> {
+    pub fn cut(&self) -> Vec<Cut> {
         self.group.as_ref().unwrap().cut().to_vec()
     }
 
@@ -133,14 +153,15 @@ impl Member {
 
     pub fn index_of(&self, name: &str) -> u32 {
         let group = self.group.as_ref().unwrap();
-        group.members().iter().find(|m| m.leaf.as_ref().unwrap().key.0 == name.as_bytes()).unwrap().index
+        let key = iroh(name).verifying_key().to_bytes();
+        group.members().iter().find(|m| m.leaf.key.0 == key).unwrap().index
     }
 
     /// Joins by the inner entry of the commit that added this member, and the Welcome of its Add, which its committer
     /// posted at `pos`.
     pub fn join(&mut self, entry: &[u8], admission: &Admission, pos: usize, package: &[u8]) {
         let reference = key_package_reference(&self.provider, package).unwrap();
-        self.group = Some(Group::join(&self.provider, entry, admission, &reference).unwrap());
+        self.group = Some(Group::join(&self.provider, entry, admission, &reference, &group_of(entry), DOMAIN).unwrap());
         self.pos = pos;
     }
 }
@@ -182,7 +203,7 @@ fn stranger() -> SignatureKeyPair {
 }
 
 /// The authenticated data of a commit that moves `moved`, for commits built past `Group::commit`.
-fn cut_aad(moved: &[Ref]) -> Vec<u8> {
+fn cut_aad(moved: &[Cut]) -> Vec<u8> {
     serde_json::to_vec(&Aad { moved: moved.to_vec(), ..Aad::default() }).unwrap()
 }
 
@@ -215,30 +236,31 @@ fn refused(m: &mut Member, change: Change) -> String {
 /// The refusal `Group::join` gives an entry and its Welcome for `package`, which must be refused.
 fn join_error(m: &Member, entry: &[u8], admission: &Admission, package: &[u8]) -> String {
     let reference = key_package_reference(&m.provider, package).unwrap();
-    Group::join(&m.provider, entry, admission, &reference).err().expect("refused").to_string()
+    Group::join(&m.provider, entry, admission, &reference, &group_of(entry), DOMAIN).err().expect("refused").to_string()
 }
 
 /// The entry of `cut` for the member with `key`.
-fn at<'a>(cut: &'a mut [Ref], key: &[u8]) -> &'a mut Ref {
+fn at<'a>(cut: &'a mut [Cut], key: &[u8]) -> &'a mut Cut {
     cut.iter_mut().find(|r| r.key.0 == key).unwrap()
 }
 
 /// Moved cut entries that `rules` refuses, each with a word of its refusal, against a cut state where `a` is at seq 2
-/// and `b` at seq 0.
-fn refusable(good: &[Ref], a: &[u8], b: &[u8]) -> Vec<(Vec<Ref>, &'static str)> {
-    let entry = |key: &[u8], seq: u64, id: Vec<u8>| Ref { id: Bytes(id), seq, ..good.iter().find(|r| r.key.0 == key).unwrap().clone() };
+/// and `b` at seq 0, and `stale` is a's seq 3 as sealed in the epoch before.
+fn refusable(good: &[Cut], a: &[u8], b: &[u8], stale: &Cut) -> Vec<(Vec<Cut>, &'static str)> {
+    let entry = |key: &[u8], seq: u64, id: Vec<u8>| Cut { id: Bytes(id), seq, ..good.iter().find(|r| r.key.0 == key).unwrap().clone() };
     let mut two = vec![entry(a, 3, vec![6; 32]), entry(b, 1, vec![5; 32])];
     two.sort();
     two.reverse();
-    let joined = Ref { joined: 9, ..entry(b, 1, vec![5; 32]) };
+    let joined = Cut { joined: 9, ..entry(b, 1, vec![5; 32]) };
+    let unsigned = Cut { sealed: stale.sealed + 1, ..entry(b, 1, vec![5; 32]) };
     vec![
         (two, "does not name each member"),
         (vec![entry(a, 3, vec![6; 32]), entry(a, 3, vec![6; 32])], "does not name each member"),
         (vec![joined], "names no member"),
         (vec![entry(a, 1, vec![4; 32])], "below the last"),
         (vec![entry(a, 2, vec![7; 32])], "below the last"),
-        (vec![entry(a, 3, vec![7; 31])], "does not fit its seq"),
-        (vec![entry(b, 0, vec![1; 32])], "does not fit its seq"),
+        (vec![stale.clone()], "of another epoch"),
+        (vec![unsigned], "did not sign"),
     ]
 }
 
@@ -277,7 +299,7 @@ impl World {
         c.group = Some(Group::create(&c.provider, &c.session, &settings()).unwrap());
         let adds: Vec<_> = others.iter().map(|&i| self.m[i].session.key_package(&self.m[i].provider).unwrap()).collect();
         let cut = self.m[creator].cut();
-        let commit = self.m[creator].commit(Change { cut, add: adds.clone(), invite: Some(INVITE.into()), ..Change::default() });
+        let commit = self.m[creator].commit(Change { cut, add: adds.clone(), invite: Some(invite()), ..Change::default() });
         let inner = self.m[creator].open_inner(&commit.entry);
         let admission = commit.admission.clone().unwrap();
         let pos = self.post(commit.entry);
@@ -317,7 +339,7 @@ fn commit_race() {
     let a = w.m[0].commit(Change { cut, ..Change::default() });
     let kp_d = w.key_package(3);
     let cut = w.m[1].cut();
-    let b = w.m[1].commit(Change { cut, add: vec![kp_d.clone()], invite: Some(INVITE.into()), ..Change::default() });
+    let b = w.m[1].commit(Change { cut, add: vec![kp_d.clone()], invite: Some(invite()), ..Change::default() });
     assert!(w.m[0].g().posted().is_some() && w.m[1].g().posted().is_some());
     w.post(a.entry);
     w.post(b.entry);
@@ -330,7 +352,7 @@ fn commit_race() {
     w.agree(&[0, 1, 2]);
 
     let cut = w.m[1].cut();
-    let b2 = w.m[1].commit(Change { cut, add: vec![kp_d.clone()], invite: Some(INVITE.into()), ..Change::default() });
+    let b2 = w.m[1].commit(Change { cut, add: vec![kp_d.clone()], invite: Some(invite()), ..Change::default() });
     let inner = w.m[1].open_inner(&b2.entry);
     let admission = b2.admission.clone().unwrap();
     let pos = w.post(b2.entry);
@@ -350,18 +372,6 @@ fn commit_race() {
     let hi = w.m[2].send("still here");
     assert_eq!(text(&w.m[0].open(&hi).unwrap()), "still here");
     w.agree(&[0, 1, 2, 3]);
-}
-
-#[test]
-fn a_commit_carries_when_its_committer_made_it() {
-    let mut w = World::new(&["A", "B"]);
-    w.found(0, &[1]);
-    lmk_proto::clock::set(|| 1_700_000_000_000);
-    let cut = w.m[0].cut();
-    let commit = w.m[0].commit(Change { cut, ..Change::default() });
-    w.post(commit.entry);
-    let read = w.read(&[0, 1]);
-    assert!(read.iter().all(|read| matches!(read[0].0, Verdict::Commit { time: 1_700_000_000_000, .. })));
 }
 
 #[test]
@@ -419,7 +429,7 @@ fn a_commit_entry_needs_its_committers_signature() {
     w.found(0, &[1, 2]);
     let kp = w.key_package(3);
     let cut = w.m[1].cut();
-    let commit = w.m[1].commit(Change { cut, add: vec![kp], invite: Some(INVITE.into()), ..Change::default() });
+    let commit = w.m[1].commit(Change { cut, add: vec![kp], invite: Some(invite()), ..Change::default() });
     let inner = w.m[0].open_inner(&commit.entry);
     let Entry { commit: bytes, .. } = Entry::parse(&inner).unwrap();
     assert_eq!(inner.len(), 1 + 4 + bytes.len() + 64, "an entry is its commit and signature");
@@ -489,7 +499,7 @@ fn a_forged_message_leaves_no_trace() {
     a.group = Some(Group::create(&a.provider, &a.session, &settings()).unwrap());
     let kp = b.session.key_package(&b.provider).unwrap();
     let cut = a.cut();
-    let commit = a.commit(Change { cut, add: vec![kp.clone()], invite: Some(INVITE.into()), ..Change::default() });
+    let commit = a.commit(Change { cut, add: vec![kp.clone()], invite: Some(invite()), ..Change::default() });
     let inner = a.open_inner(&commit.entry);
     let admission = commit.admission.clone().unwrap();
     let log = vec![commit.entry];
@@ -501,7 +511,8 @@ fn a_forged_message_leaves_no_trace() {
     let mut forger = forger;
     let forged = forger.group.as_mut().unwrap().mls.create_message(&forger.provider, &stranger(), &serde_json::to_vec(&message("forged")).unwrap()).unwrap().to_bytes().unwrap();
     let second = real(&mut b, "second");
-    assert!(a.open(&forged).is_err());
+    let message = parse::<MlsMessageIn>(&forged).unwrap().try_into_protocol_message().unwrap();
+    assert!(a.group.as_mut().unwrap().mls.process_message(&a.provider, message).is_err());
     assert_eq!(text(&a.open(&second).unwrap()), "second", "the forgery used the generation of B's second message");
     assert_eq!(text(&a.open(&first).unwrap()), "first");
 }
@@ -517,7 +528,7 @@ fn a_step_commits_or_rolls_back_with_openmls() {
     a.group = Some(Group::create(&a.provider, &a.session, &settings()).unwrap());
     let kp = b.session.key_package(&b.provider).unwrap();
     let cut = a.cut();
-    let commit = a.commit(Change { cut, add: vec![kp.clone()], invite: Some(INVITE.into()), ..Change::default() });
+    let commit = a.commit(Change { cut, add: vec![kp.clone()], invite: Some(invite()), ..Change::default() });
     let inner = a.open_inner(&commit.entry);
     let admission = commit.admission.clone().unwrap();
     let log = vec![commit.entry];
@@ -598,7 +609,7 @@ fn settings_in_the_welcome() {
 
     let kp = w.key_package(3);
     let cut = w.m[2].cut();
-    let commit = w.m[2].commit(Change { cut, add: vec![kp.clone()], invite: Some(INVITE.into()), ..Change::default() });
+    let commit = w.m[2].commit(Change { cut, add: vec![kp.clone()], invite: Some(invite()), ..Change::default() });
     let inner = w.m[2].open_inner(&commit.entry);
     let admission = commit.admission.clone().unwrap();
     let pos = w.post(commit.entry);
@@ -613,22 +624,22 @@ fn settings_in_the_welcome() {
 fn leaf_data() {
     let mut w = World::new(&["A", "B", "C"]);
     w.found(0, &[1, 2]);
-    let leaves: Vec<_> = w.m[0].g().members().into_iter().map(|m| m.leaf.unwrap()).collect();
+    let leaves: Vec<_> = w.m[0].g().members().into_iter().map(|m| m.leaf).collect();
     assert_eq!(leaves, [0, 1, 2].map(|i| w.m[i].session.leaf.clone()));
     let b = w.m[2].index_of("B");
-    let moved = Leaf { key: Bytes(b"moved".to_vec()), ..w.m[1].session.leaf.clone() };
+    let moved = Leaf { home: "moved.example".into(), ..w.m[1].session.leaf.clone() };
     let cut = w.m[1].cut();
     let commit = w.m[1].commit(Change { cut, leaf: Some(moved.clone()), ..Change::default() });
     w.post(commit.entry);
     w.read(&[0, 1, 2]);
     for i in 0..3 {
-        assert_eq!(w.m[i].g().members()[b as usize].leaf.as_ref(), Some(&moved));
+        assert_eq!(w.m[i].g().members()[b as usize].leaf, moved);
     }
     let cut = w.m[1].cut();
     let commit = w.m[1].commit(Change { cut, ..Change::default() });
     w.post(commit.entry);
     w.read(&[0, 1, 2]);
-    assert_eq!(w.m[0].g().members()[b as usize].leaf.as_ref(), Some(&moved), "a key update keeps the leaf data");
+    assert_eq!(w.m[0].g().members()[b as usize].leaf, moved, "a key update keeps the leaf data");
     w.agree(&[0, 1, 2]);
 }
 
@@ -701,12 +712,9 @@ fn a_removed_members_messages_open_up_to_its_final_cut() {
     w.found(0, &[1, 2]);
     let early = w.m[2].send("before my removal");
     let past = w.m[2].send("past my final cut");
-    let id = w.m[1].open(&early).unwrap().id;
     let (c, key) = (w.m[1].index_of("C"), w.m[2].session.key().to_vec());
     let mut cut = w.m[1].cut();
-    let last = at(&mut cut, &key);
-    last.seq = 1;
-    last.id = Bytes(id.to_vec());
+    *at(&mut cut, &key) = claim(w.m[1].g().id(), &early).unwrap();
     let commit = w.m[1].commit(Change { cut, remove: vec![c], ..Change::default() });
     w.post(commit.entry);
     let read = w.read(&[0, 1, 2]);
@@ -751,7 +759,7 @@ fn another_protocol_is_refused_at_join() {
     let sig = a.session.signer.sign(&welcome_signed(&entry, &serde_json::to_vec(&cut).unwrap(), &welcome)).unwrap();
     let admission = Admission { welcome, cut, sig };
     group.mls.merge_pending_commit(&a.provider).unwrap();
-    let error = Group::join(&w.m[1].provider, &entry, &admission, &reference).err().unwrap();
+    let error = Group::join(&w.m[1].provider, &entry, &admission, &reference, &group_of(&entry), DOMAIN).err().unwrap();
     assert!(error.to_string().contains(&format!("protocol {}", PROTOCOL + 1)), "{error}");
 }
 
@@ -765,7 +773,7 @@ fn state_survives_a_restart() {
     a.group = Some(Group::create(&a.provider, &a.session, &settings()).unwrap());
     let kp = b.session.key_package(&b.provider).unwrap();
     let cut = a.cut();
-    let commit = a.commit(Change { cut, add: vec![kp.clone()], invite: Some(INVITE.into()), ..Change::default() });
+    let commit = a.commit(Change { cut, add: vec![kp.clone()], invite: Some(invite()), ..Change::default() });
     let inner = a.open_inner(&commit.entry);
     let admission = commit.admission.clone().unwrap();
     log.push(commit.entry);
@@ -778,7 +786,7 @@ fn state_survives_a_restart() {
     let c_package = c.session.key_package(&c.provider).unwrap();
     let c_ref = key_package_reference(&c.provider, &c_package).unwrap();
     let cut = b.cut();
-    let pending = b.commit(Change { cut, add: vec![c_package.clone()], invite: Some(INVITE.into()), ..Change::default() });
+    let pending = b.commit(Change { cut, add: vec![c_package.clone()], invite: Some(invite()), ..Change::default() });
     let pending_admission = pending.admission.clone().unwrap();
     let inner = a.open_inner(&pending.entry);
     let rewrapped = a.seal_inner(&inner);
@@ -849,26 +857,36 @@ fn held_messages_keep_their_id_across_epochs() {
     assert_eq!(w.m[2].open(&again).unwrap().id, first.id);
 }
 
-/// What a held message's header is checked against once MLS opens it: its MLS sender's signature key, its claim, its
-/// group, and its author's membership.
+/// What a sealing of a held message is checked against: the signature of the author it claims, and once MLS opens it,
+/// its MLS sender's signature key, its claim, its group, and its author's membership.
 #[test]
 fn held_headers_are_checked() {
     let mut w = World::new(&["A", "B", "C"]);
     w.found(0, &[1, 2]);
     let id = w.m[0].group.as_ref().unwrap().id().to_vec();
     let joined = w.m[0].group.as_ref().unwrap().joined(w.m[0].session.key()).unwrap();
-    // A's header, sealed by B: the MLS sender is not the author.
+    let epoch = w.m[0].g().epoch();
     let plaintext = header(&w.m[0], &id, joined).encode();
+    let claim = Ref { key: Bytes(w.m[0].session.key().to_vec()), joined, seq: 1, id: Bytes(held::id(&plaintext).to_vec()), epoch: joined };
+    // The plaintext as member `by` seals it claiming `claim`, its sealing signed by A.
+    let signed_by_a = |w: &mut World, by: usize, claim: &Ref| {
+        let m = &mut w.m[by];
+        let g = m.group.as_mut().unwrap();
+        g.mls.set_aad(serde_json::to_vec(claim).unwrap());
+        let bytes = g.mls.create_message(&m.provider, &m.session.signer, &plaintext).unwrap().to_bytes().unwrap();
+        let sig = w.m[0].session.sign(&[SEALING, &held::sealing(&id, claim, epoch, &Sha256::digest(&bytes))].concat());
+        [bytes, sig].concat()
+    };
+    // A's header, sealed by B: B's signature is not A's, and with A's the MLS sender is not the author.
     let sealed = w.m[1].seal(&plaintext);
+    assert!(w.m[2].open(&sealed).unwrap_err().to_string().contains("did not sign"));
+    let sealed = signed_by_a(&mut w, 1, &claim);
     assert!(w.m[2].open(&sealed).unwrap_err().to_string().contains("did not author"));
     // Claiming another seq than its header's.
-    let claim = Claim { seq: 2, ..header(&w.m[0], &id, joined).claim() };
-    let epoch = w.m[1].g().epoch();
-    let a = &mut w.m[0];
-    let g = a.group.as_mut().unwrap();
-    g.mls.set_aad(serde_json::to_vec(&claim).unwrap());
-    let sealed = g.mls.create_message(&a.provider, &a.session.signer, &plaintext).unwrap().to_bytes().unwrap();
-    assert_eq!(crate::group::claim(&sealed).unwrap(), (claim, epoch), "the claim reads in the clear");
+    let claim = Ref { seq: 2, ..claim };
+    let sealed = signed_by_a(&mut w, 0, &claim);
+    let claimed = crate::group::claim(&id, &sealed).unwrap();
+    assert_eq!((claimed.seq, claimed.sealed), (2, epoch), "the claim reads in the clear");
     assert!(w.m[1].open(&sealed).unwrap_err().to_string().contains("claimed otherwise"));
     // Another group's.
     let other = header(&w.m[0], &[9; 16], joined).encode();
@@ -891,39 +909,34 @@ fn cuts_advance_and_refuse_what_rules_refuse() {
     let mut w = World::new(&["A", "B", "C", "D"]);
     w.found(0, &[1, 2]);
     let (a, b, c, d) = (w.m[0].session.key().to_vec(), w.m[1].session.key().to_vec(), w.m[2].session.key().to_vec(), w.m[3].session.key().to_vec());
+    let gid = w.m[0].g().id().to_vec();
     w.m[0].send("m1");
     let m2 = w.m[0].send("m2");
-    let id2 = w.m[1].open(&m2).unwrap().id;
+    let stale = claim(&gid, &w.m[0].send("m3")).unwrap();
     let mut cut = w.m[0].cut();
-    let advanced = at(&mut cut, &a);
-    advanced.seq = 2;
-    advanced.id = Bytes(id2.to_vec());
+    *at(&mut cut, &a) = claim(&gid, &m2).unwrap();
     let commit = w.m[0].commit(Change { cut: cut.clone(), ..Change::default() });
     w.post(commit.entry);
     let read = w.read(&[0, 1, 2]);
     assert_eq!(applied(&read[1][0]).cut, cut);
     assert_eq!(w.m[2].cut(), cut);
     w.agree(&[0, 1, 2]);
-    for (bad, why) in refusable(&cut, &a, &b) {
+    for (bad, why) in refusable(&cut, &a, &b, &stale) {
         let error = refused(&mut w.m[0], Change { cut: bad, ..Change::default() });
         assert!(error.contains(why), "{error}");
     }
     assert!(w.m[0].g().posted().is_none());
 
     // B sends in the new epoch, and A commits a cut that takes it, adds D and removes C.
-    let b1 = w.m[1].send("b1");
-    let id_b1 = w.m[0].open(&b1).unwrap().id;
     let mut cut = w.m[0].cut();
-    let reply = at(&mut cut, &b);
-    reply.seq = 1;
-    reply.id = Bytes(id_b1.to_vec());
+    *at(&mut cut, &b) = claim(&gid, &w.m[1].send("b1")).unwrap();
     let c_index = w.m[0].index_of("C");
     let kp_d = w.key_package(3);
     let next = w.m[0].g().epoch() + 1;
-    let commit = w.m[0].commit(Change { cut: cut.clone(), add: vec![kp_d], remove: vec![c_index], invite: Some(INVITE.into()), ..Change::default() });
+    let commit = w.m[0].commit(Change { cut: cut.clone(), add: vec![kp_d], remove: vec![c_index], invite: Some(invite()), ..Change::default() });
     w.post(commit.entry);
-    let mut expected: Vec<Ref> = cut.iter().filter(|r| r.key.0 != c).cloned().collect();
-    expected.push(Ref { key: Bytes(d), joined: next, seq: 0, id: Bytes::default(), epoch: 0 });
+    let mut expected: Vec<Cut> = cut.iter().filter(|r| r.key.0 != c).cloned().collect();
+    expected.push(Cut { key: Bytes(d), joined: next, ..Cut::default() });
     expected.sort();
     let read = w.read(&[0, 1, 2]);
     assert_eq!(applied(&read[1][0]).cut, cut);
@@ -939,18 +952,17 @@ fn members_skip_commits_with_refused_cuts() {
     let mut w = World::new(&["A", "B", "C"]);
     w.found(0, &[1, 2]);
     let (a, b) = (w.m[0].session.key().to_vec(), w.m[1].session.key().to_vec());
+    let gid = w.m[0].g().id().to_vec();
     w.m[0].send("m1");
     let m2 = w.m[0].send("m2");
-    let id2 = w.m[1].open(&m2).unwrap().id;
+    let stale = claim(&gid, &w.m[0].send("m3")).unwrap();
     let mut good = w.m[0].cut();
-    let advanced = at(&mut good, &a);
-    advanced.seq = 2;
-    advanced.id = Bytes(id2.to_vec());
+    *at(&mut good, &a) = claim(&gid, &m2).unwrap();
     let commit = w.m[0].commit(Change { cut: good.clone(), ..Change::default() });
     w.post(commit.entry);
     w.read(&[0, 1, 2]);
     w.agree(&[0, 1, 2]);
-    for (bad, why) in refusable(&good, &a, &b) {
+    for (bad, why) in refusable(&good, &a, &b, &stale) {
         let mut liar = w.m[1].copy();
         let wire = unruled(&mut liar, Aad { moved: bad, ..Aad::default() }, |b| b);
         w.post(wire);
@@ -967,28 +979,28 @@ fn members_skip_commits_with_refused_cuts() {
 }
 
 /// A joiner starts at the cut of the commit that added it: the members' cut, and seq 0 for itself. An entry a member did
-/// not sign, or one with another commit's Welcome, is refused, and leaves the package usable for the right entry.
+/// not sign, or one with another commit's Welcome, is refused, and leaves the package usable for the right entry; so is
+/// a cut its committer signed with an entry that is no sealing its member signed before the joiner's epoch, or one that
+/// names the joiner.
 #[test]
 fn a_joiner_starts_at_the_commits_cut() {
     let mut w = World::new(&["A", "B", "C", "D"]);
     w.found(0, &[1]);
+    let gid = w.m[0].g().id().to_vec();
     w.m[0].send("m1");
     let m2 = w.m[0].send("m2");
-    let id2 = w.m[1].open(&m2).unwrap().id;
-    let (a, c) = (w.m[0].session.key().to_vec(), w.m[2].session.key().to_vec());
+    let (a, b, c) = (w.m[0].session.key().to_vec(), w.m[1].session.key().to_vec(), w.m[2].session.key().to_vec());
     let next = w.m[0].g().epoch() + 1;
     let mut cut = w.m[0].cut();
-    let advanced = at(&mut cut, &a);
-    advanced.seq = 2;
-    advanced.id = Bytes(id2.to_vec());
+    *at(&mut cut, &a) = claim(&gid, &m2).unwrap();
     let kp_c = w.key_package(2);
-    let commit = w.m[0].commit(Change { cut: cut.clone(), add: vec![kp_c.clone()], invite: Some(INVITE.into()), ..Change::default() });
+    let commit = w.m[0].commit(Change { cut: cut.clone(), add: vec![kp_c.clone()], invite: Some(invite()), ..Change::default() });
     let inner = w.m[0].open_inner(&commit.entry);
     let admission = commit.admission.clone().unwrap();
     let pos = w.post(commit.entry);
     w.read(&[0, 1]);
     let mut expected = cut;
-    expected.push(Ref { key: Bytes(c), joined: next, seq: 0, id: Bytes::default(), epoch: 0 });
+    expected.push(Cut { key: Bytes(c.clone()), joined: next, ..Cut::default() });
     expected.sort();
 
     let Entry { commit: bytes, .. } = Entry::parse(&inner).unwrap();
@@ -1005,9 +1017,20 @@ fn a_joiner_starts_at_the_commits_cut() {
     let kp_d = w.key_package(3);
     let mut other = w.m[0].copy();
     let cut = other.cut();
-    let theirs = other.commit(Change { cut, add: vec![kp_d], invite: Some(INVITE.into()), ..Change::default() });
+    let theirs = other.commit(Change { cut, add: vec![kp_d], invite: Some(invite()), ..Change::default() });
     join_error(&w.m[2], &inner, &theirs.admission.unwrap(), &kp_c);
     assert_eq!(w.m[2].provider.rows(), before);
+    let (mut unsigned, mut later, mut naming) = (admission.cut.clone(), admission.cut.clone(), admission.cut.clone());
+    let moved = at(&mut unsigned, &b);
+    (moved.seq, moved.id) = (1, Bytes(vec![5; 32]));
+    *at(&mut later, &a) = claim(&gid, &w.m[0].send("m3")).unwrap();
+    naming.push(Cut { key: Bytes(c), ..Cut::default() });
+    naming.sort();
+    for cut in [unsigned, later, naming] {
+        let sig = w.m[0].session.signer.sign(&welcome_signed(&inner, &serde_json::to_vec(&cut).unwrap(), &admission.welcome)).unwrap();
+        assert!(join_error(&w.m[2], &inner, &Admission { cut, sig, ..admission.clone() }, &kp_c).contains("a malformed cut"));
+        assert_eq!(w.m[2].provider.rows(), before);
+    }
 
     w.m[2].join(&inner, &admission, pos, &kp_c);
     assert_eq!(w.m[2].cut(), expected);
@@ -1022,7 +1045,7 @@ fn a_removed_key_cannot_be_added_back_in_the_same_commit() {
     let package = w.m[1].session.key_package(&w.m[1].provider).unwrap();
     let b = w.m[0].index_of("B");
     let cut = w.m[0].cut();
-    let error = refused(&mut w.m[0], Change { cut, add: vec![package], invite: Some([1; 32].into()), remove: vec![b], ..Change::default() });
+    let error = refused(&mut w.m[0], Change { cut, add: vec![package], invite: Some(invite()), remove: vec![b], ..Change::default() });
     assert!(error.contains("adds a key it removes"), "{error}");
     assert!(w.m[0].g().posted().is_none());
 }
@@ -1036,10 +1059,29 @@ fn an_add_and_its_invite_come_together() {
     let cut = w.m[0].cut();
     let error = refused(&mut w.m[0], Change { cut: cut.clone(), add: vec![package], ..Change::default() });
     assert!(error.contains("an Add that names no invite"), "{error}");
-    let error = refused(&mut w.m[0], Change { cut, invite: Some(INVITE.into()), ..Change::default() });
+    let error = refused(&mut w.m[0], Change { cut, invite: Some(invite()), ..Change::default() });
     assert!(error.contains("an invite with no Add"), "{error}");
     assert!(w.m[0].g().posted().is_none());
     w.agree(&[0, 1]);
+}
+
+/// An Add uses an invite only by its secret: B's Add naming A's invite with another secret leaves it unused, and an Add
+/// with its secret uses it, for every member.
+#[test]
+fn an_add_uses_an_invite_only_by_its_secret() {
+    let mut w = World::new(&["A", "B", "C", "D"]);
+    w.found(0, &[1]);
+    let invite = Invited { by: Bytes(w.m[0].session.key().to_vec()), joined: 0, secret: Bytes(vec![3; 16]) };
+    let hash = invite.hash(w.m[0].g().id());
+    for (joiner, secret, used) in [(2, vec![4; 16], false), (3, vec![3; 16], true)] {
+        let package = w.key_package(joiner);
+        let cut = w.m[1].cut();
+        let commit = w.m[1].commit(Change { cut, add: vec![package], invite: Some(Invited { secret: Bytes(secret), ..invite.clone() }), ..Change::default() });
+        w.post(commit.entry);
+        w.read(&[0, 1]);
+        w.agree(&[0, 1]);
+        assert_eq!([w.m[0].g().used(&hash.0), w.m[1].g().used(&hash.0)], [used; 2]);
+    }
 }
 
 /// A member's credential names its leaf's key, as a held message's sender is known by it: a KeyPackage whose credential
@@ -1053,21 +1095,21 @@ fn a_credential_that_names_another_key_is_refused() {
     let naming_b = |key: &[u8]| CredentialWithKey { credential: BasicCredential::new(b.session.key().to_vec()).into(), signature_key: key.into() };
     let package = KeyPackage::builder()
         .leaf_node_capabilities(capabilities())
-        .leaf_node_extensions(leaf_extensions(&leaf("forger")).unwrap())
+        .leaf_node_extensions(leaf_extensions(&leaf("forger", forger.public())).unwrap())
         .key_package_lifetime(Lifetime::init(0, u64::MAX))
         .build(CIPHERSUITE, &b.provider, &forger, naming_b(forger.public()))
         .unwrap();
     let package = MlsMessageOut::from(package.key_package().clone()).to_bytes().unwrap();
     let forged = naming_b(w.m[0].session.key());
     let cut = w.m[0].cut();
-    let error = refused(&mut w.m[0], Change { cut: cut.clone(), add: vec![package], invite: Some(INVITE.into()), ..Change::default() });
+    let error = refused(&mut w.m[0], Change { cut: cut.clone(), add: vec![package], invite: Some(invite()), ..Change::default() });
     assert!(error.contains("a credential that names another key"), "{error}");
 
     // Built as `Group::commit` builds it but past `rules`, as a forger's client would.
     let package = w.key_package(2);
     let m = &mut w.m[0];
     let g = m.group.as_mut().unwrap();
-    g.mls.set_aad(serde_json::to_vec(&Aad { invite: Some(INVITE.into()), ..Aad::default() }).unwrap());
+    g.mls.set_aad(serde_json::to_vec(&Aad { invite: Some(invite()), ..Aad::default() }).unwrap());
     let bundle = g
         .mls
         .commit_builder()
@@ -1085,6 +1127,87 @@ fn a_credential_that_names_another_key_is_refused() {
     w.post(wire);
     let read = w.read(&[1]);
     assert!(matches!(&read[0][0].0, Verdict::Skipped { reason, .. } if reason.contains("a credential that names another key")), "{:?}", read[0][0].0);
+}
+
+/// Every leaf a commit brings, by an Add or an update, has a domain as its home, the proof of the iroh key it names, and
+/// a device certificate of its session if it names one, and no two members' leaves name one iroh key once the commit
+/// applies: any other is refused by the commit's builder, an Add's as its joiner asks too, and skipped by every member.
+#[test]
+fn a_commit_bringing_an_unproven_leaf_or_a_shared_iroh_key_is_refused() {
+    let mut w = World::new(&["A", "B", "C", "D"]);
+    w.found(0, &[1, 2]);
+    let c = (w.m[2].session.key().to_vec(), w.m[2].session.leaf.key.clone());
+    // Leaves of `m`, each with a word of its refusal: one naming C's iroh key, which did not sign it; one whose home is no
+    // domain; one whose device certified C; and one that C's iroh key signed.
+    let bad = |m: &Member| {
+        let own = m.session.leaf.clone();
+        [
+            (Leaf { key: c.1.clone(), ..own.clone() }, "iroh key did not sign"),
+            (Leaf { home: "Relay.example".into(), ..own.clone() }, "no domain"),
+            (Leaf { device: Some(Device::sign(&device(0), &c.0)), ..own.clone() }, "device did not certify"),
+            (Leaf { device: own.device.clone(), ..leaf("C", m.session.key()) }, "one iroh key"),
+        ]
+    };
+    for (leaf, why) in bad(&w.m[1]) {
+        let cut = w.m[1].cut();
+        let error = refused(&mut w.m[1], Change { cut, leaf: Some(leaf.clone()), ..Change::default() });
+        assert!(error.contains(why), "{error}");
+        let update = LeafNodeParameters::builder().with_extensions(leaf_extensions(&leaf).unwrap()).build();
+        w.refused_past_rules(1, Aad::default(), |b| b.leaf_node_parameters(update), &[0, 2], why);
+    }
+    w.read(&[1]);
+    for (leaf, why) in bad(&w.m[3]) {
+        let d = &mut w.m[3];
+        d.session.set_leaf(&d.provider, leaf).unwrap();
+        let package = w.key_package(3);
+        // A KeyPackage alone shows all but whose iroh key its leaf names too.
+        match key_package_leaf(&w.m[0].provider, &package) {
+            Err(error) => assert!(error.to_string().contains(why), "{error}"),
+            Ok(_) => assert_eq!(why, "one iroh key"),
+        }
+        let cut = w.m[0].cut();
+        let error = refused(&mut w.m[0], Change { cut, add: vec![package.clone()], invite: Some(invite()), ..Change::default() });
+        assert!(error.contains(why), "{error}");
+        let add = key_package_in(&w.m[0].provider, &package).unwrap();
+        w.refused_past_rules(0, Aad { invite: Some(invite()), ..Aad::default() }, |b| b.propose_adds([add]), &[1, 2], why);
+    }
+    w.read(&[0]);
+    w.agree(&[0, 1, 2]);
+}
+
+/// A joiner refuses a group with a leaf that is not proven, as its founder's, which no commit brought, can be, or with two
+/// leaves that name one iroh key, as an Add built past the rules can make.
+#[test]
+fn a_joiner_refuses_a_group_with_an_unproven_leaf_or_a_shared_iroh_key() {
+    let mut w = World::new(&["A", "B"]);
+    let a = &mut w.m[0];
+    let homeless = Leaf { home: "Relay.example".into(), ..a.session.leaf.clone() };
+    a.session.set_leaf(&a.provider, homeless).unwrap();
+    a.group = Some(Group::create(&a.provider, &a.session, &settings()).unwrap());
+    let package = w.key_package(1);
+    let cut = w.m[0].cut();
+    let commit = w.m[0].commit(Change { cut, add: vec![package.clone()], invite: Some(invite()), ..Change::default() });
+    let (inner, admission) = (w.m[0].open_inner(&commit.entry), commit.admission.unwrap());
+    assert!(join_error(&w.m[1], &inner, &admission, &package).contains("no domain"));
+
+    let mut w = World::new(&["A", "B"]);
+    let a = &mut w.m[0];
+    a.group = Some(Group::create(&a.provider, &a.session, &settings()).unwrap());
+    let b = &mut w.m[1];
+    let shared = Leaf { device: b.session.leaf.device.clone(), ..leaf("A", b.session.key()) };
+    b.session.set_leaf(&b.provider, shared).unwrap();
+    let package = w.key_package(1);
+    let cut = w.m[0].cut();
+    let m = &mut w.m[0];
+    let g = m.group.as_mut().unwrap();
+    g.mls.set_aad(serde_json::to_vec(&Aad { invite: Some(invite()), ..Aad::default() }).unwrap());
+    let bundle = g.mls.commit_builder().propose_adds(vec![key_package_in(&m.provider, &package).unwrap()]);
+    let bundle = bundle.load_psks(m.provider.storage()).unwrap().build(m.provider.rand(), m.provider.crypto(), &m.session.signer, |_| true).unwrap();
+    let (commit, welcome, _) = bundle.stage_commit(&m.provider).unwrap().into_messages();
+    let entry = entry_of(&m.session.signer, commit.to_bytes().unwrap());
+    let welcome = welcome.unwrap().to_bytes().unwrap();
+    let admission = Admission { sig: m.session.signer.sign(&welcome_signed(&entry, &serde_json::to_vec(&cut).unwrap(), &welcome)).unwrap(), welcome, cut };
+    assert!(join_error(&w.m[1], &entry, &admission, &package).contains("one iroh key"));
 }
 
 /// A KeyPackage must carry the unbounded lifetime `Session::key_package` gives: none with a bounded lifetime is taken in,
@@ -1106,9 +1229,9 @@ fn a_key_package_with_a_bounded_lifetime_is_refused() {
         let error = key_package_leaf(&w.m[0].provider, &bytes).unwrap_err().to_string();
         assert!(error.contains("bounded lifetime"), "{error}");
         let cut = w.m[0].cut();
-        let error = refused(&mut w.m[0], Change { cut, add: vec![bytes], invite: Some(INVITE.into()), ..Change::default() });
+        let error = refused(&mut w.m[0], Change { cut, add: vec![bytes], invite: Some(invite()), ..Change::default() });
         assert!(error.contains("bounded lifetime"), "{error}");
-        w.refused_past_rules(0, Aad { invite: Some(INVITE.into()), ..Aad::default() }, |b| b.propose_adds([bundle.key_package().clone()]), &[1], "bounded lifetime");
+        w.refused_past_rules(0, Aad { invite: Some(invite()), ..Aad::default() }, |b| b.propose_adds([bundle.key_package().clone()]), &[1], "bounded lifetime");
         w.read(&[0]);
         w.agree(&[0, 1]);
     }
@@ -1121,7 +1244,7 @@ fn the_committer_keeps_the_welcome_of_its_add() {
     w.found(0, &[1]);
     let package = w.key_package(2);
     let cut = w.m[0].cut();
-    let commit = w.m[0].commit(Change { cut, add: vec![package.clone()], invite: Some(INVITE.into()), ..Change::default() });
+    let commit = w.m[0].commit(Change { cut, add: vec![package.clone()], invite: Some(invite()), ..Change::default() });
     let inner = w.m[0].open_inner(&commit.entry);
     let pos = w.post(commit.entry);
     let read = w.read(&[0, 1]);
@@ -1179,7 +1302,7 @@ fn a_forgotten_group_leaves_no_epoch_keys() {
     a.group = Some(Group::create(&a.provider, &a.session, &settings()).unwrap());
     let kp = b.session.key_package(&b.provider).unwrap();
     let cut = a.cut();
-    let commit = a.commit(Change { cut, add: vec![kp.clone()], invite: Some(INVITE.into()), ..Change::default() });
+    let commit = a.commit(Change { cut, add: vec![kp.clone()], invite: Some(invite()), ..Change::default() });
     let inner = a.open_inner(&commit.entry);
     let admission = commit.admission.clone().unwrap();
     let mut log = vec![commit.entry];
@@ -1222,7 +1345,7 @@ fn only_an_add_alone_goes_without_an_update_path() {
     w.found(0, &[1]);
     let package = w.key_package(2);
     let cut = w.m[0].cut();
-    let add = w.m[0].commit(Change { cut, add: vec![package.clone()], invite: Some(INVITE.into()), ..Change::default() });
+    let add = w.m[0].commit(Change { cut, add: vec![package.clone()], invite: Some(invite()), ..Change::default() });
     let (admission, inner) = (add.admission.clone().unwrap(), w.m[0].open_inner(&add.entry));
     let pos = w.post(add.entry);
     let read = w.read(&[0, 1]);
@@ -1241,7 +1364,7 @@ impl World {
     fn add(&mut self, by: usize, joiner: usize, readers: &[usize]) {
         let package = self.key_package(joiner);
         let cut = self.m[by].cut();
-        let commit = self.m[by].commit(Change { cut, add: vec![package.clone()], invite: Some(INVITE.into()), ..Change::default() });
+        let commit = self.m[by].commit(Change { cut, add: vec![package.clone()], invite: Some(invite()), ..Change::default() });
         let (inner, admission) = (self.m[by].open_inner(&commit.entry), commit.admission.clone().unwrap());
         let pos = self.post(commit.entry);
         self.read(readers);
@@ -1287,36 +1410,33 @@ fn a_group_starts_with_its_founder_and_its_device_as_admins() {
 }
 
 /// A member that is no admin adds only sessions that a device admitted or an admin certified: not one on another device,
-/// on none, or whose certificate is of another session. An admin adds any, and admits devices.
+/// or on none. An admin adds any, and admits devices.
 #[test]
 fn a_member_that_is_no_admin_adds_only_sessions_on_admitted_devices() {
     let (admins, admitted) = (device(1), device(4));
-    let mut w = World::new(&["A", "B", "C", "D", "E", "F", "G"]);
+    let mut w = World::new(&["A", "B", "C", "D", "E", "F"]);
     for (i, device) in [(0, &admins), (1, &device(2)), (2, &device(3)), (3, &admitted), (4, &admins)] {
         w.m[i].on(Some(device));
     }
     w.m[5].on(None);
-    let forged = Leaf { device: Some(Device::sign(&admitted, w.m[3].session.key())), ..w.m[6].session.leaf.clone() };
-    let g = &mut w.m[6];
-    g.session.set_leaf(&g.provider, forged).unwrap();
     w.found(0, &[1]);
     w.add(1, 4, &[0, 1]);
     w.agree(&[0, 1, 4]);
-    for joiner in [2, 3, 5, 6] {
+    for joiner in [2, 3, 5] {
         let (package, cut) = (w.key_package(joiner), w.m[1].cut());
-        let error = refused(&mut w.m[1], Change { cut, add: vec![package], invite: Some(INVITE.into()), ..Change::default() });
+        let error = refused(&mut w.m[1], Change { cut, add: vec![package], invite: Some(invite()), ..Change::default() });
         assert!(error.contains("neither admitted nor an admin"), "{error}");
     }
     let package = key_package_in(&w.m[2].provider, &w.key_package(2)).unwrap();
-    w.refused_past_rules(1, Aad { invite: Some(INVITE.into()), ..Aad::default() }, |b| b.propose_adds([package]), &[0, 4], "neither admitted nor an admin");
+    w.refused_past_rules(1, Aad { invite: Some(invite()), ..Aad::default() }, |b| b.propose_adds([package]), &[0, 4], "neither admitted nor an admin");
 
     w.settle(0, |s| s.admitted.push(key_of(&admitted)), &[0, 1, 4]);
     assert_eq!(w.m[1].g().settings().admitted, [key_of(&admitted)]);
     w.add(1, 3, &[0, 1, 4]);
     w.add(0, 5, &[0, 1, 3, 4]);
     w.agree(&[0, 1, 3, 4, 5]);
-    let (c, leaf) = (w.m[2].session.key().to_vec(), w.m[2].session.leaf.clone());
-    assert!(!w.m[3].g().admits(&c, Some(&leaf)));
+    let leaf = w.m[2].session.leaf.clone();
+    assert!(!w.m[3].g().admits(&leaf));
 }
 
 /// A member that is no admin removes only members whose leave of their current membership its commit carries; an admin
@@ -1406,4 +1526,35 @@ fn only_an_admin_changes_the_admins_and_admitted_devices() {
     w.post(update.entry);
     assert!(w.read(&[0, 1, 2]).iter().all(|reader| applied(reader.last().unwrap()).updated));
     w.agree(&[0, 1, 2]);
+}
+
+/// Admins and admitted devices are keys in the one form each has: Ed25519's 32 bytes, or P-256's 33, compressed. A
+/// settings change naming another, as a P-256 key uncompressed, is refused by its builder and skipped by every member,
+/// and a joiner refuses a group whose settings name one.
+#[test]
+fn admins_and_admitted_devices_are_keys_in_one_form() {
+    // 65 bytes, as a P-256 key uncompressed is.
+    let uncompressed = Bytes(vec![4; 65]);
+    let mut w = World::new(&["A", "B"]);
+    w.found(0, &[1]);
+    let edits: [fn(&mut Settings, Bytes); 2] = [|s, key| s.admins.push(key), |s, key| s.admitted.push(key)];
+    for edit in edits {
+        let mut changed = w.m[0].g().settings();
+        edit(&mut changed, uncompressed.clone());
+        let cut = w.m[0].cut();
+        let error = refused(&mut w.m[0], Change { cut, settings: Some(changed.clone()), ..Change::default() });
+        assert!(error.contains("neither Ed25519 nor compressed P-256"), "{error}");
+        w.refused_past_rules(0, Aad::default(), |b| b.propose_group_context_extensions(context_extensions(&changed).unwrap()).unwrap(), &[1], "neither Ed25519 nor compressed P-256");
+    }
+    w.read(&[0]);
+    w.agree(&[0, 1]);
+
+    let mut w = World::new(&["A", "B"]);
+    let a = &mut w.m[0];
+    a.group = Some(Group::create(&a.provider, &a.session, &Settings { admitted: vec![uncompressed], ..settings() }).unwrap());
+    let package = w.key_package(1);
+    let cut = w.m[0].cut();
+    let commit = w.m[0].commit(Change { cut, add: vec![package.clone()], invite: Some(invite()), ..Change::default() });
+    let (inner, admission) = (w.m[0].open_inner(&commit.entry), commit.admission.unwrap());
+    assert!(join_error(&w.m[1], &inner, &admission, &package).contains("neither Ed25519 nor compressed P-256"));
 }

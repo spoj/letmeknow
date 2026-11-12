@@ -119,7 +119,7 @@ async fn a_commits_membership_events_come_in_the_step_that_applies_it_before_the
     let log = bob.log(&gid.0).unwrap();
     alice.inner.commit(&gid.0, |_, g| {
         let remove = g.mls.members().into_iter().filter(|m| m.key == carol_key.0).map(|m| m.index).collect();
-        Ok(Some(core::Change { add: vec![key_package.clone()], invite: Some(Bytes(vec![1; 32])), remove, ..core::Change::default() }))
+        Ok(Some(core::Change { add: vec![key_package.clone()], invite: Some(core::Invited { by: Bytes(vec![1; 32]), joined: 0, secret: Bytes(vec![1; 16]) }), remove, ..core::Change::default() }))
     }).await.unwrap();
     let hello = alice.inner.send(&mut alice.inner.lock(), &gid.0, &serde_json::json!({ "type": "message", "content": "hello" }), None).unwrap();
     let sealing = alice.inner.lock().record(&gid.0, &hello.0).unwrap().unwrap().sealing.unwrap().1.0;

@@ -6,9 +6,11 @@ use serde_json::{Map, Value};
 
 use crate::{Bytes, directory};
 
-pub const PROTOCOL: u32 = 14;
+pub const PROTOCOL: u32 = 15;
 /// What a device's certificate of a session covers, before the session's key.
 pub const DEVICE: &[u8] = b"letmeknow device v1\0";
+/// What a session's iroh key signs in its leaf, before the session's key.
+pub const LEAF: &[u8] = b"letmeknow leaf v1\0";
 /// What a member's leave covers, before the group's id and the epoch its membership began in.
 pub const LEAVE: &[u8] = b"letmeknow leave v1\0";
 /// The private-use extension types: settings in the group context, and leaf data.
@@ -34,7 +36,8 @@ pub enum Service {
     Newer(Value),
 }
 
-/// The group context extension `SETTINGS_EXTENSION`. Only its admins change it, and only its lists.
+/// The group context extension `SETTINGS_EXTENSION`. Only its admins change it, and only its lists, of keys each in its
+/// one form (`is_key`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     pub protocol: u32,
@@ -54,6 +57,8 @@ pub struct Settings {
 pub struct Leaf {
     /// The session's iroh key.
     pub key: Bytes,
+    /// That the session holds the iroh key: the iroh key's signature over `LEAF ‖ session key`.
+    pub proof: Bytes,
     /// The domain of the session's own membership service, whose relay it lives on.
     pub home: String,
     /// The certificate of the session by the device it runs on.
@@ -61,7 +66,8 @@ pub struct Leaf {
 }
 
 /// A device's certificate that a session runs on it: its signature over `DEVICE ‖ session key`, by `algorithm`:
-/// `ed25519`, or `p256`, ECDSA on P-256 with SHA-256, whose key is SEC1-encoded and whose signature is r ‖ s.
+/// `ed25519`, or `p256`, ECDSA on P-256 with SHA-256, whose key is SEC1-encoded, compressed, and whose signature is
+/// r ‖ s.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Device {
     pub algorithm: String,
@@ -87,18 +93,17 @@ impl Device {
             "p256" => {
                 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
                 let (Ok(key), Ok(sig)) = (VerifyingKey::from_sec1_bytes(&self.key.0), Signature::from_slice(&self.sig.0)) else { return false };
-                key.verify(&signed, &sig).is_ok()
+                self.key.0.len() == 33 && key.verify(&signed, &sig).is_ok()
             }
             _ => false,
         }
     }
 }
 
-impl Leaf {
-    /// The device that certified the session with key `session`, whose leaf this is.
-    pub fn device_of(&self, session: &[u8]) -> Option<&Device> {
-        self.device.as_ref().filter(|device| device.verify(session))
-    }
+/// Whether `key` is a key in the one form a session's or a device's has: Ed25519's 32 bytes, or P-256's 33, compressed.
+pub fn is_key(key: &[u8]) -> bool {
+    <[u8; 32]>::try_from(key).is_ok_and(|key| VerifyingKey::from_bytes(&key).is_ok())
+        || key.len() == 33 && p256::ecdsa::VerifyingKey::from_sec1_bytes(key).is_ok()
 }
 
 /// The core's own payloads. The plaintext of an MLS application message is JSON with a `type`; every type but these
@@ -109,7 +114,8 @@ pub enum Control {
     /// The sender asks to be removed: `sig` is its signature over `LEAVE ‖ group ‖ joined`, its membership's first epoch
     /// as 8 bytes, with which any member may commit its removal.
     Leave { sig: Bytes },
-    /// An invite, which any member admits a joiner by once: SHA-256 of its secret, and when it expires (milliseconds).
+    /// An invite the sender made, which any member admits a joiner by once: its hash, over the group, the sender's
+    /// membership and its secret, and when it expires (milliseconds).
     Invite { hash: Bytes, expires: u64 },
     /// The sender gave up on these seqs: each author is told of its own.
     Lost { lost: Vec<crate::peer::Seqs> },
@@ -178,7 +184,7 @@ mod tests {
         let settings: Settings = serde_json::from_str(text).unwrap();
         let Service::Serve { rest, .. } = &settings.membership else { panic!("a service this version knows") };
         assert_eq!((&rest["future"], &settings.admins[..]), (&serde_json::json!("t"), &[Bytes(vec![1])][..]));
-        let leaf: Leaf = serde_json::from_str(r#"{"key":"AQ","home":"h.example","device":null,"later":1}"#).unwrap();
+        let leaf: Leaf = serde_json::from_str(r#"{"key":"AQ","proof":"Ag","home":"h.example","device":null,"later":1}"#).unwrap();
         assert_eq!(leaf.home, "h.example");
     }
 
@@ -190,8 +196,6 @@ mod tests {
         assert!(!device.verify(&other), "another session's");
         assert!(!Device { algorithm: "p256".into(), ..device.clone() }.verify(&session));
         assert!(!Device { algorithm: "rsa".into(), ..device.clone() }.verify(&session), "an algorithm this release does not know");
-        let leaf = Leaf { key: Bytes(vec![1]), home: "h.example".into(), device: Some(device.clone()) };
-        assert_eq!((leaf.device_of(&session), leaf.device_of(&other)), (Some(&device), None));
 
         use p256::ecdsa::signature::Signer as _;
         let key = p256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();
@@ -201,6 +205,18 @@ mod tests {
         assert_eq!(device.sig.0.len(), 64, "r and s");
         assert!(device.verify(&session));
         assert!(!device.verify(&other));
+        let uncompressed = Bytes::from(key.verifying_key().to_encoded_point(false).as_bytes());
+        assert!(!Device { key: uncompressed, ..device.clone() }.verify(&session), "a P-256 key has one form: 33 bytes, compressed");
         assert!(!Device { algorithm: "ed25519".into(), ..device }.verify(&session));
+    }
+
+    #[test]
+    fn a_key_has_one_form() {
+        let ed25519 = SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes();
+        let p256 = p256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();
+        let (compressed, uncompressed) = (p256.verifying_key().to_encoded_point(true), p256.verifying_key().to_encoded_point(false));
+        assert!(is_key(&ed25519) && is_key(compressed.as_bytes()));
+        assert!(!is_key(uncompressed.as_bytes()), "a P-256 key uncompressed");
+        assert!(!is_key(&[2; 32]) && !is_key(&[4; 33]), "no point");
     }
 }

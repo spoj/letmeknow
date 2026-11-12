@@ -1,17 +1,18 @@
-//! Admission, both sides: a joiner asks the members an invite link names, keeping its KeyPackage until one admits it; a
-//! member answers by the invite's rule, checked again as the Add is built, with the commit entry that added the joiner,
-//! or with the one it kept to a joiner it added before whose answer was lost. A joiner whose device is neither admitted
-//! nor an admin gets in only by an admin's invite, which an admin answers: a member that is no admin brings in no other
-//! device, not even through an admin its link names.
+//! Admission, both sides: a joiner asks the members an invite link names, keeping its KeyPackage until one admits it
+//! into the group, of the service, that the link names; a member answers by the rule of the invite the link names, by
+//! its group, its inviter's membership and the hash of its secret, checked again as the Add is built, with the commit
+//! entry that added the joiner, or with the one it kept to a joiner it added before whose answer was lost. A joiner whose
+//! device is neither admitted nor an admin gets in only by an admin's invite, which an admin answers: a member that is no
+//! admin brings in no other device, not even through an admin its link names.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{EndpointId, RelayUrl};
-use lmk_core::group::{Change, Group, delete_key_package, key_package_leaf, key_package_reference};
+use lmk_core::group::{Change, Group, Invited, delete_key_package, key_package_leaf, key_package_reference};
 use lmk_net::Admit;
-use lmk_proto::directory::{check_domain, relay_url};
+use lmk_proto::directory::relay_url;
 use lmk_proto::group::{Control, Leaf, Service};
 use lmk_proto::links::Invite;
 use lmk_proto::peer::{Admitted, Join};
@@ -41,21 +42,22 @@ const INVITER_FIRST: Duration = Duration::from_secs(3);
 
 impl Node {
     /// An invite into a group, valid for `valid` milliseconds: shared with the members as a held message, unless it is
-    /// for one member (`to`), and a link that names this session and, when shared, up to three members connected to it
-    /// that hold it, admins first.
+    /// for one member (`to`), and a link that names the group, this session's membership, which made it, and the members
+    /// to ask: this session and, when shared, up to three members connected to it that hold it, admins first.
     pub async fn invite(&self, gid: &[u8], valid: u64, to: Option<&[u8]>) -> Result<Invite> {
         let secret: [u8; 16] = lmk_core::random();
-        let hash = Bytes(Sha256::digest(secret).to_vec());
+        let by = self.key();
         let expires = corrected() + valid;
         let to = to.map(|key| Bytes(key.to_vec()));
-        {
+        let (hash, joined) = {
             let mut st = self.inner.lock();
-            let by = Bytes(st.me().to_vec());
             let g = st.group_mut(gid)?;
-            let joined = g.mls.joined(&by.0);
-            g.rec.invites.push(Rule { hash: hash.clone(), expires, by, joined, to: to.clone() });
+            let joined = g.mls.joined(&by.0).context("a member of its group")?;
+            let hash = Invited { by: by.clone(), joined, secret: Bytes(secret.to_vec()) }.hash(gid);
+            g.rec.invites.push(Rule { hash: hash.clone(), expires, by: by.clone(), joined, to: to.clone() });
             st.save(gid)?;
-        }
+            (hash, joined)
+        };
         let mut holders = match to {
             Some(_) => {
                 self.inner.caught_up(gid).await?;
@@ -67,7 +69,7 @@ impl Node {
                 let seq = self.inner.lock().record(gid, &id.0)?.context("the invite's message")?.header.seq;
                 // The members connected whose summaries hold the invite's message admit by it too: a member asked before its
                 // push arrived would refuse the joiner.
-                let connected: Vec<Member> = self.connected(gid)?.into_iter().filter(|m| check_domain(&m.home).is_ok()).collect();
+                let connected = self.connected(gid)?;
                 let holding = || -> Result<Vec<Member>> {
                     let holders = self.inner.lock().holders_of(gid, seq)?;
                     Ok(connected.iter().filter(|m| holders.contains(&m.key)).cloned().collect())
@@ -91,7 +93,7 @@ impl Node {
         holders.sort_by_key(|member| !g.mls.admin(&member.key.0));
         let mut members = vec![(*self.inner.net().id().as_bytes(), self.inner.home.clone())];
         members.extend(holders.iter().filter_map(|member| Some((*endpoint_id(&member.iroh.0)?.as_bytes(), member.home.clone()))).take(LINK_MEMBERS));
-        Ok(Invite { secret, domain, members })
+        Ok(Invite { secret, domain, group: gid.try_into()?, by: by.0.as_slice().try_into()?, joined, members })
     }
 
     /// Joins through an invite link: asks the members it names in turn, as each is reached, and reads their frames whole
@@ -116,7 +118,7 @@ impl Node {
                 }
             };
             st.joins.push(link.clone());
-            Join { secret, key_package }
+            Join { group: Bytes(link.group.to_vec()), by: Bytes(link.by.to_vec()), joined: link.joined, secret, key_package }
         };
         // Each dial is a task of its own, so it goes on, and times out, while a member reached earlier is asked.
         let inviter_first = Instant::now() + INVITER_FIRST;
@@ -166,7 +168,7 @@ impl Node {
             };
             let answer = timeout(JOIN_WAIT, self.inner.net().join(peer, relays.clone(), join.clone())).await;
             match answer {
-                Ok(Ok(Answer::Ok(admitted))) => match self.inner.welcomed(admitted, &join.key_package.0).await {
+                Ok(Ok(Answer::Ok(admitted))) => match self.inner.welcomed(admitted, &join.key_package.0, link).await {
                     Ok(gid) => {
                         let mut st = self.inner.lock();
                         st.joins.retain(|other| other != link);
@@ -203,13 +205,14 @@ impl Node {
 }
 
 impl Inner {
-    /// Joins a group from the Add's answer, a member sent for this session's KeyPackage.
-    async fn welcomed(self: &Arc<Self>, admitted: Admitted, key_package: &[u8]) -> Result<Bytes> {
+    /// Joins the group a link names from the Add's answer a member sent for this session's KeyPackage.
+    async fn welcomed(self: &Arc<Self>, admitted: Admitted, key_package: &[u8], link: &Invite) -> Result<Bytes> {
         let gid = {
             let mut st = self.lock();
             let st = &mut *st;
             let admission = lmk_core::group::Admission { welcome: admitted.welcome.0, cut: admitted.cut, sig: admitted.sig.0 };
-            let mls = Group::join(&st.provider, &admitted.commit.0, &admission, &key_package_reference(&st.provider, key_package)?)?;
+            let package = key_package_reference(&st.provider, key_package)?;
+            let mls = Group::join(&st.provider, &admitted.commit.0, &admission, &package, &link.group, &link.domain)?;
             ensure!(!st.groups.contains_key(mls.id()), "this session is in that group already");
             // Its Add had no update path: its first update, due at once, merges its leaf into the tree (`merge`).
             st.add_group(mls, Rec { stirred: true, ..Rec::default() })?
@@ -235,24 +238,26 @@ const NOT_ADMITTED: &str = "the joining session's device is neither admitted nor
 /// Whether `g`, as it stands, admits a joiner, by its key and leaf data, by an invite, as the member with key `me`:
 /// checked when its request comes, and each time the commit that adds it is built. An invite dies when its inviter
 /// leaves the group.
-fn admits(g: &G, me: &[u8], (joiner, leaf): &(Vec<u8>, Option<Leaf>), rule: &Rule) -> Result<()> {
+fn admits(g: &G, me: &[u8], (joiner, leaf): &(Vec<u8>, Leaf), rule: &Rule) -> Result<()> {
     let members = g.mls.members();
     ensure!(corrected() < rule.expires && !g.mls.used(&rule.hash.0), UNKNOWN);
-    let since = g.mls.joined(&rule.by.0);
-    ensure!(members.iter().any(|m| m.key == rule.by.0) && rule.joined.is_none_or(|joined| since == Some(joined)) && g.left(&rule.by.0).is_none(), INVITER_LEFT);
+    ensure!(g.mls.joined(&rule.by.0) == Some(rule.joined) && g.left(&rule.by.0).is_none(), INVITER_LEFT);
     ensure!(rule.to.as_ref().is_none_or(|to| to.0 == *joiner), FOR_ANOTHER);
     ensure!(members.iter().all(|member| member.key != *joiner), MEMBER_ALREADY);
-    ensure!(g.mls.admits(joiner, leaf.as_ref()) || (g.mls.admin(me) && g.mls.admin(&rule.by.0)), NOT_ADMITTED);
+    ensure!(g.mls.admits(leaf) || (g.mls.admin(me) && g.mls.admin(&rule.by.0)), NOT_ADMITTED);
     Ok(())
 }
 
 impl Inner {
-    /// Answers a joiner's request, which brings an invite's secret.
+    /// Answers a joiner's request by the rule of the invite it names: in its group, of its inviter's membership, with the
+    /// hash its secret gives.
     async fn admit_join(self: &Arc<Self>, join: Join) -> Result<Admitted> {
-        let Join { secret, key_package } = join;
-        let hash = Bytes(Sha256::digest(&secret.0).to_vec());
-        let found = self.lock().groups.iter().find_map(|(gid, g)| Some((gid.clone(), g.rec.invites.iter().find(|rule| rule.hash == hash)?.clone())));
-        let (gid, rule) = found.context(UNKNOWN)?;
+        let Join { group, by, joined, secret, key_package } = join;
+        let gid = group.0;
+        let invited = Invited { by, joined, secret };
+        let hash = invited.hash(&gid);
+        let found = self.lock().groups.get(&gid).and_then(|g| g.rec.invites.iter().find(|rule| rule.by == invited.by && rule.joined == joined && rule.hash == hash).cloned());
+        let rule = found.context(UNKNOWN)?;
         let joiner = key_package_leaf(&self.lock().provider, &key_package.0)?;
         // A joiner the log shows added, whose answer was lost, asks again with the same KeyPackage: it is answered at once
         // if this session applied the Add, else once it caught up.
@@ -270,7 +275,7 @@ impl Inner {
             let st = self.lock();
             admits(st.group(&gid)?, st.me(), &joiner, &rule)?;
         }
-        match self.admit(&gid, key_package.0.clone(), &joiner, rule).await {
+        match self.admit(&gid, key_package.0.clone(), &joiner, rule, invited).await {
             // Another ask with this KeyPackage, as the joiner's again after one failed in transit, may have added it meanwhile.
             Err(error) => {
                 let logged = self.lock().logged_commit(&gid, &key_package.0)?;
@@ -306,10 +311,10 @@ impl Inner {
         Ok(())
     }
 
-    /// Commits the Add, naming the invite the joiner came in by, and answers with its commit entry. Each build of the
+    /// Commits the Add, carrying the invite the joiner came in by, and answers with its commit entry. Each build of the
     /// commit checks the joiner's rule again.
-    async fn admit(self: &Arc<Self>, gid: &[u8], key_package: Vec<u8>, joiner: &(Vec<u8>, Option<Leaf>), rule: Rule) -> Result<Admitted> {
-        let add = Change { add: vec![key_package], invite: Some(rule.hash.clone()), ..Change::default() };
+    async fn admit(self: &Arc<Self>, gid: &[u8], key_package: Vec<u8>, joiner: &(Vec<u8>, Leaf), rule: Rule, invited: Invited) -> Result<Admitted> {
+        let add = Change { add: vec![key_package], invite: Some(invited), ..Change::default() };
         let epoch = self
             .commit(gid, |st, g| {
                 admits(g, st.me(), joiner, &rule)?;

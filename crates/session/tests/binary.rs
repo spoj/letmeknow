@@ -105,7 +105,7 @@ fn the_binary_refuses_an_earlier_home_in_the_default_device_directory() {
         assert!(error.contains(&format!("{} holds the state of an earlier letmeknow, which this one cannot read: move it away", home.display())), "{error}");
         assert_eq!(std::fs::read_to_string(home.join("format")).unwrap(), "4\n");
         assert_eq!(std::fs::read_to_string(home.join("device.json")).unwrap(), r#"{"name":"old device"}"#);
-        assert!(!dir.path().join("letmeknow-v14").exists());
+        assert!(!dir.path().join("letmeknow-v15").exists());
     }
 }
 
@@ -132,13 +132,13 @@ fn the_binary_runs_skill_and_serve_with_an_earlier_home_in_the_default_device_di
     assert!(serve.status.success(), "{}", String::from_utf8_lossy(&serve.stderr));
     assert!(String::from_utf8(serve.stdout).unwrap().starts_with("membership: relay.example\nkey: "));
     assert!(String::from_utf8(run(&["sessions"]).stderr).unwrap().contains("earlier letmeknow"));
-    assert!(!dir.path().join("letmeknow-v14").exists());
+    assert!(!dir.path().join("letmeknow-v15").exists());
 }
 
 #[test]
 fn the_binary_reuses_the_device_key_in_an_explicit_current_home() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("format"), "14\n").unwrap();
+    std::fs::write(dir.path().join("format"), "15\n").unwrap();
     let first = letmeknow(dir.path(), &["device"]);
     assert!(first.status.success());
     let again = letmeknow(dir.path(), &["device"]);

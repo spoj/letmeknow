@@ -23,7 +23,7 @@ impl State {
         let (me, epoch) = (self.me(), g.mls.epoch());
         let connected = self.peers.neighbours(&Bytes(gid.to_vec()));
         let members = g.mls.members();
-        let reached = |member: &Bytes| members.iter().find(|m| m.key == member.0).and_then(|m| m.leaf.as_ref()).is_some_and(|leaf| connected.iter().any(|key| key.as_slice() == leaf.key.0.as_slice()));
+        let reached = |member: &Bytes| members.iter().find(|m| m.key == member.0).is_some_and(|m| connected.iter().any(|key| key.as_slice() == m.leaf.key.0.as_slice()));
         let group = Bytes(gid.to_vec());
         let summaries = self.peers.heard(&group).map(|heard| &heard.summary);
         Ok(summaries.filter(|summary| summary.member.0 != me && summary.epoch == epoch && reached(&summary.member)).collect())

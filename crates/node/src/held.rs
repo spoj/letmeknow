@@ -1,7 +1,8 @@
-//! Held messages: taken by the membership and seq their ciphertexts claim in the clear, opened in each membership's seq
-//! order within a window, kept by id and by membership and seq, and delivered in causal order once their requirements,
-//! `prev` and deps, are resolved: delivered, given up, lost, kept before this session joined, or past a final cut. A dep
-//! on what was sent before this session joined is not its to have, and requires nothing.
+//! Held messages: taken by the membership and seq their sealings claim in the clear, under their authors' signatures,
+//! opened in each membership's seq order within a window, kept by id and by membership and seq, and delivered in causal
+//! order once their requirements, `prev` and deps, are resolved: delivered, given up, lost, kept before this session
+//! joined, or past a final cut. A dep on what was sent before this session joined is not its to have, and requires
+//! nothing.
 //! Giving up releases dependents only: what was given up is still asked for, and is delivered `late` if it comes.
 
 use std::collections::BTreeMap;
@@ -45,8 +46,7 @@ pub(crate) struct Author {
     /// Its seqs up to here are kept: its final cut once it ended.
     pub cut: u64,
     pub ended: bool,
-    /// When it ended here, in milliseconds. A record kept since 0.25.3 or earlier has 0.
-    #[serde(default)]
+    /// When it ended here, in milliseconds.
     pub ended_at: u64,
     /// The highest seq this session knows it has.
     pub known: u64,
@@ -389,7 +389,7 @@ impl Inner {
         let group = Bytes(gid.to_vec());
         if !opened.is_empty() && !st.peers.full_mesh(&group) {
             let (large, small): (Vec<_>, Vec<_>) = opened.into_iter().partition(|(ciphertext, _)| ciphertext.len() > PUSH);
-            let large = large.iter().map(|(ciphertext, sent)| Ok((core::claim(ciphertext)?.0, *sent))).collect::<Result<Vec<_>>>()?;
+            let large = large.iter().map(|(ciphertext, sent)| Ok((core::claim(gid, ciphertext)?, *sent))).collect::<Result<Vec<_>>>()?;
             for peer in st.peers.neighbours(&group) {
                 let peer = EndpointId::from_bytes(&peer)?;
                 if Some(peer) == from {
@@ -413,7 +413,8 @@ impl Inner {
         Ok(())
     }
 
-    /// Takes one ciphertext; the ciphertext and the epoch its message was sent in, if it opened.
+    /// Takes one ciphertext, unless its claimed author did not sign it; the ciphertext and the epoch its message was sent
+    /// in, if it opened.
     fn take_one(&self, st: &mut State, gid: &[u8], from: Option<EndpointId>, ciphertext: Vec<u8>) -> Result<Option<(Vec<u8>, u64)>> {
         let now = st.tick();
         let g = st.group_mut(gid)?;
@@ -421,8 +422,8 @@ impl Inner {
         if ciphertext.len() > MAX_MESSAGE || g.seen.contains(&hash) {
             return Ok(None);
         }
-        let Ok((claim, epoch)) = core::claim(&ciphertext) else { return Ok(None) };
-        let current = g.mls.epoch();
+        let Ok(claim) = core::claim(gid, &ciphertext) else { return Ok(None) };
+        let (epoch, current) = (claim.sealed, g.mls.epoch());
         let room = |g: &G| g.early.iter().map(|(_, c)| c.len()).chain(g.unopened.values().map(|(_, c)| c.len())).sum::<usize>() + ciphertext.len() <= UNOPENED;
         if let Some(peer) = from.filter(|_| epoch > current) {
             st.peers.behind(peer.as_bytes());
@@ -447,12 +448,13 @@ impl Inner {
         let waiting = g.waiting;
         let taken = claim.seq < lowest + WINDOW && (waiting || newer || g.buckets.entry(membership).or_default().take(ciphertext.len(), 2.0, now));
         if !taken {
-            if room(g) {
+            let claim = (claim.key, claim.joined, claim.seq);
+            if room(g) && g.unopened.get(&claim).is_none_or(|(sealed, _)| *sealed < epoch) {
                 remember(&mut g.seen, hash);
-                g.unopened.insert((claim.key, claim.joined, claim.seq), (epoch, ciphertext));
+                g.unopened.insert(claim, (epoch, ciphertext));
             } else if let Some(peer) = from {
                 // Its sender holds it, and is asked for it again once there is room.
-                st.peers.unstrike(&Bytes(gid.to_vec()), peer.as_bytes(), (claim.key, claim.joined), claim.seq);
+                st.peers.unstrike(&Bytes(gid.to_vec()), peer.as_bytes(), (claim.0, claim.1), claim.2);
             }
             return Ok(None);
         }
@@ -582,8 +584,8 @@ impl Inner {
                 self.work.send(Work::Duties(gid.to_vec())).ok();
             }
             Control::Invite { hash, expires } => {
-                if !rec.invites.iter().any(|rule| rule.hash == hash) {
-                    rec.invites.push(Rule { hash, expires, by: h.author.clone(), joined: Some(h.joined), to: None });
+                if !rec.invites.iter().any(|rule| rule.hash == hash && rule.by == h.author && rule.joined == h.joined) {
+                    rec.invites.push(Rule { hash, expires, by: h.author.clone(), joined: h.joined, to: None });
                 }
             }
             // Each author is told of its own seqs lost, of those it knows it sent, with the ids of the chat messages among

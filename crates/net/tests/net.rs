@@ -182,7 +182,7 @@ async fn a_connection_without_a_peer_stream_is_counted_and_closed() {
     peers.connect(*keys[1].public().as_bytes(), Default::default(), false, 0);
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
     frame::write(&mut send, &frame::Open { stream: frame::Stream::Admission }).await.unwrap();
-    frame::write(&mut send, &Join { secret: Bytes::from(SECRET), key_package: Bytes(b"kp".to_vec()) }).await.unwrap();
+    frame::write(&mut send, &Join { group: Bytes::default(), by: Bytes::default(), joined: 0, secret: Bytes::from(SECRET), key_package: Bytes(b"kp".to_vec()) }).await.unwrap();
     let answer: Answer<lmk_proto::peer::Admitted> = frame::read(&mut recv).await.unwrap();
     assert!(matches!(answer, Answer::Ok(_)));
     assert_eq!(peers.poll(STRANGER), vec![Out::Close(*keys[1].public().as_bytes())]);
@@ -251,7 +251,7 @@ async fn requests_to_be_admitted_are_answered_each_on_its_stream() {
     let keys = keys(2);
     let member = node(&relay, keys[0].clone(), false).await;
     let joiner = node(&relay, keys[1].clone(), true).await;
-    let join = |secret: [u8; 16]| Join { secret: Bytes::from(secret), key_package: Bytes(b"kp".to_vec()) };
+    let join = |secret: [u8; 16]| Join { group: Bytes::default(), by: Bytes::default(), joined: 0, secret: Bytes::from(secret), key_package: Bytes(b"kp".to_vec()) };
     let ask = |join| joiner.net.join(keys[0].public(), vec![relay.url.clone()], join);
     joiner.net.dial(keys[0].public(), vec![relay.url.clone()]).await.unwrap();
     let (invited, refused) = tokio::join!(ask(join(SECRET)), ask(join([0; 16])));
@@ -343,7 +343,7 @@ async fn a_stream_that_never_sends_open_ends_its_wait() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
     frame::write(&mut send, &frame::Open { stream: frame::Stream::Admission }).await.unwrap();
-    frame::write(&mut send, &Join { secret: Bytes::from(SECRET), key_package: Bytes(b"kp".to_vec()) }).await.unwrap();
+    frame::write(&mut send, &Join { group: Bytes::default(), by: Bytes::default(), joined: 0, secret: Bytes::from(SECRET), key_package: Bytes(b"kp".to_vec()) }).await.unwrap();
     let answer = tokio::time::timeout(Duration::from_secs(40), frame::read::<Answer<lmk_proto::peer::Admitted>, _>(&mut recv))
         .await
         .expect("the stalled stream's wait ended")

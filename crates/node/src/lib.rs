@@ -91,9 +91,9 @@ impl From<&core::Member> for Member {
     fn from(member: &core::Member) -> Self {
         Member {
             key: Bytes(member.key.clone()),
-            iroh: member.leaf.as_ref().map(|leaf| leaf.key.clone()).unwrap_or_default(),
-            home: member.leaf.as_ref().map(|leaf| leaf.home.clone()).unwrap_or_default(),
-            device: member.device().cloned(),
+            iroh: member.leaf.key.clone(),
+            home: member.leaf.home.clone(),
+            device: member.leaf.device.clone(),
         }
     }
 }
@@ -204,7 +204,7 @@ struct Rec {
     base: u64,
     /// The epoch this session's own last commit moved the group to.
     committed: u64,
-    /// The invites shared with the group, kept for H after they expire.
+    /// The invites shared with the group, one per inviter's membership and hash, kept for H after they expire.
     invites: Vec<Rule>,
     /// The `leave`s opened: each one's membership, its seq, and the member's leave it carries (`Group::leave`).
     leaves: Vec<(Bytes, u64, u64, Bytes)>,
@@ -220,10 +220,10 @@ struct Rec {
     stirred: bool,
     /// When this session last asked which members' logs their services let go, in milliseconds.
     evicted: u64,
-    /// The latest epoch this session's own commit or message showed it in, and when the group moved past it: while
-    /// it is behind, a `present` is due `PRESENT` after that.
+    /// The latest epoch this session's own commit or message showed it in, and when it last did: while it is behind, a
+    /// `present` is due `PRESENT` after that.
     present: u64,
-    passed: u64,
+    presented: u64,
     /// The seqs this session lost and has not told the group of yet.
     lost: Vec<Seqs>,
     /// The memberships this session knows of in the group: the current ones, and those ended within H.
@@ -280,15 +280,13 @@ struct Epoch {
 /// An invite, as its inviter shared it with the group, or kept for one member.
 #[derive(Clone, Serialize, Deserialize)]
 struct Rule {
-    /// SHA-256 of its secret.
+    /// Its hash (`Invited::hash`).
     hash: Bytes,
     expires: u64,
     /// The inviter's session key.
     by: Bytes,
-    /// The epoch the inviter's membership began in, which the invite dies with. A rule kept since 0.25.2 or earlier has
-    /// none, and admits while its inviter's key is a member.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    joined: Option<u64>,
+    /// The epoch the inviter's membership began in, which the invite dies with.
+    joined: u64,
     /// The only session key it admits, when made for one member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     to: Option<Bytes>,
@@ -304,7 +302,8 @@ pub(crate) struct G {
     rec: Rec,
     /// Ciphertexts of the next epoch, and the peers that sent them.
     early: Vec<(EndpointId, Vec<u8>)>,
-    /// Ciphertexts taken but not opened yet, past the window or the bucket: by claim, with their epoch.
+    /// Ciphertexts taken but not opened yet, past the window or the bucket: by claim, the latest sealing of each, with its
+    /// epoch.
     unopened: BTreeMap<(Bytes, u64, u64), (u64, Vec<u8>)>,
     /// The flood buckets of the group's memberships, and this session's own.
     buckets: BTreeMap<(Bytes, u64), held::Bucket>,
@@ -313,9 +312,11 @@ pub(crate) struct G {
     seen: VecDeque<[u8; 32]>,
     /// Seqs that came to be known lately, and when: not asked for until `HOLD_OFF` passed.
     fresh: Vec<(Bytes, u64, lmk_proto::ranges::Ranges, u64)>,
-    /// When reading began its last wait before a commit, and that commit's position. The commits made before then, which
-    /// this session missed while away, share that wait: it waits once for them all, not once for each epoch it missed.
-    reading: Option<(u64, u64)>,
+    /// The wait of the run of commits reading is in: when it began, moved on by the time between them; and the position
+    /// of the commit last judged, and when, which is when it applied once reading is past it. A commit held within
+    /// `HEAR` of the one before it applying continues the run: the commits this session missed while away wait once for
+    /// them all, not once for each epoch.
+    reading: Option<(u64, u64, u64)>,
     /// Reading waits before a commit that deletes the keys of an epoch whose kept messages this session lacks.
     waiting: bool,
     /// The seqs an update waits to fetch before it commits, and when it first waited, in this epoch.
@@ -548,7 +549,7 @@ impl State {
     /// The member of a group whose leaf names an iroh key.
     fn in_leaf(&self, gid: &[u8], peer: &EndpointId) -> Option<core::Member> {
         let members = self.groups.get(gid)?.mls.members();
-        members.into_iter().find(|m| m.leaf.as_ref().is_some_and(|leaf| leaf.key.0 == peer.as_bytes()))
+        members.into_iter().find(|m| m.leaf.key.0 == peer.as_bytes())
     }
 
     /// The epoch the membership of a peer's member began in: what was sent before it is not the peer's to have; nothing
@@ -826,13 +827,14 @@ mod tests {
                 }
             })
         });
+        let key = |seed: u8| Bytes::from(ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key().to_bytes());
         let alice = node(&relay, post.clone()).await;
         let bob = node(&relay, post).await;
         let gid = alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: service, admins: vec![], admitted: vec![] }).unwrap();
 
         for (i, refusal) in [Refusal::Busy, Refusal::Rate, Refusal::Quota].into_iter().enumerate() {
             faults.lock().unwrap().push_back(Fault::Refuse(refusal));
-            let error = alice.change_settings(&gid.0, |s| s.admitted.push(Bytes(vec![i as u8 + 1; 32]))).await.unwrap_err();
+            let error = alice.change_settings(&gid.0, |s| s.admitted.push(key(i as u8 + 1))).await.unwrap_err();
             assert!(matches!(error.downcast_ref::<Refused>(), Some(Refused(code)) if code == refusal.code()), "{error:#}");
             let st = alice.inner.lock();
             assert!(st.group(&gid.0).unwrap().mls.posted().is_none(), "a fresh commit refused with {} is dropped", refusal.code());
@@ -845,24 +847,24 @@ mod tests {
         assert!(format!("{error:#}").contains("rate"), "{error:#}");
         assert!(bob.groups().is_empty());
 
-        alice.change_settings(&gid.0, |s| s.admitted.push(Bytes(vec![5; 32]))).await.unwrap();
-        assert_eq!(alice.settings(&gid.0).unwrap().admitted, [Bytes(vec![5; 32])]);
+        alice.change_settings(&gid.0, |s| s.admitted.push(key(5))).await.unwrap();
+        assert_eq!(alice.settings(&gid.0).unwrap().admitted, [key(5)]);
         assert!(!alice.members(&gid.0).unwrap().iter().any(|m| m.key == bob.key()));
         assert_eq!(bob.join(&link).await.unwrap().0, gid);
         bob.shutdown().await.unwrap();
         alice.caught_up(&gid.0).await.unwrap();
 
         faults.lock().unwrap().extend([Fault::Lost, Fault::Refuse(Refusal::Rate), Fault::Refuse(Refusal::Busy)]);
-        let error = alice.change_settings(&gid.0, |s| s.admitted.push(Bytes(vec![6; 32]))).await.unwrap_err();
+        let error = alice.change_settings(&gid.0, |s| s.admitted.push(key(6))).await.unwrap_err();
         assert!(matches!(error.downcast_ref::<Refused>(), Some(Refused(code)) if code == "rate"), "{error:#}");
         let kept = alice.inner.lock().group(&gid.0).unwrap().mls.posted().expect("kept after a lost earlier try").to_vec();
 
-        let error = alice.change_settings(&gid.0, |s| s.admitted.push(Bytes(vec![7; 32]))).await.unwrap_err();
+        let error = alice.change_settings(&gid.0, |s| s.admitted.push(key(7))).await.unwrap_err();
         assert!(matches!(error.downcast_ref::<Refused>(), Some(Refused(code)) if code == "busy"), "{error:#}");
         assert_eq!(alice.inner.lock().group(&gid.0).unwrap().mls.posted(), Some(kept.as_slice()));
 
-        alice.change_settings(&gid.0, |s| s.admitted.push(Bytes(vec![7; 32]))).await.unwrap();
-        assert_eq!(alice.settings(&gid.0).unwrap().admitted, [Bytes(vec![5; 32]), Bytes(vec![6; 32]), Bytes(vec![7; 32])]);
+        alice.change_settings(&gid.0, |s| s.admitted.push(key(7))).await.unwrap();
+        assert_eq!(alice.settings(&gid.0).unwrap().admitted, [key(5), key(6), key(7)]);
         alice.shutdown().await.unwrap();
     }
 
@@ -971,117 +973,6 @@ mod tests {
         assert!(st.peers.summary(&gid, heard, false));
         drop(st);
         for node in [bob, carol] {
-            node.shutdown().await.unwrap();
-        }
-    }
-
-    /// A member whose leaf names 32 bytes that are no Ed25519 point stays in the group and is not handed to `Peers`, so
-    /// neither the poll nor starting again dials it.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_member_whose_leaf_key_is_no_iroh_key_stays_in_the_group_and_is_not_dialed() {
-        let relay = lmk_testing::relay().await;
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("alice.db");
-        let start = || async {
-            let config = Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[9; 32]) };
-            Node::start(SqliteProvider::open(&db).unwrap(), config).await.unwrap().0
-        };
-        let mut alice = start().await;
-        let bob = Node::start(
-            SqliteProvider::open(":memory:".as_ref()).unwrap(),
-            Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[8; 32]) },
-        )
-        .await
-        .unwrap()
-        .0;
-        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
-        let gid = alice.create(settings).unwrap();
-        let bob_key = bob.key();
-        bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
-        assert!(!alice.admin(&gid.0, &bob_key.0).unwrap());
-        let bad = (0u8..=255).map(|b| [b; 32]).find(|k| EndpointId::from_bytes(k).is_err()).unwrap();
-        {
-            let mut st = bob.inner.lock();
-            let st = &mut *st;
-            let leaf = lmk_proto::group::Leaf { key: Bytes(bad.to_vec()), ..st.session.leaf.clone() };
-            st.session.set_leaf(&st.provider, leaf).unwrap();
-        }
-        bob.inner.merge(&gid.0).await.unwrap();
-        bob.shutdown().await.unwrap();
-        alice.read_group(&gid.0).await.unwrap();
-        for round in 0..2 {
-            if round == 1 {
-                alice = start().await;
-            }
-            n0_future::time::timeout(Duration::from_secs(10), async {
-                while {
-                    let st = alice.inner.lock();
-                    st.peers.next(st.time) == Some(st.time)
-                } {
-                    n0_future::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .unwrap();
-            assert!(alice.members(&gid.0).unwrap().iter().any(|m| m.key == bob_key && m.iroh.0 == bad));
-            {
-                let mut st = alice.inner.lock();
-                let now = st.tick();
-                st.peers.push(&gid);
-                assert!(!st.peers.poll(now).iter().any(|out| matches!(out, lmk_net::peers::Out::Dial(_))));
-            }
-            alice.shutdown().await.unwrap();
-        }
-    }
-
-    /// A member whose leaf names no canonical domain as its home gives no relay to dial it at, and is left out of the
-    /// invite links that members connected to it make.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_member_whose_leaf_home_is_no_domain_gives_no_relay_and_is_not_in_invites() {
-        use lmk_proto::links::Invite;
-
-        let relay = lmk_testing::relay().await;
-        let (alice, bob, carol, dave) = (
-            node(&relay, relay.post()).await,
-            node(&relay, relay.post()).await,
-            node(&relay, relay.post()).await,
-            node(&relay, relay.post()).await,
-        );
-        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
-        let gid = alice.create(settings).unwrap();
-        for joiner in [&bob, &carol] {
-            joiner.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
-        }
-        n0_future::time::timeout(Duration::from_secs(30), async {
-            while alice.connected(&gid.0).unwrap().len() < 2 {
-                n0_future::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .unwrap();
-        for bad in ["127.0.0.1:9/x", "Relay.example", ""] {
-            {
-                let mut st = bob.inner.lock();
-                let st = &mut *st;
-                let leaf = lmk_proto::group::Leaf { home: bad.into(), ..st.session.leaf.clone() };
-                st.session.set_leaf(&st.provider, leaf).unwrap();
-            }
-            bob.inner.merge(&gid.0).await.unwrap();
-            alice.read_group(&gid.0).await.unwrap();
-            assert!(alice.connected(&gid.0).unwrap().iter().any(|m| m.key == bob.key()));
-            assert!(alice.inner.lock().relays_of(&bob.net().id()).is_empty(), "{bad}");
-            let invite = alice.invite(&gid.0, INVITE_VALID, None).await.unwrap();
-            assert_eq!(Invite::parse(&invite.link()).unwrap(), invite, "{bad}");
-            assert_eq!(
-                invite.members,
-                vec![(*alice.net().id().as_bytes(), relay.domain.clone()), (*carol.net().id().as_bytes(), relay.domain.clone())],
-                "{bad}"
-            );
-        }
-        let invite = alice.invite(&gid.0, INVITE_VALID, None).await.unwrap();
-        alice.shutdown().await.unwrap();
-        assert_eq!(dave.join(&Invite::parse(&invite.link()).unwrap()).await.unwrap().0, gid);
-        for node in [bob, carol, dave] {
             node.shutdown().await.unwrap();
         }
     }

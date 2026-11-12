@@ -426,7 +426,7 @@ impl Peers {
     /// Whether to wait before applying a commit that deletes the keys of an epoch, given the seqs of that epoch the
     /// member lacks (kept ones of the epoch the commit ends): not once the holders were tried, `HEAR` passed and the
     /// group dials no member it has not tried since `read`, nor `WAIT` after `read`. `read` is when the node began
-    /// waiting, for this commit or, as it was made before then, for an earlier one.
+    /// waiting, for this commit or for the earlier ones whose wait it shares.
     pub fn wait(&mut self, group: &Bytes, lacking: &[Seqs], read: u64, now: u64) -> bool {
         let lack = to_set(lacking);
         let met = self.conns.values().filter(|c| c.served.contains(group)).map(|c| c.connected).min().unwrap_or(read);

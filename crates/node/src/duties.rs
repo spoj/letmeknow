@@ -16,11 +16,11 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use lmk_core::group::{Change, MAX_CUT_STEP};
+use lmk_core::group::{self as core, Change, MAX_CUT_STEP};
 use lmk_proto::Bytes;
 use lmk_proto::group::Control;
 use lmk_proto::clock::corrected;
-use lmk_proto::held::Ref;
+use lmk_proto::held::Cut;
 use n0_future::time::{Duration, sleep};
 use sha2::{Digest, Sha256};
 
@@ -38,9 +38,9 @@ const RETRY: u64 = 10 * 60 * 1000;
 /// How often a member asks which members' logs their services let go, of those it does not know to be, at most, in
 /// milliseconds; and how long a joiner removes no one for falling behind, until it holds each member's newest intro.
 pub(crate) const EVICT: u64 = 24 * 3600 * 1000;
-/// How long after the group moved past the last epoch this session showed itself in, by a commit or message of its own,
-/// it sends a `present`: after the updates a message stirs, and well before the services let that epoch's log go, a
-/// week after.
+/// How long after this session last showed itself, by a commit or message of its own, it sends a `present`, once the
+/// group moved past the epoch it showed itself in: after the updates a message stirs, and well before the services let
+/// that epoch's log go, a week after the group moved past it.
 pub(crate) const PRESENT: u64 = 2 * 24 * 3600 * 1000;
 
 /// T, in milliseconds, for a group of `members` whose settings name `update` seconds: that, times the members past 24
@@ -68,9 +68,9 @@ fn next(g: &G, me: &[u8]) -> u64 {
 
 impl State {
     /// The cut a commit removing `removing` carries: per member of the epoch, from the cut state on, each seq this
-    /// session holds sealed in the current epoch whose `prev` chains to the last; its own only as far as another member
-    /// staying that may have them holds them.
-    pub(crate) fn cut_for(&self, gid: &[u8], removing: &[u32]) -> Result<Vec<Ref>> {
+    /// session holds sealed in the current epoch whose `prev` chains to the last, by the proof of that sealing; its own
+    /// only as far as another member staying that may have them holds them.
+    pub(crate) fn cut_for(&self, gid: &[u8], removing: &[u32]) -> Result<Vec<Cut>> {
         let g = self.group(gid)?;
         let (epoch, me) = (g.mls.epoch(), self.me());
         let mut cut = Vec::new();
@@ -78,12 +78,12 @@ impl State {
             let mut kept = r.clone();
             while kept.seq < r.seq + MAX_CUT_STEP {
                 let Some(record) = self.record_at(gid, &r.key.0, r.joined, kept.seq + 1)? else { break };
-                let sealed = record.sealing.as_ref().is_some_and(|(sealed, _)| *sealed == epoch);
+                let Some((_, sealing)) = record.sealing.as_ref().filter(|(sealed, _)| *sealed == epoch) else { break };
                 let chained = record.header.prev.as_ref().map(|(id, _)| id) == (kept.seq > 0).then_some(&kept.id);
-                if !sealed || !chained || (r.key.0 == me && self.unheld(gid, &record, removing)?) {
+                if !chained || (r.key.0 == me && self.unheld(gid, &record, removing)?) {
                     break;
                 }
-                kept = Ref { seq: kept.seq + 1, id: record.id, epoch: record.header.epoch, ..kept };
+                kept = core::claim(gid, &sealing.0)?;
             }
             cut.push(kept);
         }
@@ -178,7 +178,7 @@ fn due(st: &State, g: &G) -> Result<Option<Change>> {
     }
     let Some(own) = members.iter().find(|m| m.index == g.mls.own_index()) else { return Ok(None) };
     let leaf = st.session.leaf.clone();
-    let update = own.leaf.as_ref() != Some(&leaf) || g.rec.stirred && now() >= next(g, me);
+    let update = own.leaf != leaf || g.rec.stirred && now() >= next(g, me);
     Ok((update || !change.remove.is_empty()).then_some(Change { leaf: Some(leaf), ..change }))
 }
 
@@ -256,11 +256,11 @@ impl Inner {
             }
             let g = st.group(gid)?;
             let behind = g.rec.present < g.mls.epoch();
-            if behind && tick >= g.rec.passed + PRESENT {
+            if behind && tick >= g.rec.presented + PRESENT {
                 self.send(&mut st, gid, &serde_json::to_value(Control::Present)?, None)?;
             }
             let g = st.group(gid)?;
-            let present = if g.rec.present < g.mls.epoch() { g.rec.passed + PRESENT } else { u64::MAX };
+            let present = if g.rec.present < g.mls.epoch() { g.rec.presented + PRESENT } else { u64::MAX };
             let next = if g.rec.stirred { next(g, st.me()) } else { u64::MAX }.min(present);
             let pending = due(&st, g)?;
             // A pass that removes commits at once.
@@ -433,7 +433,7 @@ mod tests {
                 let g = st.group_mut(&gid.0).unwrap();
                 while g.sending.take(0, 1.0, u64::MAX) {}
                 g.rec.lost = if lost { vec![seqs(b"other", 0, &[1])] } else { Vec::new() };
-                (g.rec.present, g.rec.passed) = (0, 0);
+                (g.rec.present, g.rec.presented) = (0, 0);
                 st.save(&gid.0).unwrap();
             }
             alice.inner.duties(&gid.0);
