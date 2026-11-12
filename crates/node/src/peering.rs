@@ -293,7 +293,8 @@ impl State {
         self.save(gid)
     }
 
-    /// Takes again the summaries and intros kept until a commit made their memberships known.
+    /// Takes again the summaries and intros kept until a commit made their memberships known, or reached the epochs their
+    /// intros name.
     pub(crate) fn reverify(&mut self, gid: &[u8]) -> Result<()> {
         let unverified = std::mem::take(&mut self.group_mut(gid)?.unverified);
         for (peer, signed) in unverified {
@@ -306,19 +307,23 @@ impl State {
     }
 
     /// Takes an intro any neighbour passed on, of at most `MAX_INTRO` bytes, and `SIGNED_INTRO` as signed: checked against
-    /// its membership and its member's signature, and kept if newer, with the epoch it names as where its member is, if
-    /// later than this session knew. One of a membership this session does not know yet is kept a while.
+    /// its membership and its member's signature, and kept if newer, with the epoch it names, from its member's joining
+    /// on, as where its member is, if later than this session knew. The capability it names of that epoch's log is this
+    /// session's own where it holds one, and else its member's claim alone. One of a membership this session does not
+    /// know yet, or naming an epoch it has not reached, is kept a while.
     pub(crate) fn intro(&mut self, gid: &[u8], signed: Signed) -> Result<()> {
         if signed.body.0.len() + signed.sig.0.len() > SIGNED_INTRO {
             return Ok(());
         }
         let Ok(intro) = serde_json::from_slice::<Intro>(&signed.body.0) else { return Ok(()) };
+        let Shown { epoch, capability } = intro.shown;
         let g = self.group_mut(gid)?;
-        if intro.group.0 != gid || intro.text.as_ref().is_some_and(|text| text.len() > MAX_INTRO) {
+        if intro.group.0 != gid || intro.text.as_ref().is_some_and(|text| text.len() > MAX_INTRO) || epoch < intro.joined {
             return Ok(());
         }
-        if g.mls.joined(&intro.member.0) != Some(intro.joined) {
-            if intro.joined > g.mls.epoch() && g.early_intros.len() < UNVERIFIED {
+        let known = g.mls.joined(&intro.member.0) == Some(intro.joined);
+        if !known || epoch > g.mls.epoch() {
+            if (known || intro.joined > g.mls.epoch()) && g.early_intros.len() < UNVERIFIED {
                 g.early_intros.push(signed);
             }
             return Ok(());
@@ -327,12 +332,21 @@ impl State {
         if !newer || !lmk_core::group::verify(&intro.member.0, INTRO, &signed.body.0, &signed.sig.0) {
             return Ok(());
         }
-        g.keep_intro(&intro, signed);
-        let Shown { epoch, capability } = intro.shown;
+        let g = self.group(gid)?;
+        let own = if epoch == g.mls.epoch() {
+            Some(g.mls.capability(&self.provider)?)
+        } else {
+            g.rec.epochs.iter().find(|e| e.epoch == epoch && e.member.is_none()).map(|e| e.capability)
+        };
+        if own.is_some_and(|own| own != capability) {
+            return Ok(());
+        }
+        self.group_mut(gid)?.keep_intro(&intro, signed);
         self.at(gid, &intro.member.0, epoch)?;
         let g = self.group_mut(gid)?;
-        if epoch < g.mls.epoch() && g.at_epoch(&intro.member.0) == epoch && g.rec.epochs.iter().all(|e| e.epoch != epoch) {
-            g.rec.epochs.push(Epoch { epoch, capability, service: g.mls.settings().membership, expired: None });
+        let claimed = g.rec.epochs.iter().any(|e| e.epoch == epoch && e.member.as_ref() == Some(&intro.member));
+        if own.is_none() && !claimed && g.at_epoch(&intro.member.0) == epoch {
+            g.rec.epochs.push(Epoch { epoch, capability, service: g.mls.settings().membership, member: Some(intro.member), expired: None });
         }
         self.save(gid)
     }

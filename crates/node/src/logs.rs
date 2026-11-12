@@ -226,7 +226,8 @@ impl State {
     }
 
     /// Takes expiries of logs of the group's earlier epochs, asked of their services or told by a neighbour: each that its
-    /// service signed, of an epoch a member is in, leaves the members in that epoch behind.
+    /// service signed, of an epoch a member is in, leaves the members in that epoch behind, or the member whose claim it
+    /// is.
     pub(crate) fn take_expiries(&mut self, gid: &[u8], expiries: &[Expiry]) -> Result<bool> {
         let g = self.group_mut(gid)?;
         let key = VerifyingKey::from_bytes(&authority(&g.mls.settings().membership)?)?;

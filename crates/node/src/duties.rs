@@ -171,7 +171,7 @@ fn due(st: &State, g: &G) -> Result<Option<Change>> {
                 change.remove.push(m.index);
                 change.left.push(sig.clone());
             }
-            _ if admin && g.left_behind(&m.key) => change.remove.push(m.index),
+            _ if admin && g.behind(&m.key).is_some_and(|epoch| epoch.expired.is_some()) => change.remove.push(m.index),
             _ => {}
         }
     }

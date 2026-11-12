@@ -290,8 +290,8 @@ impl Inner {
         let epoch = {
             let st = self.lock();
             let g = st.group(gid)?;
-            let at = (g.mls.admin(st.me()) && g.mls.members().iter().any(|m| m.key == key)).then(|| g.at_epoch(key));
-            at.and_then(|at| g.rec.epochs.iter().find(|epoch| epoch.epoch == at).cloned())
+            let member = g.mls.members().iter().any(|m| m.key == key);
+            g.behind(key).filter(|_| member && g.mls.admin(st.me())).cloned()
         };
         let Some(epoch) = epoch else { return Ok(()) };
         if epoch.expired.is_none() {

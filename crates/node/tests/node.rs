@@ -1179,6 +1179,86 @@ fn a_joiner_removes_a_member_away_since_before_it_joined_by_its_intro() {
     });
 }
 
+/// An intro counts for its own member only. A joiner keeps the capability an intro names for an epoch before it joined,
+/// which it cannot check, as that member's claim alone: Mallory's intro naming the epoch Bob is in, with a log the service
+/// let go, leaves Mallory behind and Bob in. An intro naming an epoch ahead of the joiner's waits, and one naming another
+/// capability than the joiner's own of its epoch, or an epoch before its member joined, is not taken.
+#[test]
+fn an_intro_counts_for_its_own_member_only() {
+    use lmk_proto::membership::{Expiry, Known};
+    use lmk_proto::peer::{At, INTRO, Intro, Shown};
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let dir = folder("intro-own");
+        let gone = [7; 32];
+        let client = ServeClient::for_service(relay.post(), &relay.service, false).unwrap();
+        client.append(&gone, &[b"of no group".to_vec()]).await.unwrap();
+        SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        while relay.membership.expire().await {}
+        let expiry = client.heads(&[Known(gone, 0)]).await.unwrap().remove(0).unwrap_err();
+
+        let mut alice = session(&relay).await;
+        let gid = alice.node.create(settings(&relay)).unwrap();
+        let (mallory_db, bob_db) = (dir.join("mallory.db"), dir.join("bob.db"));
+        for db in [&mallory_db, &bob_db] {
+            let joiner = stored(&relay, db).await;
+            joiner.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+            alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+            joiner.node.shutdown().await.unwrap();
+        }
+        // A stopped member's session, the epoch it joined in, and its group's epoch with that epoch's capability.
+        let state = |db: &Path| {
+            let provider = SqliteProvider::open(db).unwrap();
+            let (mls, group) = (Mls::load(&provider).unwrap(), lmk_core::group::Group::load(&provider, &gid.0).unwrap());
+            let joined = group.joined(mls.key()).unwrap();
+            (mls, joined, Shown { epoch: group.epoch(), capability: group.capability(&provider).unwrap() })
+        };
+        let ((mallory, mallory_joined, _), (bob, bob_joined, bob_shown)) = (state(&mallory_db), state(&bob_db));
+        let (mallory_key, bob_key) = (Bytes(mallory.key().to_vec()), Bytes(bob.key().to_vec()));
+        let base = lmk_node::now() + 1_000_000;
+        let hello = |mls: &Mls, joined: u64, version: u64, shown: Shown, text: &str, expired: Vec<Expiry>| {
+            let intro = Intro { group: gid.clone(), member: Bytes(mls.key().to_vec()), joined, version, shown, text: Some(text.into()) };
+            let body = serde_json::to_vec(&intro).unwrap();
+            let intros = vec![Signed { sig: Bytes(mls.sign(&[INTRO, &body].concat())), body: Bytes(body) }];
+            Frame::Hello { groups: vec![At { group: gid.clone(), log: [0; 32], head: None, seen: Default::default(), intros, expired }] }
+        };
+
+        // Carol hears Mallory's claim and the expiry of its log, then Bob's intro, before her group is added.
+        let mut carol = stored(&relay, &dir.join("carol.db")).await;
+        let mut bob_hand = hand(&relay, member_of(&bob_db).0, &carol.node).await;
+        let claim = Shown { epoch: bob_shown.epoch, capability: gone };
+        bob_hand.send(&hello(&mallory, mallory_joined, base, claim, "mallory", vec![expiry])).await;
+        bob_hand.send(&hello(&bob, bob_joined, base, bob_shown.clone(), "bob", vec![])).await;
+        bob_hand.settle(&gid).await;
+        carol.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        assert!(carol.node.members(&gid.0).unwrap().iter().any(|m| m.key == bob_key), "Mallory's claim left Bob in");
+
+        let epoch = carol.node.epoch(&gid.0).unwrap();
+        for (version, shown, text) in [
+            (base + 1, Shown { epoch: u64::MAX, ..bob_shown.clone() }, "ahead"),
+            (base + 2, Shown { epoch, capability: gone }, "another capability"),
+            (base + 3, Shown { epoch: bob_joined - 1, ..bob_shown }, "before joining"),
+        ] {
+            bob_hand.send(&hello(&bob, bob_joined, version, shown, text, vec![])).await;
+        }
+        bob_hand.settle(&gid).await;
+        assert_eq!(carol.node.intros(&gid.0).unwrap().get(&bob_key).map(String::as_str), Some("bob"), "none of Bob's later intros is taken");
+
+        let left = carol.until(|e| match e {
+            Event::Left { member, .. } => Some(member.key),
+            _ => None,
+        }).await;
+        assert_eq!(left, mallory_key, "Mallory's claim left her behind");
+        for session in [alice, carol] {
+            session.node.shutdown().await.unwrap();
+        }
+    });
+}
+
 /// A member's intro is at most `MAX_INTRO` bytes: `set_intro` refuses a longer one, and a neighbour's `hello` carrying
 /// a longer one is neither taken nor kept for a membership not known yet, so that large intros neither stay nor push a
 /// `hello` past `MAX_FRAME`. One of `MAX_INTRO` bytes is taken and passed on.

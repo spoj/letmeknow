@@ -108,7 +108,7 @@ impl Inner {
         self.lose(st, gid)?;
         let g = st.groups.get_mut(gid).unwrap();
         let inner = g.mls.open_entry(&st.provider, entry)?;
-        let ended = Epoch { epoch: ending, capability: g.mls.capability(&st.provider)?, service: g.mls.settings().membership, expired: None };
+        let ended = Epoch { epoch: ending, capability: g.mls.capability(&st.provider)?, service: g.mls.settings().membership, member: None, expired: None };
         let mut applied = g.mls.apply(&st.provider, entry)?;
         let current = g.mls.epoch();
         g.fetch = None;
@@ -288,7 +288,7 @@ impl State {
 
     /// Moves what this session knows of its members' epochs as a commit applied: the committer and the members it added
     /// are in the epoch it began; the removed are forgotten; the epoch it ended, like each earlier one, keeps its log's
-    /// capability while a member is in it.
+    /// capability while a member is in it, and a member's claim of an epoch is kept while that member is in it.
     fn moved(&mut self, gid: &[u8], applied: &core::Applied, ended: Epoch) -> Result<()> {
         let me = self.me().to_vec();
         let current = self.group(gid)?.mls.epoch();
@@ -300,8 +300,8 @@ impl State {
         let g = self.group_mut(gid)?;
         g.rec.members.retain(|(key, _)| members.iter().any(|m| m.key == key.0));
         g.rec.epochs.push(ended);
-        let at: Vec<u64> = members.iter().filter(|m| m.key != me).map(|m| g.at_epoch(&m.key)).collect();
-        g.rec.epochs.retain(|e| at.contains(&e.epoch));
+        let at: Vec<(&[u8], u64)> = members.iter().filter(|m| m.key != me).map(|m| (m.key.as_slice(), g.at_epoch(&m.key))).collect();
+        g.rec.epochs.retain(|e| at.iter().any(|(key, at)| *at == e.epoch && e.member.as_ref().is_none_or(|member| member.0 == *key)));
         Ok(())
     }
 }

@@ -251,7 +251,8 @@ struct Rec {
     members: Vec<(Bytes, u64)>,
     /// The epoch this session joined in.
     since: u64,
-    /// The epochs behind the current one that members are at, each with its log's capability and service.
+    /// The epochs behind the current one that members are at, each with its log's capability and service: this session's
+    /// own, and members' claims.
     epochs: Vec<Epoch>,
 }
 
@@ -261,6 +262,10 @@ struct Epoch {
     epoch: u64,
     capability: [u8; 32],
     service: Service,
+    /// The member whose intro named it, where this session holds no capability of its own of that epoch: it counts for
+    /// that member alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    member: Option<Bytes>,
     /// The service's expiry of its log, once this session asked or a neighbour told it: the members in it are left
     /// behind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -312,7 +317,7 @@ pub(crate) struct G {
     fetch: Option<(Vec<Seqs>, u64)>,
     /// Summaries of memberships this session does not know yet, as a joiner's before its Add applies here.
     unverified: Vec<(EndpointId, Signed)>,
-    /// Intros of memberships this session does not know yet.
+    /// Intros of memberships this session does not know yet, or naming an epoch it has not reached.
     early_intros: Vec<Signed>,
     /// This session's summary changed since it was signed.
     changed: bool,
@@ -343,10 +348,11 @@ impl G {
         self.rec.members.iter().find(|(member, _)| member.0 == key).map_or(self.rec.since, |(_, epoch)| *epoch)
     }
 
-    /// Whether the member with key `key` is in an epoch whose log its service let go.
-    fn left_behind(&self, key: &[u8]) -> bool {
+    /// The record of the epoch behind the current one that the member with key `key` is in, if this session holds one: its
+    /// own, or that member's claim.
+    fn behind(&self, key: &[u8]) -> Option<&Epoch> {
         let at = self.at_epoch(key);
-        self.rec.epochs.iter().any(|epoch| epoch.epoch == at && epoch.expired.is_some())
+        self.rec.epochs.iter().find(|epoch| epoch.epoch == at && epoch.member.as_ref().is_none_or(|member| member.0 == key))
     }
 
     /// The seq of the `leave` of the current membership of the member with key `key`, if it asked to leave, and the leave
