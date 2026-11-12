@@ -16,7 +16,7 @@ use crate::held::Author;
 use crate::{Epoch, Event, Inner, Lost, LostOf, Out, State, Work, days, put};
 
 /// How many of a group's last logs a commit tells the connected members it removes.
-const TOLD: usize = 8;
+pub(crate) const TOLD: usize = 8;
 
 /// The answer to the Add that ended an epoch, which its committer keeps for H for a joiner whose answer was lost.
 pub(crate) fn commit_key(gid: &[u8], epoch: u64) -> Vec<u8> {
@@ -141,8 +141,8 @@ impl Inner {
         for member in &removed {
             st.unhear(gid, &member.key)?;
         }
-        // The members it removed that are connected are told at once, by the group's last logs in order, as one may be a
-        // commit or two behind: no peer brings them later commits.
+        // The members it removed that are connected are told at once, by the group's last logs, as one may be a commit or
+        // two behind: it keeps those of logs it does not follow yet, and takes them once it does.
         let mut logs: Vec<(u64, Vec<u8>)> = st.group_logs(gid).into_iter().filter_map(|id| Some((st.logs.get(&id)?.since, id))).collect();
         logs.sort();
         let told = logs.len().saturating_sub(TOLD);
@@ -160,8 +160,15 @@ impl Inner {
         if gone {
             return Ok(false);
         }
-        st.next_log(gid, position)?;
+        let next = st.next_log(gid, position)?;
         st.refresh(gid);
+        let (ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut st.early_entries).into_iter().partition(|(_, log, _, _)| log.0 == next);
+        st.early_entries = later;
+        for (peer, log, entries, head) in ready {
+            if self.vouched(st, &head, &peer) {
+                self.take_entries(st, &log.0, head.length.saturating_sub(entries.len() as u64), entries, head)?;
+            }
+        }
         let g = st.group_mut(gid)?;
         let (early, later): (Vec<_>, Vec<_>) = std::mem::take(&mut g.early).into_iter().partition(|(_, ciphertext)| core::claim(ciphertext).is_ok_and(|(_, epoch)| epoch == current));
         g.early = later;

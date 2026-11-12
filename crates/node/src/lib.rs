@@ -30,6 +30,7 @@ use lmk_membership::client::Post;
 use lmk_net::peers::Peers;
 use lmk_net::Net;
 use lmk_proto::group::{Device, Service};
+use lmk_proto::head::Head;
 use lmk_proto::membership::Expiry;
 use lmk_proto::peer::{At, Frame, Seqs, Signed};
 use lmk_proto::Bytes;
@@ -374,6 +375,8 @@ pub(crate) struct State {
     quiet: bool,
     /// Hellos of groups not added yet, with the peers that sent them: taken once the group is.
     early_hellos: Vec<(EndpointId, At)>,
+    /// Entries of logs not followed yet, with the peers that sent them, at most `TOLD`: taken once the log is followed.
+    early_entries: Vec<(EndpointId, Bytes, Vec<Bytes>, Head)>,
     /// The latest time a step saw, in milliseconds: `Peers` takes no time from before.
     time: u64,
 }

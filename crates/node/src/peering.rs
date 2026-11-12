@@ -18,6 +18,7 @@ use lmk_proto::peer::{At, Frame, INTRO, Intro, MAX_INTRO, SUMMARY, Seqs, Shown, 
 use n0_future::time::{Duration, timeout};
 use serde::{Deserialize, Serialize};
 
+use crate::reading::TOLD;
 use crate::{Epoch, G, Inner, Member, Node, Out, State, Work, endpoint_id, get, now, put};
 
 /// How many summaries of memberships not known yet a group keeps.
@@ -538,7 +539,11 @@ impl Inner {
             return Ok(());
         }
         if let Frame::Entries { log, entries, head } = frame {
-            if log.0 == head.log_ref && self.vouched(st, &head, &peer) {
+            if log.0 == head.log_ref && !st.logs.contains_key(&log.0) {
+                st.early_entries.push((peer, log, entries, head));
+                let excess = st.early_entries.len().saturating_sub(TOLD);
+                st.early_entries.drain(..excess);
+            } else if log.0 == head.log_ref && self.vouched(st, &head, &peer) {
                 self.take_entries(st, &log.0, head.length.saturating_sub(entries.len() as u64), entries, head)?;
             }
             return Ok(());
@@ -583,7 +588,7 @@ impl Inner {
 
     /// Whether a head a peer showed of a log this session follows is signed by its service and agrees with this
     /// session's copy; a contradiction is reported.
-    fn vouched(&self, st: &State, head: &Head, peer: &EndpointId) -> bool {
+    pub(crate) fn vouched(&self, st: &State, head: &Head, peer: &EndpointId) -> bool {
         let id = head.log_ref.as_slice();
         let Some(log) = st.logs.get(id) else { return false };
         let checked = log.frontier(id).and_then(|frontier| frontier.check(head, st.hash_at(id, head.length)?));
