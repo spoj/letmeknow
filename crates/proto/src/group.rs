@@ -109,7 +109,8 @@ pub enum Control {
     /// The sender asks to be removed: `sig` is its signature over `LEAVE ‖ group ‖ joined`, its membership's first epoch
     /// as 8 bytes, with which any member may commit its removal.
     Leave { sig: Bytes },
-    /// An invite, which any member admits a joiner by once: SHA-256 of its secret, and when it expires (milliseconds).
+    /// An invite the sender made, which any member admits a joiner by once: its hash, over the group, the sender's
+    /// membership and its secret, and when it expires (milliseconds).
     Invite { hash: Bytes, expires: u64 },
     /// The sender gave up on these seqs: each author is told of its own.
     Lost { lost: Vec<crate::peer::Seqs> },

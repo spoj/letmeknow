@@ -202,7 +202,7 @@ struct Rec {
     base: u64,
     /// The epoch this session's own last commit moved the group to.
     committed: u64,
-    /// The invites shared with the group, kept for H after they expire.
+    /// The invites shared with the group, one per inviter's membership and hash, kept for H after they expire.
     invites: Vec<Rule>,
     /// The `leave`s opened: each one's membership, its seq, and the member's leave it carries (`Group::leave`).
     leaves: Vec<(Bytes, u64, u64, Bytes)>,
@@ -268,15 +268,13 @@ struct Epoch {
 /// An invite, as its inviter shared it with the group, or kept for one member.
 #[derive(Clone, Serialize, Deserialize)]
 struct Rule {
-    /// SHA-256 of its secret.
+    /// Its hash (`Invited::hash`).
     hash: Bytes,
     expires: u64,
     /// The inviter's session key.
     by: Bytes,
-    /// The epoch the inviter's membership began in, which the invite dies with. A rule kept since 0.25.2 or earlier has
-    /// none, and admits while its inviter's key is a member.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    joined: Option<u64>,
+    /// The epoch the inviter's membership began in, which the invite dies with.
+    joined: u64,
     /// The only session key it admits, when made for one member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     to: Option<Bytes>,

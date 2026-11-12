@@ -319,11 +319,9 @@ async fn any_member_admits_an_invite_once() {
     }
 
     // An expired one too.
-    let secret = [7u8; 16];
-    let expired = json!({ "type": "invite", "hash": Bytes(Sha256::digest(secret).to_vec()), "expires": lmk_node::now() - 1 });
-    bob.node.send(&gid.0, &expired, None).await.unwrap();
+    let expired = bob.node.invite(&gid.0, 0, None).await.unwrap();
     eventually("Alice holds the expired invite", || alice.node.messages(&gid.0).unwrap().iter().any(|m| m.payload["type"] == "invite")).await;
-    let expired = Invite { secret, members: vec![link.members[0].clone()], ..link.clone() };
+    let expired = Invite { members: vec![link.members[0].clone()], ..expired };
     assert!(format!("{:#}", erin.node.join(&expired).await.unwrap_err()).contains("unknown, used or expired"));
 
     // With the inviter offline, another member it named admits the joiner.
@@ -375,7 +373,7 @@ async fn an_unknown_secret_is_refused_whatever_the_request_carries() {
     alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
     let (id, url) = alice.node.address();
     let peer = iroh::EndpointId::from_bytes(&id).unwrap();
-    let join = Join { secret: Bytes(vec![7; 16]), key_package: Bytes(b"not a KeyPackage".to_vec()) };
+    let join = Join { group: gid.clone(), by: alice.node.key(), joined: 0, secret: Bytes(vec![7; 16]), key_package: Bytes(b"not a KeyPackage".to_vec()) };
     let answer = stranger.node.net().join(peer, vec![url], join).await.unwrap();
     assert!(matches!(&answer, Answer::Refused { refused } if refused.contains("unknown, used or expired")), "{answer:?}");
     while let Ok(event) = alice.events.try_recv() {
@@ -458,6 +456,56 @@ async fn an_invalid_admission_counts_as_a_refusal_and_asks_the_next_member() {
     alice.node.shutdown().await.unwrap();
 }
 
+/// A Welcome into another group than the link's counts as that member's refusal: the join asks the next member, which
+/// admits it into the link's group. The member asked first answers with Mallory's Add of the joiner into her group.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_welcome_into_another_group_than_the_links_counts_as_a_refusal() {
+    use lmk_net::{Admit, Groups, Net};
+    use lmk_proto::{Answer, links::Invite, peer::{Admitted, Join}};
+
+    struct NoGroups;
+    impl Groups for NoGroups {
+        fn admit(&self, _: &iroh::EndpointId, _: Frame) -> Option<Frame> {
+            None
+        }
+    }
+    /// Answers with what Mallory answers the joiner's KeyPackage brought by `join`, through `net`.
+    struct Elsewhere {
+        net: Net,
+        mallory: (iroh::EndpointId, iroh::RelayUrl),
+        join: Join,
+    }
+    impl Admit for Elsewhere {
+        fn join(&self, _: iroh::EndpointId, join: Join) -> n0_future::boxed::BoxFuture<Answer<Admitted>> {
+            let (net, (peer, url), join) = (self.net.clone(), self.mallory.clone(), Join { key_package: join.key_package, ..self.join.clone() });
+            Box::pin(async move { net.join(peer, vec![url], join).await.unwrap() })
+        }
+    }
+
+    let relay = relay().await;
+    let (alice, mallory, carol, dave) = (session(&relay).await, session(&relay).await, session(&relay).await, session(&relay).await);
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    let elsewhere = mallory.node.create(settings(&relay)).unwrap();
+    let link = alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
+    let theirs = mallory.node.invite(&elsewhere.0, INVITE_VALID, None).await.unwrap();
+    let join = Join { group: Bytes(theirs.group.to_vec()), by: Bytes(theirs.by.to_vec()), joined: theirs.joined, secret: Bytes(theirs.secret.to_vec()), key_package: Bytes::default() };
+    let (id, url) = mallory.node.address();
+    let admit = Elsewhere { net: carol.node.net().clone(), mallory: (iroh::EndpointId::from_bytes(&id).unwrap(), url), join };
+    let endpoint = lmk_net::builder([relay.url.clone()]).ca_tls_config(relay.ca()).bind().await.unwrap();
+    let (bad, _rx) = Net::spawn(endpoint, Arc::new(NoGroups), Arc::new(admit)).await.unwrap();
+    bad.dial(dave.node.net().id(), vec![relay.url.clone()]).await.unwrap();
+    eventually("the bad peer is connected", || dave.node.net().connected().contains(&bad.id())).await;
+
+    let both = Invite { members: vec![(*bad.id().as_bytes(), relay.domain.clone()), link.members[0].clone()], ..link.clone() };
+    let (joined, by) = dave.node.join(&both).await.unwrap();
+    assert_eq!((joined, by), (gid.clone(), link.members[0].0));
+    assert_eq!(dave.node.groups(), vec![gid]);
+    bad.shutdown().await.unwrap();
+    for session in [alice, mallory, carol, dave] {
+        session.node.shutdown().await.unwrap();
+    }
+}
+
 /// An invite dies when its inviter leaves the group, removed or by `leave`, even if it returns with the same key.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_invite_dies_when_its_inviter_leaves() {
@@ -498,29 +546,79 @@ async fn an_invite_dies_when_its_inviter_leaves() {
     alice.node.shutdown().await.unwrap();
 }
 
-/// An invite kept since 0.25.2 or earlier, which names no epoch of its inviter's membership, still admits.
+/// A member's copy of another's invite keeps no member from admitting by the invite, even one that opens the copy first:
+/// it keeps a rule for each inviter, and admits the invite's joiner by the inviter's. Mallory copies Alice's invite as
+/// hers, expired; Bob, back while both are stopped, takes the copy first from Mallory's hand.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_invite_kept_without_its_inviters_epoch_admits() {
+async fn a_members_copy_of_an_invite_keeps_no_member_from_admitting_by_it() {
+    use lmk_proto::links::Invite;
     let relay = relay().await;
-    let dir = folder("kept-invites");
-    let db = dir.join("alice.db");
-    let alice = stored(&relay, &db).await;
-    let bob = session(&relay).await;
+    let dir = folder("copied-invite");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = |name: &str| dir.join(format!("{name}.db"));
+    let mut alice = session(&relay).await;
+    let bob = stored(&relay, &db("bob")).await;
+    let mallory = stored(&relay, &db("mallory")).await;
     let gid = alice.node.create(settings(&relay)).unwrap();
+    for joiner in [&bob, &mallory] {
+        joiner.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    }
+    bob.node.shutdown().await.unwrap();
+    drop(bob);
+
+    let alice_key = alice.node.key();
     let link = alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
-    alice.node.shutdown().await.unwrap();
-    drop(alice);
+    let invite = || mallory.node.messages(&gid.0).unwrap().into_iter().find(|m| m.sender.key == alice_key && m.payload["type"] == "invite");
+    eventually("Mallory holds Alice's invite", || invite().is_some()).await;
+    let original = invite().unwrap();
+    let copy = mallory.node.send(&gid.0, &json!({ "type": "invite", "hash": original.payload["hash"], "expires": 0 }), None).await.unwrap();
+    for session in [alice, mallory] {
+        session.node.shutdown().await.unwrap();
+    }
 
-    let mut provider = SqliteProvider::open(&db).unwrap();
-    let key = [b"node/group/".as_slice(), &gid.0].concat();
-    let mut rec: Value = serde_json::from_slice(&provider.get(&key).unwrap().unwrap()).unwrap();
-    assert!(rec["invites"][0].as_object_mut().unwrap().remove("joined").is_some());
-    provider.put(&key, &serde_json::to_vec(&rec).unwrap()).unwrap();
-    provider.close().unwrap();
+    let bob = stored(&relay, &db("bob")).await;
+    bob.node.read_group(&gid.0).await.unwrap();
+    let mut hand = hand(&relay, member_of(&db("mallory")).0, &bob.node).await;
+    let items = [&copy, &original.id].map(|id| sealed(&db("mallory"), &gid, id).1).to_vec();
+    hand.send(&Frame::Held { group: gid.clone(), items, answers: None }).await;
+    hand.settle(&gid).await;
+    let dave = session(&relay).await;
+    let ask_bob = Invite { members: vec![(bob.node.address().0, relay.domain.clone())], ..link };
+    assert_eq!(dave.node.join(&ask_bob).await.unwrap().0, gid);
+    for session in [bob, dave] {
+        session.node.shutdown().await.unwrap();
+    }
+}
 
-    let alice = stored(&relay, &db).await;
-    assert_eq!(bob.node.join(&link).await.unwrap().0, gid);
-    for session in [alice, bob] {
+/// A member's copy of an invite, in another group its inviter is in, draws no joiner there: the inviter admits the joiner
+/// into the group the link names. Mallory's group sorts before Alice's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_members_copy_of_an_invite_in_another_group_draws_no_joiner_there() {
+    use lmk_proto::links::Invite;
+    let relay = relay().await;
+    let mut alice = session(&relay).await;
+    let mut mallory = session(&relay).await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    mallory.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    let trap = std::iter::repeat_with(|| mallory.node.create(settings(&relay)).unwrap()).find(|trap| *trap < gid).unwrap();
+    alice.node.join(&mallory.node.invite(&trap.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    mallory.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+
+    let (alice_key, mallory_key) = (alice.node.key(), mallory.node.key());
+    let link = alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
+    let invite = || mallory.node.messages(&gid.0).unwrap().into_iter().find(|m| m.sender.key == alice_key && m.payload["type"] == "invite");
+    eventually("Mallory holds Alice's invite", || invite().is_some()).await;
+    let original = invite().unwrap();
+    let copy = json!({ "type": "invite", "hash": original.payload["hash"], "expires": original.payload["expires"] });
+    mallory.node.send(&trap.0, &copy, None).await.unwrap();
+    eventually("Alice holds Mallory's copy", || alice.node.messages(&trap.0).unwrap().iter().any(|m| m.sender.key == mallory_key && m.payload["type"] == "invite")).await;
+
+    let dave = session(&relay).await;
+    let ask_alice = Invite { members: vec![link.members[0].clone()], ..link };
+    assert_eq!(dave.node.join(&ask_alice).await.unwrap().0, gid);
+    for session in [alice, mallory, dave] {
         session.node.shutdown().await.unwrap();
     }
 }

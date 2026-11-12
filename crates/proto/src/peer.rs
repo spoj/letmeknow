@@ -138,10 +138,14 @@ pub struct Signed {
     pub sig: Bytes,
 }
 
-/// A joiner's request, the one frame it writes on an `admission` stream: an invite's secret, and its KeyPackage. The
-/// member answers with an `Answer<Admitted>`.
+/// A joiner's request, the one frame it writes on an `admission` stream: the invite its link names, by the group, the
+/// session key of the member that made it and the epoch that member's membership began in, and its secret; and the
+/// joiner's KeyPackage. The member answers with an `Answer<Admitted>`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Join {
+    pub group: Bytes,
+    pub by: Bytes,
+    pub joined: u64,
     pub secret: Bytes,
     pub key_package: Bytes,
 }
@@ -180,7 +184,7 @@ mod tests {
         let text = serde_json::to_string(&at).unwrap();
         assert!(text.ends_with(r#""head":null,"seen":{"Ag":5}}"#), "{text}");
         assert_eq!(serde_json::from_str::<At>(&text).unwrap(), at);
-        let join = Join { secret: Bytes(vec![2]), key_package: Bytes(vec![3]) };
-        assert_eq!(serde_json::to_string(&join).unwrap(), r#"{"secret":"Ag","key_package":"Aw"}"#);
+        let join = Join { group: Bytes(vec![4]), by: Bytes(vec![5]), joined: 6, secret: Bytes(vec![2]), key_package: Bytes(vec![3]) };
+        assert_eq!(serde_json::to_string(&join).unwrap(), r#"{"group":"BA","by":"BQ","joined":6,"secret":"Ag","key_package":"Aw"}"#);
     }
 }

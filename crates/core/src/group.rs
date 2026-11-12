@@ -28,6 +28,7 @@ pub const MAX_CUT_STEP: u64 = 100_000;
 const ADDRESS_LABEL: &str = "letmeknow epoch log address v1";
 const SEALING_LABEL: &str = "letmeknow epoch log sealing v1";
 const ENVELOPE_DOMAIN: &[u8] = b"letmeknow epoch envelope v1\0";
+const INVITE_DOMAIN: &[u8] = b"letmeknow invite v1\0";
 const MAX_INNER: usize = (1 << 20) - 45;
 
 fn service_key(settings: &Settings) -> Result<[u8; 32]> {
@@ -189,8 +190,8 @@ fn key_package_in(provider: &SqliteProvider, bytes: &[u8]) -> Result<KeyPackage>
 #[derive(Clone, Debug, Default)]
 pub struct Change {
     pub add: Vec<Vec<u8>>,
-    /// SHA-256 of the secret of the invite the added member came in by, carried in the commit's authenticated data.
-    pub invite: Option<Bytes>,
+    /// The invite the added member came in by, carried in the commit's authenticated data.
+    pub invite: Option<Invited>,
     /// Leaf indices.
     pub remove: Vec<u32>,
     /// The leaves of members it removes (`Group::leave`), carried in its authenticated data: with them a member that is
@@ -205,12 +206,29 @@ pub struct Change {
     pub cut: Vec<Cut>,
 }
 
+/// The invite an Add's member came in by: the session key of the member that made it, the epoch that member's membership
+/// began in, and its secret, from which every member derives its hash. Naming a hash without its secret uses nothing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Invited {
+    pub by: Bytes,
+    pub joined: u64,
+    pub secret: Bytes,
+}
+
+impl Invited {
+    /// The invite's hash, as its maker shares it: SHA-256 of `INVITE_DOMAIN`, the group's id, `by`, `joined` (8 bytes)
+    /// and `secret`.
+    pub fn hash(&self, group: &[u8]) -> Bytes {
+        Bytes(Sha256::digest([INVITE_DOMAIN, group, &self.by.0, &self.joined.to_be_bytes(), &self.secret.0].concat()).to_vec())
+    }
+}
+
 /// A commit's authenticated data, inside its sealed entry: the invite the member it adds came in by, the leaves of
 /// members it removes, and the entries of the cut state it moves.
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Aad {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    invite: Option<Bytes>,
+    invite: Option<Invited>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     left: Vec<Bytes>,
     #[serde(default)]
@@ -325,7 +343,7 @@ pub struct Opened {
 pub struct Added {
     /// The session key of the member it added.
     pub member: Bytes,
-    /// SHA-256 of the secret of the invite it came in by.
+    /// The hash of the invite it came in by (`Invited::hash`).
     pub invite: Bytes,
     /// The epoch the Add moves into.
     pub epoch: u64,
@@ -394,12 +412,13 @@ impl Group {
         Ok(group)
     }
 
-    /// Joins by the admission that admitted this session to the commit entry it came with, whose signatures it checks
-    /// against the Welcome's sender, its committer, and whose cut is where it starts: the cut state of the members it
-    /// names, none this session, each past seq 0 by its member's proof of a sealing from before the new epoch, and every
-    /// other at seq 0 of the new epoch. OpenMLS consumes a package during `build_from_welcome`, before `into_group`, so
-    /// an error here rolls back this call's writes, the package's consumption included.
-    pub fn join(provider: &SqliteProvider, entry: &[u8], admission: &Admission, expected_package: &[u8; 32]) -> Result<Self> {
+    /// Joins the group `gid` of the service at `domain`, as an invite link names them, by the admission that admitted this
+    /// session to the commit entry it came with, whose signatures it checks against the Welcome's sender, its committer,
+    /// and whose cut is where it starts: the cut state of the members it names, none this session, each past seq 0 by its
+    /// member's proof of a sealing from before the new epoch, and every other at seq 0 of the new epoch. OpenMLS consumes
+    /// a package during `build_from_welcome`, before `into_group`, so an error here rolls back this call's writes, the
+    /// package's consumption included.
+    pub fn join(provider: &SqliteProvider, entry: &[u8], admission: &Admission, expected_package: &[u8; 32], gid: &[u8; 16], domain: &str) -> Result<Self> {
         let Entry { commit, sig } = Entry::parse(entry)?;
         let Admission { welcome: welcome_bytes, cut: ended, sig: welcome_sig } = admission;
         let MlsMessageBodyIn::Welcome(welcome) = parse::<MlsMessageIn>(welcome_bytes)?.extract() else {
@@ -423,7 +442,11 @@ impl Group {
                 settings.protocol
             );
             service_key(&settings)?;
-            ensure!(staged.group_context().group_id().as_slice().len() == 16, "group ID is not 16 bytes");
+            ensure!(staged.group_context().group_id().as_slice() == gid, "a Welcome into another group than the link names");
+            ensure!(
+                matches!(&settings.membership, Service::Serve { domain: theirs, .. } if theirs == domain),
+                "a Welcome into a group of another service than the link names"
+            );
             let mls = staged.into_group(provider)?;
             ensure!(mls.members().all(|m| names_its_key(&m.credential, &m.signature_key)), "a member whose credential names another key");
             let epoch = mls.epoch().as_u64();
@@ -555,7 +578,7 @@ impl Group {
         self.save(provider)
     }
 
-    /// Whether a commit this session applied added a member by the invite whose secret hashes to `hash`.
+    /// Whether a commit this session applied added a member by the invite whose hash is `hash` (`Invited::hash`).
     pub fn used(&self, hash: &[u8]) -> bool {
         self.state.added.iter().any(|added| added.invite.0 == hash)
     }
@@ -858,6 +881,7 @@ fn observe(
         .collect();
     let epoch = staged.epoch().as_u64();
     if let Some(invite) = &aad.invite {
+        let invite = invite.hash(group.group_id().as_slice());
         let records = staged.add_proposals().enumerate().map(|(index, add)| {
             let key_package_ref = if own {
                 state.posted.as_ref().unwrap().add_refs[index]
