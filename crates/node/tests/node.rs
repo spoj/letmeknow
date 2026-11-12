@@ -2188,6 +2188,52 @@ async fn a_leaver_asks_again_past_its_update() {
     alice.node.shutdown().await.unwrap();
 }
 
+/// A session still in its group whose kept `leave` expired from its own records sends the `leave` again: it answers with
+/// the id of a new one, and is not told it is out of the group.
+#[test]
+fn a_leave_whose_record_expired_is_sent_again() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let dir = folder("leave-expired");
+        let alice_db = dir.join("alice.db");
+        let mut alice = stored(&relay, &alice_db).await;
+        let bob = session_with(&relay, failing(relay.post(), |route| route.ends_with("/append"))).await;
+        let carol = session(&relay).await;
+        let gid = alice.node.create(Settings { carry: 1, ..settings(&relay) }).unwrap();
+        bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+        carol.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+        eventually("Alice has Carol's update", || alice.node.epoch(&gid.0).unwrap() == carol.node.epoch(&gid.0).unwrap()).await;
+        carol.node.shutdown().await.unwrap();
+
+        let leave_id = alice.node.leave(&gid.0).unwrap().expect("leave id");
+        let leave_seq = alice.node.message(&gid.0, &leave_id.0).unwrap().unwrap().seq;
+        eventually("Bob's summary holds Alice's leave", || {
+            alice.node.heard(&gid.0).unwrap().iter().any(|h| h.held.iter().any(|s| s.key == alice.node.key() && s.seqs.contains(leave_seq)))
+        })
+        .await;
+        let dev = Bytes(SigningKey::from_bytes(&[77; 32]).verifying_key().to_bytes().to_vec());
+        alice.node.change_settings(&gid.0, |s| s.admitted.push(dev.clone())).await.unwrap();
+        bob.node.shutdown().await.unwrap();
+        alice.node.shutdown().await.unwrap();
+        drop(alice);
+
+        SHIFT.store(2 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        let alice = stored(&relay, &alice_db).await;
+        eventually("Alice expired the kept leave record", || alice.node.message(&gid.0, &leave_id.0).unwrap().is_none()).await;
+
+        assert!(alice.node.groups().contains(&gid), "Alice is still in the group");
+        let second_leave = alice.node.leave(&gid.0).unwrap();
+        alice.node.shutdown().await.unwrap();
+        assert!(second_leave.is_some(), "Node::leave answered none while Alice is still in the group");
+    });
+}
+
 /// A stopped stored member's record of a message of `gid`, as its database keeps it.
 fn record(db: &Path, gid: &Bytes, id: &Bytes) -> Value {
     let provider = SqliteProvider::open(db).unwrap();

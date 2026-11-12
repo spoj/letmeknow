@@ -159,16 +159,22 @@ impl Node {
             self.inner.forget(&mut st, gid)?;
             return Ok(None);
         }
-        let id = match g.left(&me) {
-            Some((seq, _)) => st.id_at(gid, &me, g.mls.joined(&me).context("a member of its group")?, seq)?,
+        let joined = g.mls.joined(&me).context("a member of its group")?;
+        let kept = match g.left(&me) {
+            Some((seq, _)) => st.id_at(gid, &me, joined, seq)?,
+            None => None,
+        };
+        let id = match kept {
+            Some(id) => id,
             None => {
                 let leave = serde_json::to_value(Control::Leave { sig: g.mls.leave(&st.session)? })?;
-                Some(self.inner.send(&mut st, gid, &leave, None)?)
+                st.group_mut(gid)?.rec.leaves.retain(|(by, at, _, _)| by.0 != me || *at != joined);
+                self.inner.send(&mut st, gid, &leave, None)?
             }
         };
         st.group_mut(gid)?.rec.leaving = true;
         st.save(gid)?;
-        Ok(id)
+        Ok(Some(id))
     }
 
     /// Sends a held payload, a reply to the delivered message `reply_to` if given. The node first asks the membership
