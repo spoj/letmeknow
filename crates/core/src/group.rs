@@ -10,7 +10,7 @@ use lmk_proto::Bytes;
 use lmk_proto::clock::now;
 use lmk_proto::directory::check_domain;
 use lmk_proto::entry::{Entry, signed, welcome_signed};
-use lmk_proto::group::{LEAF, LEAF_EXTENSION, LEAVE, Leaf, PROTOCOL, SETTINGS_EXTENSION, Service, Settings};
+use lmk_proto::group::{LEAF, LEAF_EXTENSION, LEAVE, Leaf, PROTOCOL, SETTINGS_EXTENSION, Service, Settings, is_key};
 use lmk_proto::held::{self, Cut, Header, Ref, SEALING};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -424,9 +424,9 @@ impl Group {
     /// session to the commit entry it came with, whose signatures it checks against the Welcome's sender, its committer,
     /// and whose cut is where it starts: the cut state of the members it names, none this session, each past seq 0 by its
     /// member's proof of a sealing from before the new epoch, and every other at seq 0 of the new epoch. Every leaf of the
-    /// group is proven (`proven`), and names an iroh key no other names. OpenMLS consumes a package during
-    /// `build_from_welcome`, before `into_group`, so an error here rolls back this call's writes, the package's
-    /// consumption included.
+    /// group is proven (`proven`), and names an iroh key no other names; its settings hold keys each in its one form
+    /// (`is_key`). OpenMLS consumes a package during `build_from_welcome`, before `into_group`, so an error here rolls
+    /// back this call's writes, the package's consumption included.
     pub fn join(provider: &SqliteProvider, entry: &[u8], admission: &Admission, expected_package: &[u8; 32], gid: &[u8; 16], domain: &str) -> Result<Self> {
         let Entry { commit, sig } = Entry::parse(entry)?;
         let Admission { welcome: welcome_bytes, cut: ended, sig: welcome_sig } = admission;
@@ -451,6 +451,7 @@ impl Group {
                 settings.protocol
             );
             service_key(&settings)?;
+            ensure!(settings.admins.iter().chain(&settings.admitted).all(|key| is_key(&key.0)), "a group whose settings hold a key that is neither Ed25519 nor compressed P-256");
             ensure!(staged.group_context().group_id().as_slice() == gid, "a Welcome into another group than the link names");
             ensure!(
                 matches!(&settings.membership, Service::Serve { domain: theirs, .. } if theirs == domain),
@@ -941,10 +942,11 @@ fn well_formed(group: &[u8], c: &Cut) -> bool {
 /// the kinds we make: Adds, of KeyPackages that never expire, which name the invite they came in by, and none of a key
 /// it removes, of sessions whose device is admitted or an admin unless the committer is an admin; Removes, of members
 /// that signed their leave unless the committer is an admin; and settings, by an admin, that change only the admins and
-/// admitted devices and leave an admin; the committer's key unchanged; every leaf it brings, by an Add or its update
-/// path, proven (`proven`), and no two members' leaves naming one iroh key once it applies; and cut entries that each
-/// name a member of the cut state `cut` once, by key, in order, at its membership, past its entry there by at most
-/// `MAX_CUT_STEP`, each its member's proof of a sealing in the epoch the commit ends.
+/// admitted devices, to keys each in its one form (`is_key`), and leave an admin; the committer's key unchanged; every
+/// leaf it brings, by an Add or its update path, proven (`proven`), and no two members' leaves naming one iroh key once
+/// it applies; and cut entries that each name a member of the cut state `cut` once, by key, in order, at its
+/// membership, past its entry there by at most `MAX_CUT_STEP`, each its member's proof of a sealing in the epoch the
+/// commit ends.
 fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad, cut: &[Cut]) -> Result<()> {
     let settings = settings_of(group.extensions())?;
     let committer = Member::of(group, by).context("not a member")?;
@@ -978,6 +980,7 @@ fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad, 
                 let fixed = |s: &Settings| (s.protocol, s.carry, s.update, s.membership.clone());
                 ensure!(fixed(&new) == fixed(&settings), "a settings change of more than the admins and admitted devices");
                 ensure!(!new.admins.is_empty(), "a settings change that leaves the group no admin");
+                ensure!(new.admins.iter().chain(&new.admitted).all(|key| is_key(&key.0)), "a settings change with a key that is neither Ed25519 nor compressed P-256");
             }
             other => bail!("a {:?} proposal", other.proposal_type()),
         }

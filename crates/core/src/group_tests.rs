@@ -1527,3 +1527,34 @@ fn only_an_admin_changes_the_admins_and_admitted_devices() {
     assert!(w.read(&[0, 1, 2]).iter().all(|reader| applied(reader.last().unwrap()).updated));
     w.agree(&[0, 1, 2]);
 }
+
+/// Admins and admitted devices are keys in the one form each has: Ed25519's 32 bytes, or P-256's 33, compressed. A
+/// settings change naming another, as a P-256 key uncompressed, is refused by its builder and skipped by every member,
+/// and a joiner refuses a group whose settings name one.
+#[test]
+fn admins_and_admitted_devices_are_keys_in_one_form() {
+    // 65 bytes, as a P-256 key uncompressed is.
+    let uncompressed = Bytes(vec![4; 65]);
+    let mut w = World::new(&["A", "B"]);
+    w.found(0, &[1]);
+    let edits: [fn(&mut Settings, Bytes); 2] = [|s, key| s.admins.push(key), |s, key| s.admitted.push(key)];
+    for edit in edits {
+        let mut changed = w.m[0].g().settings();
+        edit(&mut changed, uncompressed.clone());
+        let cut = w.m[0].cut();
+        let error = refused(&mut w.m[0], Change { cut, settings: Some(changed.clone()), ..Change::default() });
+        assert!(error.contains("neither Ed25519 nor compressed P-256"), "{error}");
+        w.refused_past_rules(0, Aad::default(), |b| b.propose_group_context_extensions(context_extensions(&changed).unwrap()).unwrap(), &[1], "neither Ed25519 nor compressed P-256");
+    }
+    w.read(&[0]);
+    w.agree(&[0, 1]);
+
+    let mut w = World::new(&["A", "B"]);
+    let a = &mut w.m[0];
+    a.group = Some(Group::create(&a.provider, &a.session, &Settings { admitted: vec![uncompressed], ..settings() }).unwrap());
+    let package = w.key_package(1);
+    let cut = w.m[0].cut();
+    let commit = w.m[0].commit(Change { cut, add: vec![package.clone()], invite: Some(invite()), ..Change::default() });
+    let (inner, admission) = (w.m[0].open_inner(&commit.entry), commit.admission.unwrap());
+    assert!(join_error(&w.m[1], &inner, &admission, &package).contains("neither Ed25519 nor compressed P-256"));
+}

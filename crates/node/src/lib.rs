@@ -812,13 +812,14 @@ mod tests {
                 }
             })
         });
+        let key = |seed: u8| Bytes::from(ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key().to_bytes());
         let alice = node(&relay, post.clone()).await;
         let bob = node(&relay, post).await;
         let gid = alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: service, admins: vec![], admitted: vec![] }).unwrap();
 
         for (i, refusal) in [Refusal::Busy, Refusal::Rate, Refusal::Quota].into_iter().enumerate() {
             faults.lock().unwrap().push_back(Fault::Refuse(refusal));
-            let error = alice.change_settings(&gid.0, |s| s.admitted.push(Bytes(vec![i as u8 + 1; 32]))).await.unwrap_err();
+            let error = alice.change_settings(&gid.0, |s| s.admitted.push(key(i as u8 + 1))).await.unwrap_err();
             assert!(matches!(error.downcast_ref::<Refused>(), Some(Refused(code)) if code == refusal.code()), "{error:#}");
             let st = alice.inner.lock();
             assert!(st.group(&gid.0).unwrap().mls.posted().is_none(), "a fresh commit refused with {} is dropped", refusal.code());
@@ -831,24 +832,24 @@ mod tests {
         assert!(format!("{error:#}").contains("rate"), "{error:#}");
         assert!(bob.groups().is_empty());
 
-        alice.change_settings(&gid.0, |s| s.admitted.push(Bytes(vec![5; 32]))).await.unwrap();
-        assert_eq!(alice.settings(&gid.0).unwrap().admitted, [Bytes(vec![5; 32])]);
+        alice.change_settings(&gid.0, |s| s.admitted.push(key(5))).await.unwrap();
+        assert_eq!(alice.settings(&gid.0).unwrap().admitted, [key(5)]);
         assert!(!alice.members(&gid.0).unwrap().iter().any(|m| m.key == bob.key()));
         assert_eq!(bob.join(&link).await.unwrap().0, gid);
         bob.shutdown().await.unwrap();
         alice.caught_up(&gid.0).await.unwrap();
 
         faults.lock().unwrap().extend([Fault::Lost, Fault::Refuse(Refusal::Rate), Fault::Refuse(Refusal::Busy)]);
-        let error = alice.change_settings(&gid.0, |s| s.admitted.push(Bytes(vec![6; 32]))).await.unwrap_err();
+        let error = alice.change_settings(&gid.0, |s| s.admitted.push(key(6))).await.unwrap_err();
         assert!(matches!(error.downcast_ref::<Refused>(), Some(Refused(code)) if code == "rate"), "{error:#}");
         let kept = alice.inner.lock().group(&gid.0).unwrap().mls.posted().expect("kept after a lost earlier try").to_vec();
 
-        let error = alice.change_settings(&gid.0, |s| s.admitted.push(Bytes(vec![7; 32]))).await.unwrap_err();
+        let error = alice.change_settings(&gid.0, |s| s.admitted.push(key(7))).await.unwrap_err();
         assert!(matches!(error.downcast_ref::<Refused>(), Some(Refused(code)) if code == "busy"), "{error:#}");
         assert_eq!(alice.inner.lock().group(&gid.0).unwrap().mls.posted(), Some(kept.as_slice()));
 
-        alice.change_settings(&gid.0, |s| s.admitted.push(Bytes(vec![7; 32]))).await.unwrap();
-        assert_eq!(alice.settings(&gid.0).unwrap().admitted, [Bytes(vec![5; 32]), Bytes(vec![6; 32]), Bytes(vec![7; 32])]);
+        alice.change_settings(&gid.0, |s| s.admitted.push(key(7))).await.unwrap();
+        assert_eq!(alice.settings(&gid.0).unwrap().admitted, [key(5), key(6), key(7)]);
         alice.shutdown().await.unwrap();
     }
 

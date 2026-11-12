@@ -36,7 +36,8 @@ pub enum Service {
     Newer(Value),
 }
 
-/// The group context extension `SETTINGS_EXTENSION`. Only its admins change it, and only its lists.
+/// The group context extension `SETTINGS_EXTENSION`. Only its admins change it, and only its lists, of keys each in its
+/// one form (`is_key`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     pub protocol: u32,
@@ -65,7 +66,8 @@ pub struct Leaf {
 }
 
 /// A device's certificate that a session runs on it: its signature over `DEVICE ‖ session key`, by `algorithm`:
-/// `ed25519`, or `p256`, ECDSA on P-256 with SHA-256, whose key is SEC1-encoded and whose signature is r ‖ s.
+/// `ed25519`, or `p256`, ECDSA on P-256 with SHA-256, whose key is SEC1-encoded, compressed, and whose signature is
+/// r ‖ s.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Device {
     pub algorithm: String,
@@ -91,11 +93,17 @@ impl Device {
             "p256" => {
                 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
                 let (Ok(key), Ok(sig)) = (VerifyingKey::from_sec1_bytes(&self.key.0), Signature::from_slice(&self.sig.0)) else { return false };
-                key.verify(&signed, &sig).is_ok()
+                self.key.0.len() == 33 && key.verify(&signed, &sig).is_ok()
             }
             _ => false,
         }
     }
+}
+
+/// Whether `key` is a key in the one form a session's or a device's has: Ed25519's 32 bytes, or P-256's 33, compressed.
+pub fn is_key(key: &[u8]) -> bool {
+    <[u8; 32]>::try_from(key).is_ok_and(|key| VerifyingKey::from_bytes(&key).is_ok())
+        || key.len() == 33 && p256::ecdsa::VerifyingKey::from_sec1_bytes(key).is_ok()
 }
 
 /// The core's own payloads. The plaintext of an MLS application message is JSON with a `type`; every type but these
@@ -197,6 +205,18 @@ mod tests {
         assert_eq!(device.sig.0.len(), 64, "r and s");
         assert!(device.verify(&session));
         assert!(!device.verify(&other));
+        let uncompressed = Bytes::from(key.verifying_key().to_encoded_point(false).as_bytes());
+        assert!(!Device { key: uncompressed, ..device.clone() }.verify(&session), "a P-256 key has one form: 33 bytes, compressed");
         assert!(!Device { algorithm: "ed25519".into(), ..device }.verify(&session));
+    }
+
+    #[test]
+    fn a_key_has_one_form() {
+        let ed25519 = SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes();
+        let p256 = p256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();
+        let (compressed, uncompressed) = (p256.verifying_key().to_encoded_point(true), p256.verifying_key().to_encoded_point(false));
+        assert!(is_key(&ed25519) && is_key(compressed.as_bytes()));
+        assert!(!is_key(uncompressed.as_bytes()), "a P-256 key uncompressed");
+        assert!(!is_key(&[2; 32]) && !is_key(&[4; 33]), "no point");
     }
 }
