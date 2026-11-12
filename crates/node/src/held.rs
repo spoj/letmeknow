@@ -677,10 +677,12 @@ impl Inner {
         Ok(())
     }
 
-    /// Gives up, at the log's head, on what the held messages next in line require and this session does not hold,
-    /// of what it knows was sent: after `HOLD_OFF` once no holder, by summaries, may still be asked, else after
-    /// `GIVE_UP`, then held ones too, as two pending messages may require each other. A dep past what it knows was sent
-    /// is met after `GIVE_UP` once all it knows was sent is. Then delivers.
+    /// Gives up, at the log's head, on what the held messages next in line require and this session neither holds nor
+    /// waits to open, of what it knows was sent: after `HOLD_OFF` once no holder, by summaries, may still be asked, else
+    /// after `GIVE_UP`, when what waits unopened past the window counts as lacking, as it opens only once the seqs below
+    /// it come. Once all of them waited `GIVE_UP` with nothing else to give up, on held ones too, as two pending messages
+    /// may require each other. A dep past what it knows was sent is met after `GIVE_UP` once all it knows was sent is.
+    /// Then delivers.
     pub(crate) fn give_up(&self, st: &mut State, gid: &[u8]) -> Result<()> {
         if !st.at_head(gid) {
             return Ok(());
@@ -688,12 +690,12 @@ impl Inner {
         let now = st.tick();
         let group = Bytes(gid.to_vec());
         let g = st.group(gid)?;
-        let mut giving = Vec::new();
-        let mut releasing = Vec::new();
+        let (mut giving, mut cycles, mut releasing, mut settled) = (Vec::new(), Vec::new(), Vec::new(), true);
         for author in &g.rec.authors {
             let Some(seq) = author.held.difference(&author.delivered).first() else { continue };
             let Some(record) = st.record_at(gid, &author.key.0, author.joined, seq)? else { continue };
             let waited = now.saturating_sub(record.opened);
+            settled &= waited >= GIVE_UP;
             if waited < HOLD_OFF {
                 continue;
             }
@@ -704,16 +706,20 @@ impl Inner {
                 if seq > required.evidence() && waited >= GIVE_UP && !record.released && !releasing.contains(&record.id) {
                     releasing.push(record.id.clone());
                 }
-                let unopened: Ranges = g.unopened.keys().filter(|(k, j, _)| *k == key && *j == joined).map(|(_, _, s)| *s).collect();
-                let mut lacking = Ranges::range(1, seq.min(required.evidence())).difference(&required.resolved()).difference(&unopened);
-                if waited < GIVE_UP {
-                    lacking = lacking.difference(&required.held);
+                let unopened: Ranges = g.unopened.keys().filter(|(k, j, s)| *k == key && *j == joined && (waited < GIVE_UP || *s < required.lowest() + WINDOW)).map(|(_, _, s)| *s).collect();
+                let lacking = Ranges::range(1, seq.min(required.evidence())).difference(&required.resolved()).difference(&unopened);
+                let (pending, unheld) = (lacking.intersection(&required.held), lacking.difference(&required.held));
+                let untried = || required.seqs(&unheld).is_some_and(|unheld| st.peers.holder(&group, &[unheld], now));
+                if !unheld.is_empty() && (waited >= GIVE_UP || !untried()) {
+                    giving.push((key.clone(), joined, unheld));
                 }
-                let untried = || required.seqs(&lacking).is_some_and(|lacking| st.peers.holder(&group, &[lacking], now));
-                if !lacking.is_empty() && (waited >= GIVE_UP || !untried()) {
-                    giving.push((key, joined, lacking));
+                if !pending.is_empty() && waited >= GIVE_UP {
+                    cycles.push((key, joined, pending));
                 }
             }
+        }
+        if giving.is_empty() && releasing.is_empty() && settled {
+            giving = cycles;
         }
         if giving.is_empty() && releasing.is_empty() {
             return Ok(());

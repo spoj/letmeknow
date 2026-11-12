@@ -285,6 +285,116 @@ async fn a_ciphertext_past_the_window_is_dropped_when_its_epochs_keys_go() {
     }
 }
 
+/// Bob, Alice and Carol, who joined in that order by invites made for them, so that no member sent a held message: each
+/// at the group's head with no tasks running.
+async fn three() -> (Node, Node, Node, Bytes) {
+    let relay = lmk_testing::relay().await;
+    let config = |seed| Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[seed; 32]) };
+    let bob = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(1)).await.unwrap().0;
+    let alice = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(2)).await.unwrap().0;
+    let carol = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(3)).await.unwrap().0;
+    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+    let gid = bob.create(settings).unwrap();
+    for joiner in [&alice, &carol] {
+        joiner.join(&bob.invite(&gid.0, INVITE_VALID, Some(&joiner.key().0)).await.unwrap()).await.unwrap();
+    }
+    for node in [&bob, &alice, &carol] {
+        let tasks: Vec<_> = node.inner.tasks.lock().unwrap().drain(..).collect();
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+    for node in [&bob, &alice, &carol] {
+        node.read_group(&gid.0).await.unwrap();
+    }
+    (bob, alice, carol, gid)
+}
+
+/// The first message of `node`'s membership that began in `joined`, which depends on `dep`: its id and ciphertext.
+fn depending(node: &Node, gid: &Bytes, joined: u64, dep: lmk_proto::held::Ref) -> (Bytes, Vec<u8>) {
+    let mut st = node.inner.lock();
+    let header = Header {
+        group: gid.clone(), author: Bytes(st.session.key().to_vec()), joined, seq: 1, epoch: dep.epoch, prev: None,
+        deps: vec![dep], reply_to: None, payload: serde_json::json!({ "type": "message", "content": "depending" }),
+    };
+    let plaintext = header.encode();
+    let State { provider, session, groups, .. } = &mut *st;
+    let ciphertext = groups.get_mut(&gid.0).unwrap().mls.seal(provider, session, &plaintext).unwrap();
+    (Bytes(lmk_proto::held::id(&plaintext).to_vec()), ciphertext)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn giving_up_leaves_what_is_held_in_causal_order_neither_late_nor_missing() {
+    let (bob, alice, carol, gid) = three().await;
+    let (alice_key, epoch) = (alice.key(), carol.epoch(&gid.0).unwrap());
+    let (a1, _) = seal(&alice, &gid, 1, None, "withheld");
+    let (a2, second) = seal(&alice, &gid, 2, Some((a1, epoch)), "second");
+    let (b1, reply) = depending(&bob, &gid, 0, lmk_proto::held::Ref { key: alice_key.clone(), joined: 1, seq: 2, id: a2.clone(), epoch });
+    let delivered = {
+        let mut st = carol.inner.lock();
+        st.time = crate::now() + 60_000;
+        for ciphertext in [second, reply] {
+            assert!(carol.inner.open_one(&mut st, &gid.0, ciphertext).unwrap().is_some());
+        }
+        st.time += GIVE_UP;
+        carol.inner.give_up(&mut st, &gid.0).unwrap();
+        st.messages(&gid.0).unwrap()
+    };
+    for node in [bob, alice, carol] {
+        node.shutdown().await.unwrap();
+    }
+    let delivered: Vec<_> = delivered.into_iter().map(|m| (m.id, m.late, m.missing)).collect();
+    assert_eq!(delivered, [(a2, false, vec![Seqs { key: alice_key, joined: 1, seqs: Ranges::range(1, 1) }]), (b1, false, vec![])]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn giving_up_reaches_what_waits_unopened_past_the_window() {
+    let (bob, alice, carol, gid) = three().await;
+    let (alice_key, epoch) = (alice.key(), carol.epoch(&gid.0).unwrap());
+    let (past, unopened) = seal(&alice, &gid, WINDOW + 1, Some((Bytes(vec![0; 32]), epoch)), "past the window");
+    let (b1, reply) = depending(&bob, &gid, 0, lmk_proto::held::Ref { key: alice_key.clone(), joined: 1, seq: WINDOW + 1, id: past, epoch });
+    let delivered = {
+        let mut st = carol.inner.lock();
+        st.time = crate::now() + 60_000;
+        // A commit kept Alice's seqs through the one past the window, which waits unopened while those below it lack.
+        st.group_mut(&gid.0).unwrap().author_mut(&alice_key.0, 1).unwrap().cut = WINDOW + 1;
+        assert!(carol.inner.take_one(&mut st, &gid.0, None, unopened).unwrap().is_none());
+        assert!(carol.inner.open_one(&mut st, &gid.0, reply).unwrap().is_some());
+        st.time += GIVE_UP;
+        carol.inner.give_up(&mut st, &gid.0).unwrap();
+        st.message(&gid.0, &b1.0).unwrap()
+    };
+    for node in [bob, alice, carol] {
+        node.shutdown().await.unwrap();
+    }
+    assert_eq!(delivered.map(|m| m.missing), Some(vec![Seqs { key: alice_key, joined: 1, seqs: Ranges::range(1, WINDOW + 1) }]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn giving_up_breaks_two_messages_requiring_each_other() {
+    let (bob, alice, carol, gid) = three().await;
+    let (alice_key, bob_key, epoch) = (alice.key(), bob.key(), carol.epoch(&gid.0).unwrap());
+    let (a1, first) = depending(&alice, &gid, 1, lmk_proto::held::Ref { key: bob_key, joined: 0, seq: 1, id: Bytes(vec![0; 32]), epoch });
+    let (b1, second) = depending(&bob, &gid, 0, lmk_proto::held::Ref { key: alice_key, joined: 1, seq: 1, id: a1.clone(), epoch });
+    let late = {
+        let mut st = carol.inner.lock();
+        st.time = crate::now() + 60_000;
+        for ciphertext in [first, second] {
+            assert!(carol.inner.open_one(&mut st, &gid.0, ciphertext).unwrap().is_some());
+        }
+        st.time += GIVE_UP;
+        carol.inner.give_up(&mut st, &gid.0).unwrap();
+        [a1, b1].map(|id| st.message(&gid.0, &id.0).unwrap().is_some_and(|m| m.late))
+    };
+    for node in [bob, alice, carol] {
+        node.shutdown().await.unwrap();
+    }
+    assert_eq!(late, [true, true]);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn messages_made_ready_as_a_commit_applies_deliver_at_once_and_leave_the_session_idle() {
     let relay = lmk_testing::relay().await;
