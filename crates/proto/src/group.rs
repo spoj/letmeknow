@@ -9,6 +9,8 @@ use crate::{Bytes, directory};
 pub const PROTOCOL: u32 = 14;
 /// What a device's certificate of a session covers, before the session's key.
 pub const DEVICE: &[u8] = b"letmeknow device v1\0";
+/// What a session's iroh key signs in its leaf, before the session's key.
+pub const LEAF: &[u8] = b"letmeknow leaf v1\0";
 /// What a member's leave covers, before the group's id and the epoch its membership began in.
 pub const LEAVE: &[u8] = b"letmeknow leave v1\0";
 /// The private-use extension types: settings in the group context, and leaf data.
@@ -54,6 +56,8 @@ pub struct Settings {
 pub struct Leaf {
     /// The session's iroh key.
     pub key: Bytes,
+    /// That the session holds the iroh key: the iroh key's signature over `LEAF ‖ session key`.
+    pub proof: Bytes,
     /// The domain of the session's own membership service, whose relay it lives on.
     pub home: String,
     /// The certificate of the session by the device it runs on.
@@ -91,13 +95,6 @@ impl Device {
             }
             _ => false,
         }
-    }
-}
-
-impl Leaf {
-    /// The device that certified the session with key `session`, whose leaf this is.
-    pub fn device_of(&self, session: &[u8]) -> Option<&Device> {
-        self.device.as_ref().filter(|device| device.verify(session))
     }
 }
 
@@ -179,7 +176,7 @@ mod tests {
         let settings: Settings = serde_json::from_str(text).unwrap();
         let Service::Serve { rest, .. } = &settings.membership else { panic!("a service this version knows") };
         assert_eq!((&rest["future"], &settings.admins[..]), (&serde_json::json!("t"), &[Bytes(vec![1])][..]));
-        let leaf: Leaf = serde_json::from_str(r#"{"key":"AQ","home":"h.example","device":null,"later":1}"#).unwrap();
+        let leaf: Leaf = serde_json::from_str(r#"{"key":"AQ","proof":"Ag","home":"h.example","device":null,"later":1}"#).unwrap();
         assert_eq!(leaf.home, "h.example");
     }
 
@@ -191,8 +188,6 @@ mod tests {
         assert!(!device.verify(&other), "another session's");
         assert!(!Device { algorithm: "p256".into(), ..device.clone() }.verify(&session));
         assert!(!Device { algorithm: "rsa".into(), ..device.clone() }.verify(&session), "an algorithm this release does not know");
-        let leaf = Leaf { key: Bytes(vec![1]), home: "h.example".into(), device: Some(device.clone()) };
-        assert_eq!((leaf.device_of(&session), leaf.device_of(&other)), (Some(&device), None));
 
         use p256::ecdsa::signature::Signer as _;
         let key = p256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();

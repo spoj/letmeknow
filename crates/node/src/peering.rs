@@ -12,13 +12,13 @@ use lmk_membership::Contradiction;
 use lmk_net::Groups;
 use lmk_net::peers::{self, Own};
 use lmk_proto::Bytes;
-use lmk_proto::directory::{check_domain, relay_url};
+use lmk_proto::directory::relay_url;
 use lmk_proto::head::Head;
 use lmk_proto::peer::{At, Frame, INTRO, Intro, MAX_INTRO, SUMMARY, Seqs, Shown, Signed, Summary};
 use n0_future::time::{Duration, timeout};
 use serde::{Deserialize, Serialize};
 
-use crate::{Epoch, G, Inner, Member, Node, Out, State, Work, endpoint_id, get, now, put};
+use crate::{Epoch, G, Inner, Member, Node, Out, State, Work, get, now, put};
 
 /// How many summaries of memberships not known yet a group keeps.
 const UNVERIFIED: usize = 32;
@@ -99,7 +99,7 @@ impl State {
         let intros = g.intros().map(|(intro, signed)| ((intro.member, intro.joined), (intro.version, signed.clone()))).collect();
         let expired = g.rec.epochs.iter().filter_map(|epoch| epoch.expired.clone()).collect();
         let members = g.mls.members().into_iter().filter(|m| m.key != me).filter_map(|m| {
-            let iroh = *endpoint_id(&m.leaf.as_ref()?.key.0)?.as_bytes();
+            let iroh = m.leaf.key.0.as_slice().try_into().expect("a proven leaf names an iroh key");
             Some(((Bytes(m.key.clone()), g.mls.joined(&m.key)?), iroh))
         });
         Own {
@@ -121,9 +121,8 @@ impl State {
         let mut relays = Vec::new();
         for g in self.groups.values() {
             for member in g.mls.members() {
-                if let Some(leaf) = member.leaf.filter(|leaf| leaf.key.0 == peer.as_bytes())
-                    && check_domain(&leaf.home).is_ok()
-                    && let Ok(relay) = relay_url(&leaf.home).parse()
+                if member.leaf.key.0 == peer.as_bytes()
+                    && let Ok(relay) = relay_url(&member.leaf.home).parse()
                     && !relays.contains(&relay)
                 {
                     relays.push(relay);
@@ -269,7 +268,7 @@ impl State {
             }
             return Ok(());
         }
-        let leaf = g.mls.members().into_iter().find(|m| m.key == summary.member.0).and_then(|m| m.leaf);
+        let leaf = g.mls.members().into_iter().find(|m| m.key == summary.member.0).map(|m| m.leaf);
         if leaf.as_ref().is_none_or(|leaf| leaf.key.0 != peer.as_bytes()) || !lmk_core::group::verify(&summary.member.0, SUMMARY, &signed.body.0, &signed.sig.0) {
             return Ok(());
         }

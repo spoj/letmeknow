@@ -147,7 +147,7 @@ impl Inner {
             let head = st.logs.get(id)?.head.clone()?;
             Some(Frame::Entries { log: Bytes(id.clone()), entries: st.entries(id, 0), head })
         }).collect();
-        for peer in removed.iter().filter_map(|member| crate::endpoint_id(&member.leaf.as_ref()?.key.0)).filter(|peer| st.peers.is_connected(peer.as_bytes())) {
+        for peer in removed.iter().filter_map(|member| crate::endpoint_id(&member.leaf.key.0)).filter(|peer| st.peers.is_connected(peer.as_bytes())) {
             for frame in &frames {
                 st.out.push(Out::Frame { peer, frame: frame.clone() });
             }

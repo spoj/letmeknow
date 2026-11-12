@@ -2,12 +2,15 @@
 //! epoch it ends; held messages as application messages whose plaintext is their header, naming in the clear which
 //! message they are, each sealing signed by its author.
 
+use std::collections::BTreeSet;
+
 use anyhow::{Context, Result, bail, ensure};
 use chacha20poly1305::{XChaCha20Poly1305, aead::{Aead, KeyInit, Payload}};
 use lmk_proto::Bytes;
 use lmk_proto::clock::now;
+use lmk_proto::directory::check_domain;
 use lmk_proto::entry::{Entry, signed, welcome_signed};
-use lmk_proto::group::{Device, LEAF_EXTENSION, LEAVE, Leaf, PROTOCOL, SETTINGS_EXTENSION, Service, Settings};
+use lmk_proto::group::{LEAF, LEAF_EXTENSION, LEAVE, Leaf, PROTOCOL, SETTINGS_EXTENSION, Service, Settings};
 use lmk_proto::held::{self, Cut, Header, Ref, SEALING};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -105,11 +108,11 @@ struct SessionRecord {
 }
 
 impl Session {
-    /// A new session with a fresh MLS key; a provider holds one session.
-    pub fn create(provider: &SqliteProvider, leaf: Leaf) -> Result<Self> {
+    /// A new session with a fresh MLS key, and the leaf `leaf` makes for that key; a provider holds one session.
+    pub fn create(provider: &SqliteProvider, leaf: impl FnOnce(&[u8]) -> Leaf) -> Result<Self> {
         let signer = SignatureKeyPair::new(SignatureScheme::ED25519)?;
         signer.store(provider.storage())?;
-        let session = Session { signer, leaf };
+        let session = Session { leaf: leaf(signer.public()), signer };
         session.save(provider)?;
         Ok(session)
     }
@@ -160,11 +163,11 @@ impl Session {
     }
 }
 
-/// Validates a KeyPackage as it arrives at a member that admits it, and returns its session key and leaf data.
-pub fn key_package_leaf(provider: &SqliteProvider, key_package: &[u8]) -> Result<(Vec<u8>, Option<Leaf>)> {
+/// Validates a KeyPackage as it arrives at a member that admits it, and returns its session key and leaf data, proven.
+pub fn key_package_leaf(provider: &SqliteProvider, key_package: &[u8]) -> Result<(Vec<u8>, Leaf)> {
     let key_package = key_package_in(provider, key_package)?;
     let leaf = key_package.leaf_node();
-    Ok((leaf.signature_key().as_slice().to_vec(), leaf_of(leaf.extensions())))
+    Ok((leaf.signature_key().as_slice().to_vec(), proven(leaf)?))
 }
 
 pub fn key_package_reference(provider: &SqliteProvider, key_package: &[u8]) -> Result<[u8; 32]> {
@@ -255,19 +258,14 @@ pub struct Admission {
 pub struct Member {
     pub index: u32,
     pub key: Vec<u8>,
-    pub leaf: Option<Leaf>,
+    pub leaf: Leaf,
 }
 
 impl Member {
     fn of(group: &MlsGroup, index: LeafNodeIndex) -> Option<Self> {
         let member = group.member_at(index)?;
         let leaf = group.public_group().leaf(index)?;
-        Some(Member { index: index.u32(), key: member.signature_key, leaf: leaf_of(leaf.extensions()) })
-    }
-
-    /// The device that certified it, as its leaf names it.
-    pub fn device(&self) -> Option<&Device> {
-        self.leaf.as_ref()?.device_of(&self.key)
+        Some(Member { index: index.u32(), key: member.signature_key, leaf: leaf_of(leaf.extensions()).expect("a member's leaf carries its data") })
     }
 }
 
@@ -275,18 +273,28 @@ fn leaf_of(extensions: &Extensions<LeafNode>) -> Option<Leaf> {
     serde_json::from_slice(&extensions.unknown(LEAF_EXTENSION)?.0).ok()
 }
 
+/// A leaf node's data, which must hold of its session: a home that is a domain, the proof of its iroh key (`LEAF`), and
+/// the certificate of the device it names, if any.
+fn proven(leaf: &LeafNode) -> Result<Leaf> {
+    let key = leaf.signature_key().as_slice();
+    let data = leaf_of(leaf.extensions()).context("a leaf without its data")?;
+    ensure!(check_domain(&data.home).is_ok(), "a leaf whose home is no domain");
+    ensure!(verify(&data.key.0, LEAF, key, &data.proof.0), "a leaf its iroh key did not sign");
+    ensure!(data.device.as_ref().is_none_or(|device| device.verify(key)), "a leaf its device did not certify");
+    Ok(data)
+}
+
 /// Whether a session, by its key and its leaf data, is one of the settings' admins: by its key, or by the device that
 /// certified it.
 fn admin(settings: &Settings, key: &[u8], leaf: Option<&Leaf>) -> bool {
-    let device = leaf.and_then(|leaf| leaf.device_of(key));
+    let device = leaf.and_then(|leaf| leaf.device.as_ref());
     settings.admins.iter().any(|admin| admin.0 == key) || device.is_some_and(|device| settings.admins.contains(&device.key))
 }
 
-/// Whether the settings let any member add a session, by its key and its leaf data: the device that certified it is
-/// admitted, or an admin.
-fn admits(settings: &Settings, key: &[u8], leaf: Option<&Leaf>) -> bool {
-    let device = leaf.and_then(|leaf| leaf.device_of(key));
-    device.is_some_and(|device| settings.admitted.contains(&device.key) || settings.admins.contains(&device.key))
+/// Whether the settings let any member add a session, by its leaf data: the device that certified it is admitted, or an
+/// admin.
+fn admits(settings: &Settings, leaf: &Leaf) -> bool {
+    leaf.device.as_ref().is_some_and(|device| settings.admitted.contains(&device.key) || settings.admins.contains(&device.key))
 }
 
 /// Whether `sig` is the leave of the member with key `key` of the group `group`, whose cut state `cut` names it.
@@ -390,7 +398,7 @@ impl Group {
     pub fn create(provider: &SqliteProvider, session: &Session, settings: &Settings) -> Result<Self> {
         ensure!(settings.protocol == PROTOCOL, "settings name protocol {}", settings.protocol);
         service_key(settings)?;
-        let device = session.leaf.device_of(session.key()).map(|device| device.key.clone());
+        let device = session.leaf.device.as_ref().map(|device| device.key.clone());
         let admins = [Bytes(session.key().to_vec())].into_iter().chain(device).collect();
         let settings = Settings { admins, ..settings.clone() };
         let config = MlsGroupCreateConfig::builder()
@@ -415,9 +423,10 @@ impl Group {
     /// Joins the group `gid` of the service at `domain`, as an invite link names them, by the admission that admitted this
     /// session to the commit entry it came with, whose signatures it checks against the Welcome's sender, its committer,
     /// and whose cut is where it starts: the cut state of the members it names, none this session, each past seq 0 by its
-    /// member's proof of a sealing from before the new epoch, and every other at seq 0 of the new epoch. OpenMLS consumes
-    /// a package during `build_from_welcome`, before `into_group`, so an error here rolls back this call's writes, the
-    /// package's consumption included.
+    /// member's proof of a sealing from before the new epoch, and every other at seq 0 of the new epoch. Every leaf of the
+    /// group is proven (`proven`), and names an iroh key no other names. OpenMLS consumes a package during
+    /// `build_from_welcome`, before `into_group`, so an error here rolls back this call's writes, the package's
+    /// consumption included.
     pub fn join(provider: &SqliteProvider, entry: &[u8], admission: &Admission, expected_package: &[u8; 32], gid: &[u8; 16], domain: &str) -> Result<Self> {
         let Entry { commit, sig } = Entry::parse(entry)?;
         let Admission { welcome: welcome_bytes, cut: ended, sig: welcome_sig } = admission;
@@ -449,6 +458,9 @@ impl Group {
             );
             let mls = staged.into_group(provider)?;
             ensure!(mls.members().all(|m| names_its_key(&m.credential, &m.signature_key)), "a member whose credential names another key");
+            let leaves = mls.members().filter_map(|m| mls.public_group().leaf(m.index)).map(proven).collect::<Result<Vec<_>>>()?;
+            let irohs: BTreeSet<&Bytes> = leaves.iter().map(|leaf| &leaf.key).collect();
+            ensure!(irohs.len() == leaves.len(), "a group whose leaves name one iroh key twice");
             let epoch = mls.epoch().as_u64();
             ensure!(message.group_id() == mls.group_id() && message.epoch().as_u64() + 1 == epoch, "a commit entry of another group or epoch");
             ensure!(
@@ -517,13 +529,13 @@ impl Group {
 
     /// Whether the member with key `key` is an admin: by its key, or by the device its leaf names.
     pub fn admin(&self, key: &[u8]) -> bool {
-        let leaf = self.members().into_iter().find(|m| m.key == key).and_then(|m| m.leaf);
+        let leaf = self.members().into_iter().find(|m| m.key == key).map(|m| m.leaf);
         admin(&self.settings(), key, leaf.as_ref())
     }
 
-    /// Whether any member may add the session with key `key` and leaf data `leaf`: its device is admitted, or an admin.
-    pub fn admits(&self, key: &[u8], leaf: Option<&Leaf>) -> bool {
-        admits(&self.settings(), key, leaf)
+    /// Whether any member may add the session with leaf data `leaf`: its device is admitted, or an admin.
+    pub fn admits(&self, leaf: &Leaf) -> bool {
+        admits(&self.settings(), leaf)
     }
 
     /// This session's leave of its membership, for its `leave` to carry: a commit that removes it may carry the leave in
@@ -876,7 +888,7 @@ fn observe(
         .map(|add| {
             let leaf = add.add_proposal().key_package().leaf_node();
             // `index` is set once merged.
-            Member { index: 0, key: leaf.signature_key().as_slice().to_vec(), leaf: leaf_of(leaf.extensions()) }
+            Member { index: 0, key: leaf.signature_key().as_slice().to_vec(), leaf: leaf_of(leaf.extensions()).expect("`rules` proved an Add's leaf") }
         })
         .collect();
     let epoch = staged.epoch().as_u64();
@@ -929,14 +941,18 @@ fn well_formed(group: &[u8], c: &Cut) -> bool {
 /// the kinds we make: Adds, of KeyPackages that never expire, which name the invite they came in by, and none of a key
 /// it removes, of sessions whose device is admitted or an admin unless the committer is an admin; Removes, of members
 /// that signed their leave unless the committer is an admin; and settings, by an admin, that change only the admins and
-/// admitted devices and leave an admin; the committer's key unchanged; and cut entries that each name a member of the
-/// cut state `cut` once, by key, in order, at its membership, past its entry there by at most `MAX_CUT_STEP`, each its
-/// member's proof of a sealing in the epoch the commit ends.
+/// admitted devices and leave an admin; the committer's key unchanged; every leaf it brings, by an Add or its update
+/// path, proven (`proven`), and no two members' leaves naming one iroh key once it applies; and cut entries that each
+/// name a member of the cut state `cut` once, by key, in order, at its membership, past its entry there by at most
+/// `MAX_CUT_STEP`, each its member's proof of a sealing in the epoch the commit ends.
 fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad, cut: &[Cut]) -> Result<()> {
     let settings = settings_of(group.extensions())?;
     let committer = Member::of(group, by).context("not a member")?;
-    let admin = admin(&settings, &committer.key, committer.leaf.as_ref());
+    let admin = admin(&settings, &committer.key, Some(&committer.leaf));
     let removed: Vec<Vec<u8>> = staged.remove_proposals().filter_map(|r| group.member_at(r.remove_proposal().removed())).map(|m| m.signature_key).collect();
+    // The leaves once it applies: of the members it keeps, its committer's as its update path leaves it, and its Adds'.
+    let kept = group.members().filter(|m| m.index != by && !removed.contains(&m.signature_key));
+    let mut leaves: Vec<Leaf> = kept.filter_map(|m| Member::of(group, m.index)).map(|m| m.leaf).collect();
     for proposal in staged.queued_proposals() {
         ensure!(proposal.proposal_or_ref_type() == ProposalOrRefType::Proposal, "a proposal by reference");
         match proposal.proposal() {
@@ -946,7 +962,9 @@ fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad, 
                 let key = leaf.signature_key().as_slice();
                 ensure!(names_its_key(leaf.credential(), key), "a credential that names another key");
                 ensure!(!removed.iter().any(|removed| removed == key), "a commit that adds a key it removes");
-                ensure!(admin || admits(&settings, key, leaf_of(leaf.extensions()).as_ref()), "an Add by a member that is no admin, of a session whose device is neither admitted nor an admin");
+                let leaf = proven(leaf)?;
+                ensure!(admin || admits(&settings, &leaf), "an Add by a member that is no admin, of a session whose device is neither admitted nor an admin");
+                leaves.push(leaf);
             }
             Proposal::Remove(remove) => {
                 let key = group.member_at(remove.removed()).context("a Remove of no member")?.signature_key;
@@ -973,11 +991,17 @@ fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad, 
         ensure!(new.sealed == group.epoch().as_u64(), "a cut of a sealing of another epoch than the one the commit ends");
         ensure!(well_formed(group.group_id().as_slice(), new), "a cut its member did not sign");
     }
-    if let Some(leaf) = staged.update_path_leaf_node() {
-        let member = group.member_at(by).context("not a member")?;
-        ensure!(leaf.signature_key().as_slice() == member.signature_key, "an update changed the member's key");
-        ensure!(names_its_key(leaf.credential(), &member.signature_key), "a credential that names another key");
+    match staged.update_path_leaf_node() {
+        Some(leaf) => {
+            let member = group.member_at(by).context("not a member")?;
+            ensure!(leaf.signature_key().as_slice() == member.signature_key, "an update changed the member's key");
+            ensure!(names_its_key(leaf.credential(), &member.signature_key), "a credential that names another key");
+            leaves.push(proven(leaf)?);
+        }
+        None => leaves.push(committer.leaf),
     }
+    let irohs: BTreeSet<&Bytes> = leaves.iter().map(|leaf| &leaf.key).collect();
+    ensure!(irohs.len() == leaves.len(), "a commit after which two leaves name one iroh key");
     Ok(())
 }
 

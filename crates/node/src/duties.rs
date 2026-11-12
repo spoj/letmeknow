@@ -176,7 +176,7 @@ fn due(st: &State, g: &G) -> Result<Option<Change>> {
     }
     let Some(own) = members.iter().find(|m| m.index == g.mls.own_index()) else { return Ok(None) };
     let leaf = st.session.leaf.clone();
-    let update = own.leaf.as_ref() != Some(&leaf) || g.rec.stirred && now() >= next(g, me);
+    let update = own.leaf != leaf || g.rec.stirred && now() >= next(g, me);
     Ok((update || !change.remove.is_empty()).then_some(Change { leaf: Some(leaf), ..change }))
 }
 

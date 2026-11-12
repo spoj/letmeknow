@@ -74,7 +74,7 @@ fn epoch_zero_and_every_accepted_commit_rotate_once() {
     assert_ne!(exports(&w.m[0]).0, zero.0);
     let changes = [
         ("update", Change::default()),
-        ("leaf", Change { leaf: Some(leaf("new route")), ..Change::default() }),
+        ("leaf", Change { leaf: Some(leaf("new route", w.m[0].session.key())), ..Change::default() }),
     ];
     for (label, change) in changes {
         let before = exports(&w.m[0]);
@@ -219,9 +219,9 @@ fn staged_oversize_and_malformed_builds_restore_everything() {
     let mut w = World::new(&["A", "B"]);
     w.found(0, &[1]);
     let a = &mut w.m[0];
-    let padded = |n: usize| Leaf { key: Bytes(vec![b'x'; n]), home: "lmk.example".into(), device: None };
+    let padded = |n: usize| vec![Bytes(vec![b'x'; n])];
     let cut = a.cut();
-    let top = a.commit(Change { cut, leaf: Some(padded(700_000)), ..Change::default() });
+    let top = a.commit(Change { cut, left: padded(700_000), ..Change::default() });
     assert_eq!(top.entry.len(), 1 << 20);
     a.cancel();
     let group = a.group.as_mut().unwrap();
@@ -234,7 +234,7 @@ fn staged_oversize_and_malformed_builds_restore_everything() {
     let before_epoch = (group.epoch(), group.epoch_authenticator().to_vec(), group.capability(&a.provider).unwrap());
     let cut = group.cut().to_vec();
     for (index, change) in [
-        Change { cut: cut.clone(), leaf: Some(padded(800_000)), ..Change::default() },
+        Change { cut: cut.clone(), left: padded(800_000), ..Change::default() },
         Change { cut: cut.clone(), add: vec![b"malformed package".to_vec()], invite: Some(invite()), ..Change::default() },
         Change { cut: cut.clone(), invite: Some(invite()), ..Change::default() },
     ].into_iter().enumerate() {
@@ -372,7 +372,7 @@ fn a_multi_package_welcome_cannot_select_another_saved_package() {
     let other = stranger();
     let other_package = KeyPackage::builder()
         .leaf_node_capabilities(capabilities())
-        .leaf_node_extensions(leaf_extensions(&leaf("other")).unwrap())
+        .leaf_node_extensions(leaf_extensions(&leaf("other", other.public())).unwrap())
         .key_package_lifetime(Lifetime::init(0, u64::MAX))
         .build(CIPHERSUITE, &b.provider, &other, CredentialWithKey { credential: BasicCredential::new(other.public().to_vec()).into(), signature_key: other.public().into() })
         .unwrap();

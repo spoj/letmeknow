@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail, ensure};
 use iroh::{EndpointId, RelayUrl};
 use lmk_core::group::{Change, Group, Invited, delete_key_package, key_package_leaf, key_package_reference};
 use lmk_net::Admit;
-use lmk_proto::directory::{check_domain, relay_url};
+use lmk_proto::directory::relay_url;
 use lmk_proto::group::{Control, Leaf, Service};
 use lmk_proto::links::Invite;
 use lmk_proto::peer::{Admitted, Join};
@@ -69,7 +69,7 @@ impl Node {
                 let seq = self.inner.lock().record(gid, &id.0)?.context("the invite's message")?.header.seq;
                 // The members connected whose summaries hold the invite's message admit by it too: a member asked before its
                 // push arrived would refuse the joiner.
-                let connected: Vec<Member> = self.connected(gid)?.into_iter().filter(|m| check_domain(&m.home).is_ok()).collect();
+                let connected = self.connected(gid)?;
                 let holding = || -> Result<Vec<Member>> {
                     let holders = self.inner.lock().holders_of(gid, seq)?;
                     Ok(connected.iter().filter(|m| holders.contains(&m.key)).cloned().collect())
@@ -233,13 +233,13 @@ const NOT_ADMITTED: &str = "the joining session's device is neither admitted nor
 /// Whether `g`, as it stands, admits a joiner, by its key and leaf data, by an invite, as the member with key `me`:
 /// checked when its request comes, and each time the commit that adds it is built. An invite dies when its inviter
 /// leaves the group.
-fn admits(g: &G, me: &[u8], (joiner, leaf): &(Vec<u8>, Option<Leaf>), rule: &Rule) -> Result<()> {
+fn admits(g: &G, me: &[u8], (joiner, leaf): &(Vec<u8>, Leaf), rule: &Rule) -> Result<()> {
     let members = g.mls.members();
     ensure!(corrected() < rule.expires && !g.mls.used(&rule.hash.0), UNKNOWN);
     ensure!(g.mls.joined(&rule.by.0) == Some(rule.joined) && g.left(&rule.by.0).is_none(), INVITER_LEFT);
     ensure!(rule.to.as_ref().is_none_or(|to| to.0 == *joiner), FOR_ANOTHER);
     ensure!(members.iter().all(|member| member.key != *joiner), MEMBER_ALREADY);
-    ensure!(g.mls.admits(joiner, leaf.as_ref()) || (g.mls.admin(me) && g.mls.admin(&rule.by.0)), NOT_ADMITTED);
+    ensure!(g.mls.admits(leaf) || (g.mls.admin(me) && g.mls.admin(&rule.by.0)), NOT_ADMITTED);
     Ok(())
 }
 
@@ -308,7 +308,7 @@ impl Inner {
 
     /// Commits the Add, carrying the invite the joiner came in by, and answers with its commit entry. Each build of the
     /// commit checks the joiner's rule again.
-    async fn admit(self: &Arc<Self>, gid: &[u8], key_package: Vec<u8>, joiner: &(Vec<u8>, Option<Leaf>), rule: Rule, invited: Invited) -> Result<Admitted> {
+    async fn admit(self: &Arc<Self>, gid: &[u8], key_package: Vec<u8>, joiner: &(Vec<u8>, Leaf), rule: Rule, invited: Invited) -> Result<Admitted> {
         let add = Change { add: vec![key_package], invite: Some(invited), ..Change::default() };
         let epoch = self
             .commit(gid, |st, g| {

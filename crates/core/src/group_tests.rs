@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::provider::SqliteProvider;
-use lmk_proto::group::{ChatMessage, Service};
+use lmk_proto::group::{ChatMessage, Device, Service};
 use std::path::Path;
 use sha2::{Digest, Sha256};
 
@@ -19,9 +19,17 @@ pub(crate) fn settings() -> Settings {
     Settings { protocol: PROTOCOL, carry: 7, update: lmk_proto::group::UPDATE, membership: service(DOMAIN), admins: vec![], admitted: vec![] }
 }
 
-/// A leaf naming no device.
-pub(crate) fn leaf(name: &str) -> Leaf {
-    Leaf { key: Bytes(name.as_bytes().to_vec()), home: DOMAIN.into(), device: None }
+/// The iroh key of the session named `name`.
+fn iroh(name: &str) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&Sha256::digest(name).into())
+}
+
+/// The leaf of the session with key `session`, by the iroh key of `name`, which proves it, naming no device.
+pub(crate) fn leaf(name: &str, session: &[u8]) -> Leaf {
+    use ed25519_dalek::Signer as _;
+    let iroh = iroh(name);
+    let proof = iroh.sign(&[LEAF, session].concat()).to_bytes().to_vec();
+    Leaf { key: Bytes(iroh.verifying_key().to_bytes().to_vec()), proof: Bytes(proof), home: DOMAIN.into(), device: None }
 }
 
 /// A device key, by a byte of its seed: the 0th is every test member's, unless it moves (`Member::on`).
@@ -61,7 +69,7 @@ pub(crate) struct Member {
 impl Member {
     /// A member on device 0, as all are by default: the founder's device makes them all admins.
     pub fn new(provider: SqliteProvider, name: &str) -> Self {
-        let session = Session::create(&provider, leaf(name)).unwrap();
+        let session = Session::create(&provider, |session| leaf(name, session)).unwrap();
         let mut member = Member { provider, session, group: None, pos: 0, sent: Vec::new() };
         member.on(Some(&device(0)));
         member
@@ -145,7 +153,8 @@ impl Member {
 
     pub fn index_of(&self, name: &str) -> u32 {
         let group = self.group.as_ref().unwrap();
-        group.members().iter().find(|m| m.leaf.as_ref().unwrap().key.0 == name.as_bytes()).unwrap().index
+        let key = iroh(name).verifying_key().to_bytes();
+        group.members().iter().find(|m| m.leaf.key.0 == key).unwrap().index
     }
 
     /// Joins by the inner entry of the commit that added this member, and the Welcome of its Add, which its committer
@@ -615,22 +624,22 @@ fn settings_in_the_welcome() {
 fn leaf_data() {
     let mut w = World::new(&["A", "B", "C"]);
     w.found(0, &[1, 2]);
-    let leaves: Vec<_> = w.m[0].g().members().into_iter().map(|m| m.leaf.unwrap()).collect();
+    let leaves: Vec<_> = w.m[0].g().members().into_iter().map(|m| m.leaf).collect();
     assert_eq!(leaves, [0, 1, 2].map(|i| w.m[i].session.leaf.clone()));
     let b = w.m[2].index_of("B");
-    let moved = Leaf { key: Bytes(b"moved".to_vec()), ..w.m[1].session.leaf.clone() };
+    let moved = Leaf { home: "moved.example".into(), ..w.m[1].session.leaf.clone() };
     let cut = w.m[1].cut();
     let commit = w.m[1].commit(Change { cut, leaf: Some(moved.clone()), ..Change::default() });
     w.post(commit.entry);
     w.read(&[0, 1, 2]);
     for i in 0..3 {
-        assert_eq!(w.m[i].g().members()[b as usize].leaf.as_ref(), Some(&moved));
+        assert_eq!(w.m[i].g().members()[b as usize].leaf, moved);
     }
     let cut = w.m[1].cut();
     let commit = w.m[1].commit(Change { cut, ..Change::default() });
     w.post(commit.entry);
     w.read(&[0, 1, 2]);
-    assert_eq!(w.m[0].g().members()[b as usize].leaf.as_ref(), Some(&moved), "a key update keeps the leaf data");
+    assert_eq!(w.m[0].g().members()[b as usize].leaf, moved, "a key update keeps the leaf data");
     w.agree(&[0, 1, 2]);
 }
 
@@ -1086,7 +1095,7 @@ fn a_credential_that_names_another_key_is_refused() {
     let naming_b = |key: &[u8]| CredentialWithKey { credential: BasicCredential::new(b.session.key().to_vec()).into(), signature_key: key.into() };
     let package = KeyPackage::builder()
         .leaf_node_capabilities(capabilities())
-        .leaf_node_extensions(leaf_extensions(&leaf("forger")).unwrap())
+        .leaf_node_extensions(leaf_extensions(&leaf("forger", forger.public())).unwrap())
         .key_package_lifetime(Lifetime::init(0, u64::MAX))
         .build(CIPHERSUITE, &b.provider, &forger, naming_b(forger.public()))
         .unwrap();
@@ -1118,6 +1127,87 @@ fn a_credential_that_names_another_key_is_refused() {
     w.post(wire);
     let read = w.read(&[1]);
     assert!(matches!(&read[0][0].0, Verdict::Skipped { reason, .. } if reason.contains("a credential that names another key")), "{:?}", read[0][0].0);
+}
+
+/// Every leaf a commit brings, by an Add or an update, has a domain as its home, the proof of the iroh key it names, and
+/// a device certificate of its session if it names one, and no two members' leaves name one iroh key once the commit
+/// applies: any other is refused by the commit's builder, an Add's as its joiner asks too, and skipped by every member.
+#[test]
+fn a_commit_bringing_an_unproven_leaf_or_a_shared_iroh_key_is_refused() {
+    let mut w = World::new(&["A", "B", "C", "D"]);
+    w.found(0, &[1, 2]);
+    let c = (w.m[2].session.key().to_vec(), w.m[2].session.leaf.key.clone());
+    // Leaves of `m`, each with a word of its refusal: one naming C's iroh key, which did not sign it; one whose home is no
+    // domain; one whose device certified C; and one that C's iroh key signed.
+    let bad = |m: &Member| {
+        let own = m.session.leaf.clone();
+        [
+            (Leaf { key: c.1.clone(), ..own.clone() }, "iroh key did not sign"),
+            (Leaf { home: "Relay.example".into(), ..own.clone() }, "no domain"),
+            (Leaf { device: Some(Device::sign(&device(0), &c.0)), ..own.clone() }, "device did not certify"),
+            (Leaf { device: own.device.clone(), ..leaf("C", m.session.key()) }, "one iroh key"),
+        ]
+    };
+    for (leaf, why) in bad(&w.m[1]) {
+        let cut = w.m[1].cut();
+        let error = refused(&mut w.m[1], Change { cut, leaf: Some(leaf.clone()), ..Change::default() });
+        assert!(error.contains(why), "{error}");
+        let update = LeafNodeParameters::builder().with_extensions(leaf_extensions(&leaf).unwrap()).build();
+        w.refused_past_rules(1, Aad::default(), |b| b.leaf_node_parameters(update), &[0, 2], why);
+    }
+    w.read(&[1]);
+    for (leaf, why) in bad(&w.m[3]) {
+        let d = &mut w.m[3];
+        d.session.set_leaf(&d.provider, leaf).unwrap();
+        let package = w.key_package(3);
+        // A KeyPackage alone shows all but whose iroh key its leaf names too.
+        match key_package_leaf(&w.m[0].provider, &package) {
+            Err(error) => assert!(error.to_string().contains(why), "{error}"),
+            Ok(_) => assert_eq!(why, "one iroh key"),
+        }
+        let cut = w.m[0].cut();
+        let error = refused(&mut w.m[0], Change { cut, add: vec![package.clone()], invite: Some(invite()), ..Change::default() });
+        assert!(error.contains(why), "{error}");
+        let add = key_package_in(&w.m[0].provider, &package).unwrap();
+        w.refused_past_rules(0, Aad { invite: Some(invite()), ..Aad::default() }, |b| b.propose_adds([add]), &[1, 2], why);
+    }
+    w.read(&[0]);
+    w.agree(&[0, 1, 2]);
+}
+
+/// A joiner refuses a group with a leaf that is not proven, as its founder's, which no commit brought, can be, or with two
+/// leaves that name one iroh key, as an Add built past the rules can make.
+#[test]
+fn a_joiner_refuses_a_group_with_an_unproven_leaf_or_a_shared_iroh_key() {
+    let mut w = World::new(&["A", "B"]);
+    let a = &mut w.m[0];
+    let homeless = Leaf { home: "Relay.example".into(), ..a.session.leaf.clone() };
+    a.session.set_leaf(&a.provider, homeless).unwrap();
+    a.group = Some(Group::create(&a.provider, &a.session, &settings()).unwrap());
+    let package = w.key_package(1);
+    let cut = w.m[0].cut();
+    let commit = w.m[0].commit(Change { cut, add: vec![package.clone()], invite: Some(invite()), ..Change::default() });
+    let (inner, admission) = (w.m[0].open_inner(&commit.entry), commit.admission.unwrap());
+    assert!(join_error(&w.m[1], &inner, &admission, &package).contains("no domain"));
+
+    let mut w = World::new(&["A", "B"]);
+    let a = &mut w.m[0];
+    a.group = Some(Group::create(&a.provider, &a.session, &settings()).unwrap());
+    let b = &mut w.m[1];
+    let shared = Leaf { device: b.session.leaf.device.clone(), ..leaf("A", b.session.key()) };
+    b.session.set_leaf(&b.provider, shared).unwrap();
+    let package = w.key_package(1);
+    let cut = w.m[0].cut();
+    let m = &mut w.m[0];
+    let g = m.group.as_mut().unwrap();
+    g.mls.set_aad(serde_json::to_vec(&Aad { invite: Some(invite()), ..Aad::default() }).unwrap());
+    let bundle = g.mls.commit_builder().propose_adds(vec![key_package_in(&m.provider, &package).unwrap()]);
+    let bundle = bundle.load_psks(m.provider.storage()).unwrap().build(m.provider.rand(), m.provider.crypto(), &m.session.signer, |_| true).unwrap();
+    let (commit, welcome, _) = bundle.stage_commit(&m.provider).unwrap().into_messages();
+    let entry = entry_of(&m.session.signer, commit.to_bytes().unwrap());
+    let welcome = welcome.unwrap().to_bytes().unwrap();
+    let admission = Admission { sig: m.session.signer.sign(&welcome_signed(&entry, &serde_json::to_vec(&cut).unwrap(), &welcome)).unwrap(), welcome, cut };
+    assert!(join_error(&w.m[1], &entry, &admission, &package).contains("one iroh key"));
 }
 
 /// A KeyPackage must carry the unbounded lifetime `Session::key_package` gives: none with a bounded lifetime is taken in,
@@ -1320,22 +1410,19 @@ fn a_group_starts_with_its_founder_and_its_device_as_admins() {
 }
 
 /// A member that is no admin adds only sessions that a device admitted or an admin certified: not one on another device,
-/// on none, or whose certificate is of another session. An admin adds any, and admits devices.
+/// or on none. An admin adds any, and admits devices.
 #[test]
 fn a_member_that_is_no_admin_adds_only_sessions_on_admitted_devices() {
     let (admins, admitted) = (device(1), device(4));
-    let mut w = World::new(&["A", "B", "C", "D", "E", "F", "G"]);
+    let mut w = World::new(&["A", "B", "C", "D", "E", "F"]);
     for (i, device) in [(0, &admins), (1, &device(2)), (2, &device(3)), (3, &admitted), (4, &admins)] {
         w.m[i].on(Some(device));
     }
     w.m[5].on(None);
-    let forged = Leaf { device: Some(Device::sign(&admitted, w.m[3].session.key())), ..w.m[6].session.leaf.clone() };
-    let g = &mut w.m[6];
-    g.session.set_leaf(&g.provider, forged).unwrap();
     w.found(0, &[1]);
     w.add(1, 4, &[0, 1]);
     w.agree(&[0, 1, 4]);
-    for joiner in [2, 3, 5, 6] {
+    for joiner in [2, 3, 5] {
         let (package, cut) = (w.key_package(joiner), w.m[1].cut());
         let error = refused(&mut w.m[1], Change { cut, add: vec![package], invite: Some(invite()), ..Change::default() });
         assert!(error.contains("neither admitted nor an admin"), "{error}");
@@ -1348,8 +1435,8 @@ fn a_member_that_is_no_admin_adds_only_sessions_on_admitted_devices() {
     w.add(1, 3, &[0, 1, 4]);
     w.add(0, 5, &[0, 1, 3, 4]);
     w.agree(&[0, 1, 3, 4, 5]);
-    let (c, leaf) = (w.m[2].session.key().to_vec(), w.m[2].session.leaf.clone());
-    assert!(!w.m[3].g().admits(&c, Some(&leaf)));
+    let leaf = w.m[2].session.leaf.clone();
+    assert!(!w.m[3].g().admits(&leaf));
 }
 
 /// A member that is no admin removes only members whose leave of their current membership its commit carries; an admin
