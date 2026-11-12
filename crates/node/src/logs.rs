@@ -113,6 +113,11 @@ impl Epoch {
     pub(crate) fn reference(&self) -> Result<[u8; 32]> {
         Ok(head::reference(&authority(&self.service)?, &self.capability))
     }
+
+    /// Whether this session knows its log let go.
+    pub(crate) fn gone(&self) -> bool {
+        self.expired.is_some() || self.forgotten
+    }
 }
 
 pub(crate) fn log_key(id: &[u8]) -> Vec<u8> {
@@ -225,10 +230,11 @@ impl State {
         logs
     }
 
-    /// Takes expiries of logs of the group's earlier epochs, asked of their services or told by a neighbour: each that its
-    /// service signed, of an epoch a member is in, leaves the members in that epoch behind, or the member whose claim it
-    /// is.
-    pub(crate) fn take_expiries(&mut self, gid: &[u8], expiries: &[Expiry]) -> Result<bool> {
+    /// Takes expiries of logs of the group's earlier epochs, asked of their services or told by a neighbour, and the
+    /// references of logs `forgotten`, that their services answered this session's own ask with a head of length 0
+    /// (`let_go`): each expiry its service signed, and each forgotten log, of an epoch a member is in, leaves the
+    /// members in that epoch behind, or the member whose claim it is.
+    pub(crate) fn take_expiries(&mut self, gid: &[u8], expiries: &[Expiry], forgotten: &[[u8; 32]]) -> Result<bool> {
         let g = self.group_mut(gid)?;
         let key = VerifyingKey::from_bytes(&authority(&g.mls.settings().membership)?)?;
         let mut taken = false;
@@ -236,6 +242,8 @@ impl State {
             let reference = epoch.reference()?;
             if let Some(expiry) = expiries.iter().find(|expiry| expiry.log_ref == reference && expiry.verify(&key)) {
                 (epoch.expired, taken) = (Some(expiry.clone()), true);
+            } else if forgotten.contains(&reference) {
+                (epoch.forgotten, taken) = (true, true);
             }
         }
         if taken {
@@ -305,18 +313,20 @@ impl Inner {
         let asked: Vec<Epoch> = {
             let st = self.lock();
             let g = st.group(gid)?;
-            g.rec.epochs.iter().filter(|e| e.epoch < g.mls.epoch() && e.expired.is_none()).cloned().collect()
+            g.rec.epochs.iter().filter(|e| e.epoch < g.mls.epoch() && !e.gone()).cloned().collect()
         };
         if asked.is_empty() {
             return Ok(());
         }
-        let gone = self.let_go(asked.iter().map(|epoch| (epoch.service.clone(), epoch.capability)).collect()).await;
-        self.lock().take_expiries(gid, &gone).map(drop)
+        let (expiries, forgotten) = self.let_go(asked.iter().map(|epoch| (epoch.service.clone(), epoch.capability)).collect()).await;
+        self.lock().take_expiries(gid, &expiries, &forgotten).map(drop)
     }
 
-    /// The expiries of the logs among `logs`, each a service and a capability, that their services let go. Each answers
-    /// each log's expiry or its head, and only expiries are taken.
-    pub(crate) async fn let_go(&self, logs: Vec<(Service, [u8; 32])>) -> Vec<Expiry> {
+    /// Of the logs among `logs`, each a service and a capability of an epoch behind the group's current one, those their
+    /// services let go: the expiries of those they answer so, and the references of those they answer with a head of
+    /// length 0. Such a log held the commit that ended its epoch, so it holds nothing once its service forgot it,
+    /// `EXPIRED_DAYS` after it let it go.
+    pub(crate) async fn let_go(&self, logs: Vec<(Service, [u8; 32])>) -> (Vec<Expiry>, Vec<[u8; 32]>) {
         let mut services: Vec<(Service, Vec<[u8; 32]>)> = Vec::new();
         for (service, capability) in logs {
             match services.iter_mut().find(|(s, _)| *s == service) {
@@ -324,18 +334,26 @@ impl Inner {
                 None => services.push((service, vec![capability])),
             }
         }
-        let mut gone = Vec::new();
+        let (mut expiries, mut forgotten) = (Vec::new(), Vec::new());
         for (service, capabilities) in services {
             let answers = match self.clients.client(&service) {
                 Ok(client) => client.heads(&capabilities).await,
                 Err(error) => Err(error),
             };
             match answers {
-                Ok(answers) => gone.extend(answers.into_iter().filter_map(Result::err)),
+                Ok(answers) => {
+                    for answer in answers {
+                        match answer {
+                            Ok(head) if head.length == 0 => forgotten.push(head.log_ref),
+                            Ok(_) => {}
+                            Err(expiry) => expiries.push(expiry),
+                        }
+                    }
+                }
                 Err(error) => self.report(&error),
             }
         }
-        gone
+        (expiries, forgotten)
     }
 
     /// Warns once of what the service answered that it is not the group's, or runs another minor. Other failures are

@@ -1186,7 +1186,7 @@ fn a_joiner_removes_a_member_away_since_before_it_joined_by_its_intro() {
 /// member joined, is not taken.
 #[test]
 fn an_intro_counts_for_its_own_member_only() {
-    use lmk_proto::membership::{Expiry, Known};
+    use lmk_proto::membership::Expiry;
     use lmk_proto::peer::{At, INTRO, Intro, Shown};
     static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     fn shifted() -> u64 {
@@ -1200,7 +1200,7 @@ fn an_intro_counts_for_its_own_member_only() {
         client.append(&gone, &[b"of no group".to_vec()]).await.unwrap();
         SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         while relay.membership.expire().await {}
-        let expiry = client.heads(&[Known(gone, 0)]).await.unwrap().remove(0).unwrap_err();
+        let expiry = client.heads(&[gone]).await.unwrap().remove(0).unwrap_err();
 
         let mut alice = session(&relay).await;
         let gid = alice.node.create(settings(&relay)).unwrap();
@@ -1265,6 +1265,65 @@ fn an_intro_counts_for_its_own_member_only() {
         for session in [alice, carol] {
             session.node.shutdown().await.unwrap();
         }
+    });
+}
+
+/// A member's claim of an epoch whose log the service holds nothing of, as of one it forgot, leaves that member behind,
+/// and no other: Mallory's intro naming the epoch Bob is in, with a capability of no log, gets her removed by a joiner a
+/// day after it joined, and Bob, whose own intro names that epoch, stays.
+#[test]
+fn a_claim_whose_log_the_service_holds_nothing_of_leaves_only_its_member_behind() {
+    use lmk_proto::peer::{At, INTRO, Intro, Shown};
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let dir = folder("claim-of-nothing");
+        let mut alice = session(&relay).await;
+        let gid = alice.node.create(settings(&relay)).unwrap();
+        let (mallory_db, bob_db, carol_db) = (dir.join("mallory.db"), dir.join("bob.db"), dir.join("carol.db"));
+        for db in [&mallory_db, &bob_db, &carol_db] {
+            let joiner = stored(&relay, db).await;
+            joiner.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+            alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+            joiner.node.shutdown().await.unwrap();
+        }
+        alice.node.shutdown().await.unwrap();
+        // A stopped member's session, the epoch it joined in, and its group's epoch with that epoch's capability.
+        let state = |db: &Path| {
+            let provider = SqliteProvider::open(db).unwrap();
+            let (mls, group) = (Mls::load(&provider).unwrap(), lmk_core::group::Group::load(&provider, &gid.0).unwrap());
+            let joined = group.joined(mls.key()).unwrap();
+            (mls, joined, Shown { epoch: group.epoch(), capability: group.capability(&provider).unwrap() })
+        };
+        let signed = |mls: &Mls, joined: u64, shown: Shown| {
+            let intro = Intro { group: gid.clone(), member: Bytes(mls.key().to_vec()), joined, version: lmk_node::now() + 1_000_000, shown, text: None };
+            let body = serde_json::to_vec(&intro).unwrap();
+            Signed { sig: Bytes(mls.sign(&[INTRO, &body].concat())), body: Bytes(body) }
+        };
+        let ((mallory, mallory_joined, _), (bob, bob_joined, bob_shown)) = (state(&mallory_db), state(&bob_db));
+        let (mallory_key, bob_key) = (Bytes(mallory.key().to_vec()), Bytes(bob.key().to_vec()));
+        let claim = Shown { epoch: bob_shown.epoch, capability: [8; 32] };
+        let intros = vec![signed(&mallory, mallory_joined, claim), signed(&bob, bob_joined, bob_shown)];
+
+        let carol = stored(&relay, &carol_db).await;
+        let mut bob_hand = hand(&relay, member_of(&bob_db).0, &carol.node).await;
+        bob_hand.send(&Frame::Hello { groups: vec![At { group: gid.clone(), log: [0; 32], head: None, seen: Default::default(), intros, expired: vec![] }] }).await;
+        bob_hand.settle(&gid).await;
+        carol.node.shutdown().await.unwrap();
+
+        SHIFT.store(DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        let mut carol = stored(&relay, &carol_db).await;
+        carol.node.send(&gid.0, &message("stir"), None).await.unwrap();
+        let left = carol.until(|e| match e {
+            Event::Left { member, .. } => Some(member.key),
+            _ => None,
+        }).await;
+        assert_eq!(left, mallory_key, "Mallory's claim left her behind");
+        assert!(carol.node.members(&gid.0).unwrap().iter().any(|m| m.key == bob_key), "and Bob in");
+        carol.node.shutdown().await.unwrap();
     });
 }
 
@@ -1937,6 +1996,59 @@ fn a_joiner_whose_key_is_in_the_tree_of_a_lapsed_member_is_removed_before_its_ad
 
         // Alice is away, so that no peer brings Bob the commits.
         SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        while relay.membership.expire().await {}
+        let mut bob = stored(&relay, &dir.join("bob.db")).await;
+        bob.node.read_group(&gid.0).await.unwrap_err();
+        SHIFT.fetch_add(lmk_net::peers::WAIT + 60_000, std::sync::atomic::Ordering::Relaxed);
+        bob.node.read_group(&gid.0).await.unwrap_err();
+        bob.until(|e| matches!(&e, Event::Removed { group, .. } if *group == gid).then_some(())).await;
+        bob.node.shutdown().await.unwrap();
+
+        let mut alice = stored(&relay, &dir.join("alice.db")).await;
+        let bob = stored(&relay, &dir.join("bob.db")).await;
+        bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        alice.until(|e| matches!(&e, Event::Left { member, .. } if member.key == bob_key).then_some(())).await;
+        alice.until(|e| matches!(&e, Event::Joined { member, .. } if member.key == bob_key).then_some(())).await;
+        assert_eq!(alice.node.members(&gid.0).unwrap().len(), 2);
+        alice.node.shutdown().await.unwrap();
+        bob.node.shutdown().await.unwrap();
+    });
+}
+
+/// A member left behind in an epoch whose log the service forgot, `EXPIRED_DAYS` after it let it go, is as one whose log
+/// it let go: that log held the commit that ended its epoch, so the head of length 0 the service answers of it shows it
+/// gone. The member is removed, and comes back by invite with the key it had.
+#[test]
+fn a_member_in_an_epoch_whose_log_the_service_forgot_is_removed_and_comes_back() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let dir = folder("forgotten-rejoin");
+        let mut alice = stored(&relay, &dir.join("alice.db")).await;
+        let bob = stored(&relay, &dir.join("bob.db")).await;
+        let bob_key = bob.node.key();
+        let gid = alice.node.create(settings(&relay)).unwrap();
+        let spares = strangers(&mut alice, &gid, &relay, 2).await;
+        bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+        bob.node.shutdown().await.unwrap();
+        alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
+        alice.node.shutdown().await.unwrap();
+        drop(alice);
+
+        SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        while relay.membership.expire().await {}
+        // A removal asks the service nothing of the logs members are behind in, and keeps Alice's log alive.
+        SHIFT.store(20 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        let alice = stored(&relay, &dir.join("alice.db")).await;
+        alice.node.remove(&gid.0, &spares[1..]).await.unwrap();
+        alice.node.shutdown().await.unwrap();
+        drop(alice);
+
+        SHIFT.store((9 + lmk_proto::membership::EXPIRED_DAYS) * DAY_MS, std::sync::atomic::Ordering::Relaxed);
         while relay.membership.expire().await {}
         let mut bob = stored(&relay, &dir.join("bob.db")).await;
         bob.node.read_group(&gid.0).await.unwrap_err();

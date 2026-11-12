@@ -346,7 +346,7 @@ impl State {
         let g = self.group_mut(gid)?;
         let claimed = g.rec.epochs.iter().any(|e| e.epoch == epoch && e.member.as_ref() == Some(&intro.member));
         if own.is_none() && !claimed && g.at_epoch(&intro.member.0) == epoch {
-            g.rec.epochs.push(Epoch { epoch, capability, service: g.mls.settings().membership, member: Some(intro.member), expired: None });
+            g.rec.epochs.push(Epoch { epoch, capability, service: g.mls.settings().membership, member: Some(intro.member), expired: None, forgotten: false });
         }
         self.save(gid)
     }
@@ -540,7 +540,7 @@ impl Inner {
                 for signed in at.intros.clone() {
                     st.intro(&at.group.0, signed)?;
                 }
-                if st.take_expiries(&at.group.0, &at.expired)? {
+                if st.take_expiries(&at.group.0, &at.expired, &[])? {
                     self.work.send(Work::Duties(at.group.0.clone())).ok();
                 }
                 st.refresh(&at.group.0);

@@ -172,7 +172,7 @@ fn due(st: &State, g: &G) -> Result<Option<Change>> {
                 change.remove.push(m.index);
                 change.left.push(sig.clone());
             }
-            _ if admin && g.behind(&m.key).is_some_and(|epoch| epoch.expired.is_some()) => change.remove.push(m.index),
+            _ if admin && g.behind(&m.key).is_some_and(|epoch| epoch.gone()) => change.remove.push(m.index),
             _ => {}
         }
     }
@@ -474,7 +474,7 @@ mod tests {
         // Alice is, as far as Bob knows, in an epoch whose log was let go.
         let index = g.mls.members().into_iter().find(|m| m.key == alice.key().0).unwrap().index;
         let expired = Some(Expiry { log_ref: [0; 32], sig: Bytes(vec![0; 64]) });
-        g.rec.epochs = vec![Epoch { epoch: 0, capability: [0; 32], service: g.mls.settings().membership, member: None, expired }];
+        g.rec.epochs = vec![Epoch { epoch: 0, capability: [0; 32], service: g.mls.settings().membership, member: None, expired, forgotten: false }];
         g.rec.members = vec![(alice.key(), 0)];
         let removes = |st: &State| due(st, st.group(&gid.0).unwrap()).unwrap().map(|change| change.remove).unwrap_or_default();
         assert!(removes(&st).is_empty(), "Bob removes no one on the day he joined");

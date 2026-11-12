@@ -294,12 +294,12 @@ impl Inner {
             g.behind(key).filter(|_| member && g.mls.admin(st.me())).cloned()
         };
         let Some(epoch) = epoch else { return Ok(()) };
-        if epoch.expired.is_none() {
-            let gone = self.let_go(vec![(epoch.service.clone(), epoch.capability)]).await;
-            if gone.is_empty() {
+        if !epoch.gone() {
+            let (expiries, forgotten) = self.let_go(vec![(epoch.service.clone(), epoch.capability)]).await;
+            if expiries.is_empty() && forgotten.is_empty() {
                 return Ok(());
             }
-            self.lock().take_expiries(gid, &gone)?;
+            self.lock().take_expiries(gid, &expiries, &forgotten)?;
         }
         let remove = |_: &State, g: &G| Ok(g.mls.members().into_iter().find(|m| m.key == key).map(|m| Change { remove: vec![m.index], ..Change::default() }));
         self.commit(gid, remove).await?;

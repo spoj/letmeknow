@@ -271,6 +271,10 @@ struct Epoch {
     /// behind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expired: Option<Expiry>,
+    /// The service answered this session's own ask with a head of length 0: its log held the commit that ended the
+    /// epoch, so the service let it go and forgot it, and the members in it are left behind. No neighbour shows that, as
+    /// a member could keep such a head from before that commit.
+    forgotten: bool,
 }
 
 /// An invite, as its inviter shared it with the group, or kept for one member.
@@ -580,7 +584,7 @@ impl State {
             self.intro(&gid, signed)?;
         }
         for (_, at) in &early {
-            self.take_expiries(&gid, &at.expired)?;
+            self.take_expiries(&gid, &at.expired, &[])?;
         }
         self.refresh(&gid);
         for (peer, at) in early {

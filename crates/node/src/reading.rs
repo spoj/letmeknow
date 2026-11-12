@@ -108,7 +108,7 @@ impl Inner {
         self.lose(st, gid)?;
         let g = st.groups.get_mut(gid).unwrap();
         let inner = g.mls.open_entry(&st.provider, entry)?;
-        let ended = Epoch { epoch: ending, capability: g.mls.capability(&st.provider)?, service: g.mls.settings().membership, member: None, expired: None };
+        let ended = Epoch { epoch: ending, capability: g.mls.capability(&st.provider)?, service: g.mls.settings().membership, member: None, expired: None, forgotten: false };
         let mut applied = g.mls.apply(&st.provider, entry)?;
         let current = g.mls.epoch();
         g.fetch = None;
