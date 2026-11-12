@@ -1399,6 +1399,8 @@ fn a_detached_session_holds_what_concerns_it_for_one_reader_at_a_time() {
         assert!(refused.contains("has a reader attached already"), "{refused}");
         bob.cmd(&["send", "--to", &alice.fp, "two"]).await.unwrap();
         assert_eq!(read(&mut printed).await["content"], "two");
+        let db = rusqlite::Connection::open(session_dir(&alice.home, "alice").unwrap().join("session.db")).unwrap();
+        until(|| async { json!(db.query_row("SELECT count(*) FROM held", [], |row| row.get::<_, i64>(0)).unwrap()) }, |n| *n == json!(0)).await;
 
         alice.stop().await;
         let mut alice = world.launch(detached(), usize::MAX).await;
@@ -1418,6 +1420,60 @@ fn a_detached_session_holds_what_concerns_it_for_one_reader_at_a_time() {
         let (mut printed, _reading) = attached(&alice);
         assert_eq!(read(&mut printed).await["type"], "ready");
         assert_eq!(read(&mut printed).await["type"], "removed");
+    });
+}
+
+/// A line is held until its reader has printed it: a reader whose output fails on it does not retire it, so the next reader
+/// prints it, and once it is printed, its text leaves the session's database.
+#[test]
+fn a_detached_line_is_held_until_its_reader_prints_it() {
+    local(async {
+        let world = world("printed").await;
+        let (mut alice, bob, _) = pair(&world).await;
+        alice.stop().await;
+        let detached = || Config { detached: true, ..world.config("alice", "alice") };
+        let alice = world.launch(detached(), usize::MAX).await;
+        let secret = "the vault code is 7-tangerine-42";
+        bob.cmd(&["send", "--to", &alice.fp, secret]).await.unwrap();
+        until(|| async { json!(alice.log().iter().any(|line| line.contains(secret))) }, |logged| *logged == json!(true)).await;
+        let refused = crate::cli::attach(&alice.home, &alice.name, |line| if line.contains(secret) { Err(std::io::ErrorKind::BrokenPipe.into()) } else { Ok(()) }).await;
+        assert!(refused.is_ok());
+        // Lets the session see its reader gone.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let (mut printed, _reading) = attached(&alice);
+        assert_eq!(read(&mut printed).await["type"], "ready");
+        assert_eq!(read(&mut printed).await["content"], secret, "a line its reader did not print waits for the next reader");
+        let dir = session_dir(&alice.home, "alice").unwrap();
+        let db = rusqlite::Connection::open(dir.join("session.db")).unwrap();
+        until(|| async { json!(db.query_row("SELECT count(*) FROM held", [], |row| row.get::<_, i64>(0)).unwrap()) }, |n| *n == json!(0)).await;
+        assert_eq!(holding(&dir, secret), vec![dir.join("log.jsonl")], "a printed line's text leaves the database");
+    });
+}
+
+/// As a session starts, a line held for a reader past its group's carry goes, and its text leaves the database with it.
+#[test]
+fn a_held_line_past_its_carry_leaves_no_text_in_the_database() {
+    static LATER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn later() -> u64 {
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64 + LATER.load(Ordering::Relaxed)
+    }
+    local(async {
+        lmk_proto::clock::set(later);
+        let world = world("held-carry").await;
+        let (mut alice, bob, _) = pair(&world).await;
+        alice.stop().await;
+        let detached = || Config { detached: true, ..world.config("alice", "alice") };
+        let mut alice = world.launch(detached(), usize::MAX).await;
+        let secret = "the vault code is 7-tangerine-42";
+        bob.cmd(&["send", "--to", &alice.fp, secret]).await.unwrap();
+        alice.told(&["message"]).await;
+        alice.stop().await;
+        LATER.store(8 * 24 * 3600 * 1000, Ordering::Relaxed);
+        let alice = world.launch(detached(), usize::MAX).await;
+        let dir = session_dir(&alice.home, "alice").unwrap();
+        let db = rusqlite::Connection::open(dir.join("session.db")).unwrap();
+        assert_eq!(db.query_row("SELECT count(*) FROM held", [], |row| row.get::<_, i64>(0)).unwrap(), 0, "the carry is past");
+        assert_eq!(holding(&dir, secret), Vec::<PathBuf>::new(), "a line past its carry leaves no text in the database");
     });
 }
 
@@ -1473,9 +1529,9 @@ fn a_detached_session_keeps_lines_queued_for_a_reader_that_goes_away() {
         let (reader, mut queued) = mpsc::unbounded_channel();
         session.handle(crate::session::Inbound::Attach(reader));
         assert!(queued.try_recv().is_ok(), "ready");
-        let (seq, line) = queued.try_recv().expect("the next reader gets the unwritten line");
+        let (seq, line) = queued.try_recv().expect("the next reader gets the unprinted line");
         assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["content"], "wake me");
-        session.handle(crate::session::Inbound::Written(seq.unwrap()));
+        session.handle(crate::session::Inbound::Printed(seq.unwrap()));
         assert_eq!(db.query_row("SELECT count(*) FROM held", [], |row| row.get::<_, i64>(0)).unwrap(), 0, "writing releases the line");
         session.shutdown().await;
     });
@@ -1508,14 +1564,14 @@ fn a_detached_readers_late_acknowledgment_does_not_release_a_newer_line() {
             let (seq, line) = queued.try_recv().unwrap();
             assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["content"], text);
             seqs.push(seq.unwrap());
-            assert_eq!(db.query_row("SELECT count(*) FROM held", [], |row| row.get::<_, i64>(0)).unwrap(), 1, "live lines are held until written too");
+            assert_eq!(db.query_row("SELECT count(*) FROM held", [], |row| row.get::<_, i64>(0)).unwrap(), 1, "live lines are held until printed too");
             if text == "old" {
                 db.execute("DELETE FROM held", []).unwrap();
             }
         }
-        session.handle(crate::session::Inbound::Written(seqs[0]));
+        session.handle(crate::session::Inbound::Printed(seqs[0]));
         assert_eq!(db.query_row("SELECT count(*) FROM held", [], |row| row.get::<_, i64>(0)).unwrap(), 1, "a pruned line's acknowledgment cannot release its successor");
-        session.handle(crate::session::Inbound::Written(seqs[1]));
+        session.handle(crate::session::Inbound::Printed(seqs[1]));
         assert_eq!(db.query_row("SELECT count(*) FROM held", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
         session.shutdown().await;
     });

@@ -45,8 +45,8 @@ pub enum Inbound {
     Request(Request, oneshot::Sender<Value>),
     /// A reader's lines go here, each held one with its seq.
     Attach(mpsc::UnboundedSender<(Option<i64>, String)>),
-    /// The held line of this seq was written to a reader's connection.
-    Written(i64),
+    /// The held line of this seq was printed by a reader.
+    Printed(i64),
 }
 
 /// What work the session loop started gave: a request's answer, and where it goes; or, with no request, warnings to
@@ -72,7 +72,7 @@ pub struct Session {
     /// The reader attached to this detached session, while one is.
     reader: Option<mpsc::UnboundedSender<(Option<i64>, String)>>,
     /// The last held line's seq, never one again while this process runs: SQLite gives a deleted last row's again, and a
-    /// reader's word that it was written a line would then let a later one go.
+    /// reader's word that it printed a line would then let a later one go.
     held_seq: i64,
     /// Work in flight: the loop takes each as it finishes, and never waits on one.
     running: JoinSet<Answered>,
@@ -212,7 +212,7 @@ impl Session {
         Ok(true)
     }
 
-    /// Holds a line that wakes the agent until a reader's connection wrote it, and gives it to the reader attached.
+    /// Holds a line that wakes the agent until a reader prints it, and gives it to the reader attached.
     fn hand(&mut self, line: String) -> Result<()> {
         self.held_seq += 1;
         self.db.execute("INSERT INTO held (seq, line) VALUES (?, ?)", params![self.held_seq, line])?;
@@ -288,7 +288,7 @@ impl Session {
                 self.db.execute("DELETE FROM held WHERE seq = ?", [seq])?;
             }
         }
-        Ok(())
+        self.node.scrub()
     }
 
     /// Takes a reader attaching, or a request: what may wait on the network goes on in `running`, and is answered once done.
@@ -301,9 +301,10 @@ impl Session {
                 }
                 return;
             }
-            Inbound::Written(seq) => {
-                if let Err(error) = self.db.execute("DELETE FROM held WHERE seq = ?", [seq]) {
-                    self.warn(format!("letting go a line its reader was written: {error:#}"));
+            Inbound::Printed(seq) => {
+                let let_go = self.db.execute("DELETE FROM held WHERE seq = ?", [seq]).map_err(anyhow::Error::from).and_then(|_| self.node.scrub());
+                if let Err(error) = let_go {
+                    self.warn(format!("letting go a line its reader printed: {error:#}"));
                 }
                 return;
             }

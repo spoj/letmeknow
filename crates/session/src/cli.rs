@@ -439,22 +439,29 @@ async fn answer(stream: TcpStream, token: String, inbound: mpsc::UnboundedSender
         Ok(Call { ask: Ask::Attach {}, .. }) => {
             let (reader, mut lines) = mpsc::unbounded_channel();
             let _ = inbound.send(Inbound::Attach(reader));
-            // A reader sends nothing more: it is gone once its end closes.
-            let mut gone = [0; 1];
+            // A line goes out once the reader has printed the one before it, and says so with an empty line. Anything else
+            // from the reader, or its end closing, ends the attachment.
+            let mut acks = read.into_inner().lines();
+            let mut printing: Option<Option<i64>> = None;
             loop {
                 tokio::select! {
-                    line = lines.recv() => match line {
+                    line = lines.recv(), if printing.is_none() => match line {
                         Some((seq, line)) => {
                             if write.write_all(format!("{line}\n").as_bytes()).await.is_err() {
                                 return;
                             }
-                            if let Some(seq) = seq {
-                                let _ = inbound.send(Inbound::Written(seq));
-                            }
+                            printing = Some(seq);
                         }
                         None => return,
                     },
-                    _ = read.read(&mut gone) => return,
+                    ack = acks.next_line() => match ack {
+                        Ok(Some(ack)) if ack.is_empty() => {
+                            if let Some(seq) = printing.take().flatten() {
+                                let _ = inbound.send(Inbound::Printed(seq));
+                            }
+                        }
+                        _ => return,
+                    },
                 }
             }
         }
@@ -499,8 +506,8 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
 }
 
 /// Prints with `print`, as the reader of the detached session `session`, what it prints: its `ready`, what concerned it
-/// since its last reader, and what comes, until a line cannot be printed. Once the session stops, waits for it to run
-/// again, and attaches again.
+/// since its last reader, and what comes, until a line cannot be printed. Each line is acknowledged once printed, so the
+/// session keeps what was not. Once the session stops, waits for it to run again, and attaches again.
 pub async fn attach(home: &Path, session: &str, mut print: impl FnMut(String) -> std::io::Result<()>) -> Result<()> {
     let dir = session_dir(home, session)?;
     let mut attached = false;
@@ -527,6 +534,9 @@ pub async fn attach(home: &Path, session: &str, mut print: impl FnMut(String) ->
             (first, attached) = (false, true);
             if print(line).is_err() {
                 return Ok(());
+            }
+            if write.write_all(b"\n").await.is_err() {
+                break;
             }
         }
         ensure!(attached, "session {session} stopped");

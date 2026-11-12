@@ -11,7 +11,7 @@ PRAGMA secure_delete = ON;
 -- Chat messages taken in, so that each is printed once, with when, in milliseconds, and the file its attachment is saved
 -- in: kept for the group's H.
 CREATE TABLE IF NOT EXISTS taken (id BLOB PRIMARY KEY, gid BLOB NOT NULL, at INTEGER NOT NULL, attachment TEXT);
--- The lines that wake the agent of a detached session, in order, until written to its reader's connection.
+-- The lines that wake the agent of a detached session, in order, until its reader prints it.
 CREATE TABLE IF NOT EXISTS held (seq INTEGER PRIMARY KEY, line TEXT NOT NULL);
 ";
 
