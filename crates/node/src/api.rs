@@ -11,7 +11,7 @@ use lmk_proto::group::{Control, Settings};
 use lmk_proto::Bytes;
 use serde_json::Value;
 
-use crate::{G, Member, Message, Node, Rec, Seen, State, now};
+use crate::{G, Leave, Member, Message, Node, Rec, Seen, State, Work, now};
 
 /// What a member that is no admin is told as it asks what only admins do.
 const NOT_ADMIN: &str = "this session is no admin of the group: only its admins (`admins` lists them) remove members, and change its admins and admitted devices";
@@ -175,6 +175,29 @@ impl Node {
         st.group_mut(gid)?.rec.leaving = true;
         st.save(gid)?;
         Ok(Some(id))
+    }
+
+    /// Takes members' leaves from outside, as this session's machine keeps them: of each of a member of one of this
+    /// session's groups at that `joined` whose signature holds, its duties remove that member as they remove a leaver
+    /// whose `leave` a cut kept. Answers those of this session's groups that name no member at that `joined`, of an epoch
+    /// this session reached: that membership ended.
+    pub fn take_leaves(&self, leaves: Vec<Leave>) -> Result<Vec<Leave>> {
+        let mut st = self.inner.lock();
+        let mut ended = Vec::new();
+        for leave in leaves {
+            let Some(g) = st.groups.get_mut(&leave.group.0) else { continue };
+            if g.mls.joined(&leave.key.0) != Some(leave.joined) {
+                if leave.joined <= g.mls.epoch() {
+                    ended.push(leave);
+                }
+            } else if g.mls.left(&leave.key.0, &leave.sig.0) {
+                g.rec.leaves.retain(|(key, joined, _, _)| *key != leave.key || *joined != leave.joined);
+                g.rec.leaves.push((leave.key, leave.joined, 0, leave.sig));
+                st.save(&leave.group.0)?;
+                self.inner.work.send(Work::Duties(leave.group.0)).ok();
+            }
+        }
+        Ok(ended)
     }
 
     /// Sends a held payload, a reply to the delivered message `reply_to` if given. The node first asks the membership

@@ -122,6 +122,17 @@ pub struct Message {
     pub late: bool,
 }
 
+/// A member's signed leave of its membership (`Group::leave`), by which any member removes it: kept on its machine for
+/// the machine's sessions in the group to hand their nodes (`Node::take_leaves`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Leave {
+    pub group: Bytes,
+    /// The member's session key, and the epoch its membership began in.
+    pub key: Bytes,
+    pub joined: u64,
+    pub sig: Bytes,
+}
+
 /// Held messages a member can no longer have, as this session found its own or a member's summary told them.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Lost {
@@ -206,7 +217,8 @@ struct Rec {
     committed: u64,
     /// The invites shared with the group, one per inviter's membership and hash, kept for H after they expire.
     invites: Vec<Rule>,
-    /// The `leave`s opened: each one's membership, its seq, and the member's leave it carries (`Group::leave`).
+    /// The `leave`s opened, and the leaves taken from outside (`Node::take_leaves`) at seq 0, which every cut keeps: each
+    /// one's membership, its seq, and the member's leave (`Group::leave`).
     leaves: Vec<(Bytes, u64, u64, Bytes)>,
     /// This session asked to leave: it is in the group until a member removes it.
     leaving: bool,
@@ -1128,6 +1140,46 @@ mod tests {
         assert!(bob.leaving(&gid.0));
         assert_eq!(bob.leave(&gid.0).unwrap(), Some(id));
         for node in [alice, bob] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    /// Leaves taken from outside, of members at that `joined` whose signatures hold, are removed by the next pass of a
+    /// member's duties, one that is no admin too, in one commit. One of a membership that ended is answered; one of an
+    /// epoch not reached, or of another group, is not; one its member did not sign is not kept, by an admin either.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn leaves_taken_from_outside_are_removed_by_any_member_in_one_commit() {
+        let relay = lmk_testing::relay().await;
+        let (alice, carol, dave) = (node(&relay, relay.post()).await, node(&relay, relay.post()).await, node(&relay, relay.post()).await);
+        let config = Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[8; 32]) };
+        let bob = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0;
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let (gid, other) = (alice.create(settings.clone()).unwrap(), alice.create(settings).unwrap());
+        for joiner in [&bob, &carol, &dave] {
+            joiner.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        }
+        bob.caught_up(&gid.0).await.unwrap();
+        assert!(!bob.admin(&gid.0, &bob.key().0).unwrap());
+        let leave = |node: &Node, gid: &Bytes| {
+            let st = node.inner.lock();
+            let g = st.group(&gid.0).unwrap();
+            Leave { group: gid.clone(), key: Bytes(st.me().to_vec()), joined: g.mls.joined(st.me()).unwrap(), sig: g.mls.leave(&st.session).unwrap() }
+        };
+        let (carols, daves, epoch) = (leave(&carol, &gid), leave(&dave, &gid), bob.epoch(&gid.0).unwrap());
+        let forged = Leave { sig: carols.sig.clone(), ..leave(&bob, &gid) };
+        assert!(alice.take_leaves(vec![forged]).unwrap().is_empty());
+        assert!(alice.inner.lock().group(&gid.0).unwrap().rec.leaves.is_empty(), "a leave its member did not sign is not kept");
+        let ended = Leave { joined: 0, ..carols.clone() };
+        let unreached = Leave { joined: epoch + 1, ..carols.clone() };
+        let answered = bob.take_leaves(vec![carols, daves, ended.clone(), unreached, leave(&alice, &other)]).unwrap();
+        assert_eq!(answered, [ended]);
+        n0_future::time::timeout(Duration::from_secs(60), async {
+            while bob.members(&gid.0).unwrap().len() > 2 {
+                n0_future::time::sleep(Duration::from_millis(50)).await;
+            }
+        }).await.expect("Bob removes Carol and Dave");
+        assert_eq!(bob.epoch(&gid.0).unwrap(), epoch + 1, "in one commit");
+        for node in [alice, bob, carol, dave] {
             node.shutdown().await.unwrap();
         }
     }
