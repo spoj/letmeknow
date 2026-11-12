@@ -77,6 +77,8 @@ pub(crate) struct Inner {
     groups: Arc<dyn Groups>,
     admit: Arc<dyn Admit>,
     links: Mutex<BTreeMap<EndpointId, Link>>,
+    /// Held while a link changes and its event goes, so that `Peers` hears of the changes in the order they were made.
+    order: tokio::sync::Mutex<()>,
     events: mpsc::Sender<Event>,
 }
 
@@ -99,6 +101,7 @@ impl Net {
             groups,
             admit,
             links: Mutex::default(),
+            order: tokio::sync::Mutex::default(),
             events,
         });
         let router = Router::builder(endpoint).accept(ALPN, Handler(inner.clone())).spawn();
@@ -153,7 +156,7 @@ impl Inner {
             return Ok(conn);
         }
         let conn = self.endpoint.connect(addr(key, relays), ALPN).await?;
-        match self.register(&conn, true) {
+        match self.register(&conn, true).await {
             Some(out) => {
                 spawn(self.clone().serve(conn.clone(), true, out));
                 Ok(conn)
@@ -168,46 +171,55 @@ impl Inner {
     }
 
     async fn accept(self: Arc<Self>, conn: Connection) {
-        if let Some(out) = self.register(&conn, false) {
+        if let Some(out) = self.register(&conn, false).await {
             self.serve(conn, false, out).await;
         }
     }
 
     /// Keeps one connection per peer: of two live ones, the one dialed by the smaller key, which
-    /// both sides pick alike; a redial replaces the old one.
-    fn register(&self, conn: &Connection, dialed: bool) -> Option<mpsc::UnboundedReceiver<Frame>> {
+    /// both sides pick alike; a redial replaces the old one. The connection's `Connected` goes out with it.
+    async fn register(&self, conn: &Connection, dialed: bool) -> Option<mpsc::UnboundedReceiver<Frame>> {
+        let _order = self.order.lock().await;
         let (me, peer) = (self.endpoint.id(), conn.remote_id());
         let dialer = if dialed { me } else { peer };
-        let mut links = self.links.lock().unwrap();
-        match links.get(&peer).filter(|old| old.conn.close_reason().is_none()) {
-            Some(old) if old.dialer != dialer && old.dialer == me.min(peer) => {
-                conn.close(0u32.into(), b"duplicate");
-                return None;
-            }
-            Some(old) => old.conn.close(0u32.into(), b"duplicate"),
-            None => {}
-        }
         let (out, rx) = mpsc::unbounded_channel();
-        links.insert(peer, Link { conn: conn.clone(), dialer, out });
+        {
+            let mut links = self.links.lock().unwrap();
+            match links.get(&peer).filter(|old| old.conn.close_reason().is_none()) {
+                Some(old) if old.dialer != dialer && old.dialer == me.min(peer) => {
+                    conn.close(0u32.into(), b"duplicate");
+                    return None;
+                }
+                Some(old) => old.conn.close(0u32.into(), b"duplicate"),
+                None => {}
+            }
+            links.insert(peer, Link { conn: conn.clone(), dialer, out });
+        }
+        self.events.send(Event::Connected(peer, dialed)).await.ok();
         Some(rx)
     }
 
-    /// Whether the connection was the peer's link, which it no longer is.
-    fn unregister(&self, conn: &Connection) -> bool {
+    /// Drops the connection if it is the peer's link, and tells `Peers` of it.
+    async fn unregister(&self, conn: &Connection) {
+        let _order = self.order.lock().await;
         let peer = conn.remote_id();
-        let mut links = self.links.lock().unwrap();
-        let linked = links.get(&peer).is_some_and(|link| link.conn.stable_id() == conn.stable_id());
+        let linked = {
+            let mut links = self.links.lock().unwrap();
+            let linked = links.get(&peer).is_some_and(|link| link.conn.stable_id() == conn.stable_id());
+            if linked {
+                links.remove(&peer);
+            }
+            linked
+        };
         if linked {
-            links.remove(&peer);
+            self.events.send(Event::Disconnected(peer)).await.ok();
         }
-        linked
     }
 
-    /// Runs a connection's streams until it closes. The dialer opens the one `peer` stream, within `ASK`; it tells of the
-    /// connection before the stream's frames, and of its end after.
+    /// Runs a connection's streams until it closes. The dialer opens the one `peer` stream, within `ASK`; `Peers` is told
+    /// of the connection's end after the stream's frames.
     async fn serve(self: Arc<Self>, conn: Connection, dialed: bool, out: mpsc::UnboundedReceiver<Frame>) {
         let peer = conn.remote_id();
-        self.events.send(Event::Connected(peer, dialed)).await.ok();
         let opened = timeout(ASK, async {
             if dialed {
                 return open_peer(&conn).await.inspect_err(|e| tracing::debug!("no peer stream to {}: {e:#}", peer.fmt_short())).ok();
@@ -234,9 +246,7 @@ impl Inner {
         } else {
             conn.close(0u32.into(), b"no peer stream");
         }
-        if self.unregister(&conn) {
-            self.events.send(Event::Disconnected(peer)).await.ok();
-        }
+        self.unregister(&conn).await;
     }
 
     /// Answers a joiner's request to be admitted, which it sends within `ASK`.
