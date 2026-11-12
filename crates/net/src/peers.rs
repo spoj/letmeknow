@@ -379,6 +379,13 @@ impl Peers {
         }
     }
 
+    /// The member dropped what the peer sent of a membership's seq for want of room: the peer is not struck for it.
+    pub fn unstrike(&mut self, group: &Bytes, peer: &Key, m: Membership, seq: u64) {
+        if let Some(struck) = self.groups.get_mut(group).and_then(|g| g.struck.get_mut(&(*peer, m))) {
+            struck.remove(seq);
+        }
+    }
+
     /// A verified summary: a neighbour's, which goes no further, or this member's own, with `own`, which goes to every
     /// neighbour the group is served to. Returns whether it was kept.
     pub fn summary(&mut self, group: &Bytes, heard: Heard, own: bool) -> bool {

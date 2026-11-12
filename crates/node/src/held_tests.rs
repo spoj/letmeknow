@@ -203,6 +203,64 @@ async fn a_ciphertext_past_the_flood_bucket_opens_after_it_refills() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_session_short_of_room_asks_only_what_opens_as_it_comes() {
+    let (alice, bob, gid, _) = members().await;
+    let (alice_key, me) = (alice.key(), bob.key());
+    {
+        let mut st = bob.inner.lock();
+        let now = st.tick();
+        let g = st.group_mut(&gid.0).unwrap();
+        g.author_mut(&alice_key.0, 1).unwrap().known = 2 * WINDOW;
+        assert_eq!(g.wanted(now, &me.0).0, vec![Seqs { key: alice_key.clone(), joined: 1, seqs: Ranges::range(1, 2 * WINDOW) }]);
+        // What waits unopened past the window leaves no room for an answer: the seqs that move the window are still asked.
+        g.unopened.insert((alice_key.clone(), 1, WINDOW + 1), (2, vec![0; MAX_MESSAGE]));
+        assert_eq!(g.wanted(now, &me.0).0, vec![Seqs { key: alice_key.clone(), joined: 1, seqs: Ranges::range(1, WINDOW) }]);
+        g.buckets.insert((alice_key.clone(), 1), Bucket { messages: 0.0, bytes: 0.0, at: now });
+        assert!(g.wanted(now, &me.0).0.is_empty());
+    }
+    for node in [alice, bob] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_dropped_for_want_of_room_leaves_its_holder_to_ask_again() {
+    let (alice, bob, gid, _) = members().await;
+    let (_, ciphertext) = seal(&alice, &gid, 1, None, "first");
+    let (alice_key, peer) = (alice.key(), iroh::EndpointId::from_bytes(&alice.address().0).unwrap());
+    let first = vec![Seqs { key: alice_key.clone(), joined: 1, seqs: Ranges::range(1, 1) }];
+    let asked = |outs: Vec<lmk_net::peers::Out>| outs.into_iter().any(|out| matches!(out, lmk_net::peers::Out::Frame(_, Frame::Want { wants, .. }) if wants == first));
+    {
+        let mut st = bob.inner.lock();
+        st.time = crate::now() + 60_000;
+        let now = st.time;
+        st.peers.connect(*peer.as_bytes(), std::collections::BTreeSet::from([gid.clone()]), true, now);
+        let summary = lmk_proto::peer::Summary { group: gid.clone(), member: alice_key.clone(), joined: 1, version: now, time: now, epoch: 2, held: first.clone(), sealed: vec![] };
+        let signed = lmk_proto::peer::Signed { body: Bytes::default(), sig: Bytes::default() };
+        assert!(st.peers.summary(&gid, lmk_net::peers::Heard { signed, summary, at: now }, false));
+        st.group_mut(&gid.0).unwrap().author_mut(&alice_key.0, 1).unwrap().known = 1;
+        st.tell_peers();
+        assert!(asked(st.peers.poll(now)));
+        // Pushes fill what is kept unopened before the answer comes, while Alice's bucket is spent.
+        let g = st.group_mut(&gid.0).unwrap();
+        g.unopened.insert((alice_key.clone(), 1, WINDOW + 1), (2, vec![0; UNOPENED]));
+        g.buckets.insert((alice_key.clone(), 1), Bucket { messages: 0.0, bytes: 0.0, at: now });
+    }
+    bob.inner.peer_event(lmk_net::Event::Frame(peer, Frame::Held { group: gid.clone(), items: vec![Bytes(ciphertext)], answers: Some(first.clone()) }));
+    {
+        let mut st = bob.inner.lock();
+        assert!(st.id_at(&gid.0, &alice_key.0, 1, 1).unwrap().is_none());
+        st.group_mut(&gid.0).unwrap().unopened.clear();
+        st.tell_peers();
+        let now = st.tick();
+        assert!(asked(st.peers.poll(now)), "Alice is asked again");
+    }
+    for node in [alice, bob] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_ciphertext_past_the_window_is_dropped_when_its_epochs_keys_go() {
     let (alice, bob, gid, _) = members().await;
     let (edge, past) = seal(&alice, &gid, WINDOW + 1, Some((Bytes(vec![0; 32]), 2)), "just past the window");

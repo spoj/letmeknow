@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use iroh::EndpointId;
 use lmk_core::group::{self as core, MAX_MESSAGE};
+use lmk_net::peers::ANSWER;
 use lmk_proto::Bytes;
 use lmk_proto::group::{Control, type_of};
 use lmk_proto::held::Header;
@@ -240,10 +241,13 @@ impl G {
 
     /// What this session wants of each membership now, and, second, the seqs it holds sealed in an ended epoch, which it
     /// wants sealed again: known, neither held nor lost nor waiting unopened here, and not learned of within `HOLD_OFF`.
-    /// A commit keeps only what is sealed in its own epoch, so a holder must show the second sealed in this one.
+    /// A commit keeps only what is sealed in its own epoch, so a holder must show the second sealed in this one. Only what
+    /// it can take: while what waits unopened leaves no room for a whole answer, what opens as it comes, within the window
+    /// and, but for resealings, while reading waits or the membership's bucket would open the largest message.
     pub(crate) fn wanted(&mut self, now: u64, me: &[u8]) -> (Vec<Seqs>, Vec<Seqs>) {
         self.fresh.retain(|(_, _, _, at)| now < at + HOLD_OFF);
         let epoch = self.mls.epoch();
+        let room = self.early.iter().map(|(_, c)| c.len()).chain(self.unopened.values().map(|(_, c)| c.len())).sum::<usize>() + ANSWER + MAX_MESSAGE <= UNOPENED;
         let (mut wanted, mut stale) = (Vec::new(), Vec::new());
         for author in &self.rec.authors {
             let ended: Ranges = match author.key.0 == me {
@@ -252,8 +256,14 @@ impl G {
             };
             let learned = self.fresh.iter().filter(|(key, joined, _, _)| *key == author.key && *joined == author.joined).fold(Ranges::default(), |all, (_, _, seqs, _)| all.union(seqs));
             let unopened: Ranges = self.unopened.keys().filter(|(k, j, _)| *k == author.key && *j == author.joined).map(|(_, _, s)| *s).collect();
-            let pending = |seqs: Ranges| seqs.difference(&learned).difference(&unopened);
-            wanted.extend(author.seqs(&pending(author.wanted())));
+            let pending = |seqs: Ranges| {
+                let seqs = seqs.difference(&learned).difference(&unopened);
+                if room { seqs } else { seqs.through(author.lowest() + WINDOW - 1) }
+            };
+            let opens = || self.buckets.get(&(author.key.clone(), author.joined)).is_none_or(|b| b.clone().take(MAX_MESSAGE, 2.0, now));
+            if room || self.waiting || opens() {
+                wanted.extend(author.seqs(&pending(author.wanted())));
+            }
             stale.extend(author.seqs(&pending(ended)));
         }
         (wanted, stale)
@@ -440,6 +450,9 @@ impl Inner {
             if room(g) {
                 remember(&mut g.seen, hash);
                 g.unopened.insert((claim.key, claim.joined, claim.seq), (epoch, ciphertext));
+            } else if let Some(peer) = from {
+                // Its sender holds it, and is asked for it again once there is room.
+                st.peers.unstrike(&Bytes(gid.to_vec()), peer.as_bytes(), (claim.key, claim.joined), claim.seq);
             }
             return Ok(None);
         }
