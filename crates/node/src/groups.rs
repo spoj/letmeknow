@@ -1,10 +1,8 @@
-//! Changing a group: commits built on its current epoch, retried until one wins (`commit`), what applied commits tell,
-//! and leaving the group behind.
-
-use std::sync::Arc;
+//! Changing a group: commits built on its current epoch, retried until one wins (`commit`), and leaving the group
+//! behind.
 
 use anyhow::{Context, Result, bail, ensure};
-use lmk_core::group::{self as core, Change};
+use lmk_core::group::Change;
 use lmk_membership::{Expired, Refused};
 use lmk_proto::Bytes;
 
@@ -134,33 +132,9 @@ impl Inner {
         Ok(())
     }
 
-    pub(crate) async fn applied(self: &Arc<Self>, gid: &[u8], by: Option<core::Member>, added: Vec<core::Member>, removed: Vec<core::Member>, gone: bool) {
-        let group = Bytes(gid.to_vec());
-        let mut st = self.lock();
-        let by = by.map(|by| Member::from(&by));
-        if gone {
-            drop(st);
-            self.gone(gid, by);
-            return;
-        }
-        if st.groups.contains_key(gid) {
-            st.reverify(gid).ok();
-        }
-        let Some(by) = by else { return };
-        for member in &added {
-            let member = Member::from(member);
-            st.events.push(Event::Joined { group: group.clone(), member, by: by.clone() });
-        }
-        for member in &removed {
-            let member = Member::from(member);
-            st.events.push(Event::Left { group: group.clone(), member, by: by.clone() });
-        }
-    }
-
     /// Forgets a removed group and reports removal once that step is durable, with this session's chat messages that no cut
     /// kept, which its records still show.
-    pub(crate) fn gone(&self, gid: &[u8], by: Option<Member>) {
-        let mut st = self.lock();
+    pub(crate) fn gone(&self, st: &mut State, gid: &[u8], by: Option<Member>) {
         if !st.groups.contains_key(gid) {
             return;
         }
@@ -168,7 +142,7 @@ impl Inner {
             Ok(not_kept) => not_kept,
             Err(error) => return self.warn(Some(gid), format!("{error:#}")),
         };
-        match self.forget(&mut st, gid) {
+        match self.forget(st, gid) {
             Ok(()) => st.events.push(Event::Removed { group: Bytes(gid.to_vec()), by, not_kept }),
             Err(error) => self.warn(Some(gid), format!("{error:#}")),
         }

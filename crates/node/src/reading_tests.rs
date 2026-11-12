@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Config, Node};
+use crate::{Config, INVITE_VALID, Node};
 use lmk_core::provider::SqliteProvider;
 use lmk_proto::group::{PROTOCOL, Settings, UPDATE};
 
@@ -81,4 +81,69 @@ async fn a_removed_member_two_commits_behind_learns_it() {
         node.shutdown().await.unwrap();
     }
     assert!(removed, "Bob dropped the removing Entries frame while waiting at the prior commit and never learned he was removed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commits_membership_events_come_in_the_step_that_applies_it_before_the_next_epochs_messages() {
+    let relay = lmk_testing::relay().await;
+    let config = |seed| Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[seed; 32]) };
+    let alice = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(1)).await.unwrap().0;
+    let bob = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(2)).await.unwrap().0;
+    let carol = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(3)).await.unwrap().0;
+    let dave = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(4)).await.unwrap().0;
+    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+    let gid = alice.create(settings).unwrap();
+    for joiner in [&bob, &carol] {
+        joiner.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    }
+    for node in [&alice, &bob, &carol] {
+        let tasks: Vec<_> = node.inner.tasks.lock().unwrap().drain(..).collect();
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+    for node in [&alice, &bob] {
+        node.read_group(&gid.0).await.unwrap();
+    }
+    // The entry that begins a log, as Alice holds it: the commit that ends its epoch.
+    let first = |log: Bytes| alice.inner.lock().entry(&log.0, 1).unwrap().unwrap();
+
+    let key_package = {
+        let st = dave.inner.lock();
+        st.session.key_package(&st.provider).unwrap()
+    };
+    let carol_key = carol.key();
+    let log = bob.log(&gid.0).unwrap();
+    alice.inner.commit(&gid.0, |_, g| {
+        let remove = g.mls.members().into_iter().filter(|m| m.key == carol_key.0).map(|m| m.index).collect();
+        Ok(Some(core::Change { add: vec![key_package.clone()], invite: Some(Bytes(vec![1; 32])), remove, ..core::Change::default() }))
+    }).await.unwrap();
+    let hello = alice.inner.send(&mut alice.inner.lock(), &gid.0, &serde_json::json!({ "type": "message", "content": "hello" }), None).unwrap();
+    let sealing = alice.inner.lock().record(&gid.0, &hello.0).unwrap().unwrap().sealing.unwrap().1.0;
+    let commit = first(log);
+    {
+        let mut st = bob.inner.lock();
+        bob.inner.take(&mut st, &gid.0, Some(iroh::EndpointId::from_bytes(&alice.address().0).unwrap()), vec![sealing], true).unwrap();
+        assert_eq!(st.group(&gid.0).unwrap().early.len(), 1);
+        let position = st.group(&gid.0).unwrap().rec.position;
+        assert!(bob.inner.judge(&mut st, &gid.0, position + 1, &commit).unwrap());
+        assert!(matches!(&st.events[..], [Event::Joined { member: joined, by: adder, .. }, Event::Left { member: left, by: remover, .. }, Event::Message(message)]
+            if joined.key == dave.key() && left.key == carol_key && adder.key == alice.key() && remover.key == alice.key() && message.id == hello), "{:?}", st.events);
+    }
+
+    alice.remove(&gid.0, std::slice::from_ref(&bob.key())).await.unwrap();
+    let removal = first(bob.log(&gid.0).unwrap());
+    {
+        let mut st = bob.inner.lock();
+        let position = st.group(&gid.0).unwrap().rec.position;
+        assert!(!bob.inner.judge(&mut st, &gid.0, position + 1, &removal).unwrap());
+        assert!(!st.groups.contains_key(&gid.0));
+        assert!(matches!(&st.events[..], [Event::Removed { by: Some(by), .. }] if by.key == alice.key()), "{:?}", st.events);
+    }
+    for node in [alice, bob, carol, dave] {
+        node.shutdown().await.unwrap();
+    }
 }

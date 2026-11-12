@@ -241,8 +241,7 @@ impl Inner {
                 return Ok(());
             }
             if g.rec.leaving && g.mls.members().len() == 1 {
-                drop(st);
-                self.gone(gid, None);
+                self.gone(&mut st, gid, None);
                 return Ok(());
             }
             st.expire(gid)?;

@@ -162,9 +162,9 @@ pub enum Event {
         member: Member,
         by: Member,
     },
-    /// This session was removed, by `by` as it applied the commit, or else with no `by`: by a commit applied before it
-    /// stopped, left the only member of a group it asked to leave, or away past its log's retention. The group is gone
-    /// from it, with its chat messages no cut kept: `not_kept`, by id.
+    /// This session was removed, by `by` as it applied the commit, or else with no `by`: by a commit it applied but could
+    /// not forget the group at, as it starts again; left the only member of a group it asked to leave; or away past its
+    /// log's retention. The group is gone from it, with its chat messages no cut kept: `not_kept`, by id.
     Removed {
         group: Bytes,
         by: Option<Member>,
@@ -435,13 +435,6 @@ impl Drop for Step<'_> {
 }
 
 pub(crate) enum Work {
-    Applied {
-        group: Vec<u8>,
-        by: Option<Box<core::Member>>,
-        added: Vec<core::Member>,
-        removed: Vec<core::Member>,
-        gone: bool,
-    },
     /// A group's duties to run.
     Duties(Vec<u8>),
     /// A group this session is out of, by no one's commit.

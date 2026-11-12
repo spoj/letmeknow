@@ -127,8 +127,8 @@ impl Inner {
         self.spawn(self.clone().drive(work));
         self.spawn(self.clone().send_out(outbox));
         let st = self.lock();
-        // A session removed by a commit it applied before it stopped is told so now. A group its log's reading dropped
-        // meanwhile is gone already.
+        // A session removed by a commit it applied but could not forget the group at is told so now. A group its log's
+        // reading dropped meanwhile is gone already.
         for (gid, g) in &st.groups {
             let work = if g.mls.active() { Work::Duties(gid.clone()) } else { Work::Gone(gid.clone()) };
             self.work.send(work).ok();
@@ -185,9 +185,8 @@ impl Inner {
     async fn drive(self: Arc<Self>, mut work: mpsc::UnboundedReceiver<Work>) {
         while let Some(item) = work.recv().await {
             match item {
-                Work::Applied { group, by, added, removed, gone } => self.applied(&group, by.map(|by| *by), added, removed, gone).await,
                 Work::Duties(gid) => self.duties(&gid),
-                Work::Gone(group) => self.gone(&group, None),
+                Work::Gone(group) => self.gone(&mut self.lock(), &group, None),
             }
         }
     }

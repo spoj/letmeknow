@@ -934,14 +934,16 @@ async fn a_log_let_go_is_no_removal_while_a_peer_brings_the_commits() {
     let mut bob = start("Bob").await;
     let error = bob.node.read_group(&gid.0).await.unwrap_err();
     assert!(error.is::<lmk_membership::Expired>(), "{error:#}");
-    // The barrier's commit is made through the same work a removal would be, so its event comes after any removal of the
-    // group that was queued before it.
+    // The barrier, a group this session leaves and is then alone in, is forgotten through the same work a removal would
+    // be, so its removal comes after any removal of the group that was queued before it. The commit that leaves it alone
+    // may find it forgotten as it reads the log back.
     let barrier = bob.node.create(settings(&relay)).unwrap();
     let barrier_spare = strangers(&mut bob, &barrier, &relay, 1).await;
-    bob.node.remove(&barrier.0, &barrier_spare[..1]).await.unwrap();
+    bob.node.leave(&barrier.0).unwrap();
+    let _ = bob.node.remove(&barrier.0, &barrier_spare[..1]).await;
     bob.until(|e| {
         assert!(!matches!(&e, Event::Removed { group, .. } if group == &gid), "refusal removed the group");
-        matches!(e, Event::Left { group, .. } if group == barrier).then_some(())
+        matches!(e, Event::Removed { group, .. } if group == barrier).then_some(())
     }).await;
     assert!(bob.node.groups().contains(&gid));
     assert_eq!(bob.node.members(&gid.0).unwrap(), members);
@@ -3419,7 +3421,7 @@ async fn a_removed_member_is_not_told_its_control_messages_were_not_kept() {
     assert!(alice.node.remove(&gid.0, from_ref(&dave_key)).await.unwrap());
     alice.node.shutdown().await.unwrap();
     let mut dave = stored(&relay, &db("dave")).await;
-    dave.node.read_group(&gid.0).await.unwrap();
+    dave.node.read_group(&gid.0).await.unwrap_err();
     let not_kept = dave.until(|e| match e {
         Event::Removed { not_kept, .. } => Some(not_kept),
         _ => None,

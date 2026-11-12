@@ -3,7 +3,8 @@
 //! one, whose messages the last commit kept: before it applies, this session waits for those it lacks as
 //! `Peers::wait` decides, unless the commit was made more than H ago, and what it still lacks then is lost to it. The
 //! commits made before a wait began, which it missed while away, share that wait.
-//! Applying a commit moves the cuts: what they kept, and the memberships that ended and began.
+//! Applying a commit moves the cuts: what they kept, and the memberships that ended and began; the same step tells who
+//! joined and left, or forgets the group if it removed this session.
 
 use anyhow::{Context, Result};
 use lmk_core::group::{self as core, Verdict};
@@ -13,7 +14,7 @@ use lmk_proto::peer::{Admitted, Frame, Seqs};
 use lmk_proto::ranges::Ranges;
 
 use crate::held::Author;
-use crate::{Epoch, Event, Inner, Lost, LostOf, Out, State, Work, days, put};
+use crate::{Epoch, Event, Inner, Lost, LostOf, Member, Out, State, Work, days, put};
 
 /// How many of a group's last logs a commit tells the connected members it removes.
 pub(crate) const TOLD: usize = 8;
@@ -112,8 +113,7 @@ impl Inner {
         let current = g.mls.epoch();
         g.fetch = None;
         g.changed = true;
-        let members = g.mls.members();
-        let by = members.iter().find(|m| m.index == applied.by).cloned();
+        let by = Member::from(g.mls.members().iter().find(|m| m.index == applied.by).expect("a committer stays a member"));
         if !applied.added.is_empty() || !applied.removed.is_empty() {
             g.rec.stirred = true;
         }
@@ -155,25 +155,34 @@ impl Inner {
                 st.out.push(Out::Frame { peer, frame: frame.clone() });
             }
         }
-        self.work.send(Work::Applied { group: gid.to_vec(), by: by.map(Box::new), added, removed, gone }).ok();
         st.group_mut(gid)?.rec.position = position;
         if gone {
+            self.gone(st, gid, Some(by));
             return Ok(false);
         }
         let next = st.next_log(gid, position)?;
         st.refresh(gid);
-        let (ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut st.early_entries).into_iter().partition(|(_, log, _, _)| log.0 == next);
-        st.early_entries = later;
-        for (peer, log, entries, head) in ready {
-            if self.vouched(st, &head, &peer) {
-                self.take_entries(st, &log.0, head.length.saturating_sub(entries.len() as u64), entries, head)?;
-            }
+        // Once `Peers` knows the joiners, whose early summaries it takes, and before the early messages of the new epoch.
+        st.reverify(gid)?;
+        let group = Bytes(gid.to_vec());
+        for member in &added {
+            st.events.push(Event::Joined { group: group.clone(), member: Member::from(member), by: by.clone() });
+        }
+        for member in &removed {
+            st.events.push(Event::Left { group: group.clone(), member: Member::from(member), by: by.clone() });
         }
         let g = st.group_mut(gid)?;
         let (early, later): (Vec<_>, Vec<_>) = std::mem::take(&mut g.early).into_iter().partition(|(_, ciphertext)| core::claim(ciphertext).is_ok_and(|(_, epoch)| epoch == current));
         g.early = later;
         for (peer, ciphertext) in early {
             self.take(st, gid, Some(peer), vec![ciphertext], true)?;
+        }
+        let (ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut st.early_entries).into_iter().partition(|(_, log, _, _)| log.0 == next);
+        st.early_entries = later;
+        for (peer, log, entries, head) in ready {
+            if self.vouched(st, &head, &peer) {
+                self.take_entries(st, &log.0, head.length.saturating_sub(entries.len() as u64), entries, head)?;
+            }
         }
         Ok(true)
     }
