@@ -301,6 +301,32 @@ async fn a_ciphertext_waiting_unopened_is_replaced_only_by_a_later_sealing() {
     }
 }
 
+/// A later sealing takes the room of the one it replaces: it is kept though what waits unopened leaves room for it only
+/// once that one goes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_later_sealing_needs_room_only_past_the_one_it_replaces() {
+    let (alice, bob, gid, _) = members().await;
+    let (_, first) = seal(&alice, &gid, 1, None, "first");
+    let (_, later) = seal(&alice, &gid, 1, None, "later");
+    let claim = (alice.key(), 1, 1);
+    {
+        let mut st = bob.inner.lock();
+        st.time = crate::now() + 60_000;
+        let at = st.time;
+        st.group_mut(&gid.0).unwrap().buckets.insert((alice.key(), 1), Bucket { messages: 0.0, bytes: 0.0, at });
+        assert!(bob.inner.take_one(&mut st, &gid.0, None, first).unwrap().is_none());
+        let g = st.group_mut(&gid.0).unwrap();
+        // As if `first` had waited since the epoch before, and pushes past the window filled the rest of the room.
+        g.unopened.get_mut(&claim).unwrap().0 = 1;
+        g.unopened.insert((alice.key(), 1, WINDOW + 1), (2, vec![0; UNOPENED - later.len()]));
+        assert!(bob.inner.take_one(&mut st, &gid.0, None, later.clone()).unwrap().is_none());
+        assert_eq!(st.group(&gid.0).unwrap().unopened[&claim], (2, later));
+    }
+    for node in [alice, bob] {
+        node.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_short_of_room_asks_only_what_opens_as_it_comes() {
     let (alice, bob, gid, _) = members().await;

@@ -424,14 +424,14 @@ impl Inner {
         }
         let Ok(claim) = core::claim(gid, &ciphertext) else { return Ok(None) };
         let (epoch, current) = (claim.sealed, g.mls.epoch());
-        let room = |g: &G| g.early.iter().map(|(_, c)| c.len()).chain(g.unopened.values().map(|(_, c)| c.len())).sum::<usize>() + ciphertext.len() <= UNOPENED;
+        let room = |g: &G, freed: usize| g.early.iter().map(|(_, c)| c.len()).chain(g.unopened.values().map(|(_, c)| c.len())).sum::<usize>() + ciphertext.len() <= UNOPENED + freed;
         if let Some(peer) = from.filter(|_| epoch > current) {
             st.peers.behind(peer.as_bytes());
         }
         let g = st.group_mut(gid)?;
         if epoch == current + 1 {
             if let Some(peer) = from
-                && room(g)
+                && room(g, 0)
             {
                 g.early.push((peer, ciphertext));
             }
@@ -449,7 +449,8 @@ impl Inner {
         let taken = claim.seq < lowest + WINDOW && (waiting || newer || g.buckets.entry(membership).or_default().take(ciphertext.len(), 2.0, now));
         if !taken {
             let claim = (claim.key, claim.joined, claim.seq);
-            if room(g) && g.unopened.get(&claim).is_none_or(|(sealed, _)| *sealed < epoch) {
+            let replaced = g.unopened.get(&claim).map(|(sealed, c)| (*sealed, c.len()));
+            if replaced.is_none_or(|(sealed, _)| sealed < epoch) && room(g, replaced.map_or(0, |(_, size)| size)) {
                 remember(&mut g.seen, hash);
                 g.unopened.insert(claim, (epoch, ciphertext));
             } else if let Some(peer) = from {
