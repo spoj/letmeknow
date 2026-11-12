@@ -1690,6 +1690,41 @@ fn a_group_nobody_is_online_in_past_stale_ends() {
     });
 }
 
+/// A group nobody is online in ends on its own once `STALE` has passed, for a session that stays up: its duties pass is
+/// timed at that moment, reads its log, which holds nothing new, and leaves the group `WAIT` later. Updates are set far
+/// off, as an update's commit would keep the log alive.
+#[tokio::test]
+async fn an_idle_group_past_stale_ends_while_its_session_runs() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    lmk_proto::clock::set(shifted);
+    let relay = relay().await;
+    let dir = folder("idle-running");
+    let bob = session(&relay).await;
+    let (requests, post) = recording(relay.post());
+    let mut alice = stored_with(&relay, &dir.join("alice.db"), post).await;
+    let gid = bob.node.create(Settings { update: u32::MAX, ..settings(&relay) }).unwrap();
+    alice.node.join(&bob.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+    bob.node.shutdown().await.unwrap();
+    quiet(&requests).await;
+
+    SHIFT.store(lmk_proto::membership::STALE + DAY_MS, std::sync::atomic::Ordering::Relaxed);
+    while relay.membership.expire().await {}
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_millis(lmk_proto::membership::STALE + DAY_MS)).await;
+    tokio::time::resume();
+    quiet(&requests).await;
+    tokio::time::pause();
+    SHIFT.fetch_add(lmk_net::peers::WAIT + 60_000, std::sync::atomic::Ordering::Relaxed);
+    tokio::time::advance(Duration::from_millis(lmk_net::peers::WAIT + 60_000)).await;
+    tokio::time::resume();
+    alice.until(|e| matches!(&e, Event::Removed { group, by: None, .. } if *group == gid).then_some(())).await;
+    assert!(alice.node.groups().is_empty());
+    alice.node.shutdown().await.unwrap();
+}
+
 /// A group nobody is online in lives past the retention: its current log holds no entry, so the service keeps nothing
 /// of it to let go, and its members, back within `STALE`, chat on.
 #[test]

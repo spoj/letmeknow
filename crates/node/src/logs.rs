@@ -90,7 +90,12 @@ impl Log {
     /// Whether this session has not seen the log alive for `STALE`: past that, the service may have forgotten that it
     /// let the log go, so only new entries show it alive, and it is never appended to.
     pub fn stale(&self) -> bool {
-        corrected() > self.at.max(self.since) + STALE
+        corrected() > self.stale_at()
+    }
+
+    /// When the log turns stale unless this session sees it alive first, in milliseconds.
+    pub fn stale_at(&self) -> u64 {
+        self.at.max(self.since) + STALE
     }
 
     /// How far the log is authenticated, for the membership client.

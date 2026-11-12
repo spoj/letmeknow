@@ -9,7 +9,8 @@
 //! days: an online member's update shows it is there well within the services' retention.
 //!
 //! A pass first reads the group's log again where its service let it go: `WAIT` after the session found that, at once
-//! if it starts later, and again after `RETRY` while the service does not answer.
+//! if it starts later, and again after `RETRY` while the service does not answer. It reads the log too once the session
+//! has not seen it alive for `STALE`, a pass being timed for that moment: a read that finds nothing new lets it go.
 
 use std::sync::Arc;
 
@@ -211,20 +212,26 @@ impl Inner {
 
     async fn pass(self: &Arc<Self>, gid: &[u8]) -> Result<()> {
         // The log read again says whether it is still gone, and the group is left then.
-        let lapsed = {
+        let (log, at) = {
             let st = self.lock();
-            st.groups.get(gid).and_then(|g| {
-                let log = &g.rec.log.0;
-                st.logs[log].lapsed.map(|(since, _)| (log.clone(), since + WAIT))
-            })
+            let Some(g) = st.groups.get(gid) else { return Ok(()) };
+            let log = &st.logs[&g.rec.log.0];
+            (g.rec.log.0.clone(), log.lapsed.map_or(log.stale_at(), |(since, _)| since + WAIT))
         };
-        if let Some((log, at)) = lapsed {
-            if now() < at {
-                self.time(gid, at);
-            } else if let Err(error) = self.read(&log).await {
+        if now() < at {
+            self.time(gid, at);
+        } else {
+            if let Err(error) = self.read(&log).await {
                 self.time(gid, now() + RETRY);
-                tracing::debug!("reading the lapsed log {}: {error:#}", hex(&log));
+                tracing::debug!("reading the log {}: {error:#}", hex(&log));
                 return Ok(());
+            }
+            let stale = {
+                let st = self.lock();
+                st.groups.get(gid).map(|g| st.logs[&g.rec.log.0].stale_at())
+            };
+            if let Some(at) = stale {
+                self.time(gid, at);
             }
         }
         let (commit, next) = {
