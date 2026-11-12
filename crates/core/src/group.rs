@@ -1,6 +1,6 @@
 //! Sessions and groups on OpenMLS: epoch-sealed commit entries judged strictly in order, each carrying the cut of the
-//! epoch it ends; held messages as application messages whose plaintext is their header, claiming in the clear whose
-//! they are.
+//! epoch it ends; held messages as application messages whose plaintext is their header, naming in the clear which
+//! message they are, each sealing signed by its author.
 
 use anyhow::{Context, Result, bail, ensure};
 use chacha20poly1305::{XChaCha20Poly1305, aead::{Aead, KeyInit, Payload}};
@@ -8,19 +8,20 @@ use lmk_proto::Bytes;
 use lmk_proto::clock::now;
 use lmk_proto::entry::{Entry, signed, welcome_signed};
 use lmk_proto::group::{Device, LEAF_EXTENSION, LEAVE, Leaf, PROTOCOL, SETTINGS_EXTENSION, Service, Settings};
-use lmk_proto::held::{self, Claim, Header, Ref};
+use lmk_proto::held::{self, Header, Ref, SEALING};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::signatures::Signer;
 use openmls_traits::storage::StorageProvider as _;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::provider::SqliteProvider;
 
 pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519;
 /// The largest message ciphertext taken, and sent.
 pub const MAX_MESSAGE: usize = 16 << 20;
-/// More than an application message's ciphertext adds to its plaintext.
+/// More than a held message's sealing adds to its plaintext.
 pub const FRAMING: usize = 1024;
 /// How far one cut may move a membership's.
 pub const MAX_CUT_STEP: u64 = 100_000;
@@ -72,12 +73,17 @@ fn join_config() -> MlsGroupJoinConfig {
         .build()
 }
 
-/// Whose a held message's ciphertext claims to be, and the epoch it was sealed in, as its clear framing shows them:
-/// `open` checks the claim.
-pub fn claim(bytes: &[u8]) -> Result<(Claim, u64)> {
+/// Which message a sealing of the group `group` claims to be, and the epoch it was sealed in, as the clear framing of its
+/// MLS ciphertext shows them, once the signature that follows the ciphertext verifies by the key the claim names
+/// (`SEALING`): `open` checks the claim.
+pub fn claim(group: &[u8], sealing: &[u8]) -> Result<(Ref, u64)> {
+    let (bytes, sig) = sealing.split_at(sealing.len().checked_sub(64).context("a sealing without its signature")?);
     let MlsMessageBodyIn::PrivateMessage(message) = parse::<MlsMessageIn>(bytes)?.extract() else { bail!("not a private message") };
     ensure!(message.content_type() == ContentType::Application, "not an application message");
-    Ok((serde_json::from_slice(message.aad()).context("a held message's claim")?, message.epoch().as_u64()))
+    let claimed: Ref = serde_json::from_slice(message.aad()).context("a held message's claim")?;
+    let sealed = message.epoch().as_u64();
+    ensure!(verify(&claimed.key.0, SEALING, &held::sealing(group, &claimed, sealed, &Sha256::digest(bytes)), sig), "a sealing its claimed author did not sign");
+    Ok((claimed, sealed))
 }
 
 fn parse<T: tls_codec::DeserializeBytes>(bytes: &[u8]) -> Result<T> {
@@ -777,37 +783,43 @@ impl Group {
     }
 
     /// Seals a held message's plaintext, its header's JSON, as an application message of the current epoch, claiming
-    /// its membership and seq. One whose ciphertext could be over `MAX_MESSAGE` fails before it uses any of the sender's
-    /// keys.
+    /// in the clear which message it is, and signs the sealing: its MLS ciphertext, then that signature (`claim`). One
+    /// whose sealing could be over `MAX_MESSAGE` fails before it uses any of the sender's keys.
     pub fn seal(&mut self, provider: &SqliteProvider, session: &Session, plaintext: &[u8]) -> Result<Vec<u8>> {
         let size = plaintext.len() + FRAMING;
         ensure!(size <= MAX_MESSAGE, "the message is {size} bytes, over the 16 MiB members take");
-        self.mls.set_aad(serde_json::to_vec(&Header::open(plaintext)?.claim())?);
-        Ok(self.mls.create_message(provider, &session.signer, plaintext)?.to_bytes()?)
+        let h = Header::open(plaintext)?;
+        let claim = Ref { key: h.author, joined: h.joined, seq: h.seq, id: Bytes(held::id(plaintext).to_vec()), epoch: h.epoch };
+        self.mls.set_aad(serde_json::to_vec(&claim)?);
+        let bytes = self.mls.create_message(provider, &session.signer, plaintext)?.to_bytes()?;
+        let sig = session.sign(&[SEALING, &held::sealing(self.id(), &claim, self.epoch(), &Sha256::digest(&bytes))].concat());
+        Ok([bytes, sig].concat())
     }
 
-    /// Decrypts a member's held message and checks its header: of this group, its author the sender, as it claimed, of
-    /// the membership its author had in the epoch it was sealed in, and within its final cut if that membership ended.
-    pub fn open(&mut self, provider: &SqliteProvider, bytes: &[u8]) -> Result<Opened> {
-        let message = parse::<MlsMessageIn>(bytes)?.try_into_protocol_message()?;
-        ensure!(message.content_type() == ContentType::Application, "not an application message");
+    /// Decrypts a member's sealing of a held message, once its signature verifies (`claim`), and checks its header: of
+    /// this group, its author the sender, the message its sealing claimed, of the membership its author had in the epoch
+    /// it was sealed in, and within its final cut if that membership ended.
+    pub fn open(&mut self, provider: &SqliteProvider, sealing: &[u8]) -> Result<Opened> {
+        let (claimed, _) = claim(self.id(), sealing)?;
+        let message = parse::<MlsMessageIn>(&sealing[..sealing.len() - 64])?.try_into_protocol_message()?;
         let processed = self.mls.process_message(provider, message)?;
         let epoch = processed.epoch().as_u64();
-        let claim: Claim = serde_json::from_slice(processed.aad()).context("a held message's claim")?;
         let sender = processed.credential().serialized_content().to_vec();
         let ProcessedMessageContent::ApplicationMessage(message) = processed.into_content() else {
             bail!("not an application message")
         };
         let plaintext = message.into_bytes();
         let header = Header::open(&plaintext)?;
+        let id = held::id(&plaintext);
         ensure!(header.group.0 == self.id(), "a held message of another group");
-        ensure!(header.author.0 == sender && header.claim() == claim, "a held message its sender did not author, or claimed otherwise");
+        let opened = Ref { key: header.author.clone(), joined: header.joined, seq: header.seq, id: Bytes(id.to_vec()), epoch: header.epoch };
+        ensure!(header.author.0 == sender && opened == claimed, "a held message its sender did not author, or claimed otherwise");
         let cuts = if epoch == self.epoch() { &self.state.cut } else { &self.state.ended };
         let membership = cuts.iter().find(|r| r.key == header.author).context("a held message of no membership")?;
         ensure!(membership.joined == header.joined, "a held message of another membership of its author");
         let ended = self.joined(&header.author.0) != Some(header.joined);
         ensure!(!ended || header.seq <= membership.seq, "a held message past its membership's final cut");
-        Ok(Opened { id: held::id(&plaintext), epoch, header, plaintext })
+        Ok(Opened { id, epoch, header, plaintext })
     }
 }
 

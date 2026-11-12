@@ -23,7 +23,8 @@ pub enum Frame {
     Entries { log: Bytes, entries: Vec<Bytes>, head: Head },
     /// The sender's own signed summary of the group, on connecting and as it changes; it goes no further.
     Summary { group: Bytes, summary: Signed },
-    /// Held messages' ciphertexts: pushed, or the answer to `want`, which covered `answers`.
+    /// Held messages' sealings, each its MLS ciphertext and its author's signature: pushed, or the answer to `want`,
+    /// which covered `answers`.
     Held {
         group: Bytes,
         items: Vec<Bytes>,

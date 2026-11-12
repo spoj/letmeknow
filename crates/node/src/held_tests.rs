@@ -202,6 +202,71 @@ async fn a_ciphertext_past_the_flood_bucket_opens_after_it_refills() {
     }
 }
 
+/// A sealing its claimed author did not sign is dropped before anything is charged to, kept or remembered of that
+/// author: copies of Alice's sealings with a byte of their MLS ciphertext changed neither empty her bucket nor replace
+/// what of hers waits unopened, which opens once the bucket allows it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sealing_its_author_did_not_sign_spends_and_replaces_nothing() {
+    let (alice, bob, gid, _) = members().await;
+    let (first_id, first) = seal(&alice, &gid, 1, None, "first");
+    let (second, next) = seal(&alice, &gid, 2, Some((first_id, 2)), "second");
+    let forged = |item: &[u8], n: u8| {
+        let mut forged = item.to_vec();
+        let at = forged.len() - 100;
+        forged[at] ^= n;
+        forged
+    };
+    {
+        let mut st = bob.inner.lock();
+        // The bucket's clock stays fixed until this test advances it.
+        st.time = crate::now() + 60_000;
+        for n in 1..=200 {
+            assert!(bob.inner.take_one(&mut st, &gid.0, None, forged(&first, n)).unwrap().is_none());
+        }
+        assert!(bob.inner.take_one(&mut st, &gid.0, None, first).unwrap().is_some(), "Alice's bucket is full");
+        let at = st.time;
+        st.group_mut(&gid.0).unwrap().buckets.insert((alice.key(), 1), Bucket { messages: 0.0, bytes: 0.0, at });
+        for item in [next.clone(), forged(&next, 1)] {
+            assert!(bob.inner.take_one(&mut st, &gid.0, None, item).unwrap().is_none());
+        }
+        st.time += 1000;
+        let mut opened = Vec::new();
+        bob.inner.open_unopened(&mut st, &gid.0, &mut opened).unwrap();
+        assert_eq!(opened, vec![(next, 2)]);
+        assert_eq!(st.id_at(&gid.0, &alice.key().0, 1, 2).unwrap(), Some(second));
+    }
+    for node in [alice, bob] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// A ciphertext waiting unopened is replaced by another its author sealed as the same membership and seq only if that
+/// one is a later sealing: not by one sealed in the same epoch, which is not remembered as taken either.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ciphertext_waiting_unopened_is_replaced_only_by_a_later_sealing() {
+    let (alice, bob, gid, _) = members().await;
+    let (_, first) = seal(&alice, &gid, 1, None, "first");
+    let (_, other) = seal(&alice, &gid, 1, None, "other");
+    let claim = (alice.key(), 1, 1);
+    {
+        let mut st = bob.inner.lock();
+        st.time = crate::now() + 60_000;
+        let at = st.time;
+        st.group_mut(&gid.0).unwrap().buckets.insert((alice.key(), 1), Bucket { messages: 0.0, bytes: 0.0, at });
+        for item in [first.clone(), other.clone()] {
+            assert!(bob.inner.take_one(&mut st, &gid.0, None, item).unwrap().is_none());
+        }
+        assert_eq!(st.group(&gid.0).unwrap().unopened[&claim], (2, first));
+        // As if `first` had waited since the epoch before.
+        st.group_mut(&gid.0).unwrap().unopened.get_mut(&claim).unwrap().0 = 1;
+        assert!(bob.inner.take_one(&mut st, &gid.0, None, other.clone()).unwrap().is_none());
+        assert_eq!(st.group(&gid.0).unwrap().unopened[&claim], (2, other));
+    }
+    for node in [alice, bob] {
+        node.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_ciphertext_past_the_window_is_dropped_when_its_epochs_keys_go() {
     let (alice, bob, gid, _) = members().await;

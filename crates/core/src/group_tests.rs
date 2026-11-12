@@ -489,7 +489,8 @@ fn a_forged_message_leaves_no_trace() {
     let mut forger = forger;
     let forged = forger.group.as_mut().unwrap().mls.create_message(&forger.provider, &stranger(), &serde_json::to_vec(&message("forged")).unwrap()).unwrap().to_bytes().unwrap();
     let second = real(&mut b, "second");
-    assert!(a.open(&forged).is_err());
+    let message = parse::<MlsMessageIn>(&forged).unwrap().try_into_protocol_message().unwrap();
+    assert!(a.group.as_mut().unwrap().mls.process_message(&a.provider, message).is_err());
     assert_eq!(text(&a.open(&second).unwrap()), "second", "the forgery used the generation of B's second message");
     assert_eq!(text(&a.open(&first).unwrap()), "first");
 }
@@ -837,26 +838,35 @@ fn held_messages_keep_their_id_across_epochs() {
     assert_eq!(w.m[2].open(&again).unwrap().id, first.id);
 }
 
-/// What a held message's header is checked against once MLS opens it: its MLS sender's signature key, its claim, its
-/// group, and its author's membership.
+/// What a sealing of a held message is checked against: the signature of the author it claims, and once MLS opens it,
+/// its MLS sender's signature key, its claim, its group, and its author's membership.
 #[test]
 fn held_headers_are_checked() {
     let mut w = World::new(&["A", "B", "C"]);
     w.found(0, &[1, 2]);
     let id = w.m[0].group.as_ref().unwrap().id().to_vec();
     let joined = w.m[0].group.as_ref().unwrap().joined(w.m[0].session.key()).unwrap();
-    // A's header, sealed by B: the MLS sender is not the author.
+    let epoch = w.m[0].g().epoch();
     let plaintext = header(&w.m[0], &id, joined).encode();
+    let claim = Ref { key: Bytes(w.m[0].session.key().to_vec()), joined, seq: 1, id: Bytes(held::id(&plaintext).to_vec()), epoch: joined };
+    // The plaintext as member `by` seals it claiming `claim`, its sealing signed by A.
+    let signed_by_a = |w: &mut World, by: usize, claim: &Ref| {
+        let m = &mut w.m[by];
+        let g = m.group.as_mut().unwrap();
+        g.mls.set_aad(serde_json::to_vec(claim).unwrap());
+        let bytes = g.mls.create_message(&m.provider, &m.session.signer, &plaintext).unwrap().to_bytes().unwrap();
+        let sig = w.m[0].session.sign(&[SEALING, &held::sealing(&id, claim, epoch, &Sha256::digest(&bytes))].concat());
+        [bytes, sig].concat()
+    };
+    // A's header, sealed by B: B's signature is not A's, and with A's the MLS sender is not the author.
     let sealed = w.m[1].seal(&plaintext);
+    assert!(w.m[2].open(&sealed).unwrap_err().to_string().contains("did not sign"));
+    let sealed = signed_by_a(&mut w, 1, &claim);
     assert!(w.m[2].open(&sealed).unwrap_err().to_string().contains("did not author"));
     // Claiming another seq than its header's.
-    let claim = Claim { seq: 2, ..header(&w.m[0], &id, joined).claim() };
-    let epoch = w.m[1].g().epoch();
-    let a = &mut w.m[0];
-    let g = a.group.as_mut().unwrap();
-    g.mls.set_aad(serde_json::to_vec(&claim).unwrap());
-    let sealed = g.mls.create_message(&a.provider, &a.session.signer, &plaintext).unwrap().to_bytes().unwrap();
-    assert_eq!(crate::group::claim(&sealed).unwrap(), (claim, epoch), "the claim reads in the clear");
+    let claim = Ref { seq: 2, ..claim };
+    let sealed = signed_by_a(&mut w, 0, &claim);
+    assert_eq!(crate::group::claim(&id, &sealed).unwrap(), (claim, epoch), "the claim reads in the clear");
     assert!(w.m[1].open(&sealed).unwrap_err().to_string().contains("claimed otherwise"));
     // Another group's.
     let other = header(&w.m[0], &[9; 16], joined).encode();

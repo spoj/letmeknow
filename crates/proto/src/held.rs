@@ -1,6 +1,7 @@
 //! A held message: an MLS application message whose plaintext is its header's JSON, and whose authenticated data, clear
-//! on the wire, claims whose it is. MLS authenticates its author; its id is the hash of the plaintext, the same in every
-//! epoch its author seals it in.
+//! on the wire, is its reference. Its author signs each sealing of it (`SEALING`), so that whose it is shows before it
+//! is opened, and MLS authenticates its author as it opens. Its id is the hash of the plaintext, the same in every epoch
+//! its author seals it in.
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -58,27 +59,13 @@ impl From<Ref> for (Bytes, u64, u64, Bytes, u64) {
     }
 }
 
-/// Whose a held message is, as its authenticated data claims before it is opened: `[key, joined, seq]`.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "Vec<Value>", into = "(Bytes, u64, u64)")]
-pub struct Claim {
-    pub key: Bytes,
-    pub joined: u64,
-    pub seq: u64,
-}
+/// What a sealing's signature covers, before `sealing`.
+pub const SEALING: &[u8] = b"letmeknow sealing v1\0";
 
-impl TryFrom<Vec<Value>> for Claim {
-    type Error = serde_json::Error;
-    fn try_from(values: Vec<Value>) -> serde_json::Result<Self> {
-        let (key, joined, seq) = leading(values, 3)?;
-        Ok(Claim { key, joined, seq })
-    }
-}
-
-impl From<Claim> for (Bytes, u64, u64) {
-    fn from(c: Claim) -> Self {
-        (c.key, c.joined, c.seq)
-    }
+/// What its author signs of a sealing of the message `r` of the group `group`, after `SEALING`: the group, `r`'s
+/// membership's first epoch, seq, epoch and id, the epoch it was sealed in, and `digest`, SHA-256 of its MLS ciphertext.
+pub fn sealing(group: &[u8], r: &Ref, sealed: u64, digest: &[u8]) -> Vec<u8> {
+    [group, &r.joined.to_be_bytes(), &r.seq.to_be_bytes(), &r.epoch.to_be_bytes(), &r.id.0, &sealed.to_be_bytes(), digest].concat()
 }
 
 impl Header {
@@ -106,10 +93,6 @@ impl Header {
         };
         ensure!(header.reply_to.as_ref().is_none_or(covered), "a held message answers one its prev and deps do not cover");
         Ok(header)
-    }
-
-    pub fn claim(&self) -> Claim {
-        Claim { key: self.author.clone(), joined: self.joined, seq: self.seq }
     }
 }
 
@@ -143,17 +126,12 @@ mod tests {
         assert_eq!(Header::open(&plaintext).unwrap(), header());
         let text = String::from_utf8(plaintext).unwrap();
         assert!(text.contains(r#""deps":[["BQ"#), "{text}");
-        let claim = serde_json::to_string(&header().claim()).unwrap();
-        assert!(claim.starts_with(r#"["CQkJ"#) && claim.ends_with(r#"",3,2]"#), "{claim}");
-        assert_eq!(serde_json::from_str::<Claim>(&claim).unwrap(), header().claim());
     }
 
     #[test]
     fn tuples_ignore_what_later_releases_append() {
         let dep: Ref = serde_json::from_str(r#"["BQ",0,7,"Bg",2,{"later":1}]"#).unwrap();
         assert_eq!(dep, Ref { key: Bytes(vec![5]), joined: 0, seq: 7, id: Bytes(vec![6]), epoch: 2 });
-        let claim: Claim = serde_json::from_str(r#"["CQ",3,2,"more"]"#).unwrap();
-        assert_eq!(claim, Claim { key: Bytes(vec![9]), joined: 3, seq: 2 });
         assert!(serde_json::from_str::<Ref>(r#"["BQ",0,7,"Bg"]"#).is_err(), "too few");
     }
 

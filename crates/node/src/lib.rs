@@ -292,7 +292,8 @@ pub(crate) struct G {
     rec: Rec,
     /// Ciphertexts of the next epoch, and the peers that sent them.
     early: Vec<(EndpointId, Vec<u8>)>,
-    /// Ciphertexts taken but not opened yet, past the window or the bucket: by claim, with their epoch.
+    /// Ciphertexts taken but not opened yet, past the window or the bucket: by claim, the latest sealing of each, with its
+    /// epoch.
     unopened: BTreeMap<(Bytes, u64, u64), (u64, Vec<u8>)>,
     /// The flood buckets of the group's memberships, and this session's own.
     buckets: BTreeMap<(Bytes, u64), held::Bucket>,
