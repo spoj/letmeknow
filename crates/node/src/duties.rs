@@ -1,13 +1,13 @@
 //! A group's duties, each derived from committed records and idempotent: a pass runs at the log's head after each
-//! advance, at start, and at this session's next update, and one that failed again after `RETRY`. It drops what
-//! the group kept past H, and commits at most once, with every Remove due (members whose `leave` the cut it builds
-//! keeps, and members left behind in an epoch whose log was let go, as the service answered, asked at most daily, or a
-//! neighbour passed on its answer, from `EVICT` after this session joined; of a session that is no admin, only those
-//! leavers whose `leave` carries their leave) and this session's update if due: T after the last, at an offset of its
-//! own, once the group delivered a message or changed its members since. The update first fetches for at most `HEAR`
-//! what the last commit kept and connected members hold past the cut. T grows with the group, so that its members
-//! update about hourly between them, up to three days: an online member's update shows it is there well within the
-//! services' retention.
+//! advance, at start, at this session's next update, and as its first `EVICT` in the group ends if that held back a
+//! Remove, and one that failed again after `RETRY`. It drops what the group kept past H, and commits at most once, with
+//! every Remove due (members whose `leave` the cut it builds keeps, and members left behind in an epoch whose log was
+//! let go, as the service answered, asked at most daily, or a neighbour passed on its answer, from `EVICT` after this
+//! session joined; of a session that is no admin, only those leavers whose `leave` carries their leave) and this
+//! session's update if due: T after the last, at an offset of its own, once the group delivered a message or changed
+//! its members since. The update first fetches for at most `HEAR` what the last commit kept and connected members hold
+//! past the cut. T grows with the group, so that its members update about hourly between them, up to three days: an
+//! online member's update shows it is there well within the services' retention.
 //!
 //! A pass first reads the group's log again where its service let it go: `WAIT` after the session found that, at once
 //! if it starts later, and again after `RETRY` while the service does not answer. It reads the log too once the session
@@ -261,7 +261,11 @@ impl Inner {
             }
             let g = st.group(gid)?;
             let present = if g.rec.present < g.mls.epoch() { g.rec.presented + PRESENT } else { u64::MAX };
-            let next = if g.rec.stirred { next(g, st.me()) } else { u64::MAX }.min(present);
+            // This session's first `EVICT` in the group holds back removing members left behind in an epoch let go
+            // (`G::behind`): a pass is due as it ends.
+            let ends = g.rec.joined_at + EVICT;
+            let held_back = now() < ends && g.mls.admin(st.me()) && g.rec.epochs.iter().any(|epoch| epoch.gone());
+            let next = if g.rec.stirred { next(g, st.me()) } else { u64::MAX }.min(present).min(if held_back { ends } else { u64::MAX });
             let pending = due(&st, g)?;
             // A pass that removes commits at once.
             let removing = pending.as_ref().is_some_and(|change| !change.remove.is_empty());
@@ -479,7 +483,8 @@ mod tests {
         alice.shutdown().await.unwrap();
     }
 
-    /// A joiner removes no one for falling behind in its first `EVICT`, by when it holds each member's newest intro.
+    /// A joiner removes no one for falling behind in its first `EVICT`, by when it holds each member's newest intro, and
+    /// times its next pass for when that ends.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_joiner_removes_no_one_for_falling_behind_in_its_first_evict() {
         use crate::{Config, Epoch, INVITE_VALID, Node};
@@ -509,6 +514,11 @@ mod tests {
         g.rec.members = vec![(alice.key(), 0)];
         let removes = |st: &State| due(st, st.group(&gid.0).unwrap()).unwrap().map(|change| change.remove).unwrap_or_default();
         assert!(removes(&st).is_empty(), "Bob removes no one on the day he joined");
+        let ends = st.group(&gid.0).unwrap().rec.joined_at + EVICT;
+        drop(st);
+        bob.inner.pass(&gid.0).await.unwrap();
+        assert_eq!(bob.inner.timers.lock().unwrap().get(&gid.0), Some(&ends), "Bob's next pass is due as his first day ends");
+        let mut st = bob.inner.lock();
         st.group_mut(&gid.0).unwrap().rec.joined_at -= EVICT;
         assert_eq!(removes(&st), [index]);
         drop(st);
