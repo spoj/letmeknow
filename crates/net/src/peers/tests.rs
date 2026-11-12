@@ -251,6 +251,31 @@ fn a_failed_dial_outweighs_the_sightings_before_it() {
     assert!(p.targets(&id(), 20_000).contains(&far));
 }
 
+/// A member sighted while it is in backoff is dialed once the backoff ends: the sighting is not spent on the dial that
+/// backoff skips.
+#[test]
+fn news_of_a_member_in_backoff_is_dialed_when_the_backoff_ends() {
+    let mut p = peers();
+    p.group(id(), own(1, &(1..=19).collect::<Vec<_>>()), 0);
+    let r = ranked();
+    let (a, b, far) = (r[18], r[17], r[16]);
+    p.connect(a, gs(), false, 0);
+    p.connect(b, gs(), false, 0);
+    p.dialed(&far, false, 5_000);
+    p.frame(&a, &telling(&[(far, 0)]), 10_000);
+    let dial = |p: &mut Peers, now| {
+        let out = dials(&p.poll(now));
+        for k in &out {
+            p.dialed(k, true, now);
+        }
+        out
+    };
+    assert!(!dial(&mut p, 10_000).contains(&far), "backing off");
+    assert!(dial(&mut p, 14_999).is_empty(), "still backing off");
+    assert_eq!(p.next(14_999), Some(15_000), "poll is next due as the backoff ends");
+    assert!(dial(&mut p, 15_000).contains(&far), "dialed once the backoff ends");
+}
+
 /// A `hello` tells a neighbour each sighting once, and again only once it is `RETELL` fresher.
 #[test]
 fn a_sighting_is_told_again_only_once_it_is_retell_fresher() {

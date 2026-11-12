@@ -102,6 +102,8 @@ pub struct Peers {
     changed: Option<u64>,
     /// The groups whose targets are dialed at the next poll.
     dial: BTreeSet<Bytes>,
+    /// The groups with news of a member in backoff, due once the latest such backoff ends.
+    retry: BTreeMap<Bytes, u64>,
     groups: BTreeMap<Bytes, Group>,
     conns: BTreeMap<Key, Conn>,
     backoff: BTreeMap<Key, Backoff>,
@@ -173,6 +175,7 @@ impl Peers {
             online: now,
             changed: None,
             dial: BTreeSet::new(),
+            retry: BTreeMap::new(),
             groups: BTreeMap::new(),
             conns: BTreeMap::new(),
             backoff: BTreeMap::new(),
@@ -221,6 +224,7 @@ impl Peers {
     pub fn forget(&mut self, id: &Bytes) {
         self.groups.remove(id);
         self.dial.remove(id);
+        self.retry.remove(id);
         for c in self.conns.values_mut() {
             c.served.remove(id);
             c.opened.remove(id);
@@ -456,7 +460,7 @@ impl Peers {
             _ => None,
         });
         let times = [due.then_some(now), busy.then_some(now + BUSY), self.changed.map(|since| since + DEBOUNCE)];
-        times.into_iter().flatten().chain(closes).chain(repair).min()
+        times.into_iter().flatten().chain(closes).chain(repair).chain(self.retry.values().copied()).min()
     }
 
     fn backing(&self, peer: &Key, now: u64) -> bool {
@@ -489,7 +493,7 @@ impl Peers {
 
     /// Takes the sightings of a group's members that a neighbour told: as told to it, and as this member's own when
     /// fresher. One of a member this member did not know to be online is news: it tells its neighbours, and dials the
-    /// group's targets again.
+    /// group's targets again, or once its backoff ends, if it is in one.
     fn saw(&mut self, peer: &Key, group: &Bytes, seen: &BTreeMap<Bytes, u64>, now: u64) {
         let Some(g) = self.groups.get(group) else { return };
         let members: BTreeSet<&Key> = g.own.members.iter().map(|(_, k)| k).collect();
@@ -498,7 +502,8 @@ impl Peers {
             .filter_map(|(key, ago)| Key::try_from(key.0.as_slice()).ok().filter(|k| members.contains(k)).map(|k| (k, now.saturating_sub(*ago))))
             .collect();
         let known = |k: &Key| self.conns.contains_key(k) || g.seen.get(k).is_some_and(|at| self.alive(k, *at, now));
-        let news = sightings.iter().any(|(k, at)| self.alive(k, *at, now) && !known(k));
+        let news: Vec<Key> = sightings.iter().filter(|(k, at)| self.alive(k, *at, now) && !known(k)).map(|(k, _)| *k).collect();
+        let until = news.iter().filter_map(|k| self.backoff.get(k)).map(|b| b.until).filter(|until| now < *until).max();
         let told = self.conns.get_mut(peer).expect("a connected peer").told.entry(group.clone()).or_default();
         let mine = &mut self.groups.get_mut(group).expect("a group of ours").seen;
         for (k, at) in sightings {
@@ -506,9 +511,13 @@ impl Peers {
                 *latest = (*latest).max(at);
             }
         }
-        if news {
+        if !news.is_empty() {
             self.changed.get_or_insert(now);
             self.dial.insert(group.clone());
+        }
+        if let Some(until) = until {
+            let due = self.retry.entry(group.clone()).or_default();
+            *due = (*due).max(until);
         }
     }
 
@@ -707,6 +716,13 @@ impl Peers {
 
     /// The targets not connected of each group due to dial, `DIALS` at a time: a group stays due until each was dialed.
     fn dials(&mut self, now: u64) -> Vec<Out> {
+        self.retry.retain(|id, until| {
+            let due = *until <= now;
+            if due {
+                self.dial.insert(id.clone());
+            }
+            !due
+        });
         let mut out = Vec::new();
         for id in mem::take(&mut self.dial) {
             if !self.groups.contains_key(&id) {
