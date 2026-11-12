@@ -24,7 +24,7 @@ use crate::cli::{Action, Request, private_file};
 use crate::policy::wakes;
 use crate::{message_id, short};
 
-/// How often a session forgets the messages it took in more than H ago.
+/// How often a session forgets the messages it took in more than H ago, and hands its node the machine's leaves.
 const FORGET: Duration = Duration::from_secs(3600);
 /// How long the log keeps a line of no group the session is in, in days.
 const KEEP: u64 = 7;
@@ -120,20 +120,52 @@ impl Session {
         Ok(session)
     }
 
-    /// Lets go of the groups this session is no longer in, removed or left, and writes its groups, by id, to
-    /// `groups.json` in its directory, for `sessions`, when they changed.
+    /// Lets go of the groups this session is no longer in, removed or left, hands its node the machine's leaves once it is
+    /// in a group it was not, and writes its groups, by id, to `groups.json` in its directory, for `sessions`, when they
+    /// changed.
     fn publish(&mut self) {
         let groups = self.node.groups();
         if groups == self.groups {
             return;
         }
+        let joined = groups.iter().any(|gid| !self.groups.contains(gid));
         let gone: Vec<Bytes> = std::mem::replace(&mut self.groups, groups).into_iter().filter(|gid| !self.groups.contains(gid)).collect();
         for gid in gone {
             if let Err(error) = self.forget(&gid) {
                 self.warn(format!("letting go of a group: {error:#}"));
             }
         }
+        if joined {
+            self.deliver();
+        }
         self.write_groups();
+    }
+
+    /// Hands the node the machine's leaves (`crate::keep_leave`), and deletes those of its groups that name a membership
+    /// that ended.
+    fn deliver(&mut self) {
+        let delivered = || -> Result<()> {
+            let mut leaves = Vec::new();
+            // One is deleted meanwhile as another session found its membership ended; a file whose name begins with a dot is
+            // being written.
+            for entry in std::fs::read_dir(&self.leaves).into_iter().flatten().flatten() {
+                if !entry.file_name().to_string_lossy().starts_with('.')
+                    && let Ok(leave) = std::fs::read(entry.path())
+                {
+                    leaves.push(serde_json::from_slice(&leave)?);
+                }
+            }
+            for ended in self.node.take_leaves(leaves)? {
+                match std::fs::remove_file(self.leaves.join(fp(&ended.sig.0))) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+                    _ => {}
+                }
+            }
+            Ok(())
+        };
+        if let Err(error) = delivered() {
+            self.warn(format!("handing the node this machine's leaves: {error:#}"));
+        }
     }
 
     fn write_groups(&mut self) {
@@ -151,6 +183,7 @@ impl Session {
         if let Err(error) = self.forget_old() {
             self.warn(format!("forgetting old messages: {error:#}"));
         }
+        self.deliver();
     }
 
     fn log_path(&self) -> PathBuf {
@@ -917,6 +950,8 @@ pub async fn run(
                         Answered(answer, Some(reply)) => session.answer(answer, reply),
                         Answered(warnings, None) => {
                             session.publish();
+                            // As it starts, once `delete_stopped` kept the leaves of the sessions it deleted.
+                            session.deliver();
                             match warnings {
                                 Ok(Value::Array(warnings)) => warnings.into_iter().for_each(|text| session.out.push((json!({ "type": "warning", "text": text }), true))),
                                 Ok(_) => {}

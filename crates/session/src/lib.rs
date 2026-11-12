@@ -15,7 +15,6 @@ use lmk_proto::Bytes;
 use lmk_proto::directory::{Directory, MAX_BYTES, check_domain};
 use lmk_proto::group::Service;
 use lmk_proto::links::{DOMAIN, MEMBERSHIP_KEY};
-use lmk_proto::membership::STALE;
 use n0_future::boxed::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -243,7 +242,7 @@ pub async fn listen(
     let (node, events) = Node::start(provider, node_config).await?;
     let dir = config.dir.clone();
     let mut session = session::Session::open(config, db, node, held, membership).await?;
-    session.start(delete_stopped(home.to_owned()));
+    session.start(delete_stopped(home.to_owned(), dir.clone()));
     session::run(session, queue, events, print, shutdown).await?;
     // A session that stops in no group leaves nothing behind.
     if lmk_node::groups(&SqliteProvider::open(&dir.join("session.db"))?)?.is_empty() {
@@ -322,29 +321,69 @@ fn last_ran(dir: &Path) -> Option<SystemTime> {
     std::fs::read_dir(dir).ok()?.flatten().filter_map(|entry| entry.metadata().ok()?.modified().ok()).max().or_else(|| dir.metadata().ok()?.modified().ok())
 }
 
-/// Deletes the home's stopped sessions in no group, as each would have as it stopped, by its database read under its
-/// lock: those that found, started again to invite a new session, that they were removed while stopped. And those that
-/// have not run for `STALE`, whatever their groups: one that started would take its groups' logs as let go, and leave
-/// them. Answers what it warns of: one not deleted, as when Windows finds a file of it open, is tried again as the next
-/// session starts.
-async fn delete_stopped(home: PathBuf) -> Result<Vec<String>> {
-    let mut warnings = Vec::new();
-    for entry in std::fs::read_dir(home.join("sessions"))?.flatten() {
-        let dir = entry.path();
+/// How long before the newest other session of its machine a stopped session last ran, at which it is deleted.
+const BEHIND: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// Deletes the home's stopped sessions, each under its lock. Those in no group, as each would have as it stopped, by its
+/// database: those that found, started again to invite a new session, that they were removed while stopped. And those
+/// that last ran `BEHIND` or more before the newest other session last ran, `own`, the one starting, aside: but the one
+/// that ran last of a group its `groups.json` names, through which the machine's new sessions join that group. Each is
+/// renamed aside, so that it cannot run again; then its leave of each group it is in goes to the machine's leaves, by
+/// which the machine's sessions in the group remove it, and its directory goes. One a crash left aside is finished so.
+/// Answers what it warns of: one not deleted, as when Windows finds a file of it open, is tried again as the next session
+/// starts.
+async fn delete_stopped(home: PathBuf, own: PathBuf) -> Result<Vec<String>> {
+    let (sessions, mut warnings) = (home.join("sessions"), Vec::new());
+    let aside = |entry: &std::fs::DirEntry| entry.file_name().to_string_lossy().starts_with(".gone-");
+    let others: Vec<(String, SystemTime, Vec<String>)> = std::fs::read_dir(&sessions)?
+        .flatten()
+        .filter(|entry| entry.path() != own && !aside(entry))
+        .filter_map(|entry| {
+            let dir = entry.path();
+            let groups = std::fs::read(dir.join("groups.json")).ok().and_then(|groups| serde_json::from_slice(&groups).ok()).unwrap_or_default();
+            Some((entry.file_name().to_string_lossy().into_owned(), last_ran(&dir)?, groups))
+        })
+        .collect();
+    for (name, ran, groups) in &others {
+        let rest = || others.iter().filter(|(other, ..)| other != name);
+        let last = groups.iter().any(|group| rest().all(|(_, other, theirs)| !theirs.contains(group) || other <= ran));
+        let behind = !last && rest().any(|(_, other, _)| *ran + BEHIND <= *other);
+        let dir = sessions.join(name);
         let deleted = || -> Result<()> {
-            let stale = last_ran(&dir).and_then(|at| at.elapsed().ok()).is_some_and(|idle| idle >= Duration::from_millis(STALE));
             // One without groups.json may be starting.
-            if !stale && !dir.join("groups.json").exists() {
+            if !behind && !dir.join("groups.json").exists() {
                 return Ok(());
             }
             let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("session.lock"))?;
-            if held.try_lock().is_ok() && (stale || lmk_node::groups(&SqliteProvider::open(&dir.join("session.db"))?)?.is_empty()) {
-                drop(held);
-                std::fs::remove_dir_all(&dir)?;
+            if held.try_lock().is_err() || (!behind && !lmk_node::groups(&SqliteProvider::open(&dir.join("session.db"))?)?.is_empty()) {
+                return Ok(());
             }
+            // Windows renames no directory with a file in it open: a session that started meanwhile keeps its own in place.
+            #[cfg(windows)]
+            drop(held);
+            std::fs::rename(&dir, sessions.join(format!(".gone-{name}")))?;
             Ok(())
         };
         if let Err(error) = deleted() {
+            warnings.push(format!("deleting the stopped session {name}: {error:#}"));
+        }
+    }
+    for entry in std::fs::read_dir(&sessions)?.flatten().filter(aside) {
+        let dir = entry.path();
+        let finished = || -> Result<()> {
+            let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("session.lock"))?;
+            // Another session that starts finishes it.
+            if held.try_lock().is_err() {
+                return Ok(());
+            }
+            for leave in lmk_node::leaves(&SqliteProvider::open(&dir.join("session.db"))?)? {
+                keep_leave(&home.join("leaves"), &leave)?;
+            }
+            drop(held);
+            std::fs::remove_dir_all(&dir)?;
+            Ok(())
+        };
+        if let Err(error) = finished() {
             warnings.push(format!("deleting the stopped session {}: {error:#}", entry.file_name().to_string_lossy()));
         }
     }

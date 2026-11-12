@@ -520,7 +520,7 @@ fn a_session_in_a_group_stays_though_its_groups_json_says_none() {
         std::fs::write(dir.join("groups.json"), "[]").unwrap();
         alice.stop().await;
         assert!(dir.exists(), "a session in a group is kept as it stops");
-        crate::delete_stopped(alice.home.clone()).await.unwrap();
+        crate::delete_stopped(alice.home.clone(), session_dir(&alice.home, "next").unwrap()).await.unwrap();
         assert!(dir.exists(), "a stopped session in a group is kept as the next one starts");
     });
 }
@@ -1126,19 +1126,35 @@ async fn lookups_during_a_fetch_do_not_start_another() {
     assert_eq!(calls.load(Ordering::Relaxed), 1);
 }
 
-/// As a session starts, the stopped sessions that have not run for 28 days go, whatever their groups, by the last change
-/// of any of their files; and so do those in no group.
+/// As a session starts, the stopped sessions in no group go, and so do those that last ran a week or more before the
+/// newest other session but the one starting, by the last change of any of their files, unless one ran last of a group
+/// its `groups.json` names; and one a crash left renamed aside.
 #[tokio::test]
-async fn stopped_sessions_that_have_not_run_for_28_days_are_deleted() {
+async fn stopped_sessions_a_week_behind_the_newest_other_are_deleted_but_each_groups_last() {
     let home = tempfile::tempdir().unwrap();
-    let ago = |days: u64| SystemTime::now() - Duration::from_secs(days * 24 * 3600);
-    for (name, days, log_days, groups) in [("old", 28, 28, r#"["AAAA"]"#), ("recent", 27, 27, r#"["AAAA"]"#), ("logged", 40, 1, r#"["AAAA"]"#), ("running", 29, 29, r#"["AAAA"]"#), ("empty", 0, 0, "[]")] {
+    let now = SystemTime::now();
+    let ago = |days: u64| now - Duration::from_secs(days * 24 * 3600);
+    // Each one's directory, the days since its files and its log changed, its groups as `groups.json` and its database
+    // say: whether one goes for being behind is read from `groups.json` only.
+    let sessions = [
+        ("starting", 0, 0, r#"["AAAA"]"#, r#"["AAAA"]"#),
+        ("newest", 20, 20, r#"["AAAA"]"#, r#"["AAAA"]"#),
+        ("behind", 27, 27, r#"["AAAA"]"#, "[]"),
+        ("logged", 40, 26, r#"["AAAA"]"#, r#"["AAAA"]"#),
+        ("last", 40, 40, r#"["AAAA","BBBB"]"#, r#"["AAAA","BBBB"]"#),
+        ("running", 40, 40, r#"["AAAA"]"#, r#"["AAAA"]"#),
+        ("empty", 40, 40, "[]", "[]"),
+        (".gone-crashed", 0, 0, r#"["AAAA"]"#, "[]"),
+    ];
+    for (name, days, log_days, groups, in_db) in sessions {
         let dir = session_dir(home.path(), name).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
+        let db = lmk_core::provider::SqliteProvider::open(&dir.join("session.db")).unwrap();
+        lmk_node::create(&db, "relay.example.com").unwrap();
+        db.put(b"node/groups", in_db.as_bytes()).unwrap();
+        drop(db);
         for (file, days) in [("groups.json", days), ("session.db", days), ("session.lock", days), ("log.jsonl", log_days)] {
-            if file == "session.db" {
-                lmk_core::provider::SqliteProvider::open(&dir.join(file)).unwrap().put(b"node/groups", groups.as_bytes()).unwrap();
-            } else {
+            if file != "session.db" {
                 std::fs::write(dir.join(file), if file == "groups.json" { groups } else { "" }).unwrap();
             }
             std::fs::File::options().write(true).open(dir.join(file)).unwrap().set_modified(ago(days)).unwrap();
@@ -1146,18 +1162,21 @@ async fn stopped_sessions_that_have_not_run_for_28_days_are_deleted() {
     }
     let held = std::fs::File::options().write(true).open(session_dir(home.path(), "running").unwrap().join("session.lock")).unwrap();
     held.try_lock().unwrap();
-    assert!(crate::delete_stopped(home.path().to_owned()).await.unwrap().is_empty());
-    for (name, kept) in [("old", false), ("recent", true), ("logged", true), ("running", true), ("empty", false)] {
+    let starting = session_dir(home.path(), "starting").unwrap();
+    assert_eq!(crate::delete_stopped(home.path().to_owned(), starting).await.unwrap(), Vec::<String>::new());
+    for (name, kept) in [("starting", true), ("newest", true), ("behind", false), ("logged", true), ("last", true), ("running", true), ("empty", false), (".gone-crashed", false)] {
         assert_eq!(session_dir(home.path(), name).unwrap().exists(), kept, "{name}");
     }
+    assert_eq!(std::fs::read_dir(home.path().join("sessions")).unwrap().count(), 5, "nothing is left aside");
+    assert!(crate::last_ran(&session_dir(home.path(), "logged").unwrap()).is_some_and(|ran| ran < ago(25)), "a session read under its lock did not run");
 }
 
 /// A session directory without `groups.json`, as when `listen` failed before opening, or a `.new-…` directory left by a
-/// crash, is left while recent, as it may be starting, and deleted once it has not run for 28 days.
+/// crash, is left while it may be starting, and deleted once it last ran a week before the newest other session.
 #[tokio::test]
-async fn unopened_session_directories_are_kept_while_recent_and_deleted_after_28_days() {
+async fn unopened_session_directories_are_kept_while_recent_and_deleted_a_week_behind() {
     let home = tempfile::tempdir().unwrap();
-    let ago = |days: u64| SystemTime::now() - Duration::from_secs(days * 24 * 3600);
+    let newest = crate::new_session(home.path(), "Relay.example.com").unwrap();
     let starting = crate::new_session(home.path(), "Relay.example.com").unwrap();
     let failed = crate::new_session(home.path(), "Relay.example.com").unwrap();
     let making = home.path().join("sessions/.new-00000001");
@@ -1166,19 +1185,21 @@ async fn unopened_session_directories_are_kept_while_recent_and_deleted_after_28
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("session.db"), "").unwrap();
     }
-    for (dir, days) in [(&starting, 27), (&failed, 28), (&making, 27), (&crashed, 28)] {
+    let now = SystemTime::now();
+    let ago = |days: u64| now - Duration::from_secs(days * 24 * 3600);
+    for (dir, days) in [(&newest, 0), (&starting, 6), (&failed, 7), (&making, 6), (&crashed, 7)] {
         for entry in std::fs::read_dir(dir).unwrap().flatten() {
             std::fs::File::options().write(true).open(entry.path()).unwrap().set_modified(ago(days)).unwrap();
         }
     }
-    assert_eq!(crate::sessions(home.path()).await.unwrap()["sessions"].as_array().unwrap().len(), 2);
-    assert!(crate::delete_stopped(home.path().to_owned()).await.unwrap().is_empty());
+    assert_eq!(crate::sessions(home.path()).await.unwrap()["sessions"].as_array().unwrap().len(), 3);
+    assert!(crate::delete_stopped(home.path().to_owned(), session_dir(home.path(), "next").unwrap()).await.unwrap().is_empty());
     assert!(starting.exists() && !starting.join("session.lock").exists());
     assert!(!failed.exists());
     assert!(making.exists() && !crashed.exists());
     let listed = crate::sessions(home.path()).await.unwrap();
-    assert_eq!(listed["sessions"].as_array().unwrap().len(), 1);
-    assert_eq!(listed["sessions"][0]["fp"], starting.file_name().unwrap().to_string_lossy().as_ref());
+    assert_eq!(listed["sessions"].as_array().unwrap().len(), 2);
+    assert!(listed["sessions"].as_array().unwrap().iter().any(|session| session["fp"] == starting.file_name().unwrap().to_string_lossy().as_ref()));
 }
 
 /// A stopped session that the group moved past while it was stopped, started again, catches up with the group before it
@@ -1226,6 +1247,71 @@ fn a_stopped_session_started_again_catches_up_before_it_invites() {
             until(|| async { json!(gone()) }, |gone| *gone == true).await;
             assert!(gone(), "the stopped session in no group is deleted as the next session starts");
         }
+    });
+}
+
+/// A stopped session that last ran a week before its machine's newest other session goes as another starts, unless it ran
+/// last of a group, and its leave of each group it was in is kept on the machine: a session of the machine in the group
+/// removes it by that leave as it starts, and one that joins the group once it is gone deletes the leave. Windows renames
+/// no directory with a file in it open, as one of this process's other sessions may hold one of Bob's.
+#[cfg(not(windows))]
+#[test]
+fn a_session_a_week_behind_its_machine_goes_and_is_removed_by_its_leave() {
+    local(async {
+        let world = world("behind").await;
+        let home = world.root.path().join("h");
+        let mut alice = world.start_in("h", "alice").await;
+        let invite = alice.cmd(&["invite"]).await.unwrap();
+        let group = format!("--group={}", invite["group"].as_str().unwrap());
+        let mut bob = world.start_in("h", "bob").await;
+        bob.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
+        let mut carol = world.start_in("h", "carol").await;
+        carol.cmd(&["join", alice.cmd(&["invite", &group]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
+        bob.stop().await;
+        carol.stop().await;
+        let bob_dir = session_dir(&home, "bob").unwrap();
+        for entry in std::fs::read_dir(&bob_dir).unwrap().flatten() {
+            std::fs::File::options().write(true).open(entry.path()).unwrap().set_modified(SystemTime::now() - Duration::from_secs(8 * 24 * 3600)).unwrap();
+        }
+        let leaves = || std::fs::read_dir(home.join("leaves")).map_or(0, |leaves| leaves.count());
+
+        let dave = world.start_in("h", "dave").await;
+        until(|| async { json!(leaves()) }, |kept| *kept == 1).await;
+        assert!(!bob_dir.exists(), "Bob is deleted as Dave starts");
+        assert_eq!(leaves(), 1, "Bob's leave of the group is kept");
+        let carol = world.start_in("h", "carol").await;
+        let left = alice.told(&["left"]).await;
+        assert_eq!((&left["member"], &left["by"]), (&json!(bob.fp), &json!(carol.fp)), "Carol removes Bob as she starts");
+        assert_eq!(leaves(), 1);
+        dave.cmd(&["join", alice.cmd(&["invite", &group]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
+        assert_eq!(leaves(), 0, "Dave deletes the leave of a membership that ended as he joins");
+    });
+}
+
+/// A session hands its node the machine's leaves each hour, as it forgets old messages: it removes a member whose leave
+/// is kept on its machine.
+#[test]
+fn a_session_hands_its_node_the_machines_leaves_each_hour() {
+    local(async {
+        let world = world("hourly").await;
+        let (mut alice, mut bob, _) = pair(&world).await;
+        bob.stop().await;
+        alice.stop().await;
+        let db = lmk_core::provider::SqliteProvider::open(&session_dir(&bob.home, "bob").unwrap().join("session.db")).unwrap();
+        for leave in lmk_node::leaves(&db).unwrap() {
+            crate::keep_leave(&alice.home.join("leaves"), &leave).unwrap();
+        }
+        drop(db);
+        let (mut session, mut events) = world.open_session(world.config("alice", "alice")).await;
+        session.tick();
+        loop {
+            if let lmk_node::Event::Left { member, .. } = tokio::time::timeout(WAIT, events.recv()).await.unwrap().unwrap()
+                && lmk_node::fp(&member.key.0) == bob.fp
+            {
+                break;
+            }
+        }
+        session.shutdown().await;
     });
 }
 

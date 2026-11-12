@@ -47,7 +47,7 @@ use held::Author;
 
 pub use lmk_core;
 pub use peering::Heard;
-pub use tasks::{create, groups};
+pub use tasks::{create, groups, leaves};
 pub use lmk_net::peers::RECENT;
 pub use lmk_proto::clock::now;
 

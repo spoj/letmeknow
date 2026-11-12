@@ -17,7 +17,7 @@ use lmk_proto::Bytes;
 use n0_future::task::spawn;
 use tokio::sync::mpsc;
 
-use crate::{Config, Event, G, Inner, Node, Out, Rec, State, Work, admission, get, hex, iroh_key, logs, now, rec_key};
+use crate::{Config, Event, G, Inner, Leave, Node, Out, Rec, State, Work, admission, get, hex, iroh_key, logs, now, rec_key};
 
 impl Node {
     /// Opens the session in `provider`, creating it on first use, and starts its peers.
@@ -71,6 +71,18 @@ pub fn create(provider: &SqliteProvider, home: &str) -> Result<Bytes> {
 /// The groups the session in `provider` is in, as its node saved them.
 pub fn groups(provider: &SqliteProvider) -> Result<Vec<Bytes>> {
     Ok(get::<Vec<Bytes>>(provider, b"node/groups")?.unwrap_or_default())
+}
+
+/// The leaves of the session in `provider` of the groups it is a member of (`Group::leave`), as it goes for good.
+pub fn leaves(provider: &SqliteProvider) -> Result<Vec<Leave>> {
+    let mut leaves = Vec::new();
+    for gid in groups(provider)? {
+        let (session, mls) = (Session::load(provider)?, Group::load(provider, &gid.0)?);
+        // None once a commit it applied removed it.
+        let Some(joined) = mls.joined(session.key()) else { continue };
+        leaves.push(Leave { key: Bytes(session.key().to_vec()), joined, sig: mls.leave(&session)?, group: gid });
+    }
+    Ok(leaves)
 }
 
 impl State {
