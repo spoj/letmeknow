@@ -67,7 +67,7 @@ impl Member {
         self.group.as_mut().unwrap()
     }
 
-    pub fn cut(&self) -> Vec<Ref> {
+    pub fn cut(&self) -> Vec<Cut> {
         self.group.as_ref().unwrap().cut().to_vec()
     }
 
@@ -182,7 +182,7 @@ fn stranger() -> SignatureKeyPair {
 }
 
 /// The authenticated data of a commit that moves `moved`, for commits built past `Group::commit`.
-fn cut_aad(moved: &[Ref]) -> Vec<u8> {
+fn cut_aad(moved: &[Cut]) -> Vec<u8> {
     serde_json::to_vec(&Aad { moved: moved.to_vec(), ..Aad::default() }).unwrap()
 }
 
@@ -219,26 +219,27 @@ fn join_error(m: &Member, entry: &[u8], admission: &Admission, package: &[u8]) -
 }
 
 /// The entry of `cut` for the member with `key`.
-fn at<'a>(cut: &'a mut [Ref], key: &[u8]) -> &'a mut Ref {
+fn at<'a>(cut: &'a mut [Cut], key: &[u8]) -> &'a mut Cut {
     cut.iter_mut().find(|r| r.key.0 == key).unwrap()
 }
 
 /// Moved cut entries that `rules` refuses, each with a word of its refusal, against a cut state where `a` is at seq 2
-/// and `b` at seq 0.
-fn refusable(good: &[Ref], a: &[u8], b: &[u8]) -> Vec<(Vec<Ref>, &'static str)> {
-    let entry = |key: &[u8], seq: u64, id: Vec<u8>| Ref { id: Bytes(id), seq, ..good.iter().find(|r| r.key.0 == key).unwrap().clone() };
+/// and `b` at seq 0, and `stale` is a's seq 3 as sealed in the epoch before.
+fn refusable(good: &[Cut], a: &[u8], b: &[u8], stale: &Cut) -> Vec<(Vec<Cut>, &'static str)> {
+    let entry = |key: &[u8], seq: u64, id: Vec<u8>| Cut { id: Bytes(id), seq, ..good.iter().find(|r| r.key.0 == key).unwrap().clone() };
     let mut two = vec![entry(a, 3, vec![6; 32]), entry(b, 1, vec![5; 32])];
     two.sort();
     two.reverse();
-    let joined = Ref { joined: 9, ..entry(b, 1, vec![5; 32]) };
+    let joined = Cut { joined: 9, ..entry(b, 1, vec![5; 32]) };
+    let unsigned = Cut { sealed: stale.sealed + 1, ..entry(b, 1, vec![5; 32]) };
     vec![
         (two, "does not name each member"),
         (vec![entry(a, 3, vec![6; 32]), entry(a, 3, vec![6; 32])], "does not name each member"),
         (vec![joined], "names no member"),
         (vec![entry(a, 1, vec![4; 32])], "below the last"),
         (vec![entry(a, 2, vec![7; 32])], "below the last"),
-        (vec![entry(a, 3, vec![7; 31])], "does not fit its seq"),
-        (vec![entry(b, 0, vec![1; 32])], "does not fit its seq"),
+        (vec![stale.clone()], "of another epoch"),
+        (vec![unsigned], "did not sign"),
     ]
 }
 
@@ -690,12 +691,9 @@ fn a_removed_members_messages_open_up_to_its_final_cut() {
     w.found(0, &[1, 2]);
     let early = w.m[2].send("before my removal");
     let past = w.m[2].send("past my final cut");
-    let id = w.m[1].open(&early).unwrap().id;
     let (c, key) = (w.m[1].index_of("C"), w.m[2].session.key().to_vec());
     let mut cut = w.m[1].cut();
-    let last = at(&mut cut, &key);
-    last.seq = 1;
-    last.id = Bytes(id.to_vec());
+    *at(&mut cut, &key) = claim(w.m[1].g().id(), &early).unwrap();
     let commit = w.m[1].commit(Change { cut, remove: vec![c], ..Change::default() });
     w.post(commit.entry);
     let read = w.read(&[0, 1, 2]);
@@ -866,7 +864,8 @@ fn held_headers_are_checked() {
     // Claiming another seq than its header's.
     let claim = Ref { seq: 2, ..claim };
     let sealed = signed_by_a(&mut w, 0, &claim);
-    assert_eq!(crate::group::claim(&id, &sealed).unwrap(), (claim, epoch), "the claim reads in the clear");
+    let claimed = crate::group::claim(&id, &sealed).unwrap();
+    assert_eq!((claimed.seq, claimed.sealed), (2, epoch), "the claim reads in the clear");
     assert!(w.m[1].open(&sealed).unwrap_err().to_string().contains("claimed otherwise"));
     // Another group's.
     let other = header(&w.m[0], &[9; 16], joined).encode();
@@ -889,39 +888,34 @@ fn cuts_advance_and_refuse_what_rules_refuse() {
     let mut w = World::new(&["A", "B", "C", "D"]);
     w.found(0, &[1, 2]);
     let (a, b, c, d) = (w.m[0].session.key().to_vec(), w.m[1].session.key().to_vec(), w.m[2].session.key().to_vec(), w.m[3].session.key().to_vec());
+    let gid = w.m[0].g().id().to_vec();
     w.m[0].send("m1");
     let m2 = w.m[0].send("m2");
-    let id2 = w.m[1].open(&m2).unwrap().id;
+    let stale = claim(&gid, &w.m[0].send("m3")).unwrap();
     let mut cut = w.m[0].cut();
-    let advanced = at(&mut cut, &a);
-    advanced.seq = 2;
-    advanced.id = Bytes(id2.to_vec());
+    *at(&mut cut, &a) = claim(&gid, &m2).unwrap();
     let commit = w.m[0].commit(Change { cut: cut.clone(), ..Change::default() });
     w.post(commit.entry);
     let read = w.read(&[0, 1, 2]);
     assert_eq!(applied(&read[1][0]).cut, cut);
     assert_eq!(w.m[2].cut(), cut);
     w.agree(&[0, 1, 2]);
-    for (bad, why) in refusable(&cut, &a, &b) {
+    for (bad, why) in refusable(&cut, &a, &b, &stale) {
         let error = refused(&mut w.m[0], Change { cut: bad, ..Change::default() });
         assert!(error.contains(why), "{error}");
     }
     assert!(w.m[0].g().posted().is_none());
 
     // B sends in the new epoch, and A commits a cut that takes it, adds D and removes C.
-    let b1 = w.m[1].send("b1");
-    let id_b1 = w.m[0].open(&b1).unwrap().id;
     let mut cut = w.m[0].cut();
-    let reply = at(&mut cut, &b);
-    reply.seq = 1;
-    reply.id = Bytes(id_b1.to_vec());
+    *at(&mut cut, &b) = claim(&gid, &w.m[1].send("b1")).unwrap();
     let c_index = w.m[0].index_of("C");
     let kp_d = w.key_package(3);
     let next = w.m[0].g().epoch() + 1;
     let commit = w.m[0].commit(Change { cut: cut.clone(), add: vec![kp_d], remove: vec![c_index], invite: Some(INVITE.into()), ..Change::default() });
     w.post(commit.entry);
-    let mut expected: Vec<Ref> = cut.iter().filter(|r| r.key.0 != c).cloned().collect();
-    expected.push(Ref { key: Bytes(d), joined: next, seq: 0, id: Bytes::default(), epoch: 0 });
+    let mut expected: Vec<Cut> = cut.iter().filter(|r| r.key.0 != c).cloned().collect();
+    expected.push(Cut { key: Bytes(d), joined: next, ..Cut::default() });
     expected.sort();
     let read = w.read(&[0, 1, 2]);
     assert_eq!(applied(&read[1][0]).cut, cut);
@@ -937,18 +931,17 @@ fn members_skip_commits_with_refused_cuts() {
     let mut w = World::new(&["A", "B", "C"]);
     w.found(0, &[1, 2]);
     let (a, b) = (w.m[0].session.key().to_vec(), w.m[1].session.key().to_vec());
+    let gid = w.m[0].g().id().to_vec();
     w.m[0].send("m1");
     let m2 = w.m[0].send("m2");
-    let id2 = w.m[1].open(&m2).unwrap().id;
+    let stale = claim(&gid, &w.m[0].send("m3")).unwrap();
     let mut good = w.m[0].cut();
-    let advanced = at(&mut good, &a);
-    advanced.seq = 2;
-    advanced.id = Bytes(id2.to_vec());
+    *at(&mut good, &a) = claim(&gid, &m2).unwrap();
     let commit = w.m[0].commit(Change { cut: good.clone(), ..Change::default() });
     w.post(commit.entry);
     w.read(&[0, 1, 2]);
     w.agree(&[0, 1, 2]);
-    for (bad, why) in refusable(&good, &a, &b) {
+    for (bad, why) in refusable(&good, &a, &b, &stale) {
         let mut liar = w.m[1].copy();
         let wire = unruled(&mut liar, Aad { moved: bad, ..Aad::default() }, |b| b);
         w.post(wire);
@@ -965,20 +958,20 @@ fn members_skip_commits_with_refused_cuts() {
 }
 
 /// A joiner starts at the cut of the commit that added it: the members' cut, and seq 0 for itself. An entry a member did
-/// not sign, or one with another commit's Welcome, is refused, and leaves the package usable for the right entry.
+/// not sign, or one with another commit's Welcome, is refused, and leaves the package usable for the right entry; so is
+/// a cut its committer signed with an entry that is no sealing its member signed before the joiner's epoch, or one that
+/// names the joiner.
 #[test]
 fn a_joiner_starts_at_the_commits_cut() {
     let mut w = World::new(&["A", "B", "C", "D"]);
     w.found(0, &[1]);
+    let gid = w.m[0].g().id().to_vec();
     w.m[0].send("m1");
     let m2 = w.m[0].send("m2");
-    let id2 = w.m[1].open(&m2).unwrap().id;
-    let (a, c) = (w.m[0].session.key().to_vec(), w.m[2].session.key().to_vec());
+    let (a, b, c) = (w.m[0].session.key().to_vec(), w.m[1].session.key().to_vec(), w.m[2].session.key().to_vec());
     let next = w.m[0].g().epoch() + 1;
     let mut cut = w.m[0].cut();
-    let advanced = at(&mut cut, &a);
-    advanced.seq = 2;
-    advanced.id = Bytes(id2.to_vec());
+    *at(&mut cut, &a) = claim(&gid, &m2).unwrap();
     let kp_c = w.key_package(2);
     let commit = w.m[0].commit(Change { cut: cut.clone(), add: vec![kp_c.clone()], invite: Some(INVITE.into()), ..Change::default() });
     let inner = w.m[0].open_inner(&commit.entry);
@@ -986,7 +979,7 @@ fn a_joiner_starts_at_the_commits_cut() {
     let pos = w.post(commit.entry);
     w.read(&[0, 1]);
     let mut expected = cut;
-    expected.push(Ref { key: Bytes(c), joined: next, seq: 0, id: Bytes::default(), epoch: 0 });
+    expected.push(Cut { key: Bytes(c.clone()), joined: next, ..Cut::default() });
     expected.sort();
 
     let Entry { commit: bytes, .. } = Entry::parse(&inner).unwrap();
@@ -1006,6 +999,17 @@ fn a_joiner_starts_at_the_commits_cut() {
     let theirs = other.commit(Change { cut, add: vec![kp_d], invite: Some(INVITE.into()), ..Change::default() });
     join_error(&w.m[2], &inner, &theirs.admission.unwrap(), &kp_c);
     assert_eq!(w.m[2].provider.rows(), before);
+    let (mut unsigned, mut later, mut naming) = (admission.cut.clone(), admission.cut.clone(), admission.cut.clone());
+    let moved = at(&mut unsigned, &b);
+    (moved.seq, moved.id) = (1, Bytes(vec![5; 32]));
+    *at(&mut later, &a) = claim(&gid, &w.m[0].send("m3")).unwrap();
+    naming.push(Cut { key: Bytes(c), ..Cut::default() });
+    naming.sort();
+    for cut in [unsigned, later, naming] {
+        let sig = w.m[0].session.signer.sign(&welcome_signed(&inner, &serde_json::to_vec(&cut).unwrap(), &admission.welcome)).unwrap();
+        assert!(join_error(&w.m[2], &inner, &Admission { cut, sig, ..admission.clone() }, &kp_c).contains("a malformed cut"));
+        assert_eq!(w.m[2].provider.rows(), before);
+    }
 
     w.m[2].join(&inner, &admission, pos, &kp_c);
     assert_eq!(w.m[2].cut(), expected);

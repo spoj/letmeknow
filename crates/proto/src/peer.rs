@@ -153,7 +153,7 @@ pub struct Admitted {
     /// The Welcome to the joiner; the whole cut of the epoch the entry ended, where the joiner starts; and the
     /// committer's signature over the entry, the cut and the Welcome (`welcome_signed`).
     pub welcome: Bytes,
-    pub cut: Vec<crate::held::Ref>,
+    pub cut: Vec<crate::held::Cut>,
     pub sig: Bytes,
 }
 

@@ -33,8 +33,8 @@ pub struct Header {
     pub payload: Value,
 }
 
-/// A message by its author's membership and seq, its id, and the epoch it was sent in; in a cut, a membership's seq and
-/// the id there, empty with epoch 0 at seq 0. Carried as `[key, joined, seq, id, epoch]`.
+/// A message by its author's membership and seq, its id, and the epoch it was sent in. Carried as
+/// `[key, joined, seq, id, epoch]`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "Vec<Value>", into = "(Bytes, u64, u64, Bytes, u64)")]
 pub struct Ref {
@@ -56,6 +56,37 @@ impl TryFrom<Vec<Value>> for Ref {
 impl From<Ref> for (Bytes, u64, u64, Bytes, u64) {
     fn from(r: Ref) -> Self {
         (r.key, r.joined, r.seq, r.id, r.epoch)
+    }
+}
+
+/// A cut entry: a membership's seq up to which the group keeps its held messages, the id and epoch of its message
+/// there, and its author's proof of a sealing of that message: the epoch it was sealed in, SHA-256 of its MLS
+/// ciphertext, and the author's signature (`SEALING`). At seq 0 the id, digest and signature are empty and the epochs
+/// 0. Carried as `[key, joined, seq, id, epoch, sealed, digest, sig]`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "Vec<Value>", into = "(Bytes, u64, u64, Bytes, u64, u64, Bytes, Bytes)")]
+pub struct Cut {
+    pub key: Bytes,
+    pub joined: u64,
+    pub seq: u64,
+    pub id: Bytes,
+    pub epoch: u64,
+    pub sealed: u64,
+    pub digest: Bytes,
+    pub sig: Bytes,
+}
+
+impl TryFrom<Vec<Value>> for Cut {
+    type Error = serde_json::Error;
+    fn try_from(values: Vec<Value>) -> serde_json::Result<Self> {
+        let (key, joined, seq, id, epoch, sealed, digest, sig) = leading(values, 8)?;
+        Ok(Cut { key, joined, seq, id, epoch, sealed, digest, sig })
+    }
+}
+
+impl From<Cut> for (Bytes, u64, u64, Bytes, u64, u64, Bytes, Bytes) {
+    fn from(c: Cut) -> Self {
+        (c.key, c.joined, c.seq, c.id, c.epoch, c.sealed, c.digest, c.sig)
     }
 }
 

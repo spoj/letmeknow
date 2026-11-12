@@ -160,7 +160,7 @@ impl Inner {
         st.next_log(gid, position)?;
         st.refresh(gid);
         let g = st.group_mut(gid)?;
-        let (early, later): (Vec<_>, Vec<_>) = std::mem::take(&mut g.early).into_iter().partition(|(_, ciphertext)| core::claim(gid, ciphertext).is_ok_and(|(_, epoch)| epoch == current));
+        let (early, later): (Vec<_>, Vec<_>) = std::mem::take(&mut g.early).into_iter().partition(|(_, ciphertext)| core::claim(gid, ciphertext).is_ok_and(|claim| claim.sealed == current));
         g.early = later;
         for (peer, ciphertext) in early {
             self.take(st, gid, Some(peer), vec![ciphertext], true)?;

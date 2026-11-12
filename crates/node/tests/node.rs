@@ -3911,7 +3911,7 @@ async fn a_member_that_is_no_admin_removes_a_leaver_by_its_leave() {
 /// holds, is waited before as any other: for `HEAR`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_commit_made_with_the_clock_at_0_is_waited_before_as_any_other() {
-    use lmk_core::group::{Change, Group, Session as Mls};
+    use lmk_core::group::{Change, Group, Session as Mls, claim};
     fn real() -> u64 {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
     }
@@ -3931,10 +3931,11 @@ async fn a_commit_made_with_the_clock_at_0_is_waited_before_as_any_other() {
     let mls = Mls::load(&provider).unwrap();
     let mut group = Group::load(&provider, &gid.0).unwrap();
     let client = ServeClient::for_service(relay.post(), &relay.service, false).unwrap();
-    // Bob's cut, moved one past what he sent.
+    // Bob's cut, moved to a message he sealed and sent no one.
     let mut cut = group.cut().to_vec();
     let own = cut.iter_mut().find(|r| r.key.0 == mls.key()).unwrap();
-    (own.seq, own.id, own.epoch) = (own.seq + 1, Bytes(vec![7; 32]), 2);
+    let header = lmk_proto::held::Header { group: gid.clone(), author: own.key.clone(), joined: own.joined, seq: own.seq + 1, epoch: group.epoch(), prev: None, deps: vec![], reply_to: None, payload: message("held by no one") };
+    *own = claim(&gid.0, &group.seal(&provider, &mls, &header.encode()).unwrap()).unwrap();
     let capability = group.capability(&provider).unwrap();
     let first = group.commit(&provider, &mls, Change { cut, ..Change::default() }).unwrap();
     client.append(&capability, from_ref(&first.entry)).await.unwrap();
@@ -4011,7 +4012,7 @@ async fn a_dep_on_what_came_before_a_member_joined_tells_it_nothing_of_the_deps_
 /// it sends is sealed past that commit, which may remove a member.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_send_waits_for_a_commit_held_and_not_applied() {
-    use lmk_core::group::{Change, Group, Session as Mls};
+    use lmk_core::group::{Change, Group, Session as Mls, claim};
     let relay = relay().await;
     let dir = folder("held-commit");
     std::fs::create_dir_all(&dir).unwrap();
@@ -4024,14 +4025,16 @@ async fn a_send_waits_for_a_commit_held_and_not_applied() {
     bob.shutdown().await.unwrap();
     drop(bob);
 
-    // Bob's cut, moved one past what he sent, then another commit of his: Alice waits before it for what no one holds.
+    // Bob's cut, moved to a message he sealed and sent no one, then another commit of his: Alice waits before it for
+    // what no one holds.
     let provider = SqliteProvider::open(&bob_db).unwrap();
     let mls = Mls::load(&provider).unwrap();
     let mut group = Group::load(&provider, &gid.0).unwrap();
     let client = ServeClient::for_service(relay.post(), &relay.service, false).unwrap();
     let mut cut = group.cut().to_vec();
     let own = cut.iter_mut().find(|r| r.key.0 == mls.key()).unwrap();
-    (own.seq, own.id, own.epoch) = (own.seq + 1, Bytes(vec![7; 32]), 2);
+    let header = lmk_proto::held::Header { group: gid.clone(), author: own.key.clone(), joined: own.joined, seq: own.seq + 1, epoch: group.epoch(), prev: None, deps: vec![], reply_to: None, payload: message("held by no one") };
+    *own = claim(&gid.0, &group.seal(&provider, &mls, &header.encode()).unwrap()).unwrap();
     let capability = group.capability(&provider).unwrap();
     let first = group.commit(&provider, &mls, Change { cut, ..Change::default() }).unwrap();
     client.append(&capability, from_ref(&first.entry)).await.unwrap();
