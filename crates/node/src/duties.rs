@@ -1,10 +1,7 @@
 //! A group's duties, each derived from committed records and idempotent: a pass runs at the log's head after each
-//! advance, at start, at this session's next update, and as its first `EVICT` in the group ends if that held back a
-//! Remove, and one that failed again after `RETRY`. It drops what the group kept past H, and commits at most once, with
-//! every Remove due (members whose `leave` the cut it builds keeps, and members left behind in an epoch whose log was
-//! let go, as the service answered, asked at most daily, or a neighbour passed on its answer, from `EVICT` after this
-//! session joined; of a session that is no admin, only those leavers whose `leave` carries their leave) and this
-//! session's update if due: T after the last, at an offset of its own, once the group delivered a message or changed
+//! advance, at start, at this session's next update, and one that failed again after `RETRY`. It drops what the group
+//! kept past H, and commits at most once, with every Remove due (members whose `leave` the cut it builds keeps; of a
+//! session that is no admin, only those leavers whose `leave` carries their leave) and this session's update if due: T after the last, at an offset of its own, once the group delivered a message or changed
 //! its members since. The update first fetches for at most `HEAR` what the last commit kept and connected members hold
 //! past the cut. T grows with the group, so that its members update about hourly between them, up to three days: an
 //! online member's update shows it is there well within the services' retention.
@@ -36,7 +33,7 @@ const BLOCKED: u64 = 10_000;
 /// How soon a pass runs again after it failed, as while the service is down.
 const RETRY: u64 = 10 * 60 * 1000;
 /// How often a member asks which members' logs their services let go, of those it does not know to be, at most, in
-/// milliseconds; and how long a joiner removes no one for falling behind, until it holds each member's newest intro.
+/// milliseconds.
 pub(crate) const EVICT: u64 = 24 * 3600 * 1000;
 /// How long after this session last showed itself, by a commit or message of its own, it sends a `present`, once the
 /// group moved past the epoch it showed itself in: after the updates a message stirs, and well before the services let
@@ -172,7 +169,6 @@ fn due(st: &State, g: &G) -> Result<Option<Change>> {
                 change.remove.push(m.index);
                 change.left.push(sig.clone());
             }
-            _ if admin && g.behind(&m.key).is_some_and(|epoch| epoch.gone()) => change.remove.push(m.index),
             _ => {}
         }
     }
@@ -261,11 +257,7 @@ impl Inner {
             }
             let g = st.group(gid)?;
             let present = if g.rec.present < g.mls.epoch() { g.rec.presented + PRESENT } else { u64::MAX };
-            // This session's first `EVICT` in the group holds back removing members left behind in an epoch let go
-            // (`G::behind`): a pass is due as it ends.
-            let ends = g.rec.joined_at + EVICT;
-            let held_back = now() < ends && g.mls.admin(st.me()) && g.rec.epochs.iter().any(|epoch| epoch.gone());
-            let next = if g.rec.stirred { next(g, st.me()) } else { u64::MAX }.min(present).min(if held_back { ends } else { u64::MAX });
+            let next = if g.rec.stirred { next(g, st.me()) } else { u64::MAX }.min(present);
             let pending = due(&st, g)?;
             // A pass that removes commits at once.
             let removing = pending.as_ref().is_some_and(|change| !change.remove.is_empty());
@@ -481,50 +473,6 @@ mod tests {
         let due = alice.inner.timers.lock().unwrap().get(&gid.0).copied();
         assert!(due.is_some_and(|due| due.abs_diff(stale + days(1)) < 5_000), "{due:?}, stale at {stale} by the service's clock");
         alice.shutdown().await.unwrap();
-    }
-
-    /// A joiner removes no one for falling behind in its first `EVICT`, by when it holds each member's newest intro, and
-    /// times its next pass for when that ends.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_joiner_removes_no_one_for_falling_behind_in_its_first_evict() {
-        use crate::{Config, Epoch, INVITE_VALID, Node};
-        use lmk_core::provider::SqliteProvider;
-        use lmk_proto::group::{PROTOCOL, Settings, UPDATE};
-        use lmk_proto::membership::Expiry;
-
-        let relay = lmk_testing::relay().await;
-        let mut nodes = Vec::new();
-        for _ in 0..2 {
-            let config = Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[9; 32]) };
-            nodes.push(Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0);
-        }
-        let (alice, bob) = (&nodes[0], &nodes[1]);
-        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
-        let gid = alice.create(settings).unwrap();
-        bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
-        for task in bob.inner.tasks.lock().unwrap().drain(..) {
-            task.abort();
-        }
-        let mut st = bob.inner.lock();
-        let g = st.group_mut(&gid.0).unwrap();
-        // Alice is, as far as Bob knows, in an epoch whose log was let go.
-        let index = g.mls.members().into_iter().find(|m| m.key == alice.key().0).unwrap().index;
-        let expired = Some(Expiry { log_ref: [0; 32], sig: Bytes(vec![0; 64]) });
-        g.rec.epochs = vec![Epoch { epoch: 0, capability: [0; 32], service: g.mls.settings().membership, member: None, expired, forgotten: false }];
-        g.rec.members = vec![(alice.key(), 0)];
-        let removes = |st: &State| due(st, st.group(&gid.0).unwrap()).unwrap().map(|change| change.remove).unwrap_or_default();
-        assert!(removes(&st).is_empty(), "Bob removes no one on the day he joined");
-        let ends = st.group(&gid.0).unwrap().rec.joined_at + EVICT;
-        drop(st);
-        bob.inner.pass(&gid.0).await.unwrap();
-        assert_eq!(bob.inner.timers.lock().unwrap().get(&gid.0), Some(&ends), "Bob's next pass is due as his first day ends");
-        let mut st = bob.inner.lock();
-        st.group_mut(&gid.0).unwrap().rec.joined_at -= EVICT;
-        assert_eq!(removes(&st), [index]);
-        drop(st);
-        for node in nodes {
-            node.shutdown().await.unwrap();
-        }
     }
 
     #[test]

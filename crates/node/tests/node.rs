@@ -1201,233 +1201,6 @@ fn an_ended_memberships_messages_stay_shown_until_h() {
     });
 }
 
-/// A member whose epoch's log its service let go is removed by the others, which hold the commits it missed: the next
-/// commit a member builds, its update once its message stirs it, asks the service about the logs members are behind in
-/// first.
-#[test]
-fn a_member_in_an_epoch_the_service_let_go_is_removed_by_the_others() {
-    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    fn shifted() -> u64 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
-    }
-    on_clock(shifted, async {
-        let relay = relay().await;
-        let dir = folder("let-go-removed");
-        let mut alice = stored(&relay, &dir.join("alice.db")).await;
-        let bob = session(&relay).await;
-        let bob_key = bob.node.key();
-        let gid = alice.node.create(settings(&relay)).unwrap();
-        let spares = strangers(&mut alice, &gid, &relay, 1).await;
-        bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
-        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-        bob.node.shutdown().await.unwrap();
-        alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
-        alice.node.ask_behind(&gid.0).await.unwrap();
-        assert_eq!(alice.node.members(&gid.0).unwrap().len(), 2, "the log Bob is in is not gone yet");
-        alice.node.shutdown().await.unwrap();
-        drop(alice);
-
-        SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
-        while relay.membership.expire().await {}
-        let mut alice = stored(&relay, &dir.join("alice.db")).await;
-        alice.node.send(&gid.0, &message("back"), None).await.unwrap();
-        alice.until(|e| matches!(e, Event::Left { member, .. } if member.key == bob_key).then_some(())).await;
-        assert_eq!(alice.node.members(&gid.0).unwrap().len(), 1);
-        alice.node.shutdown().await.unwrap();
-    });
-}
-
-/// A member that joined after another stopped takes, from the intro the others pass on, the epoch the stopped one was
-/// last in, and removes it once that epoch's log is let go: before the log of the epoch it joined in goes.
-#[test]
-fn a_joiner_removes_a_member_away_since_before_it_joined_by_its_intro() {
-    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    fn shifted() -> u64 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
-    }
-    on_clock(shifted, async {
-        let relay = relay().await;
-        let dir = folder("intro-epoch");
-        let mut alice = stored(&relay, &dir.join("alice.db")).await;
-        let bob = session(&relay).await;
-        let bob_key = bob.node.key();
-        let gid = alice.node.create(settings(&relay)).unwrap();
-        let spares = strangers(&mut alice, &gid, &relay, 1).await;
-        bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
-        bob.node.set_intro(&gid.0, Some("bob".into())).unwrap();
-        eventually("Alice holds Bob's intro", || alice.node.intros(&gid.0).unwrap().contains_key(&bob_key)).await;
-        bob.node.shutdown().await.unwrap();
-        alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
-        alice.node.shutdown().await.unwrap();
-        drop(alice);
-
-        SHIFT.store(4 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
-        let alice = stored(&relay, &dir.join("alice.db")).await;
-        let carol = stored(&relay, &dir.join("carol.db")).await;
-        carol.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
-        eventually("Carol holds Bob's intro", || carol.node.intros(&gid.0).unwrap().contains_key(&bob_key)).await;
-        for session in [alice, carol] {
-            session.node.shutdown().await.unwrap();
-        }
-
-        SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
-        while relay.membership.expire().await {}
-        let mut carol = stored(&relay, &dir.join("carol.db")).await;
-        carol.node.send(&gid.0, &message("stir"), None).await.unwrap();
-        carol.until(|e| matches!(e, Event::Left { member, .. } if member.key == bob_key).then_some(())).await;
-        assert_eq!(carol.node.members(&gid.0).unwrap().len(), 2, "Alice, there four days ago, stays");
-        carol.node.shutdown().await.unwrap();
-    });
-}
-
-/// An intro counts for its own member only. A joiner keeps the capability an intro names for an epoch before it joined,
-/// which it cannot check, as that member's claim alone: Mallory's intro naming the epoch Bob is in, with a log the service
-/// let go, leaves Bob in, and Mallory behind, removed a day after the joiner joined. An intro naming an epoch ahead of
-/// the joiner's waits, and one naming another capability than the joiner's own of its epoch, or an epoch before its
-/// member joined, is not taken.
-#[test]
-fn an_intro_counts_for_its_own_member_only() {
-    use lmk_proto::membership::Expiry;
-    use lmk_proto::peer::{At, INTRO, Intro, Shown};
-    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    fn shifted() -> u64 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
-    }
-    on_clock(shifted, async {
-        let relay = relay().await;
-        let dir = folder("intro-own");
-        let gone = [7; 32];
-        let client = ServeClient::for_service(relay.post(), &relay.service, false).unwrap();
-        client.append(&gone, &[b"of no group".to_vec()]).await.unwrap();
-        SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
-        while relay.membership.expire().await {}
-        let expiry = client.heads(&[gone]).await.unwrap().remove(0).unwrap_err();
-
-        let mut alice = session(&relay).await;
-        let gid = alice.node.create(settings(&relay)).unwrap();
-        let (mallory_db, bob_db) = (dir.join("mallory.db"), dir.join("bob.db"));
-        for db in [&mallory_db, &bob_db] {
-            let joiner = stored(&relay, db).await;
-            joiner.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
-            alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-            joiner.node.shutdown().await.unwrap();
-        }
-        // A stopped member's session, the epoch it joined in, and its group's epoch with that epoch's capability.
-        let state = |db: &Path| {
-            let provider = SqliteProvider::open(db).unwrap();
-            let (mls, group) = (Mls::load(&provider).unwrap(), lmk_core::group::Group::load(&provider, &gid.0).unwrap());
-            let joined = group.joined(mls.key()).unwrap();
-            (mls, joined, Shown { epoch: group.epoch(), capability: group.capability(&provider).unwrap() })
-        };
-        let ((mallory, mallory_joined, _), (bob, bob_joined, bob_shown)) = (state(&mallory_db), state(&bob_db));
-        let (mallory_key, bob_key) = (Bytes(mallory.key().to_vec()), Bytes(bob.key().to_vec()));
-        let base = lmk_node::now() + 1_000_000;
-        let hello = |mls: &Mls, joined: u64, version: u64, shown: Shown, text: &str, expired: Vec<Expiry>| {
-            let intro = Intro { group: gid.clone(), member: Bytes(mls.key().to_vec()), joined, version, shown, text: Some(text.into()) };
-            let body = serde_json::to_vec(&intro).unwrap();
-            let intros = vec![Signed { sig: Bytes(mls.sign(&[INTRO, &body].concat())), body: Bytes(body) }];
-            Frame::Hello { groups: vec![At { group: gid.clone(), log: [0; 32], head: None, seen: Default::default(), intros, expired }] }
-        };
-
-        // Carol hears Mallory's claim and the expiry of its log, and Bob's intro, in the one early hello she keeps.
-        let carol = stored(&relay, &dir.join("carol.db")).await;
-        let mut bob_hand = hand(&relay, member_of(&bob_db).0, &carol.node).await;
-        let claim = Shown { epoch: bob_shown.epoch, capability: gone };
-        let (Frame::Hello { groups: mut both }, Frame::Hello { groups: bobs }) =
-            (hello(&mallory, mallory_joined, base, claim, "mallory", vec![expiry]), hello(&bob, bob_joined, base, bob_shown.clone(), "bob", vec![]))
-        else {
-            unreachable!()
-        };
-        both[0].intros.extend(bobs.into_iter().flat_map(|at| at.intros));
-        bob_hand.send(&Frame::Hello { groups: both }).await;
-        bob_hand.settle(&gid).await;
-        carol.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
-        assert!(carol.node.members(&gid.0).unwrap().iter().any(|m| m.key == bob_key), "Mallory's claim left Bob in");
-
-        let epoch = carol.node.epoch(&gid.0).unwrap();
-        for (version, shown, text) in [
-            (base + 1, Shown { epoch: u64::MAX, ..bob_shown.clone() }, "ahead"),
-            (base + 2, Shown { epoch, capability: gone }, "another capability"),
-            (base + 3, Shown { epoch: bob_joined - 1, ..bob_shown }, "before joining"),
-        ] {
-            bob_hand.send(&hello(&bob, bob_joined, version, shown, text, vec![])).await;
-        }
-        bob_hand.settle(&gid).await;
-        assert_eq!(carol.node.intros(&gid.0).unwrap().get(&bob_key).map(String::as_str), Some("bob"), "none of Bob's later intros is taken");
-
-        carol.node.shutdown().await.unwrap();
-        SHIFT.fetch_add(DAY_MS, std::sync::atomic::Ordering::Relaxed);
-        let mut carol = stored(&relay, &dir.join("carol.db")).await;
-        let left = carol.until(|e| match e {
-            Event::Left { member, .. } => Some(member.key),
-            _ => None,
-        }).await;
-        assert_eq!(left, mallory_key, "Mallory's claim left her behind");
-        for session in [alice, carol] {
-            session.node.shutdown().await.unwrap();
-        }
-    });
-}
-
-/// A member's claim of an epoch whose log the service holds nothing of, as of one it forgot, leaves that member behind,
-/// and no other: Mallory's intro naming the epoch Bob is in, with a capability of no log, gets her removed by a joiner a
-/// day after it joined, and Bob, whose own intro names that epoch, stays.
-#[test]
-fn a_claim_whose_log_the_service_holds_nothing_of_leaves_only_its_member_behind() {
-    use lmk_proto::peer::{At, INTRO, Intro, Shown};
-    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    fn shifted() -> u64 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
-    }
-    on_clock(shifted, async {
-        let relay = relay().await;
-        let dir = folder("claim-of-nothing");
-        let mut alice = session(&relay).await;
-        let gid = alice.node.create(settings(&relay)).unwrap();
-        let (mallory_db, bob_db, carol_db) = (dir.join("mallory.db"), dir.join("bob.db"), dir.join("carol.db"));
-        for db in [&mallory_db, &bob_db, &carol_db] {
-            let joiner = stored(&relay, db).await;
-            joiner.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
-            alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-            joiner.node.shutdown().await.unwrap();
-        }
-        alice.node.shutdown().await.unwrap();
-        // A stopped member's session, the epoch it joined in, and its group's epoch with that epoch's capability.
-        let state = |db: &Path| {
-            let provider = SqliteProvider::open(db).unwrap();
-            let (mls, group) = (Mls::load(&provider).unwrap(), lmk_core::group::Group::load(&provider, &gid.0).unwrap());
-            let joined = group.joined(mls.key()).unwrap();
-            (mls, joined, Shown { epoch: group.epoch(), capability: group.capability(&provider).unwrap() })
-        };
-        let signed = |mls: &Mls, joined: u64, shown: Shown| {
-            let intro = Intro { group: gid.clone(), member: Bytes(mls.key().to_vec()), joined, version: lmk_node::now() + 1_000_000, shown, text: None };
-            let body = serde_json::to_vec(&intro).unwrap();
-            Signed { sig: Bytes(mls.sign(&[INTRO, &body].concat())), body: Bytes(body) }
-        };
-        let ((mallory, mallory_joined, _), (bob, bob_joined, bob_shown)) = (state(&mallory_db), state(&bob_db));
-        let (mallory_key, bob_key) = (Bytes(mallory.key().to_vec()), Bytes(bob.key().to_vec()));
-        let claim = Shown { epoch: bob_shown.epoch, capability: [8; 32] };
-        let intros = vec![signed(&mallory, mallory_joined, claim), signed(&bob, bob_joined, bob_shown)];
-
-        let carol = stored(&relay, &carol_db).await;
-        let mut bob_hand = hand(&relay, member_of(&bob_db).0, &carol.node).await;
-        bob_hand.send(&Frame::Hello { groups: vec![At { group: gid.clone(), log: [0; 32], head: None, seen: Default::default(), intros, expired: vec![] }] }).await;
-        bob_hand.settle(&gid).await;
-        carol.node.shutdown().await.unwrap();
-
-        SHIFT.store(DAY_MS, std::sync::atomic::Ordering::Relaxed);
-        let mut carol = stored(&relay, &carol_db).await;
-        carol.node.send(&gid.0, &message("stir"), None).await.unwrap();
-        let left = carol.until(|e| match e {
-            Event::Left { member, .. } => Some(member.key),
-            _ => None,
-        }).await;
-        assert_eq!(left, mallory_key, "Mallory's claim left her behind");
-        assert!(carol.node.members(&gid.0).unwrap().iter().any(|m| m.key == bob_key), "and Bob in");
-        carol.node.shutdown().await.unwrap();
-    });
-}
-
 /// A member's intro is at most `MAX_INTRO` bytes: `set_intro` refuses a longer one, and a neighbour's `hello` carrying
 /// a longer one is neither taken nor kept for a membership not known yet, so that large intros neither stay nor push a
 /// `hello` past `MAX_FRAME`. One of `MAX_INTRO` bytes is taken and passed on.
@@ -1549,9 +1322,8 @@ fn expired_epochs(db: &Path, gid: &Bytes) -> Vec<u64> {
     rec["epochs"].as_array().unwrap().iter().filter(|epoch| epoch.get("expired").is_some()).map(|epoch| epoch["epoch"].as_u64().unwrap()).collect()
 }
 
-/// A joiner takes from its admitter the expiries it holds. Alice, no longer an admin, passes on Bob's expiry without her
-/// duties removing him before Carol's Add, and can append nothing past it. Carol, the admin, can ask the service nothing,
-/// keeps the expiry, and started again a day after she joined removes Bob, whose epoch's log was let go.
+/// A joiner takes from its admitter the expiries it holds. Alice passes on Bob's expiry, and can append nothing past
+/// Carol's Add. Carol can ask the service nothing, and keeps the expiry.
 #[test]
 fn a_joiner_takes_the_expiries_its_admitter_holds() {
     static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1602,88 +1374,10 @@ fn a_joiner_takes_the_expiries_its_admitter_holds() {
 
         appends.store(1, SeqCst);
         carol.node.join(&link).await.unwrap();
-        assert!(carol.node.members(&gid.0).unwrap().iter().any(|m| m.key == bob_key), "Bob stays for Carol to remove");
         eventually("Carol takes the expiry Alice holds", || expired_epochs(&carol_db, &gid) == [behind]).await;
         for session in [alice, carol] {
             session.node.shutdown().await.unwrap();
         }
-
-        SHIFT.fetch_add(DAY_MS, std::sync::atomic::Ordering::Relaxed);
-        let mut carol = stored_with(&relay, &carol_db, failing(relay.post(), |route| route.ends_with("/heads"))).await;
-        let by = carol.until(|e| match e {
-            Event::Left { member, by, .. } if member.key == bob_key => Some(by),
-            _ => None,
-        }).await;
-        assert_eq!(by.key, carol.node.key(), "Carol removes Bob");
-        carol.node.shutdown().await.unwrap();
-    });
-}
-
-/// An expiry a neighbour passes on in `hello` runs the group's duties: an admin already at the head with no update due,
-/// and unable to ask the service `/heads` itself, removes the member left behind at once.
-#[test]
-fn an_idle_admin_removes_a_member_whose_expiry_a_neighbour_passes_on() {
-    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    fn shifted() -> u64 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
-    }
-    on_clock(shifted, async {
-        let relay = relay().await;
-        let dir = folder("passed-expiry-idle");
-        let (alice_db, bob_db) = (dir.join("alice.db"), dir.join("bob.db"));
-        let start_on = |db: std::path::PathBuf, seed: u8, post: Post| {
-            let relay = &relay;
-            async move {
-                let device = SigningKey::from_bytes(&[seed; 32]);
-                let (node, events) = Node::start(SqliteProvider::open(&db).unwrap(), Config { device, post, ..config(relay) }).await.unwrap();
-                Session { node, events }
-            }
-        };
-        let mut alice = start_on(alice_db.clone(), 1, relay.post()).await;
-        let gid = alice.node.create(settings(&relay)).unwrap();
-        let spares = strangers(&mut alice, &gid, &relay, 1).await;
-        let bob = start_on(bob_db.clone(), 2, relay.post()).await;
-        let dave = session_on(&relay, 3).await;
-        let dave_key = dave.node.key();
-        for joiner in [&bob, &dave] {
-            joiner.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
-            alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-        }
-        let dave_epoch = dave.node.epoch(&gid.0).unwrap();
-        eventually("Alice and Bob have Dave's update", || {
-            [&alice.node, &bob.node].iter().all(|n| n.epoch(&gid.0).unwrap() == dave_epoch)
-        }).await;
-        dave.node.shutdown().await.unwrap();
-
-        // Alice's removal moves the group past Dave and leaves Alice unstirred, while stirring non-admin Bob.
-        alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
-        eventually("Bob applied the removal", || bob.node.members(&gid.0).unwrap().len() == 3).await;
-        let before = bob.node.epoch(&gid.0).unwrap();
-        alice.node.shutdown().await.unwrap();
-        bob.node.shutdown().await.unwrap();
-        drop((alice, bob));
-
-        SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
-        while relay.membership.expire().await {}
-        let bob = start_on(bob_db.clone(), 2, relay.post()).await;
-        eventually("Bob holds Dave's expiry and updated", || {
-            !expired_epochs(&bob_db, &gid).is_empty() && bob.node.epoch(&gid.0).unwrap() > before
-        }).await;
-        bob.node.shutdown().await.unwrap();
-        drop(bob);
-
-        let mut alice = start_on(alice_db.clone(), 1, failing(relay.post(), |route| route.ends_with("/heads"))).await;
-        alice.node.caught_up(&gid.0).await.unwrap();
-        assert!(alice.node.members(&gid.0).unwrap().iter().any(|m| m.key == dave_key));
-
-        let bob = start_on(bob_db, 2, relay.post()).await;
-        let by = alice.until(|e| match e {
-            Event::Left { member, by, .. } if member.key == dave_key => Some(by),
-            _ => None,
-        }).await;
-        assert_eq!(by.key, alice.node.key());
-        alice.node.shutdown().await.unwrap();
-        bob.node.shutdown().await.unwrap();
     });
 }
 
@@ -1701,8 +1395,8 @@ fn payload_types(db: &Path, gid: &Bytes) -> Vec<(Bytes, String)> {
 }
 
 /// A member that showed itself in no epoch since the group moved past the last one it did sends a `present`, while
-/// online, once two days have passed since it showed itself: the others see it in the current epoch, so their evictions
-/// spare it once the log of that last one is let go.
+/// online, once two days have passed since it showed itself: sessions of 0.26.0 see it in the current epoch then, and
+/// spare it as they remove the members in an epoch whose log was let go.
 #[test]
 fn an_idle_member_shows_itself_present_before_its_epochs_log_goes() {
     static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1737,14 +1431,6 @@ fn an_idle_member_shows_itself_present_before_its_epochs_log_goes() {
         for session in [bob, alice] {
             session.node.shutdown().await.unwrap();
         }
-
-        SHIFT.store(9 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
-        while relay.membership.expire().await {}
-        let alice = stored(&relay, &alice_db).await;
-        alice.node.send(&gid.0, &message("stir"), None).await.unwrap();
-        eventually("Alice updates", || alice.node.epoch(&gid.0).unwrap() == epoch + 2).await;
-        assert_eq!(alice.node.members(&gid.0).unwrap().len(), 2, "Bob is spared");
-        alice.node.shutdown().await.unwrap();
     });
 }
 

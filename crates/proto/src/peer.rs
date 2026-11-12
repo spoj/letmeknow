@@ -122,8 +122,8 @@ pub struct Intro {
     pub text: Option<String>,
 }
 
-/// The epoch a member was in as it signed its intro, and the capability of that epoch's log: a member that joined since
-/// asks the service by it whether the log was let go, and removes the member once it was.
+/// The epoch a member was in as it signed its intro, and the capability of that epoch's log: a session of 0.26.0 that
+/// joined since asks the service by it whether the log was let go, and removes the member once it was.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Shown {
     pub epoch: u64,

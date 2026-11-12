@@ -308,8 +308,7 @@ impl Inner {
         }
     }
 
-    /// Asks the services whether the logs the group's members are behind in were let go, but those known to be, so that
-    /// the commit this session builds next removes those members (`due`).
+    /// Asks the services whether the logs the group's members are behind in were let go, but those known to be.
     pub(crate) async fn ask_behind(self: &Arc<Self>, gid: &[u8]) -> Result<()> {
         let asked: Vec<Epoch> = {
             let st = self.lock();
