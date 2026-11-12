@@ -462,19 +462,16 @@ impl Inner {
         self.open_one(st, gid, ciphertext)
     }
 
-    /// Opens the unopened ciphertexts that are now in order, within the window and the buckets.
+    /// Opens the unopened ciphertexts that are now in order, within the window, each once its membership's bucket
+    /// allows: one membership's spent bucket holds up no other's.
     fn open_unopened(&self, st: &mut State, gid: &[u8], opened: &mut Vec<(Vec<u8>, u64)>) -> Result<()> {
         loop {
             let now = st.tick();
             let g = st.group_mut(gid)?;
             let waiting = g.waiting;
-            let ready = g.unopened.iter().find(|((key, joined, seq), _)| g.author(&key.0, *joined).is_some_and(|a| *seq < a.lowest() + WINDOW)).map(|(claim, _)| claim.clone());
-            let Some(claim) = ready else { return Ok(()) };
-            let (_, ciphertext) = &g.unopened[&claim];
-            let size = ciphertext.len();
-            if !waiting && !g.buckets.entry((claim.0.clone(), claim.1)).or_default().take(size, 2.0, now) {
-                return Ok(());
-            }
+            let ready: Vec<_> = g.unopened.iter().filter(|((key, joined, seq), _)| g.author(&key.0, *joined).is_some_and(|a| *seq < a.lowest() + WINDOW)).map(|(claim, (_, c))| (claim.clone(), c.len())).collect();
+            let paid = ready.into_iter().find(|(claim, size)| waiting || g.buckets.entry((claim.0.clone(), claim.1)).or_default().take(*size, 2.0, now));
+            let Some((claim, _)) = paid else { return Ok(()) };
             let (_, ciphertext) = g.unopened.remove(&claim).unwrap();
             opened.extend(self.open_one(st, gid, ciphertext)?);
         }

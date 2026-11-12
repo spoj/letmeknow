@@ -202,6 +202,40 @@ async fn a_ciphertext_past_the_flood_bucket_opens_after_it_refills() {
     }
 }
 
+/// What waits unopened of a membership whose bucket is spent holds up no other's: Alice's and Bob's ciphertexts wait at
+/// Carol, and once the bucket of the membership that sorts second refills, its ciphertext opens, past the other.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spent_bucket_holds_up_no_other_memberships_unopened_ciphertexts() {
+    let (bob, alice, carol, gid) = three().await;
+    let epoch = carol.epoch(&gid.0).unwrap();
+    let (a1, alices) = seal(&alice, &gid, 1, None, "Alice's");
+    let (b1, bobs) = depending(&bob, &gid, 0, lmk_proto::held::Ref { key: alice.key(), joined: 1, seq: 1, id: a1.clone(), epoch });
+    let mut waiting = [((alice.key(), 1), a1, alices), ((bob.key(), 0), b1, bobs)];
+    waiting.sort_by(|x, y| x.0.cmp(&y.0));
+    let [(spent, held, first), (refilled, id, second)] = waiting;
+    {
+        let mut st = carol.inner.lock();
+        // The buckets' clock stays fixed.
+        st.time = crate::now() + 60_000;
+        let at = st.time;
+        for membership in [&spent, &refilled] {
+            st.group_mut(&gid.0).unwrap().buckets.insert(membership.clone(), Bucket { messages: 0.0, bytes: 0.0, at });
+        }
+        for ciphertext in [first, second.clone()] {
+            assert!(carol.inner.take_one(&mut st, &gid.0, None, ciphertext).unwrap().is_none());
+        }
+        st.group_mut(&gid.0).unwrap().buckets.remove(&refilled);
+        let mut opened = Vec::new();
+        carol.inner.open_unopened(&mut st, &gid.0, &mut opened).unwrap();
+        assert_eq!(opened, vec![(second, epoch)]);
+        assert_eq!(st.id_at(&gid.0, &refilled.0.0, refilled.1, 1).unwrap(), Some(id));
+        assert!(st.record(&gid.0, &held.0).unwrap().is_none());
+    }
+    for node in [bob, alice, carol] {
+        node.shutdown().await.unwrap();
+    }
+}
+
 /// A sealing its claimed author did not sign is dropped before anything is charged to, kept or remembered of that
 /// author: copies of Alice's sealings with a byte of their MLS ciphertext changed neither empty her bucket nor replace
 /// what of hers waits unopened, which opens once the bucket allows it.
