@@ -345,10 +345,12 @@ fn welcome_must_use_the_intended_package_and_checkpoint_failure_restores_it() {
 
     // Control: OpenMLS really consumes the other operation's package before into_group.
     b.provider.savepoint().unwrap();
+    bind(&b.provider, &admission.cut).unwrap();
+    let bound = b.provider.rows();
     let MlsMessageBodyIn::Welcome(parsed) = parse::<MlsMessageIn>(&admission.welcome).unwrap().extract() else { panic!() };
     let builder = StagedWelcome::build_from_welcome(&b.provider, &join_config(), parsed).unwrap();
     assert_eq!(builder.processed_welcome().own_key_package().unwrap().hash_ref(b.provider.crypto()).unwrap().as_slice(), other_ref);
-    assert_ne!(b.provider.rows(), before);
+    assert_ne!(b.provider.rows(), bound);
     drop(builder);
     b.provider.rollback_to().unwrap();
     assert_eq!(b.provider.rows(), before);
@@ -469,10 +471,12 @@ fn last_resort_packages_do_not_bypass_exact_welcome_matching() {
     assert!(Group::join(&b.provider, &entry, &admission, &intended_ref, &group_of(&entry), DOMAIN, &key()).err().unwrap().to_string().contains("another KeyPackage"));
     assert_eq!(b.provider.rows(), before);
     b.provider.savepoint().unwrap();
+    bind(&b.provider, &admission.cut).unwrap();
+    let bound = b.provider.rows();
     let MlsMessageBodyIn::Welcome(parsed) = parse::<MlsMessageIn>(&admission.welcome).unwrap().extract() else { panic!() };
     let builder = StagedWelcome::build_from_welcome(&b.provider, &join_config(), parsed).unwrap();
     assert!(builder.processed_welcome().own_key_package().unwrap().last_resort());
-    assert_eq!(b.provider.rows(), before, "last resort leaves the saved package present, so consumption is not an identity test");
+    assert_eq!(b.provider.rows(), bound, "last resort leaves the saved package present, so consumption is not an identity test");
     drop(builder);
     b.provider.rollback_to().unwrap();
     assert!(Group::join(&b.provider, &entry, &admission, &reference, &group_of(&entry), DOMAIN, &key()).is_ok());

@@ -983,10 +983,28 @@ fn members_skip_commits_with_refused_cuts() {
     w.agree(&[0, 1, 2]);
 }
 
+/// An Add binds the whole cut its commit ends into the epoch it begins: every member skips one built past the rules that
+/// binds none, or one that gives a member another membership.
+#[test]
+fn members_skip_an_add_that_binds_another_cut() {
+    let mut w = World::new(&["A", "B", "C"]);
+    w.found(0, &[1]);
+    let package = key_package_in(&w.m[2].provider, &w.key_package(2)).unwrap();
+    let invited = Aad { invite: Some(invite()), ..Aad::default() };
+    w.refused_past_rules(0, invited.clone(), |b| b.propose_adds([package.clone()]), &[1], "does not bind");
+    let mut other = w.m[0].cut();
+    at(&mut other, w.m[1].session.key()).joined += 1;
+    let psk = Proposal::PreSharedKey(Box::new(PreSharedKeyProposal::new(bind(&w.m[0].provider, &other).unwrap())));
+    w.refused_past_rules(0, invited, |b| b.propose_adds([package]).add_proposal(psk), &[1], "confirmation tag");
+    w.read(&[0]);
+    w.agree(&[0, 1]);
+}
+
 /// A joiner starts at the cut of the commit that added it: the members' cut, and seq 0 for itself. An entry a member did
 /// not sign, or one with another commit's Welcome, is refused, and leaves the package usable for the right entry; so is
-/// a cut its committer signed with an entry that is no sealing its member signed before the joiner's epoch, or one that
-/// names the joiner.
+/// a cut its committer signed other than the one its Add bound, with which alone its Welcome decrypts: one with an entry
+/// that is no sealing its member signed before the joiner's epoch, one that names the joiner, one that gives a member
+/// another membership, or one that leaves a member out.
 #[test]
 fn a_joiner_starts_at_the_commits_cut() {
     let mut w = World::new(&["A", "B", "C", "D"]);
@@ -1025,15 +1043,17 @@ fn a_joiner_starts_at_the_commits_cut() {
     let theirs = other.commit(Change { cut, add: vec![kp_d], invite: Some(invite()), ..Change::default() });
     join_error(&w.m[2], &inner, &theirs.admission.unwrap(), &kp_c);
     assert_eq!(w.m[2].provider.rows(), before);
-    let (mut unsigned, mut later, mut naming) = (admission.cut.clone(), admission.cut.clone(), admission.cut.clone());
+    let [mut unsigned, mut later, mut naming, mut rejoined, mut missing] = std::array::from_fn(|_| admission.cut.clone());
     let moved = at(&mut unsigned, &b);
     (moved.seq, moved.id) = (1, Bytes(vec![5; 32]));
     *at(&mut later, &a) = claim(&gid, &w.m[0].send("m3")).unwrap();
     naming.push(Cut { key: Bytes(c), ..Cut::default() });
     naming.sort();
-    for cut in [unsigned, later, naming] {
+    at(&mut rejoined, &b).joined += 1;
+    missing.retain(|r| r.key.0 != b);
+    for cut in [unsigned, later, naming, rejoined, missing] {
         let sig = w.m[0].session.signer.sign(&welcome_signed(&inner, &serde_json::to_vec(&cut).unwrap(), &admission.welcome)).unwrap();
-        assert!(join_error(&w.m[2], &inner, &Admission { cut, sig, ..admission.clone() }, &kp_c).contains("a malformed cut"));
+        assert!(join_error(&w.m[2], &inner, &Admission { cut, sig, ..admission.clone() }, &kp_c).contains("Decryption failed"));
         assert_eq!(w.m[2].provider.rows(), before);
     }
 

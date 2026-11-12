@@ -13,6 +13,7 @@ use lmk_proto::entry::{Entry, signed, welcome_signed};
 use lmk_proto::group::{LEAF, LEAF_EXTENSION, LEAVE, Leaf, PROTOCOL, SETTINGS_EXTENSION, Service, Settings, is_key};
 use lmk_proto::held::{self, Cut, Header, Ref, SEALING};
 use openmls::prelude::*;
+use openmls::schedule::{ExternalPsk, PreSharedKeyId, Psk};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::signatures::Signer;
 use openmls_traits::storage::StorageProvider as _;
@@ -33,6 +34,8 @@ const SEALING_LABEL: &str = "letmeknow epoch log sealing v1";
 const ENVELOPE_DOMAIN: &[u8] = b"letmeknow epoch envelope v1\0";
 const INVITE_DOMAIN: &[u8] = b"letmeknow invite v1\0";
 const INVITE_USE_DOMAIN: &[u8] = b"letmeknow invite use v1\0";
+/// The id of the external PSK by which an Add binds the cut it ends (`bind`).
+const CUT_PSK: &[u8] = b"letmeknow cut v1";
 const MAX_INNER: usize = (1 << 20) - 45;
 
 fn service_key(settings: &Settings) -> Result<[u8; 32]> {
@@ -430,11 +433,12 @@ impl Group {
 
     /// Joins the group `gid` of the service at `domain` whose key is `key`, as an invite link names them, by the admission
     /// that admitted this session to the commit entry it came with, whose signatures it checks against the Welcome's
-    /// sender, its committer, and whose cut is where it starts: the cut state of the members it names, none this session,
-    /// each past seq 0 by its member's proof of a sealing from before the new epoch, and every other at seq 0 of the new
-    /// epoch. Every leaf of the group is proven (`proven`), and names an iroh key no other names; its settings hold keys
-    /// each in its one form (`is_key`). OpenMLS consumes a package during `build_from_welcome`, before `into_group`, so an
-    /// error here rolls back this call's writes, the package's consumption included.
+    /// sender, its committer, and whose cut is where it starts: the whole cut of the epoch the Add ended, which the Add
+    /// binds into the epoch it begins (`bind`), so that a Welcome into the members' epoch opens only with theirs, and
+    /// every member that cut does not name, as the Add added it, at seq 0 of the new epoch. Every leaf of the group is
+    /// proven (`proven`), and names an iroh key no other names; its settings hold keys each in its one form (`is_key`).
+    /// OpenMLS consumes a package during `build_from_welcome`, before `into_group`, so an error here rolls back this
+    /// call's writes, the package's consumption included.
     pub fn join(provider: &SqliteProvider, entry: &[u8], admission: &Admission, expected_package: &[u8; 32], gid: &[u8; 16], domain: &str, key: &[u8; 32]) -> Result<Self> {
         let Entry { commit, sig } = Entry::parse(entry)?;
         let Admission { welcome: welcome_bytes, cut: ended, sig: welcome_sig } = admission;
@@ -443,13 +447,12 @@ impl Group {
         };
         let MlsMessageBodyIn::PrivateMessage(message) = parse::<MlsMessageIn>(&commit)?.extract() else { bail!("not a commit") };
         ensure!(message.content_type() == ContentType::Commit, "not a commit");
-        let aad: Aad = serde_json::from_slice(message.aad()).context("a commit's authenticated data")?;
         provider.savepoint()?;
         let result = (|| {
+            bind(provider, ended)?;
             let builder = StagedWelcome::build_from_welcome(provider, &join_config(), welcome)?;
             let package = builder.processed_welcome().own_key_package().context("Welcome did not use a saved KeyPackage")?;
             ensure!(package.hash_ref(provider.crypto())?.as_slice() == expected_package, "Welcome used another KeyPackage");
-            let own = package.leaf_node().signature_key().as_slice().to_vec();
             let staged = builder.skip_lifetime_validation().build()?;
             let committer = staged.welcome_sender()?.signature_key().as_slice().to_vec();
             let settings = settings_of(staged.group_context().extensions())?;
@@ -480,12 +483,6 @@ impl Group {
                 provider.crypto().verify_signature(SignatureScheme::ED25519, &welcome_signed(entry, &serde_json::to_vec(ended)?, welcome_bytes), &committer, welcome_sig).is_ok(),
                 "a Welcome its sender did not sign"
             );
-            ensure!(
-                ended.windows(2).all(|pair| pair[0].key < pair[1].key)
-                    && ended.iter().all(|c| c.key.0 != own && c.sealed < epoch && well_formed(mls.group_id().as_slice(), c)),
-                "a malformed cut"
-            );
-            ensure!(aad.moved.iter().all(|moved| ended.contains(moved)), "a cut the commit does not move to");
             let cut = mls.members().map(|m| {
                 let found = ended.iter().find(|r| r.key.0 == m.signature_key).cloned();
                 found.unwrap_or(Cut { key: Bytes(m.signature_key), joined: epoch, ..Cut::default() })
@@ -688,7 +685,8 @@ impl Group {
             // One staged but never saved, so never posted.
             g.mls.clear_pending_commit(provider.storage())?;
             let adds = change.add.iter().map(|bytes| key_package_in(provider, bytes)).collect::<Result<Vec<_>>>()?;
-            let moved = change.cut.iter().filter(|r| !g.state.cut.contains(r)).cloned().collect();
+            let moved: Vec<Cut> = change.cut.iter().filter(|r| !g.state.cut.contains(r)).cloned().collect();
+            let ended = ending(&g.state.cut, &moved);
             let aad = Aad { invite: change.invite, left: change.left, moved };
             g.mls.set_aad(serde_json::to_vec(&aad)?);
             let mut parameters = LeafNodeParameters::builder();
@@ -702,6 +700,9 @@ impl Group {
                 .force_self_update(change.add.is_empty() || change.leaf.is_some())
                 .propose_adds(adds)
                 .propose_removals(change.remove.into_iter().map(LeafNodeIndex::new));
+            if !change.add.is_empty() {
+                builder = builder.add_proposal(Proposal::PreSharedKey(Box::new(PreSharedKeyProposal::new(bind(provider, &ended)?))));
+            }
             if let Some(settings) = &change.settings {
                 builder = builder.propose_group_context_extensions(context_extensions(settings)?)?;
             }
@@ -718,8 +719,8 @@ impl Group {
             let admission = welcome
                 .map(|welcome| -> Result<Admission> {
                     let welcome = welcome.to_bytes()?;
-                    let sig = session.sign(&welcome_signed(&entry, &serde_json::to_vec(&change.cut)?, &welcome));
-                    Ok(Admission { welcome, cut: change.cut.clone(), sig })
+                    let sig = session.sign(&welcome_signed(&entry, &serde_json::to_vec(&ended)?, &welcome));
+                    Ok(Admission { welcome, cut: ended.clone(), sig })
                 })
                 .transpose()?;
             let wire = g.seal_entry(provider, &entry)?;
@@ -798,10 +799,11 @@ impl Group {
     }
 
     fn stage(&mut self, provider: &SqliteProvider, commit: &[u8], sig: &[u8]) -> Result<Staged> {
-        let message = parse::<MlsMessageIn>(commit)?.try_into_protocol_message()?;
+        let MlsMessageBodyIn::PrivateMessage(message) = parse::<MlsMessageIn>(commit)?.extract() else { bail!("not a commit") };
         ensure!(message.content_type() == ContentType::Commit, "not a commit");
+        let aad: Aad = serde_json::from_slice(message.aad()).context("a commit's authenticated data")?;
+        bind(provider, &ending(&self.state.cut, &aad.moved))?;
         let processed = self.mls.process_message(provider, message)?;
-        let aad: Aad = serde_json::from_slice(processed.aad()).context("a commit's authenticated data")?;
         let Sender::Member(by) = *processed.sender() else { bail!("not from a member") };
         let key = self.mls.member_at(by).context("from no member")?.signature_key;
         let signed = provider.crypto().verify_signature(SignatureScheme::ED25519, &signed(commit), &key, sig).is_ok();
@@ -914,12 +916,7 @@ fn observe(
         }).collect::<Result<Vec<_>>>()?;
         state.added.extend(records);
     }
-    let mut cut = state.cut.clone();
-    for moved in aad.moved {
-        if let Some(r) = cut.iter_mut().find(|r| r.key == moved.key) {
-            *r = moved;
-        }
-    }
+    let cut = ending(&state.cut, &aad.moved);
     Ok(Applied {
         by: by.u32(),
         own,
@@ -946,15 +943,30 @@ fn well_formed(group: &[u8], c: &Cut) -> bool {
     c.id.0.len() == 32 && verify(&c.key.0, SEALING, &held::sealing(group, &named, c.sealed, &c.digest.0), &c.sig.0)
 }
 
+/// The whole cut of the epoch a commit ends: the cut state `cut`, with the entries the commit moves.
+fn ending(cut: &[Cut], moved: &[Cut]) -> Vec<Cut> {
+    cut.iter().map(|r| moved.iter().find(|m| m.key == r.key).unwrap_or(r).clone()).collect()
+}
+
+/// Makes SHA-256 of the JSON of `cut`, the whole cut of the epoch an Add ends, the secret of the PSK `CUT_PSK`, and
+/// returns that PSK for the Add to propose. A member binds its cut state, moved as a commit says, before it stages the
+/// commit, and a joiner its admission's cut before it opens its Welcome: a commit bound to another cut then fails its
+/// confirmation tag, and a Welcome bound to another does not decrypt.
+fn bind(provider: &SqliteProvider, cut: &[Cut]) -> Result<PreSharedKeyId> {
+    let psk = PreSharedKeyId::new(CIPHERSUITE, provider.rand(), Psk::External(ExternalPsk::new(CUT_PSK.to_vec())))?;
+    psk.store(provider, &Sha256::digest(serde_json::to_vec(cut)?))?;
+    Ok(psk)
+}
+
 /// The app's rules on a commit, from MLS state alone and the commit, binding the committer too: changes inline only, of
 /// the kinds we make: Adds, of KeyPackages that never expire, which name the invite they came in by, and none of a key
-/// it removes, of sessions whose device is admitted or an admin unless the committer is an admin; Removes, of members
-/// that signed their leave unless the committer is an admin; and settings, by an admin, that change only the admins and
-/// admitted devices, to keys each in its one form (`is_key`), and leave an admin; the committer's key unchanged; every
-/// leaf it brings, by an Add or its update path, proven (`proven`), and no two members' leaves naming one iroh key once
-/// it applies; and cut entries that each name a member of the cut state `cut` once, by key, in order, at its
-/// membership, past its entry there by at most `MAX_CUT_STEP`, each its member's proof of a sealing in the epoch the
-/// commit ends.
+/// it removes, of sessions whose device is admitted or an admin unless the committer is an admin, with one PSK, by
+/// which the commit binds the cut it ends (`bind`); Removes, of members that signed their leave unless the committer is
+/// an admin; and settings, by an admin, that change only the admins and admitted devices, to keys each in its one form
+/// (`is_key`), and leave an admin; the committer's key unchanged; every leaf it brings, by an Add or its update path,
+/// proven (`proven`), and no two members' leaves naming one iroh key once it applies; and cut entries that each name a
+/// member of the cut state `cut` once, by key, in order, at its membership, past its entry there by at most
+/// `MAX_CUT_STEP`, each its member's proof of a sealing in the epoch the commit ends.
 fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad, cut: &[Cut]) -> Result<()> {
     let settings = settings_of(group.extensions())?;
     let committer = Member::of(group, by).context("not a member")?;
@@ -990,6 +1002,7 @@ fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad, 
                 ensure!(!new.admins.is_empty(), "a settings change that leaves the group no admin");
                 ensure!(new.admins.iter().chain(&new.admitted).all(|key| is_key(&key.0)), "a settings change with a key that is neither Ed25519 nor compressed P-256");
             }
+            Proposal::PreSharedKey(_) => {}
             other => bail!("a {:?} proposal", other.proposal_type()),
         }
     }
@@ -1013,6 +1026,9 @@ fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad, 
     }
     let irohs: BTreeSet<&Bytes> = leaves.iter().map(|leaf| &leaf.key).collect();
     ensure!(irohs.len() == leaves.len(), "a commit after which two leaves name one iroh key");
+    // The one PSK an Add's joiner can join by is `bind`'s: members hold no other external PSK, and a Welcome takes no
+    // resumption PSK of the kind a commit may propose.
+    ensure!(staged.psk_proposals().count() == usize::from(staged.add_proposals().next().is_some()), "an Add that does not bind the cut it ends, or a PSK with no Add");
     Ok(())
 }
 
