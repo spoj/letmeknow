@@ -53,7 +53,7 @@ impl Node {
             let mut st = self.inner.lock();
             let g = st.group_mut(gid)?;
             let joined = g.mls.joined(&by.0).context("a member of its group")?;
-            let hash = Invited { by: by.clone(), joined, secret: Bytes(secret.to_vec()) }.hash(gid);
+            let hash = Invited::new(by.clone(), joined, &secret).hash(gid);
             g.rec.invites.push(Rule { hash: hash.clone(), expires, by: by.clone(), joined, to: to.clone() });
             st.save(gid)?;
             (hash, joined)
@@ -254,7 +254,7 @@ impl Inner {
     async fn admit_join(self: &Arc<Self>, join: Join) -> Result<Admitted> {
         let Join { group, by, joined, secret, key_package } = join;
         let gid = group.0;
-        let invited = Invited { by, joined, secret };
+        let invited = Invited::new(by, joined, &secret.0);
         let hash = invited.hash(&gid);
         let found = self.lock().groups.get(&gid).and_then(|g| g.rec.invites.iter().find(|rule| rule.by == invited.by && rule.joined == joined && rule.hash == hash).cloned());
         let rule = found.context(UNKNOWN)?;

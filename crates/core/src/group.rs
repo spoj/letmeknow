@@ -32,6 +32,7 @@ const ADDRESS_LABEL: &str = "letmeknow epoch log address v1";
 const SEALING_LABEL: &str = "letmeknow epoch log sealing v1";
 const ENVELOPE_DOMAIN: &[u8] = b"letmeknow epoch envelope v1\0";
 const INVITE_DOMAIN: &[u8] = b"letmeknow invite v1\0";
+const INVITE_USE_DOMAIN: &[u8] = b"letmeknow invite use v1\0";
 const MAX_INNER: usize = (1 << 20) - 45;
 
 fn service_key(settings: &Settings) -> Result<[u8; 32]> {
@@ -210,19 +211,26 @@ pub struct Change {
 }
 
 /// The invite an Add's member came in by: the session key of the member that made it, the epoch that member's membership
-/// began in, and its secret, from which every member derives its hash. Naming a hash without its secret uses nothing.
+/// began in, and `used`, which its secret gives (`Invited::new`), from which every member derives its hash. Naming the
+/// hash alone uses nothing, and an Add, which every member of its epoch reads whether it wins the epoch or not, shows no
+/// secret that joins.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Invited {
     pub by: Bytes,
     pub joined: u64,
-    pub secret: Bytes,
+    pub used: Bytes,
 }
 
 impl Invited {
+    /// The invite whose secret is `secret`: `used` is SHA-256 of `INVITE_USE_DOMAIN` and `secret`.
+    pub fn new(by: Bytes, joined: u64, secret: &[u8]) -> Self {
+        Invited { by, joined, used: Bytes(Sha256::digest([INVITE_USE_DOMAIN, secret].concat()).to_vec()) }
+    }
+
     /// The invite's hash, as its maker shares it: SHA-256 of `INVITE_DOMAIN`, the group's id, `by`, `joined` (8 bytes)
-    /// and `secret`.
+    /// and `used`.
     pub fn hash(&self, group: &[u8]) -> Bytes {
-        Bytes(Sha256::digest([INVITE_DOMAIN, group, &self.by.0, &self.joined.to_be_bytes(), &self.secret.0].concat()).to_vec())
+        Bytes(Sha256::digest([INVITE_DOMAIN, group, &self.by.0, &self.joined.to_be_bytes(), &self.used.0].concat()).to_vec())
     }
 }
 

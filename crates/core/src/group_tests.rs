@@ -43,7 +43,7 @@ fn key_of(device: &ed25519_dalek::SigningKey) -> Bytes {
 
 /// The invite tests' Adds carry, which only a node checks against its rules.
 fn invite() -> Invited {
-    Invited { by: Bytes(vec![7; 32]), joined: 0, secret: Bytes(vec![7; 16]) }
+    Invited::new(Bytes(vec![7; 32]), 0, &[7; 16])
 }
 
 /// The group a commit entry is of, as a link names it.
@@ -1065,23 +1065,40 @@ fn an_add_and_its_invite_come_together() {
     w.agree(&[0, 1]);
 }
 
-/// An Add uses an invite only by its secret: B's Add naming A's invite with another secret leaves it unused, and an Add
-/// with its secret uses it, for every member.
+/// An Add uses an invite only by what its secret gives: B's Add naming A's invite by another secret leaves it unused, and
+/// an Add by its secret uses it, for every member.
 #[test]
 fn an_add_uses_an_invite_only_by_its_secret() {
     let mut w = World::new(&["A", "B", "C", "D"]);
     w.found(0, &[1]);
-    let invite = Invited { by: Bytes(w.m[0].session.key().to_vec()), joined: 0, secret: Bytes(vec![3; 16]) };
-    let hash = invite.hash(w.m[0].g().id());
-    for (joiner, secret, used) in [(2, vec![4; 16], false), (3, vec![3; 16], true)] {
+    let by = Bytes(w.m[0].session.key().to_vec());
+    let hash = Invited::new(by.clone(), 0, &[3; 16]).hash(w.m[0].g().id());
+    for (joiner, secret, used) in [(2, [4; 16], false), (3, [3; 16], true)] {
         let package = w.key_package(joiner);
         let cut = w.m[1].cut();
-        let commit = w.m[1].commit(Change { cut, add: vec![package], invite: Some(Invited { secret: Bytes(secret), ..invite.clone() }), ..Change::default() });
+        let commit = w.m[1].commit(Change { cut, add: vec![package], invite: Some(Invited::new(by.clone(), 0, &secret)), ..Change::default() });
         w.post(commit.entry);
         w.read(&[0, 1]);
         w.agree(&[0, 1]);
         assert_eq!([w.m[0].g().used(&hash.0), w.m[1].g().used(&hash.0)], [used; 2]);
     }
+}
+
+/// An Add shows the members of its epoch, whether it wins the epoch or loses, only what its invite's secret gives, from
+/// which they derive the invite's hash: never the secret, with which a joiner asks.
+#[test]
+fn an_add_shows_no_secret_of_its_invite() {
+    let mut w = World::new(&["A", "B", "C"]);
+    w.found(0, &[1]);
+    let secret = Bytes(vec![3; 16]);
+    let invite = Invited::new(Bytes(w.m[0].session.key().to_vec()), 0, &secret.0);
+    let package = w.key_package(2);
+    let cut = w.m[1].cut();
+    let commit = w.m[1].commit(Change { cut, add: vec![package], invite: Some(invite), ..Change::default() });
+    let entry = w.m[0].open_inner(&commit.entry);
+    let MlsMessageBodyIn::PrivateMessage(message) = parse::<MlsMessageIn>(&Entry::parse(&entry).unwrap().commit).unwrap().extract() else { panic!() };
+    let shown = String::from_utf8(message.aad().to_vec()).unwrap();
+    assert!(!shown.contains(&serde_json::to_string(&secret).unwrap()), "{shown}");
 }
 
 /// A member's credential names its leaf's key, as a held message's sender is known by it: a KeyPackage whose credential
