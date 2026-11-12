@@ -66,6 +66,8 @@ pub struct Session {
     forget_at: Instant,
     /// The groups as last written to `groups.json`.
     groups: Vec<Bytes>,
+    /// The machine's leaves, which its sessions hand their nodes: `leaves` in the home this session's directory is in.
+    leaves: PathBuf,
     config: Config,
     /// What waits to be logged, and whether it also prints.
     out: Vec<(Value, bool)>,
@@ -88,6 +90,7 @@ impl Session {
         let mut session = Self {
             db,
             groups: Vec::new(),
+            leaves: config.dir.parent().and_then(Path::parent).expect("a session's directory is in its home's sessions").join("leaves"),
             node,
             membership,
             joining: Rc::default(),
@@ -500,7 +503,12 @@ impl Session {
         let item = match event {
             Event::Joined { group, member, by } => json!({ "type": "joined", "group": group, "member": describe(&me, &member), "by": describe(&me, &by) }),
             Event::Left { group, member, by } => json!({ "type": "left", "group": group, "member": describe(&me, &member), "by": describe(&me, &by) }),
-            Event::Removed { group, by, not_kept } => {
+            Event::Removed { group, by, not_kept, leave } => {
+                if let Some(leave) = leave
+                    && let Err(error) = crate::keep_leave(&self.leaves, &leave)
+                {
+                    self.warn(format!("keeping this session's leave: {error:#}"));
+                }
                 let not_kept: Vec<String> = not_kept.iter().map(|id| hex::encode(&id.0)).collect();
                 json!({ "type": "removed", "group": group, "by": by.map(|by| describe(&me, &by)), "not_kept": not_kept })
             }

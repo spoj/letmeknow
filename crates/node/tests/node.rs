@@ -1782,7 +1782,8 @@ fn a_member_away_six_days_resumes() {
 }
 
 /// A member whose service let its log go, and which no peer brings the commits of within `WAIT`, leaves the group, and is
-/// told it did, with nothing kept: the commit that moved the group on is in that log, which no member can read now.
+/// told it did, with nothing kept, and with its leave: the commit that moved the group on is in that log, which no member
+/// can read now.
 #[test]
 fn a_member_whose_log_the_service_let_go_leaves_when_no_peer_brings_it_within_wait() {
     static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1810,11 +1811,14 @@ fn a_member_whose_log_the_service_let_go_leaves_when_no_peer_brings_it_within_wa
         assert!(bob.node.groups().contains(&gid), "a log let go is left only after WAIT with no entry of it brought");
         SHIFT.fetch_add(lmk_net::peers::WAIT + 60_000, std::sync::atomic::Ordering::Relaxed);
         bob.node.read_group(&gid.0).await.unwrap_err();
-        let (by, not_kept) = bob.until(|e| match e {
-            Event::Removed { group, by, not_kept, .. } if group == gid => Some((by, not_kept)),
+        let (by, not_kept, leave) = bob.until(|e| match e {
+            Event::Removed { group, by, not_kept, leave } if group == gid => Some((by, not_kept, leave)),
             _ => None,
         }).await;
         assert!(by.is_none() && not_kept.is_empty(), "no commit removed it: its own log did");
+        let leave = leave.expect("Bob signed his leave");
+        assert_eq!((&leave.group, &leave.key), (&gid, &bob.node.key()));
+        assert!(lmk_core::group::verify(&leave.key.0, lmk_proto::group::LEAVE, &[&gid.0[..], &leave.joined.to_be_bytes()].concat(), &leave.sig.0));
         assert!(!bob.node.groups().contains(&gid));
         bob.node.shutdown().await.unwrap();
     });

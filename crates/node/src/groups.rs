@@ -7,7 +7,7 @@ use lmk_membership::{Expired, Refused};
 use lmk_proto::Bytes;
 
 use crate::held::delivered_key;
-use crate::{Event, G, Inner, Member, State, get, reading, rec_key};
+use crate::{Event, G, Inner, Leave, Member, State, get, reading, rec_key};
 
 const COMMIT_TRIES: u32 = 5;
 
@@ -133,17 +133,22 @@ impl Inner {
     }
 
     /// Forgets a removed group and reports removal once that step is durable, with this session's chat messages that no cut
-    /// kept, which its records still show.
+    /// kept, which its records still show; and, where it leaves by itself as its log was let go, its leave.
     pub(crate) fn gone(&self, st: &mut State, gid: &[u8], by: Option<Member>) {
-        if !st.groups.contains_key(gid) {
-            return;
-        }
+        let Some(g) = st.groups.get(gid) else { return };
+        let leave = match g.mls.joined(st.me()) {
+            Some(joined) if by.is_none() && st.logs[&g.rec.log.0].lapsed.is_some() => {
+                let sig = g.mls.leave(&st.session).expect("a member signs its leave");
+                Some(Leave { group: Bytes(gid.to_vec()), key: Bytes(st.me().to_vec()), joined, sig })
+            }
+            _ => None,
+        };
         let not_kept = match st.not_kept(gid) {
             Ok(not_kept) => not_kept,
             Err(error) => return self.warn(Some(gid), format!("{error:#}")),
         };
         match self.forget(st, gid) {
-            Ok(()) => st.events.push(Event::Removed { group: Bytes(gid.to_vec()), by, not_kept }),
+            Ok(()) => st.events.push(Event::Removed { group: Bytes(gid.to_vec()), by, not_kept, leave }),
             Err(error) => self.warn(Some(gid), format!("{error:#}")),
         }
     }

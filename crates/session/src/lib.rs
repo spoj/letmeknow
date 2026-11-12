@@ -310,6 +310,12 @@ pub fn new_session(home: &Path, membership: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Keeps a leave in the machine's leaves `dir`, in a file named by its signature.
+fn keep_leave(dir: &Path, leave: &lmk_node::Leave) -> Result<()> {
+    cli::private_dir(dir)?;
+    cli::private_file(&dir.join(lmk_node::fp(&leave.sig.0)), &serde_json::to_vec(leave)?)
+}
+
 /// When a session last ran: when the last of its files changed, or its directory if it has none. One that runs moves its
 /// lock's time each hour.
 fn last_ran(dir: &Path) -> Option<SystemTime> {

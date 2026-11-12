@@ -176,11 +176,13 @@ pub enum Event {
     },
     /// This session was removed, by `by` as it applied the commit, or else with no `by`: by a commit it applied but could
     /// not forget the group at, as it starts again; left the only member of a group it asked to leave; or away past its
-    /// log's retention. The group is gone from it, with its chat messages no cut kept: `not_kept`, by id.
+    /// log's retention. The group is gone from it, with its chat messages no cut kept: `not_kept`, by id. Away past its
+    /// log's retention, it signed its `leave`, by which its machine's other sessions in the group remove it.
     Removed {
         group: Bytes,
         by: Option<Member>,
         not_kept: Vec<Bytes>,
+        leave: Option<Leave>,
     },
     /// A held payload, delivered, in causal order; never one of this session's own.
     Message(Message),

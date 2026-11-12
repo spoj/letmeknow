@@ -525,6 +525,25 @@ fn a_session_in_a_group_stays_though_its_groups_json_says_none() {
     });
 }
 
+/// A session out of a group by itself, as its log was let go, keeps the leave it signed in its machine's leaves, by which
+/// the machine's other sessions in the group remove it.
+#[test]
+fn a_session_out_of_a_group_by_itself_keeps_its_leave() {
+    local(async {
+        let world = world("own-leave").await;
+        let mut alice = world.start("alice").await;
+        alice.cmd(&["invite"]).await.unwrap();
+        alice.stop().await;
+        let (mut session, _events) = world.open_session(world.config("alice", "alice")).await;
+        let leave = lmk_node::Leave { group: lmk_proto::Bytes(vec![1]), key: lmk_proto::Bytes(vec![2; 32]), joined: 3, sig: lmk_proto::Bytes(vec![4; 64]) };
+        session.event(lmk_node::Event::Removed { group: leave.group.clone(), by: None, not_kept: vec![], leave: Some(leave.clone()) });
+        let kept: Vec<lmk_node::Leave> =
+            std::fs::read_dir(alice.home.join("leaves")).unwrap().map(|entry| serde_json::from_slice(&std::fs::read(entry.unwrap().path()).unwrap()).unwrap()).collect();
+        assert_eq!(kept, [leave]);
+        session.shutdown().await;
+    });
+}
+
 /// `status` lists this session's sends that no other member holds yet, with a warning, until a member connected to it holds
 /// them.
 #[test]

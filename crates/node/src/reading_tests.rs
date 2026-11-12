@@ -24,7 +24,7 @@ async fn a_copied_sessions_commit_warns_and_stops_using_the_group() {
     assert!(matches!(events.try_recv().unwrap(), Event::Warning { group: Some(group), text }
         if group == gid && text == "a copy of this session's state committed in the group, so this session stops using it: join it again from a new session"));
     let removed = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await.unwrap().unwrap();
-    assert!(matches!(removed, Event::Removed { group, by: None, .. } if group == gid));
+    assert!(matches!(removed, Event::Removed { group, by: None, leave: None, .. } if group == gid), "a copy's membership is not left");
     assert!(!node.groups().contains(&gid));
     node.shutdown().await.unwrap();
 }
