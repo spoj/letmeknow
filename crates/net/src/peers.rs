@@ -187,8 +187,13 @@ impl Peers {
                 if own.epoch > g.own.epoch {
                     g.struck.clear();
                 }
-                g.heard.retain(|m, _| *m == own.me || own.members.iter().any(|(n, _)| n == m));
+                g.heard.retain(|m, _| is_current(&own, m));
                 g.seen.retain(|k, _| own.members.iter().any(|(_, n)| n == k));
+                for c in self.conns.values_mut() {
+                    if let Some(has) = c.has.get_mut(&id) {
+                        has.retain(|m, _| is_current(&own, m));
+                    }
+                }
                 let changed = (g.own.epoch, g.own.log, &g.own.head, &g.own.intros, &g.own.expired) != (own.epoch, own.log, &own.head, &own.intros, &own.expired);
                 let members = g.own.members != own.members;
                 g.own = own;
@@ -340,7 +345,8 @@ impl Peers {
                     for (m, (version, _)) in g.own.intros.iter().filter(|(_, (_, signed))| at.intros.contains(signed)) {
                         introduced.insert(m.clone(), *version);
                     }
-                    c.expired.entry(at.group.clone()).or_default().extend(at.expired.iter().map(|expiry| expiry.log_ref));
+                    let expired = c.expired.entry(at.group.clone()).or_default();
+                    expired.extend(at.expired.iter().map(|e| e.log_ref).filter(|log| g.own.expired.iter().any(|held| held.log_ref == *log)));
                 }
             }
             Frame::Held { group, items, answers: Some(answers) } => {
@@ -360,8 +366,10 @@ impl Peers {
             }
             Frame::Want { .. } => c.active = now,
             Frame::Have { group, held } if c.served.contains(group) => {
+                let own = &self.groups[group].own;
+                let held: Set = to_set(held).into_iter().filter(|(m, _)| is_current(own, m)).collect();
                 let has = c.has.entry(group.clone()).or_default();
-                *has = union(mem::take(has), &to_set(held));
+                *has = union(mem::take(has), &held);
             }
             _ => {}
         }
@@ -372,7 +380,7 @@ impl Peers {
     pub fn summary(&mut self, group: &Bytes, heard: Heard, own: bool) -> bool {
         let Some(g) = self.groups.get_mut(group) else { return false };
         let m = (heard.summary.member.clone(), heard.summary.joined);
-        let current = m == g.own.me || g.own.members.iter().any(|(n, _)| *n == m);
+        let current = is_current(&g.own, &m);
         if !current || g.heard.get(&m).is_some_and(|h| h.summary.version >= heard.summary.version) {
             return false;
         }
@@ -743,6 +751,11 @@ impl Peers {
 fn rank(group: &Bytes, a: &Key, b: &Key) -> [u8; 32] {
     let (low, high) = if a <= b { (a, b) } else { (b, a) };
     Sha256::new().chain_update(b"letmeknow neighbours v1\0").chain_update(&group.0).chain_update(low).chain_update(high).finalize().into()
+}
+
+/// Whether a membership is this member's own or one of the group's other current members.
+fn is_current(own: &Own, m: &Membership) -> bool {
+    *m == own.me || own.members.iter().any(|(n, _)| n == m)
 }
 
 fn membership(seq: &Seqs) -> Membership {

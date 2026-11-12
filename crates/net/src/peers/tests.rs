@@ -331,6 +331,30 @@ fn an_expiry_is_told_once_to_each_neighbour_that_did_not_tell_it() {
     assert_eq!(expired(&p.poll(4_000))[&key(1)], vec![expiry(1), expiry(2)]);
 }
 
+/// A `hello` keeps the expiries of logs this member holds, and no others.
+#[test]
+fn a_hello_keeps_only_the_expiries_of_logs_this_member_holds() {
+    let mut p = peers();
+    let expiry = |n: u8| Expiry { log_ref: [n; 32], sig: Bytes(vec![n; 64]) };
+    p.group(id(), Own { expired: vec![expiry(1)], ..own(2, &[1]) }, 0);
+    p.connect(key(1), gs(), false, 0);
+    let at = At { group: id(), log: [7; 32], head: None, seen: BTreeMap::new(), intros: vec![], expired: vec![expiry(1), expiry(2)] };
+    p.frame(&key(1), &Frame::Hello { groups: vec![at] }, 0);
+    assert_eq!(p.conns[&key(1)].expired[&id()], BTreeSet::from([[1; 32]]));
+}
+
+/// A `have` keeps the positions of the group's current memberships only, and a membership that ends is dropped.
+#[test]
+fn a_have_keeps_only_the_current_memberships() {
+    let mut p = peers();
+    p.group(id(), own(1, &[1, 2]), 0);
+    p.connect(key(1), gs(), false, 0);
+    p.frame(&key(1), &Frame::Have { group: id(), held: vec![seqs(1, &[(1, 1)]), seqs(50, &[(1, 3)])] }, 0);
+    assert_eq!(p.conns[&key(1)].has[&id()].keys().collect::<Vec<_>>(), vec![&member(1)]);
+    p.group(id(), own(1, &[2]), 10);
+    assert!(p.conns[&key(1)].has[&id()].is_empty());
+}
+
 /// Sightings count only of current members, from neighbours the group is served to, and for `RECENT`.
 #[test]
 fn sightings_count_of_members_from_neighbours_of_the_group_for_recent() {
