@@ -21,8 +21,7 @@ pub(crate) async fn run(inner: Arc<Inner>, conn: Connection, mut send: SendStrea
     let peer = conn.remote_id();
     let read = async {
         loop {
-            let max = if inner.groups.serves(&peer) { frame::MAX_FRAME } else { frame::MAX_ASK };
-            let Ok(frame) = frame::read_known(&mut recv, max).await else { break };
+            let Ok(frame) = frame::read_known(&mut recv, || inner.groups.serves(&peer)).await else { break };
             inner.events.send(Event::Frame(peer, frame)).await?;
         }
         anyhow::Ok(())

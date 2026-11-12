@@ -2315,7 +2315,7 @@ impl Hand {
     async fn until<T>(&mut self, mut pick: impl FnMut(Frame) -> Option<T>) -> T {
         tokio::time::timeout(WAIT, async {
             loop {
-                if let Some(found) = pick(frame::read_known(&mut self.recv, frame::MAX_FRAME).await.unwrap()) {
+                if let Some(found) = pick(frame::read_known(&mut self.recv, || true).await.unwrap()) {
                     return found;
                 }
             }

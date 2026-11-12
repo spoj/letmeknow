@@ -45,10 +45,13 @@ pub async fn read_within<T: DeserializeOwned, R: AsyncRead + Unpin>(r: &mut R, m
     Ok(serde_json::from_slice(&read_body(r, max).await?)?)
 }
 
-/// Reads frames of at most `max` bytes until one parses as `T`, skipping those that do not, such as a newer letmeknow's.
-pub async fn read_known<T: DeserializeOwned, R: AsyncRead + Unpin>(r: &mut R, max: u32) -> Result<T> {
+/// Reads frames until one parses as `T`, skipping those that do not, such as a newer letmeknow's: each of at most
+/// `MAX_ASK` bytes, or `MAX_FRAME` if `whole` says so as its length arrives.
+pub async fn read_known<T: DeserializeOwned, R: AsyncRead + Unpin>(r: &mut R, whole: impl Fn() -> bool) -> Result<T> {
     loop {
-        if let Ok(value) = serde_json::from_slice(&read_body(r, max).await?) {
+        let len = r.read_u32().await?;
+        let max = if len > MAX_ASK && whole() { MAX_FRAME } else { MAX_ASK };
+        if let Ok(value) = serde_json::from_slice(&body(r, len, max).await?) {
             return Ok(value);
         }
     }
@@ -56,6 +59,10 @@ pub async fn read_known<T: DeserializeOwned, R: AsyncRead + Unpin>(r: &mut R, ma
 
 async fn read_body<R: AsyncRead + Unpin>(r: &mut R, max: u32) -> Result<Vec<u8>> {
     let len = r.read_u32().await?;
+    body(r, len, max).await
+}
+
+async fn body<R: AsyncRead + Unpin>(r: &mut R, len: u32, max: u32) -> Result<Vec<u8>> {
     ensure!(len <= max, "a frame of {len} bytes exceeds {max}");
     let mut body = vec![0; len as usize];
     r.read_exact(&mut body).await?;
@@ -79,7 +86,7 @@ mod tests {
     async fn read_known_skips_what_does_not_parse() {
         let mut buf = encode(&serde_json::json!({"stream": "newer"}));
         buf.extend(encode(&Open { stream: Stream::Admission }));
-        let open: Open = read_known(&mut buf.as_slice(), MAX_FRAME).await.unwrap();
+        let open: Open = read_known(&mut buf.as_slice(), || true).await.unwrap();
         assert_eq!(open.stream, Stream::Admission);
     }
 }
