@@ -31,6 +31,7 @@ use lmk_net::peers::Peers;
 use lmk_net::Net;
 use lmk_proto::group::{Device, Service};
 use lmk_proto::head::Head;
+use lmk_proto::links::Invite;
 use lmk_proto::membership::Expiry;
 use lmk_proto::peer::{At, Frame, Seqs, Signed};
 use lmk_proto::Bytes;
@@ -376,6 +377,8 @@ pub(crate) struct State {
     /// The latest hello of each connected peer that named groups not added yet: taken once the group is, and dropped
     /// as the peer disconnects.
     early_hellos: Vec<(EndpointId, At)>,
+    /// The links of the joins in flight: the members they name are read whole (`Groups::serves`).
+    joins: Vec<Invite>,
     /// Entries of logs not followed yet, with the peers that sent them, at most `TOLD`: taken once the log is followed.
     early_entries: Vec<(EndpointId, Bytes, Vec<Bytes>, Head)>,
     /// The latest time a step saw, in milliseconds: `Peers` takes no time from before.

@@ -99,6 +99,7 @@ impl State {
             gate: true,
             quiet: false,
             early_hellos: Vec::new(),
+            joins: Vec::new(),
             early_entries: Vec::new(),
             time: now(),
         };

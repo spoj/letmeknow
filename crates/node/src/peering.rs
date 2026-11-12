@@ -667,6 +667,7 @@ impl Groups for Inner {
 
     fn serves(&self, peer: &EndpointId) -> bool {
         let st = self.lock();
-        st.groups.keys().any(|gid| st.serves(gid, peer))
+        let named = st.joins.iter().flat_map(|link| &link.members).any(|(key, _)| key == peer.as_bytes());
+        named || st.groups.keys().any(|gid| st.serves(gid, peer))
     }
 }

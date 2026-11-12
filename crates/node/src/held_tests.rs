@@ -447,3 +447,72 @@ async fn a_strangers_early_hello_is_its_latest_and_goes_when_it_disconnects() {
     .expect("the stranger's hello went with it");
     bob.shutdown().await.unwrap();
 }
+
+/// While a join is in flight, the members its link names are read whole, as an admitter's first hello, which comes before
+/// the Welcome, holds every intro of the group: a stranger's frame past `MAX_ASK` still closes its connection, and once
+/// the join ends the members are no longer read whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_joiner_reads_whole_the_members_its_link_names_while_it_joins() {
+    use lmk_net::{Admit, Groups, Net};
+    use lmk_proto::{Answer, frame, links::Invite, peer::{Admitted, At, Join, Signed}};
+    /// Lets every frame go, serves every peer, and refuses each join once told to.
+    struct Fake(tokio::sync::watch::Receiver<bool>);
+    impl Groups for Fake {
+        fn admit(&self, _: &EndpointId, frame: Frame) -> Option<Frame> {
+            Some(frame)
+        }
+        fn serves(&self, _: &EndpointId) -> bool {
+            true
+        }
+    }
+    impl Admit for Fake {
+        fn join(&self, _: EndpointId, _: Join) -> n0_future::boxed::BoxFuture<Answer<Admitted>> {
+            let mut refuse = self.0.clone();
+            Box::pin(async move {
+                refuse.wait_for(|told| *told).await.unwrap();
+                Answer::Refused { refused: "no".into() }
+            })
+        }
+    }
+    let relay = lmk_testing::relay().await;
+    let config = Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[1; 32]) };
+    let bob = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0;
+    let endpoint = lmk_net::builder([relay.url.clone()]).ca_tls_config(relay.ca()).bind().await.unwrap();
+    endpoint.online().await;
+    let (refuse, refusing) = tokio::sync::watch::channel(false);
+    let fake = std::sync::Arc::new(Fake(refusing));
+    let (member, mut events) = Net::spawn(endpoint, fake.clone(), fake).await.unwrap();
+    let link = Invite { secret: [7; 16], domain: relay.domain.clone(), members: vec![(*member.id().as_bytes(), relay.domain.clone())] };
+    let joining = n0_future::task::spawn({
+        let bob = bob.clone();
+        async move { bob.join(&link).await }
+    });
+    let timeout = n0_future::time::Duration::from_secs(20);
+    n0_future::time::timeout(timeout, async { while !matches!(events.recv().await, Some(lmk_net::Event::Connected(..))) {} })
+        .await
+        .expect("Bob dialed the member");
+    let intro = Signed { body: Bytes(vec![7; 1024]), sig: Bytes(vec![7; 64]) };
+    let hello = Frame::Hello { groups: vec![At { group: Bytes(vec![1; 16]), log: [0; 32], head: None, seen: BTreeMap::new(), intros: vec![intro; 64], expired: vec![] }] };
+    assert!(frame::encode(&hello).len() - 4 > frame::MAX_ASK as usize);
+    assert!(member.frame(bob.net().id(), hello.clone()));
+    n0_future::time::timeout(timeout, async {
+        while !bob.inner.lock().early_hellos.iter().any(|(peer, _)| *peer == member.id()) {
+            n0_future::time::sleep(n0_future::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Bob read the member's hello");
+    let stranger = relay.endpoint(iroh::SecretKey::from_bytes(&[99; 32])).await;
+    let conn = stranger.connect(iroh::EndpointAddr::new(bob.net().id()).with_relay_url(relay.url.clone()), frame::ALPN).await.unwrap();
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    frame::write(&mut send, &frame::Open { stream: frame::Stream::Peer }).await.unwrap();
+    frame::write(&mut send, &hello).await.unwrap();
+    n0_future::time::timeout(timeout, conn.closed()).await.expect("Bob closed the stranger's connection");
+    assert!(bob.inner.lock().early_hellos.iter().all(|(peer, _)| *peer == member.id()));
+    refuse.send(true).unwrap();
+    assert_eq!(format!("{:#}", joining.await.unwrap().unwrap_err()), "refused: no");
+    assert!(!bob.inner.serves(&member.id()));
+    stranger.close().await;
+    member.shutdown().await.unwrap();
+    bob.shutdown().await.unwrap();
+}

@@ -94,8 +94,9 @@ impl Node {
         Ok(Invite { secret, domain, members })
     }
 
-    /// Joins through an invite link: asks the members it names in turn, as each is reached. Returns the group, and the
-    /// iroh key of the member that admitted this session.
+    /// Joins through an invite link: asks the members it names in turn, as each is reached, and reads their frames whole
+    /// meanwhile, as an admitter's first hello, which comes before the Welcome, holds every intro of the group. Returns
+    /// the group, and the iroh key of the member that admitted this session.
     pub async fn join(&self, link: &Invite) -> Result<(Bytes, [u8; 32])> {
         // Each member is dialed at the relay of its own service.
         let member = |(key, home): &([u8; 32], String)| -> Result<(EndpointId, Vec<RelayUrl>)> { Ok((EndpointId::from_bytes(key)?, vec![relay_url(home).parse()?])) };
@@ -105,7 +106,7 @@ impl Node {
         // refuses it: a member that added it asked again answers with the commit entry it kept.
         let joining = [b"node/joining/".as_slice(), &Sha256::digest(&secret.0)].concat();
         let join = {
-            let st = self.inner.lock();
+            let mut st = self.inner.lock();
             let key_package = match get::<Bytes>(&st.provider, &joining)? {
                 Some(kept) => kept,
                 None => {
@@ -114,6 +115,7 @@ impl Node {
                     key_package
                 }
             };
+            st.joins.push(link.clone());
             Join { secret, key_package }
         };
         // Each dial is a task of its own, so it goes on, and times out, while a member reached earlier is asked.
@@ -166,7 +168,9 @@ impl Node {
             match answer {
                 Ok(Ok(Answer::Ok(admitted))) => match self.inner.welcomed(admitted, &join.key_package.0).await {
                     Ok(gid) => {
-                        self.inner.lock().provider.delete(&joining)?;
+                        let mut st = self.inner.lock();
+                        st.joins.retain(|other| other != link);
+                        st.provider.delete(&joining)?;
                         return Ok((gid, *peer.as_bytes()));
                     }
                     Err(error) => refusal = anyhow::anyhow!("refused: {error:#}"),
@@ -187,8 +191,9 @@ impl Node {
                 }
             }
         }
+        let mut st = self.inner.lock();
+        st.joins.retain(|other| other != link);
         if refused_by_all {
-            let mut st = self.inner.lock();
             delete_key_package(&st.provider, &join.key_package.0)?;
             st.provider.delete(&joining)?;
             st.scrub = true;
