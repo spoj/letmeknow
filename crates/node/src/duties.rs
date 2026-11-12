@@ -486,6 +486,78 @@ mod tests {
         }
     }
 
+    /// A lapsed member whose key a joiner brings is removed by a commit built only while that membership is still behind in
+    /// an epoch let go: one that showed itself in the current epoch while its removal waited to commit stays, and the
+    /// joiner is refused as a member already.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lapsed_member_back_before_its_removal_is_built_stays() {
+        use crate::admission::Admitter;
+        use crate::{Config, Epoch, INVITE_VALID, Node};
+        use lmk_core::provider::SqliteProvider;
+        use lmk_net::Admit;
+        use lmk_proto::Answer;
+        use lmk_proto::group::{PROTOCOL, Settings, UPDATE};
+        use lmk_proto::membership::Expiry;
+        use lmk_proto::peer::Join;
+
+        let relay = lmk_testing::relay().await;
+        let mut nodes = Vec::new();
+        for _ in 0..2 {
+            let config = Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[9; 32]) };
+            nodes.push(Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0);
+        }
+        let (alice, bob) = (&nodes[0], &nodes[1]);
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let gid = alice.create(settings).unwrap();
+        bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap()).await.unwrap();
+        let epoch = bob.epoch(&gid.0).unwrap();
+        n0_future::time::timeout(Duration::from_secs(60), async {
+            while alice.epoch(&gid.0).unwrap() < epoch {
+                sleep(Duration::from_millis(50)).await;
+            }
+        }).await.unwrap();
+        for task in alice.inner.tasks.lock().unwrap().drain(..) {
+            task.abort();
+        }
+        let bob_key = bob.key();
+        let link = alice.invite(&gid.0, INVITE_VALID, Some(&bob_key.0)).await.unwrap();
+        let key_package = {
+            let st = bob.inner.lock();
+            Bytes(st.session.key_package(&st.provider).unwrap())
+        };
+        let join = Join { group: gid.clone(), by: Bytes(link.by.to_vec()), joined: link.joined, secret: Bytes(link.secret.to_vec()), key_package };
+        let joined = {
+            let mut st = alice.inner.lock();
+            let g = st.group_mut(&gid.0).unwrap();
+            // Bob is, as far as Alice knows, in an epoch whose log was let go, and her first `EVICT` is over.
+            let expired = Some(Expiry { log_ref: [0; 32], sig: Bytes(vec![0; 64]) });
+            g.rec.epochs = vec![Epoch { epoch: 0, capability: [0; 32], service: g.mls.settings().membership, member: None, expired, forgotten: false }];
+            g.rec.members = vec![(bob_key.clone(), 0)];
+            g.rec.joined_at -= EVICT;
+            g.mls.joined(&bob_key.0).unwrap()
+        };
+        // Bob shows himself in the current epoch while the removal waits for the group's commit lock.
+        let lock = alice.inner.committing.lock().unwrap().entry(gid.0.clone()).or_default().clone();
+        let committing = lock.lock().await;
+        let answer = tokio::spawn(Admitter(alice.inner.clone()).join(iroh::SecretKey::from_bytes(&[8; 32]).public(), join));
+        n0_future::time::timeout(Duration::from_secs(60), async {
+            while Arc::strong_count(&lock) < 3 {
+                sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("the removal waits to commit");
+        alice.inner.lock().at(&gid.0, &bob_key.0, epoch).unwrap();
+        drop(committing);
+        let refused = match answer.await.unwrap() {
+            Answer::Refused { refused } => refused,
+            Answer::Ok(_) => "admitted".into(),
+        };
+        assert_eq!(refused, "this session is a member already");
+        assert_eq!(alice.inner.lock().group(&gid.0).unwrap().mls.joined(&bob_key.0), Some(joined), "Bob's membership stays");
+        for node in nodes {
+            node.shutdown().await.unwrap();
+        }
+    }
+
     #[test]
     fn an_update_waits_for_what_was_listed_when_it_first_waited_for_at_most_hear() {
         let fixed = [seqs(b"a", 0, &[3, 4])];

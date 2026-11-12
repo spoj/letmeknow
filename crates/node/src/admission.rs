@@ -290,15 +290,16 @@ impl Inner {
 
     /// Removes the member whose key a joiner brings, in a commit of its own, as an admin from `EVICT` after it joined, if the
     /// log of the epoch it is in was let go, as known or as its service answers: a member that was out past the retention,
-    /// and not yet removed, must go before its key is added.
+    /// and not yet removed, must go before its key is added. Each build of the commit removes it only while that membership
+    /// is still behind in an epoch let go: it may have shown itself since, or been replaced.
     async fn remove_lapsed(self: &Arc<Self>, gid: &[u8], key: &[u8]) -> Result<()> {
-        let epoch = {
+        let judged = {
             let st = self.lock();
             let g = st.group(gid)?;
-            let member = g.mls.members().iter().any(|m| m.key == key);
-            g.behind(key).filter(|_| member && g.mls.admin(st.me())).cloned()
+            let joined = g.mls.joined(key).filter(|_| g.mls.admin(st.me()));
+            joined.zip(g.behind(key).cloned())
         };
-        let Some(epoch) = epoch else { return Ok(()) };
+        let Some((joined, epoch)) = judged else { return Ok(()) };
         if !epoch.gone() {
             let (expiries, forgotten) = self.let_go(vec![(epoch.service.clone(), epoch.capability)]).await;
             if expiries.is_empty() && forgotten.is_empty() {
@@ -306,7 +307,10 @@ impl Inner {
             }
             self.lock().take_expiries(gid, &expiries, &forgotten)?;
         }
-        let remove = |_: &State, g: &G| Ok(g.mls.members().into_iter().find(|m| m.key == key).map(|m| Change { remove: vec![m.index], ..Change::default() }));
+        let remove = |_: &State, g: &G| {
+            let lapsed = g.mls.joined(key) == Some(joined) && g.behind(key).is_some_and(|epoch| epoch.gone());
+            Ok(g.mls.members().into_iter().find(|m| m.key == key && lapsed).map(|m| Change { remove: vec![m.index], ..Change::default() }))
+        };
         self.commit(gid, remove).await?;
         Ok(())
     }
