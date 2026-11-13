@@ -130,11 +130,18 @@ with tempfile.TemporaryDirectory(prefix="lmk-deploy-test-") as directory:
         print(f"ok - {name}, deployment={ok}")
 
 # deploy/release.sh, from a clean main pushed to a bare origin: the commit carries the version and any pins, the tag is
-# pushed, and a run again after the tag makes no commit.
+# pushed, and a run again after the tag makes no commit and runs a failed run's failed jobs again.
 RELEASE_MOCK = r"""
 import os, pathlib, sys
 name = pathlib.Path(sys.argv[0]).name
 if os.environ.get("MOCK_FAIL") == name:
+    sys.exit(1)
+run = pathlib.Path(os.environ["MOCK_RUN"])
+if name == "gh" and sys.argv[1:3] == ["run", "view"]:
+    print(run.read_text())
+elif name == "gh" and sys.argv[1:3] == ["run", "rerun"]:
+    run.write_text("")
+elif name == "gh" and sys.argv[1:3] == ["run", "watch"] and run.read_text():
     sys.exit(1)
 if name == "gh" and sys.argv[1:3] == ["repo", "view"]:
     print("spoj/letmeknow")
@@ -150,8 +157,8 @@ def git(*args, cwd):
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
 
 
-def release(tmp, before, version, mock_dir, fail_first=False):
-    tmp = tmp / f"{before}-{version}{'-rerun' if fail_first else ''}"
+def release(tmp, before, version, mock_dir, fail_first=None):
+    tmp = tmp / f"{before}-{version}-{fail_first}"
     tmp.mkdir()
     origin, work = tmp / "origin.git", tmp / "work"
     git("init", "-q", "--bare", "-b", "main", str(origin), cwd=tmp)
@@ -171,10 +178,12 @@ def release(tmp, before, version, mock_dir, fail_first=False):
     git("push", "-q", "origin", "main", cwd=work)
     notes = tmp / "notes.md"
     notes.write_text("notes\n")
-    env = {**os.environ, "PATH": str(mock_dir) + os.pathsep + os.environ["PATH"]}
+    run = tmp / "run"
+    run.write_text("failure" if fail_first == "run" else "")
+    env = {**os.environ, "PATH": str(mock_dir) + os.pathsep + os.environ["PATH"], "MOCK_RUN": str(run)}
     if fail_first:
         failed = subprocess.run(["sh", "deploy/release.sh", version, str(notes)], cwd=work,
-                                env={**env, "MOCK_FAIL": "npm"}, capture_output=True, text=True, timeout=60)
+                                env={**env, "MOCK_FAIL": fail_first}, capture_output=True, text=True, timeout=60)
         assert failed.returncode != 0, (version, failed.stdout, failed.stderr)
     result = subprocess.run(["sh", "deploy/release.sh", version, str(notes)], cwd=work, env=env, capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, (version, result.stdout, result.stderr)
@@ -213,5 +222,6 @@ with tempfile.TemporaryDirectory(prefix="lmk-release-test-") as directory:
     release(tmp, "0.16.1", "0.17.0", mock_dir)
     release(tmp, "0.16.1", "0.16.2", mock_dir)
     release(tmp, "0.17.0", "0.17.0", mock_dir)
-    release(tmp, "0.16.1", "0.17.0", mock_dir, fail_first=True)
-    release(tmp, "0.16.1", "0.16.2", mock_dir, fail_first=True)
+    release(tmp, "0.16.1", "0.17.0", mock_dir, fail_first="npm")
+    release(tmp, "0.16.1", "0.16.2", mock_dir, fail_first="npm")
+    release(tmp, "0.16.1", "0.16.2", mock_dir, fail_first="run")

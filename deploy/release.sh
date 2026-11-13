@@ -31,6 +31,9 @@ until [ -n "$run" ]; do
   sleep 5
   run=$(gh run list --repo "$repo" --workflow release.yml --branch "v$version" --limit 1 --json databaseId --jq '.[0].databaseId // empty')
 done
+if [ -n "$tagged" ] && [ "$(gh run view "$run" --repo "$repo" --json conclusion --jq .conclusion)" = failure ]; then
+  gh run rerun "$run" --repo "$repo" --failed
+fi
 echo "waiting for https://github.com/$repo/actions/runs/$run"
 gh run watch "$run" --repo "$repo" --exit-status --interval 30 >/dev/null
 python3 deploy/release-run.py "$repo" "$run" "v$version" "$sha"
