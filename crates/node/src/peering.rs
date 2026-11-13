@@ -14,6 +14,7 @@ use lmk_net::Groups;
 use lmk_net::peers::{self, Own};
 use lmk_proto::Bytes;
 use lmk_proto::directory::relay_url;
+use lmk_proto::frame::MAX_FRAME;
 use lmk_proto::head::Head;
 use lmk_proto::membership::Page;
 use lmk_proto::peer::{At, Frame, INTRO, Intro, MAX_INTRO, SUMMARY, Seqs, Shown, Signed, Summary};
@@ -524,8 +525,24 @@ impl Inner {
             }
             st.peers.frame(&key, &Frame::Hello { groups }, now);
             // A joiner's admitter says where it is as it applies the Add, which may be before the Welcome adds the group here.
-            st.early_hellos.retain(|(early, _)| *early != peer);
-            st.early_hellos.extend(early.into_iter().map(|at| (peer, at)));
+            // A hello carries only the intros not told before: those of earlier hellos of a member a join in flight names
+            // stay, the latest within a frame's size.
+            let named = st.joins.iter().flat_map(|link| &link.members).any(|(key, _)| key == peer.as_bytes());
+            let (earlier, others): (Vec<_>, Vec<_>) = std::mem::take(&mut st.early_hellos).into_iter().partition(|(early, _)| *early == peer);
+            st.early_hellos = others;
+            for mut at in early {
+                if let Some((_, held)) = earlier.iter().find(|(_, held)| named && held.group == at.group) {
+                    let mut room = MAX_FRAME as usize;
+                    let mut intros: Vec<Signed> = at.intros.into_iter().rev().chain(held.intros.iter().rev().cloned()).collect();
+                    intros.retain(|signed| {
+                        room = room.saturating_sub(signed.body.0.len() + signed.sig.0.len());
+                        room > 0
+                    });
+                    intros.reverse();
+                    at.intros = intros;
+                }
+                st.early_hellos.push((peer, at));
+            }
             return Ok(());
         }
         if let Frame::Entries { log, entries, head } = frame {

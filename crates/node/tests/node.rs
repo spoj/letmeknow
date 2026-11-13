@@ -310,10 +310,11 @@ async fn any_member_admits_an_invite_once() {
     let used = erin.node.join(&link, None).await.unwrap_err();
     assert!(format!("{used:#}").contains("unknown, used or expired"), "a used secret is refused");
 
-    // A member that redeems a link is refused, routinely, and the link stays unused.
+    // A member that redeems a link asks no member, as the Welcome would be refused here and the Add would leave a
+    // membership of its key that no session holds: the link stays unused.
     let link = alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
     let member = bob.node.join(&link, None).await.unwrap_err();
-    assert!(format!("{member:#}").contains("a member already"), "{member:#}");
+    assert!(format!("{member:#}").contains("in that group already"), "{member:#}");
     while let Ok(event) = alice.events.try_recv().or_else(|_| bob.events.try_recv()) {
         assert!(!matches!(&event, Event::Warning { text, .. } if text.contains("refused a join")), "a routine refusal is no warning: {event:?}");
     }
@@ -360,21 +361,6 @@ async fn a_refused_join_leaves_no_key_package() {
     assert!(!dump(&db).iter().any(|row| row.starts_with("openmls_key_packages ")));
     bob.node.shutdown().await.unwrap();
     alice.node.shutdown().await.unwrap();
-}
-
-/// A session asks no member to admit it to a group it holds: the Welcome would be refused here, and the Add would
-/// leave a membership of its key that no session holds.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_join_to_a_group_held_asks_no_member() {
-    let relay = relay().await;
-    let (alice, bob) = (session(&relay).await, session(&relay).await);
-    let gid = alice.node.create(settings(&relay)).unwrap();
-    bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
-    let again = alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
-    let refused = bob.node.join(&again, None).await.unwrap_err();
-    assert!(format!("{refused:#}").contains("in that group already"));
-    alice.node.join(&again, None).await.unwrap_err();
-    session(&relay).await.node.join(&again, None).await.expect("the invite is unused");
 }
 
 /// A joiner's request whose secret names no invite is refused as unknown whatever else it holds, with no warning.
@@ -3915,4 +3901,34 @@ async fn a_send_waits_for_a_commit_held_and_not_applied() {
     alice.node.send(&gid.0, &message("after it"), None).await.unwrap();
     assert_eq!(alice.node.epoch(&gid.0).unwrap(), 4);
     alice.node.shutdown().await.unwrap();
+}
+
+/// A joiner that takes its group after its admitter's second, debounced hello must still hold the admitter's intro
+/// that the first hello carried.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_joiner_keeps_the_intros_of_its_admitters_first_hello() {
+    let relay = relay().await;
+    let (late, mut landing, post) = late_append(relay.post(), Duration::from_secs(3));
+    let alice = session_with(&relay, post).await;
+    let bob = session(&relay).await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    alice.node.set_intro(&gid.0, Some("alice here".into())).unwrap();
+    let link = alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
+    let epoch = alice.node.epoch(&gid.0).unwrap();
+    late.store(true, std::sync::atomic::Ordering::SeqCst);
+    let first = {
+        let (node, link) = (bob.node.clone(), link.clone());
+        tokio::spawn(async move { node.join(&link, None).await })
+    };
+    tokio::time::timeout(WAIT, landing.recv()).await.unwrap().unwrap();
+    first.abort();
+    eventually("Alice applies the Add", || alice.node.epoch(&gid.0).unwrap() == epoch + 1).await;
+    tokio::time::sleep(Duration::from_millis(2 * lmk_net::peers::DEBOUNCE)).await;
+    assert_eq!(bob.node.join(&link, None).await.unwrap().0, gid);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let intros = bob.node.intros(&gid.0).unwrap();
+    assert_eq!(intros.get(&alice.node.key()).map(String::as_str), Some("alice here"), "{intros:?}");
+    for session in [alice, bob] {
+        session.node.shutdown().await.unwrap();
+    }
 }
