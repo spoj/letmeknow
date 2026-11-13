@@ -765,7 +765,7 @@ impl Group {
         match Entry::parse(&entry) {
             Err(error) => Ok(skipped(error)),
             Ok(Entry { commit, sig }) => {
-                let staged = self.guarded(provider, |_| false, |g| g.stage(provider, &commit, &sig));
+                let staged = self.guarded(provider, |_| false, |g| g.stage(provider, &commit, &sig))?;
                 Ok(match staged {
                     Ok(Staged::Copied) => Verdict::Copied,
                     Ok(Staged::Commit(staged, _, _)) => Verdict::Commit { removes: staged.self_removed() },
@@ -789,7 +789,7 @@ impl Group {
                 return g.merged(provider, applied);
             }
             let Entry { commit, sig } = Entry::parse(&entry)?;
-            let Staged::Commit(staged, by, aad) = g.stage(provider, &commit, &sig)? else { bail!("not a commit to apply") };
+            let Staged::Commit(staged, by, aad) = g.stage(provider, &commit, &sig)?? else { bail!("not a commit to apply") };
             let applied = observe(provider, &g.mls, &mut g.state, &staged, by, aad, false)?;
             g.state.posted = None;
             g.mls.clear_pending_commit(provider.storage())?;
@@ -798,24 +798,39 @@ impl Group {
         })
     }
 
-    fn stage(&mut self, provider: &SqliteProvider, commit: &[u8], sig: &[u8]) -> Result<Staged> {
-        let MlsMessageBodyIn::PrivateMessage(message) = parse::<MlsMessageIn>(commit)?.extract() else { bail!("not a commit") };
-        ensure!(message.content_type() == ContentType::Commit, "not a commit");
-        let aad: Aad = serde_json::from_slice(message.aad()).context("a commit's authenticated data")?;
-        bind(provider, &ending(&self.state.cut, &aad.moved))?;
-        let processed = self.mls.process_message(provider, message)?;
-        let Sender::Member(by) = *processed.sender() else { bail!("not from a member") };
-        let key = self.mls.member_at(by).context("from no member")?.signature_key;
-        let signed = provider.crypto().verify_signature(SignatureScheme::ED25519, &signed(commit), &key, sig).is_ok();
-        let staged = match processed.into_content() {
-            ProcessedMessageContent::OwnPrivateMessage if signed => return Ok(Staged::Copied),
-            ProcessedMessageContent::OwnPrivateMessage => bail!("from this session's leaf, not signed by its key"),
-            ProcessedMessageContent::StagedCommitMessage(staged) => staged,
-            _ => bail!("not a commit"),
+    /// Stages a commit entry: the inner error is the entry's, which skips it; the outer is this session's own, as its
+    /// storage failing, which judges nothing.
+    fn stage(&mut self, provider: &SqliteProvider, commit: &[u8], sig: &[u8]) -> Result<Result<Staged>> {
+        let parsed = (|| {
+            let MlsMessageBodyIn::PrivateMessage(message) = parse::<MlsMessageIn>(commit)?.extract() else { bail!("not a commit") };
+            ensure!(message.content_type() == ContentType::Commit, "not a commit");
+            let aad: Aad = serde_json::from_slice(message.aad()).context("a commit's authenticated data")?;
+            Ok((message, aad))
+        })();
+        let (message, aad) = match parsed {
+            Ok(parsed) => parsed,
+            Err(error) => return Ok(Err(error)),
         };
-        ensure!(signed, "a commit entry its committer did not sign");
-        rules(&self.mls, &staged, by, &aad, &self.state.cut)?;
-        Ok(Staged::Commit(staged, by, aad))
+        bind(provider, &ending(&self.state.cut, &aad.moved))?;
+        let processed = match self.mls.process_message(provider, message) {
+            Err(ProcessMessageError::StorageError(error)) => return Err(error.into()),
+            Err(error) => return Ok(Err(error.into())),
+            Ok(processed) => processed,
+        };
+        Ok((|| {
+            let Sender::Member(by) = *processed.sender() else { bail!("not from a member") };
+            let key = self.mls.member_at(by).context("from no member")?.signature_key;
+            let signed = provider.crypto().verify_signature(SignatureScheme::ED25519, &signed(commit), &key, sig).is_ok();
+            let staged = match processed.into_content() {
+                ProcessedMessageContent::OwnPrivateMessage if signed => return Ok(Staged::Copied),
+                ProcessedMessageContent::OwnPrivateMessage => bail!("from this session's leaf, not signed by its key"),
+                ProcessedMessageContent::StagedCommitMessage(staged) => staged,
+                _ => bail!("not a commit"),
+            };
+            ensure!(signed, "a commit entry its committer did not sign");
+            rules(&self.mls, &staged, by, &aad, &self.state.cut)?;
+            Ok(Staged::Commit(staged, by, aad))
+        })())
     }
 
     /// Records what a merged commit did: the added members' leaves, and the cut state of the new epoch: the cut, less

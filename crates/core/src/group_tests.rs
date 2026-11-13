@@ -1600,3 +1600,36 @@ fn admins_and_admitted_devices_are_keys_in_one_form() {
     let (inner, admission) = (w.m[0].open_inner(&commit.entry), commit.admission.unwrap());
     assert!(join_error(&w.m[1], &inner, &admission, &package).contains("neither Ed25519 nor compressed P-256"));
 }
+
+/// A storage failure while judging is an error, which stops the reader: as a verdict it would skip the epoch's winning
+/// commit, and the next commit of that log, a loser, would apply once storage worked again.
+#[test]
+fn a_storage_failure_while_judging_is_no_verdict() {
+    let dir = std::env::temp_dir().join(format!("lmk-judge-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("c.db");
+    let _ = std::fs::remove_file(&path);
+    let mut w = World::new(&["A", "B", "C"]);
+    w.m[2] = Member::new(SqliteProvider::open(&path).unwrap(), "C");
+    w.found(0, &[1, 2]);
+    let cut = w.m[0].cut();
+    let winner = w.m[0].commit(Change { cut, ..Change::default() });
+    let cut = w.m[1].cut();
+    let loser = w.m[1].commit(Change { cut, ..Change::default() });
+    w.post(winner.entry);
+    w.post(loser.entry);
+    w.read(&[0, 1]);
+    w.agree(&[0, 1]);
+
+    // C's disk fails for one write, as when it is full for a moment.
+    let other = rusqlite::Connection::open(&path).unwrap();
+    other.execute_batch("CREATE TRIGGER fail BEFORE INSERT ON openmls_psks BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;").unwrap();
+    let c = &mut w.m[2];
+    let pos = c.pos;
+    let verdict = c.group.as_mut().unwrap().judge(&c.provider, &w.log[pos]);
+    other.execute_batch("DROP TRIGGER fail").unwrap();
+    assert!(verdict.is_err(), "the epoch's winning commit judged as {verdict:?}");
+    c.read(&w.log);
+    std::fs::remove_dir_all(dir).ok();
+    w.agree(&[0, 1, 2]);
+}
