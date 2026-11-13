@@ -202,6 +202,9 @@ async fn own_directory(home: &Path, network: &Network, domain: &str) -> Result<D
     let key = hex::encode(directory.key);
     ensure!(domain != DOMAIN || key == MEMBERSHIP_KEY, "{DOMAIN}'s directory names key {key}, not letmeknow's {MEMBERSHIP_KEY}");
     let pins = home.join("membership.json");
+    // Sessions that start at once each add their pin.
+    let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(home.join("membership.lock"))?;
+    held.lock()?;
     let mut pinned: BTreeMap<String, String> = if pins.exists() { serde_json::from_slice(&std::fs::read(&pins)?)? } else { BTreeMap::new() };
     match pinned.get(domain) {
         Some(pin) => ensure!(*pin == key, "the directory of {domain} names key {key}, but this home pinned {pin} at its first start"),
@@ -355,8 +358,16 @@ async fn delete_stopped(home: PathBuf, own: PathBuf) -> Result<Vec<String>> {
                 return Ok(());
             }
             let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("session.lock"))?;
-            if held.try_lock().is_err() || (!behind && !lmk_node::groups(&SqliteProvider::open(&dir.join("session.db"))?)?.is_empty()) {
+            if held.try_lock().is_err() {
                 return Ok(());
+            }
+            if !behind {
+                // Reading recovers a WAL that a killed session left into its database: it did not run for that.
+                let in_some = !lmk_node::groups(&SqliteProvider::open(&dir.join("session.db"))?)?.is_empty();
+                std::fs::File::options().write(true).open(dir.join("session.db"))?.set_modified(*ran)?;
+                if in_some {
+                    return Ok(());
+                }
             }
             // Windows renames no directory with a file in it open: a session that started meanwhile keeps its own in place.
             #[cfg(windows)]

@@ -1796,3 +1796,59 @@ fn a_long_message_prints_cut_and_is_logged_whole() {
         assert_eq!((logged["content"].as_str(), logged.get("truncated")), (Some(text.as_str()), None));
     });
 }
+
+/// A stopped session that was killed, its WAL holding commits not yet in its database, is read under its lock as another
+/// session starts: that reading must not make it look as if it ran now.
+#[tokio::test]
+async fn a_killed_session_read_under_its_lock_did_not_run() {
+    let home = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let dir = session_dir(home.path(), "killed").unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    // The database and WAL as a kill left them: copied while the connection that wrote them is open.
+    let db = lmk_core::provider::SqliteProvider::open(&scratch.path().join("session.db")).unwrap();
+    lmk_node::create(&db, "relay.example.com").unwrap();
+    db.put(b"node/groups", br#"["AAAA"]"#).unwrap();
+    for file in ["session.db", "session.db-wal"] {
+        std::fs::copy(scratch.path().join(file), dir.join(file)).unwrap();
+    }
+    drop(db);
+    std::fs::write(dir.join("groups.json"), r#"["AAAA"]"#).unwrap();
+    std::fs::write(dir.join("session.lock"), "").unwrap();
+    let ago = SystemTime::now() - Duration::from_secs(3 * 24 * 3600);
+    for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+        std::fs::File::options().write(true).open(entry.path()).unwrap().set_modified(ago).unwrap();
+    }
+    let before = crate::last_ran(&dir).unwrap();
+    assert!(crate::delete_stopped(home.path().to_owned(), session_dir(home.path(), "next").unwrap()).await.unwrap().is_empty());
+    assert!(dir.exists());
+    let after = crate::last_ran(&dir).unwrap();
+    assert!(after < SystemTime::now() - Duration::from_secs(24 * 3600), "last_ran moved from {before:?} to {after:?}");
+}
+
+/// Sessions of one home starting at once on different services each pin their service's key.
+#[test]
+fn sessions_starting_at_once_on_different_services_each_pin_their_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let network = crate::Network {
+        ca: iroh::tls::CaTlsConfig::embedded(),
+        resolve: Arc::new(|_| Box::pin(async { Ok(Directory { key: [1; 32] }) })),
+        post: Arc::new(|_, _, _| Box::pin(async { unreachable!() })),
+    };
+    crate::own_format(&home).unwrap();
+    std::thread::scope(|scope| {
+        for worker in 0..2 {
+            let (home, network) = (&home, &network);
+            scope.spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                for round in 0..200 {
+                    rt.block_on(crate::own_directory(home, network, &format!("w{worker}-{round}.example"))).unwrap();
+                }
+            });
+        }
+    });
+    let pinned: std::collections::BTreeMap<String, String> = serde_json::from_slice(&std::fs::read(home.join("membership.json")).unwrap()).unwrap();
+    assert_eq!(pinned.len(), 400, "pins lost");
+}
+
