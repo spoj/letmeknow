@@ -306,15 +306,15 @@ fn accepted_package_refs_survive_pending_serde_and_reenveloping() {
     let read = w.read(&[0, 1]);
     assert!(applied(&read[0][0]).own);
     assert!(!applied(&read[1][0]).own);
-    for i in 0..2 {
-        assert_eq!(w.m[i].g().epoch(), epoch + 1);
-        let added: Vec<_> = w.m[i].g().added().iter().filter(|add| add.epoch == epoch + 1).cloned().collect();
+    for m in &mut w.m[..2] {
+        assert_eq!(m.g().epoch(), epoch + 1);
+        let added: Vec<_> = m.g().added().iter().filter(|add| add.epoch == epoch + 1).cloned().collect();
         assert_eq!(added.iter().map(|add| add.key_package_ref).collect::<Vec<_>>(), refs);
-        let hash = invite().hash(w.m[i].g().id());
+        let hash = invite().hash(m.g().id());
         assert!(added.iter().all(|add| add.invite == hash));
-        w.m[i] = w.m[i].copy();
-        assert!(w.m[i].g().posted().is_none());
-        assert_eq!(w.m[i].g().added().iter().filter(|add| add.epoch == epoch + 1).cloned().collect::<Vec<_>>(), added);
+        *m = m.copy();
+        assert!(m.g().posted().is_none());
+        assert_eq!(m.g().added().iter().filter(|add| add.epoch == epoch + 1).cloned().collect::<Vec<_>>(), added);
     }
     for (i, package) in packages.iter().enumerate() {
         w.m[i + 2].join(&inner, &admission, pos, package);

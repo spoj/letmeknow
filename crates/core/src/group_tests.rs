@@ -637,8 +637,8 @@ fn leaf_data() {
     let commit = w.m[1].commit(Change { cut, leaf: Some(moved.clone()), ..Change::default() });
     w.post(commit.entry);
     w.read(&[0, 1, 2]);
-    for i in 0..3 {
-        assert_eq!(w.m[i].g().members()[b as usize].leaf, moved);
+    for m in &mut w.m {
+        assert_eq!(m.g().members()[b as usize].leaf, moved);
     }
     let cut = w.m[1].cut();
     let commit = w.m[1].commit(Change { cut, ..Change::default() });
@@ -1486,8 +1486,8 @@ fn a_member_that_is_no_admin_adds_only_sessions_on_admitted_devices() {
 #[test]
 fn a_member_that_is_no_admin_removes_only_members_that_signed_their_leave() {
     let mut w = World::new(&["A", "B", "C", "D"]);
-    for i in 1..4 {
-        w.m[i].on(None);
+    for m in &mut w.m[1..] {
+        m.on(None);
     }
     w.found(0, &[1, 2, 3]);
     let (c, d) = (w.m[0].index_of("C"), w.m[0].index_of("D"));
@@ -1527,8 +1527,8 @@ fn a_member_that_is_no_admin_removes_only_members_that_signed_their_leave() {
 #[test]
 fn only_an_admin_changes_the_admins_and_admitted_devices() {
     let mut w = World::new(&["A", "B", "C"]);
-    for i in 1..3 {
-        w.m[i].on(Some(&device(i as u8)));
+    for (i, m) in w.m.iter_mut().enumerate().skip(1) {
+        m.on(Some(&device(i as u8)));
     }
     w.found(0, &[1, 2]);
     let (b, c) = (Bytes(w.m[1].session.key().to_vec()), Bytes(w.m[2].session.key().to_vec()));
