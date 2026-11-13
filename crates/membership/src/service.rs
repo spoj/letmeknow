@@ -132,7 +132,7 @@ impl Quota {
     }
 
     fn roll(&mut self, at: u64) {
-        if at / self.period != self.window {
+        if at / self.period > self.window {
             self.window = at / self.period;
             self.spent.clear();
             self.nets.clear();
@@ -382,6 +382,19 @@ mod tests {
         assert!(quota.fits(0, &[(v4(0), 1)], 1));
         assert!(!quota.fits(0, &[(v4(100), 1)], 1));
         assert!(quota.fits(MINUTE, &[(v4(100), 1)], 1));
+    }
+
+    /// A request whose time is from the window before (taken before it waited for the database) must not reset the
+    /// window that later requests already charged.
+    #[test]
+    fn a_late_request_from_the_previous_window_does_not_reset_the_current_one() {
+        let mut quota = Quota::new(MINUTE, 2, 100);
+        let key = [(Source::V4(Ipv4Addr::new(192, 0, 2, 1)), 1)];
+        assert!(quota.take(MINUTE + 1, &key, 1));
+        assert!(quota.take(MINUTE + 2, &key, 1));
+        assert!(!quota.fits(MINUTE + 3, &key, 1), "the budget of the current minute is spent");
+        quota.charge(MINUTE - 1, &key, 1);
+        assert!(!quota.fits(MINUTE + 4, &key, 1), "a late charge from the minute before reset the current minute's budget");
     }
 
     #[test]
