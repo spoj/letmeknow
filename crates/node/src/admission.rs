@@ -111,6 +111,7 @@ impl Node {
         let joining = [b"node/joining/".as_slice(), &Sha256::digest(&secret.0)].concat();
         let join = {
             let mut st = self.inner.lock();
+            ensure!(!st.groups.contains_key(link.group.as_slice()), "this session is in that group already");
             let key_package = match get::<Bytes>(&st.provider, &joining)? {
                 Some(kept) => kept,
                 None => {
@@ -215,7 +216,6 @@ impl Inner {
             let admission = lmk_core::group::Admission { welcome: admitted.welcome.0, cut: admitted.cut, sig: admitted.sig.0 };
             let package = key_package_reference(&st.provider, key_package)?;
             let mls = Group::join(&st.provider, &admitted.commit.0, &admission, &package, &link.group, &link.domain, &link.key)?;
-            ensure!(!st.groups.contains_key(mls.id()), "this session is in that group already");
             // Its Add had no update path: its first update, due at once, merges its leaf into the tree (`merge`).
             st.add_group(mls, Rec { stirred: true, ..Rec::default() })?
         };

@@ -362,6 +362,21 @@ async fn a_refused_join_leaves_no_key_package() {
     alice.node.shutdown().await.unwrap();
 }
 
+/// A session asks no member to admit it to a group it holds: the Welcome would be refused here, and the Add would
+/// leave a membership of its key that no session holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_to_a_group_held_asks_no_member() {
+    let relay = relay().await;
+    let (alice, bob) = (session(&relay).await, session(&relay).await);
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
+    let again = alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap();
+    let refused = bob.node.join(&again, None).await.unwrap_err();
+    assert!(format!("{refused:#}").contains("in that group already"));
+    alice.node.join(&again, None).await.unwrap_err();
+    session(&relay).await.node.join(&again, None).await.expect("the invite is unused");
+}
+
 /// A joiner's request whose secret names no invite is refused as unknown whatever else it holds, with no warning.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unknown_secret_is_refused_whatever_the_request_carries() {
