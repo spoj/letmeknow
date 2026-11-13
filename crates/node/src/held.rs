@@ -484,14 +484,17 @@ impl Inner {
 
     /// Opens the ciphertexts kept unopened of epoch `epoch` that are within the window, and drops the rest, as its keys
     /// are about to go.
-    pub(crate) fn open_all(&self, st: &mut State, gid: &[u8], epoch: u64) -> Result<()> {
+    pub(crate) fn open_all(&self, st: &mut State, gid: &[u8], epoch: u64, going: bool) -> Result<()> {
         let g = st.group_mut(gid)?;
         let claims: Vec<_> = g.unopened.iter().filter(|(_, (sealed, _))| *sealed <= epoch).map(|(claim, _)| claim.clone()).collect();
         for claim in claims {
             let g = st.group_mut(gid)?;
-            let (_, ciphertext) = g.unopened.remove(&claim).unwrap();
-            if g.author(&claim.0.0, claim.1).is_some_and(|a| claim.2 < a.lowest() + WINDOW) {
-                self.open_one(st, gid, ciphertext)?;
+            let within = g.author(&claim.0.0, claim.1).is_some_and(|a| claim.2 < a.lowest() + WINDOW);
+            if within || going {
+                let (_, ciphertext) = g.unopened.remove(&claim).unwrap();
+                if within {
+                    self.open_one(st, gid, ciphertext)?;
+                }
             }
         }
         Ok(())

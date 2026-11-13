@@ -81,7 +81,8 @@ impl Inner {
         };
         g.waiting = true;
         let prior = g.mls.epoch().saturating_sub(1);
-        self.open_all(st, gid, prior)?;
+        // What waits past the window stays while this waits, as the lowest seqs may yet come: it goes as the commit applies.
+        self.open_all(st, gid, prior, false)?;
         self.deliver_ready(st, gid)?;
         st.refresh(gid);
         let lacking = st.group(gid)?.lacking();
@@ -101,8 +102,9 @@ impl Inner {
         }
         let now = st.tick();
         let ending = st.group(gid)?.mls.epoch();
+        self.open_all(st, gid, ending.saturating_sub(1), true)?;
         if removes {
-            self.open_all(st, gid, ending)?;
+            self.open_all(st, gid, ending, true)?;
         }
         self.lose(st, gid)?;
         let g = st.groups.get_mut(gid).unwrap();

@@ -186,3 +186,64 @@ async fn a_commits_membership_events_come_in_the_step_that_applies_it_before_the
         node.shutdown().await.unwrap();
     }
 }
+
+/// While a commit waits, judging it again must not drop a kept message's ciphertext that waits unopened past the
+/// window, as it opens once the lowest seq comes; dropped, it is remembered as seen and never taken again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_waiting_commit_keeps_what_waits_past_the_window() {
+    use crate::held::Record;
+    use lmk_proto::held::Header;
+    let relay = lmk_testing::relay().await;
+    let config = Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[9; 32]) };
+    let alice = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config.clone()).await.unwrap().0;
+    let bob = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0;
+    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+    let gid = bob.create(settings).unwrap();
+    alice.join(&bob.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
+    for node in [&alice, &bob] {
+        let tasks: Vec<_> = node.inner.tasks.lock().unwrap().drain(..).collect();
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(20), bob.read_group(&gid.0)).await.expect("bob reads").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(20), alice.read_group(&gid.0)).await.expect("alice reads").unwrap();
+    let alice_key = alice.key();
+    let joined = alice.inner.lock().group(&gid.0).unwrap().mls.joined(&alice_key.0).unwrap();
+    let seal = |seq: u64, prev: Option<(Bytes, u64)>| {
+        let mut st = alice.inner.lock();
+        let g = st.group(&gid.0).unwrap();
+        let header = Header {
+            group: gid.clone(), author: alice_key.clone(), joined, seq, epoch: g.mls.epoch(), prev,
+            deps: vec![], reply_to: None, payload: serde_json::json!({ "type": "message", "content": format!("{seq}") }),
+        };
+        let plaintext = header.encode();
+        let State { provider, session, groups, .. } = &mut *st;
+        let ciphertext = groups.get_mut(&gid.0).unwrap().mls.seal(provider, session, &plaintext).unwrap();
+        (Bytes(lmk_proto::held::id(&plaintext).to_vec()), ciphertext)
+    };
+    let far = 501;
+    let (id, past) = seal(far, Some((Bytes(vec![0; 32]), 0)));
+    let (_, first) = seal(1, None);
+    // Bob moves on an epoch: Alice's sealings are of the epoch before, whose keys the next commit deletes.
+    let device = Bytes(ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes().to_vec());
+    tokio::time::timeout(std::time::Duration::from_secs(30), bob.change_settings(&gid.0, |s| s.admitted.push(device.clone()))).await.unwrap().unwrap();
+    let mut st = bob.inner.lock();
+    bob.inner.take(&mut st, &gid.0, None, vec![past.clone()], false).unwrap();
+    assert_eq!(st.group(&gid.0).unwrap().unopened.len(), 1, "past the window, it waits unopened");
+    let position = st.group(&gid.0).unwrap().rec.position;
+    // The last commit kept Alice's seqs through `far`, which Bob lacks: a commit held at the next position waits for them.
+    st.group_mut(&gid.0).unwrap().rec.keep = vec![Seqs { key: alice_key.clone(), joined, seqs: lmk_proto::ranges::Ranges::range(1, far) }];
+    assert!(!bob.inner.cleared(&mut st, &gid.0, position + 1).unwrap(), "the commit waits");
+    bob.inner.take(&mut st, &gid.0, None, vec![first], false).unwrap();
+    bob.inner.take(&mut st, &gid.0, None, vec![past], false).unwrap();
+    let record: Option<Record> = st.record(&gid.0, &id.0).unwrap();
+    assert!(record.is_some(), "the message past the window opens once the lowest seq came");
+    drop(st);
+    for node in [alice, bob] {
+        node.shutdown().await.unwrap();
+    }
+}

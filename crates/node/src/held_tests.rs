@@ -445,7 +445,7 @@ async fn a_ciphertext_past_the_window_is_dropped_when_its_epochs_keys_go() {
             assert!(bob.inner.take_one(&mut st, &gid.0, None, ciphertext).unwrap().is_none());
         }
         assert_eq!(st.group(&gid.0).unwrap().unopened.len(), 2);
-        bob.inner.open_all(&mut st, &gid.0, 2).unwrap();
+        bob.inner.open_all(&mut st, &gid.0, 2, true).unwrap();
         assert!(st.group(&gid.0).unwrap().unopened.is_empty());
         st.time += HOLD_OFF + 1;
         bob.inner.give_up(&mut st, &gid.0).unwrap();
@@ -740,11 +740,11 @@ async fn unopened_ciphertexts_within_the_window_open_before_their_epochs_keys_go
             assert!(bob.inner.take_one(&mut st, &gid.0, None, ciphertext).unwrap().is_none());
         }
         assert_eq!(st.group(&gid.0).unwrap().unopened.len(), 2);
-        bob.inner.open_all(&mut st, &gid.0, 1).unwrap();
+        bob.inner.open_all(&mut st, &gid.0, 1, true).unwrap();
         assert_eq!(st.group(&gid.0).unwrap().unopened.len(), 2);
         assert!(st.record(&gid.0, &id.0).unwrap().is_none());
         assert!(st.record(&gid.0, &first.0).unwrap().is_none());
-        bob.inner.open_all(&mut st, &gid.0, 2).unwrap();
+        bob.inner.open_all(&mut st, &gid.0, 2, true).unwrap();
         assert!(st.group(&gid.0).unwrap().unopened.is_empty());
         assert_eq!(st.id_at(&gid.0, &alice.key().0, 1, WINDOW + 1).unwrap(), Some(id));
         assert_eq!(st.id_at(&gid.0, &alice.key().0, 1, 1).unwrap(), Some(first));
