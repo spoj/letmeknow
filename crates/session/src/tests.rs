@@ -972,8 +972,8 @@ fn a_session_runs_in_one_process() {
 fn a_session_goes_on_while_a_join_waits() {
     local(async {
         let world = world("busy").await;
-        let (alice, mut bob, group) = pair(&world).await;
-        let link = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap().to_owned();
+        let (alice, mut bob, _) = pair(&world).await;
+        let link = world.start("carol").await.cmd(&["invite"]).await.unwrap()["link"].as_str().unwrap().to_owned();
         let mut invite = lmk_proto::links::Invite::parse(&link).unwrap();
         invite.members[0].0 = *iroh::SecretKey::generate().public().as_bytes();
         let (home, name) = (bob.home.clone(), bob.name.clone());
