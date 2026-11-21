@@ -343,7 +343,9 @@ async fn delete_stopped(home: PathBuf, own: PathBuf) -> Result<Vec<String>> {
         .filter(|entry| entry.path() != own && !aside(entry))
         .filter_map(|entry| {
             let dir = entry.path();
-            let groups = std::fs::read(dir.join("groups.json")).ok().and_then(|groups| serde_json::from_slice(&groups).ok()).unwrap_or_default();
+            let mut groups: Vec<String> = std::fs::read(dir.join("groups.json")).ok().and_then(|groups| serde_json::from_slice(&groups).ok()).unwrap_or_default();
+            let subgroups: Vec<String> = std::fs::read(dir.join("subgroups.json")).ok().and_then(|sub| serde_json::from_slice(&sub).ok()).unwrap_or_default();
+            groups.retain(|g| !subgroups.contains(g));
             Some((entry.file_name().to_string_lossy().into_owned(), last_ran(&dir)?, groups))
         })
         .collect();

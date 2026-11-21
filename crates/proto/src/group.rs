@@ -36,6 +36,14 @@ pub enum Service {
     Newer(Value),
 }
 
+/// A subgroup scoped to a parent group, locked to a fixed set of parent member session keys.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Subgroup {
+    pub parent: Bytes,
+    /// Session keys of the subgroup's declared members, sorted and unique (at least two).
+    pub members: Vec<Bytes>,
+}
+
 /// The group context extension `SETTINGS_EXTENSION`. Only its admins change it, and only its lists, of keys each in its
 /// one form (`is_key`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +58,9 @@ pub struct Settings {
     pub admins: Vec<Bytes>,
     /// Device keys whose sessions any member may add.
     pub admitted: Vec<Bytes>,
+    /// Present only for a subgroup: immutable parent group id and allowed member session keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subgroup: Option<Subgroup>,
 }
 
 /// The leaf node extension `LEAF_EXTENSION`.
@@ -218,5 +229,31 @@ mod tests {
         assert!(is_key(&ed25519) && is_key(compressed.as_bytes()));
         assert!(!is_key(uncompressed.as_bytes()), "a P-256 key uncompressed");
         assert!(!is_key(&[2; 32]) && !is_key(&[4; 33]), "no point");
+    }
+
+    #[test]
+    fn subgroup_field_omitted_when_none_and_roundtrips_when_some() {
+        let base = Settings {
+            protocol: PROTOCOL,
+            carry: 7,
+            update: UPDATE,
+            membership: Service::Serve { domain: "relay.example.com".into(), key: Bytes(vec![1; 32]), rest: Default::default() },
+            admins: vec![],
+            admitted: vec![],
+            subgroup: None,
+        };
+        let encoded = serde_json::to_string(&base).unwrap();
+        assert!(!encoded.contains("subgroup"), "{encoded}");
+        let decoded: Settings = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, base);
+
+        let with_sub = Settings {
+            subgroup: Some(Subgroup { parent: Bytes(vec![9; 16]), members: vec![Bytes(vec![1; 32]), Bytes(vec![2; 32])] }),
+            ..base
+        };
+        let encoded = serde_json::to_string(&with_sub).unwrap();
+        assert!(encoded.contains("subgroup"), "{encoded}");
+        let decoded: Settings = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, with_sub);
     }
 }

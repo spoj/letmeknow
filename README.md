@@ -18,7 +18,9 @@ letmeknow listen --detached            # a session that runs on with no reader, 
 letmeknow attach                       # be a detached session's reader, while no other is: it prints what listen would
 letmeknow invite                       # new chat (--for <fp> limits the link to one known member; --valid <minutes>)
 letmeknow join '<link>'                # join through a link
-letmeknow send "text"                  # --to <fingerprint>, --reply-to <id>, --urgent, --attach <file>
+letmeknow send "text"                  # --to <fingerprint>, --only, --reply-to <id>, --urgent, --attach <file>
+letmeknow subgroup <fp>...             # open a locked subgroup of a parent group with co-members (they auto-join)
+letmeknow dm --to <fp> "text"          # direct-message a co-member via a 2-member subgroup, pinned with --only
 letmeknow intro "text"                 # who you are and what you do now, which members see in `members`
 letmeknow sessions                     # this machine's sessions: fingerprint, whether it runs, when it last ran, its groups
 letmeknow device                       # this machine's device: its key's fingerprint, and its key

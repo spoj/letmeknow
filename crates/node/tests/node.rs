@@ -120,6 +120,7 @@ fn settings(relay: &Relay) -> Settings {
         membership: relay.service.clone(),
         admins: vec![],
         admitted: vec![],
+        subgroup: None,
     }
 }
 
@@ -1432,7 +1433,7 @@ fn a_member_whose_log_the_service_let_go_leaves_when_no_peer_brings_it_within_wa
         SHIFT.fetch_add(lmk_net::peers::WAIT + 60_000, std::sync::atomic::Ordering::Relaxed);
         bob.node.read_group(&gid.0).await.unwrap_err();
         let (by, not_kept, leave) = bob.until(|e| match e {
-            Event::Removed { group, by, not_kept, leave } if group == gid => Some((by, not_kept, leave)),
+            Event::Removed { group, by, not_kept, leave, .. } if group == gid => Some((by, not_kept, leave)),
             _ => None,
         }).await;
         assert!(by.is_none() && not_kept.is_empty(), "no commit removed it: its own log did");
@@ -3929,6 +3930,107 @@ async fn a_joiner_keeps_the_intros_of_its_admitters_first_hello() {
     let intros = bob.node.intros(&gid.0).unwrap();
     assert_eq!(intros.get(&alice.node.key()).map(String::as_str), Some("alice here"), "{intros:?}");
     for session in [alice, bob] {
+        session.node.shutdown().await.unwrap();
+    }
+}
+
+/// `send_pinned` succeeds when every other current member is pinned, refuses before sealing when an extra member is in
+/// the group, and fails closed (`SendError::Unverified`) if the membership service is unreachable.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_pinned_guards_recipients_and_fails_closed() {
+    let relay = relay().await;
+    let dir = folder("send-pinned");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (membership, _service) = served(&relay, &dir).await;
+    let (gate, _reaching) = Gate::new(Some(&membership));
+    let mut alice = stored_with(&relay, &dir.join("alice.db"), gate.post("Alice", relay.post())).await;
+    let mut bob = session(&relay).await;
+    let mut carol = session(&relay).await;
+    let gid = alice.node.create(Settings { membership, ..settings(&relay) }).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+
+    // 2-member group: pinned to Bob succeeds.
+    let ok = alice.node.send_pinned(&gid.0, &message("only bob"), None, Some(&[bob.node.key()])).await.unwrap();
+    bob.until(|e| matches!(e, Event::Message(m) if m.id == ok).then_some(())).await;
+
+    // Gate off membership service -> send_pinned fails closed with Unverified.
+    gate.set(false);
+    let err = alice.node.send_pinned(&gid.0, &message("unverified"), None, Some(&[bob.node.key()])).await.unwrap_err();
+    assert!(matches!(err.downcast_ref(), Some(SendError::Unverified(_))), "{err:#}");
+    gate.set(true);
+
+    // Carol joins; Alice pins only Bob -> refused with SendError::Pinned, and neither Bob nor Carol receives it.
+    carol.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    let err = alice.node.send_pinned(&gid.0, &message("not for carol"), None, Some(&[bob.node.key()])).await.unwrap_err();
+    assert!(matches!(err.downcast_ref(), Some(SendError::Pinned(_))), "{err:#}");
+    let quiet = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            _ = bob.until(|e| matches!(e, Event::Message(m) if m.payload["content"] == "not for carol").then_some(())) => (),
+            _ = carol.until(|e| matches!(e, Event::Message(m) if m.payload["content"] == "not for carol").then_some(())) => (),
+        }
+    })
+    .await;
+    assert!(quiet.is_err(), "refused pinned message must never be broadcast");
+
+    // Pinning both Bob and Carol succeeds.
+    let both = alice.node.send_pinned(&gid.0, &message("both"), None, Some(&[bob.node.key(), carol.node.key()])).await.unwrap();
+    bob.until(|e| matches!(e, Event::Message(m) if m.id == both).then_some(())).await;
+    carol.until(|e| matches!(e, Event::Message(m) if m.id == both).then_some(())).await;
+
+    for session in [alice, bob, carol] {
+        session.node.shutdown().await.unwrap();
+    }
+}
+
+/// Creating a subgroup auto-joins the selected co-members; parent removal cascades to subgroups across distinct
+/// devices (3-member subgroup removes a departed member — even the subgroup creator — while remaining members stay;
+/// 2-member subgroup auto-exits locally).
+#[tokio::test(flavor = "multi_thread")]
+async fn subgroup_auto_joins_and_cascades_parent_removal() {
+    let relay = relay().await;
+    let mut alice = session_on(&relay, 1).await;
+    let mut bob = session_on(&relay, 2).await;
+    let mut carol = session_on(&relay, 3).await;
+    let parent = alice.node.create(settings(&relay)).unwrap();
+    bob.node.join(&alice.node.invite(&parent.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    carol.node.join(&alice.node.invite(&parent.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    eventually("Bob sees 3 members", || bob.node.members(&parent.0).unwrap().len() == 3).await;
+    eventually("Carol sees 3 members", || carol.node.members(&parent.0).unwrap().len() == 3).await;
+
+    // 2-member subgroup (Alice + Bob): Bob auto-joins, Carol never sees messages, nested subgroup is refused.
+    let dm = alice.node.subgroup(&parent.0, &[bob.node.key()], 1, relay.service.clone()).await.unwrap();
+    assert_eq!(dm.joined, vec![bob.node.key()]);
+    assert!(dm.failed.is_empty());
+    eventually("Bob is in dm subgroup", || bob.node.groups().contains(&dm.group)).await;
+    assert!(alice.node.subgroup(&dm.group.0, &[bob.node.key()], 1, relay.service.clone()).await.is_err());
+
+    let msg = alice.node.send_pinned(&dm.group.0, &message("private"), None, Some(&[bob.node.key()])).await.unwrap();
+    bob.until(|e| matches!(e, Event::Message(m) if m.id == msg).then_some(())).await;
+    assert!(!carol.node.groups().contains(&dm.group));
+
+    // 3-member subgroup created by Carol (distinct device from Alice & Bob): all declared members are subgroup admins.
+    let trio = carol.node.subgroup(&parent.0, &[alice.node.key(), bob.node.key()], 1, relay.service.clone()).await.unwrap();
+    assert_eq!(trio.joined.len(), 2);
+    eventually("Alice is in trio subgroup", || alice.node.groups().contains(&trio.group)).await;
+    eventually("Bob is in trio subgroup", || bob.node.groups().contains(&trio.group)).await;
+    eventually("trio has 3 members", || bob.node.members(&trio.group.0).unwrap().len() == 3).await;
+
+    // Remove Carol (the subgroup creator!) from parent -> Alice & Bob both stay in trio (neither spuriously exits) and remove Carol.
+    assert!(alice.node.remove(&parent.0, &[carol.node.key()]).await.unwrap());
+    eventually("Alice sees 2 in trio", || alice.node.members(&trio.group.0).unwrap().len() == 2).await;
+    eventually("Bob sees 2 in trio", || bob.node.members(&trio.group.0).unwrap().len() == 2).await;
+    carol.until(|e| matches!(e, Event::Removed { group, parent: Some(p), .. } if group == trio.group && p == parent).then_some(())).await;
+
+    // Remove Bob from parent -> 2-member dm subgroup auto-exits on Alice (with parent metadata).
+    assert!(alice.node.remove(&parent.0, &[bob.node.key()]).await.unwrap());
+    alice.until(|e| matches!(e, Event::Removed { group, parent: Some(p), .. } if group == dm.group && p == parent).then_some(())).await;
+    eventually("Alice left dm subgroup", || !alice.node.groups().contains(&dm.group)).await;
+
+    for session in [alice, bob, carol] {
         session.node.shutdown().await.unwrap();
     }
 }

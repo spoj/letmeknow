@@ -8,7 +8,7 @@ async fn a_copied_sessions_commit_warns_and_stops_using_the_group() {
     let relay = lmk_testing::relay().await;
     let config = Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[9; 32]) };
     let (node, mut events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap();
-    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
     let gid = node.create(settings).unwrap();
     {
         let mut st = node.inner.lock();
@@ -39,7 +39,7 @@ async fn a_removed_member_two_commits_behind_learns_it() {
     let alice = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config.clone()).await.unwrap().0;
     let bob = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config.clone()).await.unwrap().0;
     let spare = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0;
-    let gid = alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] }).unwrap();
+    let gid = alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None }).unwrap();
     bob.join(&alice.invite(&gid.0, INVITE_VALID, Some(&bob.key().0)).await.unwrap(), None).await.unwrap();
     spare.join(&alice.invite(&gid.0, INVITE_VALID, Some(&spare.key().0)).await.unwrap(), None).await.unwrap();
     let (alice_key, bob_key, spare_key) = (alice.key(), bob.key(), spare.key());
@@ -94,7 +94,7 @@ async fn early_entries_wait_only_as_a_whole_signed_log_within_a_page() {
     let relay = lmk_testing::relay().await;
     let config = Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[9; 32]) };
     let alice = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0;
-    alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] }).unwrap();
+    alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None }).unwrap();
     let client = ServeClient::for_service(relay.post(), &relay.service, false).unwrap();
     let frame = |entries: &[Vec<u8>], head: &Head| Frame::Entries { log: Bytes(head.log_ref.to_vec()), entries: entries.iter().cloned().map(Bytes).collect(), head: head.clone() };
     let kept = [b"kept".to_vec()];
@@ -130,7 +130,7 @@ async fn a_commits_membership_events_come_in_the_step_that_applies_it_before_the
     let bob = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(2)).await.unwrap().0;
     let carol = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(3)).await.unwrap().0;
     let dave = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(4)).await.unwrap().0;
-    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
     let gid = alice.create(settings).unwrap();
     for joiner in [&bob, &carol] {
         joiner.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
@@ -160,7 +160,7 @@ async fn a_commits_membership_events_come_in_the_step_that_applies_it_before_the
         let remove = g.mls.members().into_iter().filter(|m| m.key == carol_key.0).map(|m| m.index).collect();
         Ok(Some(core::Change { add: vec![key_package.clone()], invite: Some(core::Invited::new(Bytes(vec![1; 32]), 0, &[1; 16])), remove, ..core::Change::default() }))
     }).await.unwrap();
-    let hello = alice.inner.send(&mut alice.inner.lock(), &gid.0, &serde_json::json!({ "type": "message", "content": "hello" }), None).unwrap();
+    let hello = alice.inner.send(&mut alice.inner.lock(), &gid.0, &serde_json::json!({ "type": "message", "content": "hello" }), None, None).unwrap();
     let sealing = alice.inner.lock().record(&gid.0, &hello.0).unwrap().unwrap().sealing.unwrap().1.0;
     let commit = first(log);
     {
@@ -197,7 +197,7 @@ async fn a_waiting_commit_keeps_what_waits_past_the_window() {
     let config = Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[9; 32]) };
     let alice = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config.clone()).await.unwrap().0;
     let bob = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0;
-    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
     let gid = bob.create(settings).unwrap();
     alice.join(&bob.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
     for node in [&alice, &bob] {

@@ -87,12 +87,27 @@ impl State {
 impl Inner {
     /// Sends a held payload in a step: seals it in the current epoch with this session's next seq, after the messages
     /// it seals again first, and with the deps its client showed; delivers it to this session, and pushes it, or announces
-    /// it if it is over `PUSH` beyond a full mesh. Answers its id.
-    pub(crate) fn send(&self, st: &mut State, gid: &[u8], payload: &Value, reply_to: Option<&[u8]>) -> Result<Bytes> {
+    /// it if it is over `PUSH` beyond a full mesh. When `pinned` is set, verifies atomically before sealing that every
+    /// other current member is in `pinned` and at least one pinned member is present. Answers its id.
+    pub(crate) fn send(&self, st: &mut State, gid: &[u8], payload: &Value, reply_to: Option<&[u8]>, pinned: Option<&[Bytes]>) -> Result<Bytes> {
         self.reseal(st, gid)?;
         let now = st.tick();
         let me = st.me().to_vec();
         let g = st.group(gid)?;
+        if let Some(pinned) = pinned {
+            let members = g.mls.members();
+            let unexpected: Vec<String> = members
+                .iter()
+                .filter(|m| m.key != me && !pinned.iter().any(|p| p.0 == m.key))
+                .map(|m| crate::fp(&m.key))
+                .collect();
+            if !unexpected.is_empty() {
+                return Err(SendError::Pinned(format!("unexpected members in group: {}", unexpected.join(", "))).into());
+            }
+            if !members.iter().any(|m| m.key != me && pinned.iter().any(|p| p.0 == m.key)) {
+                return Err(SendError::Pinned("none of the pinned recipients are currently in the group".into()).into());
+            }
+        }
         let joined = g.mls.joined(&me).context("a member of its group")?;
         let seq = g.current(&me).context("its own membership")?.last() + 1;
         // A message a cut kept may be gone after H; the cut names it.

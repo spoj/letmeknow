@@ -80,7 +80,8 @@ impl Node {
             let mut st = self.inner.lock();
             let st = &mut *st;
             let mls = Group::create(&st.provider, &st.session, &settings)?;
-            st.add_group(mls, Rec { updated: now(), ..Rec::default() })?
+            let now = now();
+            st.add_group(mls, Rec { updated: now, created: now, ..Rec::default() })?
         };
         Ok(Bytes(gid))
     }
@@ -137,6 +138,10 @@ impl Node {
         self.inner.lock().groups.get(gid).is_some_and(|g| g.rec.leaving)
     }
 
+    pub fn left(&self, gid: &[u8], key: &[u8]) -> Result<bool> {
+        Ok(self.inner.lock().group(gid)?.left(key).is_some())
+    }
+
     /// Sets what this session says of itself to the group, signed, for its neighbours to pass on.
     pub fn set_intro(&self, gid: &[u8], text: Option<String>) -> Result<()> {
         self.inner.lock().introduce(gid, text)
@@ -169,7 +174,7 @@ impl Node {
             None => {
                 let leave = serde_json::to_value(Control::Leave { sig: g.mls.leave(&st.session)? })?;
                 st.group_mut(gid)?.rec.leaves.retain(|(by, at, _, _)| by.0 != me || *at != joined);
-                self.inner.send(&mut st, gid, &leave, None)?
+                self.inner.send(&mut st, gid, &leave, None, None)?
             }
         };
         st.group_mut(gid)?.rec.leaving = true;
@@ -207,8 +212,14 @@ impl Node {
     /// the members online, and seals it again in each epoch until a cut keeps it. Answers its id. Fails with `SendError`
     /// when this session sends faster than members take, the message is too large, or the service let the log go.
     pub async fn send(&self, gid: &[u8], payload: &Value, reply_to: Option<&[u8]>) -> Result<Bytes> {
-        self.inner.refresh(gid).await?;
-        self.inner.send(&mut self.inner.lock(), gid, payload, reply_to)
+        self.send_pinned(gid, payload, reply_to, None).await
+    }
+
+    /// Sends a held payload; when `pinned` is set, refreshes strictly against the membership service (failing closed if
+    /// unreachable) and aborts before sealing if any member outside `pinned` is in the group or none of `pinned` remain.
+    pub async fn send_pinned(&self, gid: &[u8], payload: &Value, reply_to: Option<&[u8]>, pinned: Option<&[Bytes]>) -> Result<Bytes> {
+        self.inner.refresh(gid, pinned.is_some()).await?;
+        self.inner.send(&mut self.inner.lock(), gid, payload, reply_to, pinned)
     }
 
     /// A held message of the group this session delivered.

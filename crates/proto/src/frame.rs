@@ -21,6 +21,7 @@ pub struct Open {
 pub enum Stream {
     Peer,
     Admission,
+    Subgroup,
 }
 
 pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {

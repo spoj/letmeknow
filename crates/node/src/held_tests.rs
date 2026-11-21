@@ -9,7 +9,7 @@ async fn members() -> (Node, Node, Bytes, UnboundedReceiver<Event>) {
     let config = Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[9; 32]) };
     let alice = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config.clone()).await.unwrap().0;
     let (bob, mut events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap();
-    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
     let gid = bob.create(settings).unwrap();
     alice.join(&bob.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
     for node in [&alice, &bob] {
@@ -92,7 +92,7 @@ async fn a_message_before_a_join_in_a_later_cut_is_neither_lacking_nor_lost() {
     let alice = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(1)).await.unwrap().0;
     let bob = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(2)).await.unwrap().0;
     let carol = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(3)).await.unwrap().0;
-    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
     let gid = alice.create(settings).unwrap();
     bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
     let tasks: Vec<_> = bob.inner.tasks.lock().unwrap().drain(..).collect();
@@ -104,7 +104,7 @@ async fn a_message_before_a_join_in_a_later_cut_is_neither_lacking_nor_lost() {
     }
     alice.read_group(&gid.0).await.unwrap();
     bob.read_group(&gid.0).await.unwrap();
-    let before = bob.inner.send(&mut bob.inner.lock(), &gid.0, &serde_json::json!({ "type": "message", "content": "before Carol" }), None).unwrap();
+    let before = bob.inner.send(&mut bob.inner.lock(), &gid.0, &serde_json::json!({ "type": "message", "content": "before Carol" }), None, None).unwrap();
 
     carol.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
     for node in [&alice, &carol] {
@@ -120,7 +120,7 @@ async fn a_message_before_a_join_in_a_later_cut_is_neither_lacking_nor_lost() {
         node.read_group(&gid.0).await.unwrap();
     }
 
-    let after = bob.inner.send(&mut bob.inner.lock(), &gid.0, &serde_json::json!({ "type": "message", "content": "after Carol" }), None).unwrap();
+    let after = bob.inner.send(&mut bob.inner.lock(), &gid.0, &serde_json::json!({ "type": "message", "content": "after Carol" }), None, None).unwrap();
     let (first, second) = {
         let st = bob.inner.lock();
         let first = st.record(&gid.0, &before.0).unwrap().unwrap().sealing.unwrap().1.0;
@@ -356,7 +356,7 @@ async fn next_epoch_sealings_are_kept_once_within_a_bound_per_peer_and_leave_thi
     let config = |seed| Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[seed; 32]) };
     let bob = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(1)).await.unwrap().0;
     let alice = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(2)).await.unwrap().0;
-    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
     let gid = bob.create(settings).unwrap();
     alice.join(&bob.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
     for node in [&alice, &bob] {
@@ -466,7 +466,7 @@ async fn three() -> (Node, Node, Node, Bytes) {
     let bob = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(1)).await.unwrap().0;
     let alice = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(2)).await.unwrap().0;
     let carol = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(3)).await.unwrap().0;
-    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
     let gid = bob.create(settings).unwrap();
     for joiner in [&alice, &carol] {
         joiner.join(&bob.invite(&gid.0, INVITE_VALID, Some(&joiner.key().0)).await.unwrap(), None).await.unwrap();
@@ -579,7 +579,7 @@ async fn messages_made_ready_as_a_commit_applies_deliver_at_once_and_leave_the_s
     let carol = Node::start(SqliteProvider::open(&carol_db).unwrap(), config(3)).await.unwrap().0;
     let dave = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(4)).await.unwrap().0;
     let erin = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(5)).await.unwrap().0;
-    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
     let gid = alice.create(settings).unwrap();
     for joiner in [&bob, &carol, &dave, &erin] {
         joiner.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
@@ -599,9 +599,9 @@ async fn messages_made_ready_as_a_commit_applies_deliver_at_once_and_leave_the_s
 
     let msg = |text| serde_json::json!({ "type": "message", "content": text });
     let sealing = |node: &Node, id: &Bytes| node.inner.lock().record(&gid.0, &id.0).unwrap().unwrap().sealing.unwrap().1.0;
-    let by_open = alice.inner.send(&mut alice.inner.lock(), &gid.0, &msg("from open_all"), None).unwrap();
-    let lost_msg = bob.inner.send(&mut bob.inner.lock(), &gid.0, &msg("lost"), None).unwrap();
-    let after_lost = bob.inner.send(&mut bob.inner.lock(), &gid.0, &msg("after lost"), None).unwrap();
+    let by_open = alice.inner.send(&mut alice.inner.lock(), &gid.0, &msg("from open_all"), None, None).unwrap();
+    let lost_msg = bob.inner.send(&mut bob.inner.lock(), &gid.0, &msg("lost"), None, None).unwrap();
+    let after_lost = bob.inner.send(&mut bob.inner.lock(), &gid.0, &msg("after lost"), None, None).unwrap();
     alice.inner.take(&mut alice.inner.lock(), &gid.0, None, vec![sealing(&bob, &lost_msg)], false).unwrap();
     {
         let mut st = carol.inner.lock();
@@ -618,10 +618,10 @@ async fn messages_made_ready_as_a_commit_applies_deliver_at_once_and_leave_the_s
         node.read_group(&gid.0).await.unwrap();
     }
 
-    let unkept_dave = dave.inner.send(&mut dave.inner.lock(), &gid.0, &msg("unkept"), None).unwrap();
+    let unkept_dave = dave.inner.send(&mut dave.inner.lock(), &gid.0, &msg("unkept"), None, None).unwrap();
     erin.inner.take(&mut erin.inner.lock(), &gid.0, None, vec![sealing(&dave, &unkept_dave)], false).unwrap();
     erin.mark_shown(&gid.0, std::slice::from_ref(&unkept_dave)).unwrap();
-    let after_ended = erin.inner.send(&mut erin.inner.lock(), &gid.0, &msg("after ended"), None).unwrap();
+    let after_ended = erin.inner.send(&mut erin.inner.lock(), &gid.0, &msg("after ended"), None, None).unwrap();
     carol.inner.take(&mut carol.inner.lock(), &gid.0, None, vec![sealing(&erin, &after_ended)], false).unwrap();
     for id in [&by_open, &after_lost, &after_ended] {
         assert!(carol.message(&gid.0, &id.0).unwrap().is_none());
@@ -664,7 +664,7 @@ async fn a_commit_removing_this_session_delivers_what_became_ready_before_forget
     let config = |seed| Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[seed; 32]) };
     let alice = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(1)).await.unwrap().0;
     let bob = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config(2)).await.unwrap().0;
-    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+    let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
     let gid = alice.create(settings).unwrap();
     bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
     let tasks: Vec<_> = bob.inner.tasks.lock().unwrap().drain(..).collect();
@@ -679,7 +679,7 @@ async fn a_commit_removing_this_session_delivers_what_became_ready_before_forget
 
     let msg = |text| serde_json::json!({ "type": "message", "content": text });
     let sealing = |node: &Node, id: &Bytes| node.inner.lock().record(&gid.0, &id.0).unwrap().unwrap().sealing.unwrap().1.0;
-    let before_carol = alice.inner.send(&mut alice.inner.lock(), &gid.0, &msg("before Carol"), None).unwrap();
+    let before_carol = alice.inner.send(&mut alice.inner.lock(), &gid.0, &msg("before Carol"), None, None).unwrap();
     bob.inner.take(&mut bob.inner.lock(), &gid.0, None, vec![sealing(&alice, &before_carol)], false).unwrap();
     bob.mark_shown(&gid.0, std::slice::from_ref(&before_carol)).unwrap();
 
@@ -697,7 +697,7 @@ async fn a_commit_removing_this_session_delivers_what_became_ready_before_forget
     }
     while events.try_recv().is_ok() {}
 
-    let farewell = bob.inner.send(&mut bob.inner.lock(), &gid.0, &msg("farewell"), None).unwrap();
+    let farewell = bob.inner.send(&mut bob.inner.lock(), &gid.0, &msg("farewell"), None, None).unwrap();
     {
         let mut st = carol.inner.lock();
         st.time = crate::now() + 600_000;

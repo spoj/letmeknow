@@ -21,7 +21,7 @@ fn key() -> [u8; 32] {
 }
 
 pub(crate) fn settings() -> Settings {
-    Settings { protocol: PROTOCOL, carry: 7, update: lmk_proto::group::UPDATE, membership: service(DOMAIN), admins: vec![], admitted: vec![] }
+    Settings { protocol: PROTOCOL, carry: 7, update: lmk_proto::group::UPDATE, membership: service(DOMAIN), admins: vec![], admitted: vec![], subgroup: None }
 }
 
 /// The iroh key of the session named `name`.
@@ -1632,4 +1632,53 @@ fn a_storage_failure_while_judging_is_no_verdict() {
     c.read(&w.log);
     std::fs::remove_dir_all(dir).ok();
     w.agree(&[0, 1, 2]);
+}
+
+#[test]
+fn subgroup_settings_lock_roster_and_are_immutable() {
+    let mut w = World::new(&["A", "B", "C"]);
+    let a = Bytes(w.m[0].session.key().to_vec());
+    let b = Bytes(w.m[1].session.key().to_vec());
+    let mut members = vec![a.clone(), b.clone()];
+    members.sort();
+    let parent = Bytes(vec![7; 16]);
+
+    // Invalid subgroup configs are rejected at creation.
+    let bad_unsorted = Settings { subgroup: Some(Subgroup { parent: parent.clone(), members: vec![members[1].clone(), members[0].clone()] }), ..settings() };
+    assert!(Group::create(&w.m[0].provider, &w.m[0].session, &bad_unsorted).is_err());
+    let bad_solo = Settings { subgroup: Some(Subgroup { parent: parent.clone(), members: vec![a.clone()] }), ..settings() };
+    assert!(Group::create(&w.m[0].provider, &w.m[0].session, &bad_solo).is_err());
+
+    let sub_settings = Settings { subgroup: Some(Subgroup { parent: parent.clone(), members: members.clone() }), ..settings() };
+    let group = Group::create(&w.m[0].provider, &w.m[0].session, &sub_settings).unwrap();
+    w.m[0].group = Some(group);
+    w.m[0].pos = 0;
+
+    // Adding an allowed member (B) succeeds.
+    let kp_b = w.key_package(1);
+    let cut = w.m[0].cut();
+    let commit = w.m[0].commit(Change { cut, add: vec![kp_b.clone()], invite: Some(invite()), ..Change::default() });
+    let inner = w.m[0].open_inner(&commit.entry);
+    let admission = commit.admission.clone().unwrap();
+    let pos = w.post(commit.entry);
+    w.read(&[0]);
+    w.m[1].join(&inner, &admission, pos, &kp_b);
+    w.agree(&[0, 1]);
+
+    // Adding C (outside subgroup.members) is refused by rules() inside commit().
+    let kp_c = w.key_package(2);
+    let cut = w.m[0].cut();
+    let m0 = &mut w.m[0];
+    let bad_add = m0.group.as_mut().unwrap().commit(&m0.provider, &m0.session, Change { cut, add: vec![kp_c], invite: Some(invite()), ..Change::default() });
+    let err = bad_add.err().expect("must fail").to_string();
+    assert!(err.contains("subgroup"), "{err}");
+
+    // Changing subgroup settings is refused as immutable.
+    let mut widened = sub_settings.clone();
+    widened.subgroup = None;
+    let cut = w.m[0].cut();
+    let m0 = &mut w.m[0];
+    let bad_cfg = m0.group.as_mut().unwrap().commit(&m0.provider, &m0.session, Change { cut, settings: Some(widened), ..Change::default() });
+    assert!(bad_cfg.is_err());
+    w.agree(&[0, 1]);
 }

@@ -47,6 +47,7 @@ impl Node {
             tasks: Mutex::default(),
             contradictions: Mutex::default(),
             warned: Mutex::default(),
+            subgroup_offers: Mutex::default(),
         });
         let (net, net_events) = Net::spawn(endpoint, inner.clone(), Arc::new(admission::Admitter(inner.clone()))).await?;
         inner.net.set(net).ok();

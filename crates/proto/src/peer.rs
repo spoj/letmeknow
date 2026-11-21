@@ -164,6 +164,13 @@ pub struct Admitted {
     pub sig: Bytes,
 }
 
+/// A co-member's request on a `subgroup` stream to auto-join a subgroup of `parent` via its invite `link`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubgroupAsk {
+    pub parent: Bytes,
+    pub link: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -150,6 +150,15 @@ impl State {
     }
 }
 
+/// Members of a subgroup (other than this session) that are no longer in its parent group, by leaf index.
+fn subgroup_departed(st: &State, g: &G) -> Vec<u32> {
+    let Some(sub) = g.mls.settings().subgroup else { return Vec::new() };
+    let Some(parent) = st.groups.get(&sub.parent.0).filter(|p| p.mls.active()) else { return Vec::new() };
+    let parent_keys: Vec<Vec<u8>> = parent.mls.members().into_iter().map(|m| m.key).collect();
+    let me = st.me();
+    g.mls.members().into_iter().filter(|m| m.key != me && !parent_keys.contains(&m.key)).map(|m| m.index).collect()
+}
+
 /// What a pass commits on the group as it stands, if anything: the Removes due, which a session that is no admin may
 /// commit, and this session's update.
 fn due(st: &State, g: &G) -> Result<Option<Change>> {
@@ -167,6 +176,13 @@ fn due(st: &State, g: &G) -> Result<Option<Change>> {
                 change.left.push(sig.clone());
             }
             _ => {}
+        }
+    }
+    if admin {
+        for index in subgroup_departed(st, g) {
+            if !change.remove.contains(&index) {
+                change.remove.push(index);
+            }
         }
     }
     let Some(own) = members.iter().find(|m| m.index == g.mls.own_index()) else { return Ok(None) };
@@ -238,23 +254,60 @@ impl Inner {
                 self.gone(&mut st, gid, None);
                 return Ok(());
             }
+            // Subgroup level-triggered cascade: exit locally if the parent is gone or a member left the parent and we
+            // cannot keep a >=2-member subgroup as admin.
+            if let Some(sub) = g.mls.settings().subgroup {
+                let parent_ok = st.groups.get(&sub.parent.0).is_some_and(|p| p.mls.active());
+                let departed = subgroup_departed(&st, g);
+                let members_len = g.mls.members().len();
+                let local_exit = !parent_ok || (!departed.is_empty() && members_len.saturating_sub(departed.len()) <= 1);
+                if local_exit {
+                    if members_len > 1
+                        && let Ok(sig) = g.mls.leave(&st.session)
+                        && let Ok(leave) = serde_json::to_value(Control::Leave { sig })
+                    {
+                        let _ = self.send(&mut st, gid, &leave, None, None);
+                    }
+                    self.gone(&mut st, gid, None);
+                    return Ok(());
+                }
+            }
             st.expire(gid)?;
             let tick = st.tick();
             let g = st.group(gid)?;
             if !g.rec.lost.is_empty() {
                 let lost = Control::Lost { lost: g.rec.lost.clone() };
-                self.send(&mut st, gid, &serde_json::to_value(lost)?, None)?;
+                self.send(&mut st, gid, &serde_json::to_value(lost)?, None, None)?;
                 st.group_mut(gid)?.rec.lost.clear();
                 st.save(gid)?;
             }
             let g = st.group(gid)?;
             let behind = g.rec.present < g.mls.epoch();
             if behind && tick >= g.rec.presented + PRESENT {
-                self.send(&mut st, gid, &serde_json::to_value(Control::Present)?, None)?;
+                self.send(&mut st, gid, &serde_json::to_value(Control::Present)?, None, None)?;
+            }
+            // Sole-member subgroup ages out once nothing has been delivered for `carry` days.
+            let mut sole_expire = u64::MAX;
+            let g = st.group(gid)?;
+            if g.mls.settings().subgroup.is_some() && g.mls.members().len() == 1 {
+                let mut last_active = g.rec.created.max(g.rec.updated);
+                if g.rec.index >= g.rec.first.max(1)
+                    && let Ok(Some(id)) = get::<Bytes>(&st.provider, &delivered_key(gid, g.rec.index))
+                    && let Ok(Some(record)) = st.record(gid, &id.0)
+                    && let Some(delivered) = record.delivered
+                {
+                    last_active = last_active.max(delivered.at);
+                }
+                let at = last_active.saturating_add(days(g.mls.settings().carry));
+                if last_active > 0 && now() >= at {
+                    self.gone(&mut st, gid, None);
+                    return Ok(());
+                }
+                sole_expire = at;
             }
             let g = st.group(gid)?;
             let present = if g.rec.present < g.mls.epoch() { g.rec.presented + PRESENT } else { u64::MAX };
-            let next = if g.rec.stirred { next(g, st.me()) } else { u64::MAX }.min(present);
+            let next = if g.rec.stirred { next(g, st.me()) } else { u64::MAX }.min(present).min(sole_expire);
             let pending = due(&st, g)?;
             // A pass that removes commits at once.
             let removing = pending.as_ref().is_some_and(|change| !change.remove.is_empty());
@@ -335,7 +388,7 @@ mod tests {
             nodes.push(Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0);
         }
         let (alice, bob) = (&nodes[0], &nodes[1]);
-        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
         let gid = alice.create(settings).unwrap();
         bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
         let own = alice.send(&gid.0, &json!({ "type": "message", "content": "unkept" }), None).await.unwrap();
@@ -403,7 +456,7 @@ mod tests {
         for task in alice.inner.tasks.lock().unwrap().drain(..) {
             task.abort();
         }
-        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
         let gid = alice.create(settings).unwrap();
         {
             let mut st = alice.inner.lock();
@@ -451,7 +504,7 @@ mod tests {
         for task in alice.inner.tasks.lock().unwrap().drain(..) {
             task.abort();
         }
-        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
         let gid = alice.create(settings).unwrap();
         heard(now(), now(), now() - days(1));
         alice.inner.pass(&gid.0).await.unwrap();

@@ -243,6 +243,10 @@ pub enum Request {
         /// A member to address, by fingerprint; repeat for several
         #[arg(long)]
         to: Vec<String>,
+        /// Fail unless every current group member aside from you is listed in --to (fails closed if the membership service cannot be reached)
+        #[arg(long, requires = "to")]
+        #[serde(default)]
+        only: bool,
         /// Id of the message this answers, or any unique beginning of it
         #[arg(long)]
         reply_to: Option<String>,
@@ -250,6 +254,48 @@ pub enum Request {
         #[arg(long)]
         urgent: bool,
         /// File to attach ("-" reads stdin), up to about 12 MiB; each recipient's session saves it into a private file
+        #[arg(long, value_name = "FILE")]
+        attach: Option<String>,
+        /// The attached file's name, set from its path
+        #[arg(skip)]
+        #[serde(default)]
+        attach_name: String,
+        text: String,
+    },
+    /// Wire-only variant for `send --only`, so running <=0.26.3 sessions reject it instead of ignoring `only`.
+    #[command(skip)]
+    SendOnly {
+        group: Option<String>,
+        to: Vec<String>,
+        reply_to: Option<String>,
+        urgent: bool,
+        attach: Option<String>,
+        #[serde(default)]
+        attach_name: String,
+        text: String,
+    },
+    /// Create a subgroup of an existing group with selected co-members (they join automatically)
+    #[command(display_order = 12)]
+    Subgroup {
+        #[arg(long)]
+        group: Option<String>,
+        /// Days members carry the subgroup's messages for one another
+        #[arg(long, default_value_t = SUBGROUP_CARRY)]
+        #[serde(default = "subgroup_carry")]
+        carry: u32,
+        /// Co-members of the parent group, by fingerprint
+        #[arg(required = true)]
+        members: Vec<String>,
+    },
+    /// Direct-message one co-member (reuses or creates a 2-member subgroup, pinned with --only; "-" reads stdin)
+    #[command(display_order = 12)]
+    Dm {
+        #[arg(long)]
+        group: Option<String>,
+        /// Recipient co-member, by fingerprint
+        #[arg(long)]
+        to: String,
+        /// File to attach ("-" reads stdin), up to about 12 MiB
         #[arg(long, value_name = "FILE")]
         attach: Option<String>,
         /// The attached file's name, set from its path
@@ -269,10 +315,15 @@ pub enum Action {
 }
 
 const CARRY: u32 = 7;
+const SUBGROUP_CARRY: u32 = 1;
 const VALID: u64 = lmk_node::INVITE_VALID / 60_000;
 
 fn carry() -> u32 {
     CARRY
+}
+
+fn subgroup_carry() -> u32 {
+    SUBGROUP_CARRY
 }
 
 fn valid() -> u64 {
@@ -473,7 +524,7 @@ async fn answer(stream: TcpStream, token: String, inbound: mpsc::UnboundedSender
 /// Sends a request to the running session and returns its answer: made short, but for `members`. Files the request
 /// names are read here: the session process runs elsewhere.
 pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Value> {
-    if let Request::Send { text, attach, attach_name, .. } = &mut request {
+    let read_inputs = |text: &mut String, attach: &mut Option<String>, attach_name: &mut String| -> Result<()> {
         if let Some(file) = attach {
             let (bytes, name) = match file.as_str() {
                 "-" => {
@@ -493,6 +544,18 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
             text.clear();
             std::io::stdin().read_to_string(text)?;
         }
+        Ok(())
+    };
+    match &mut request {
+        Request::Send { text, attach, attach_name, .. }
+        | Request::SendOnly { text, attach, attach_name, .. }
+        | Request::Dm { text, attach, attach_name, .. } => {
+            read_inputs(text, attach, attach_name)?;
+        }
+        _ => {}
+    }
+    if let Request::Send { group, to, only: true, reply_to, urgent, attach, attach_name, text } = request {
+        request = Request::SendOnly { group, to, reply_to, urgent, attach, attach_name, text };
     }
     let full = matches!(request, Request::Members { .. } | Request::Join { .. } | Request::Admins { .. } | Request::Admitted { .. });
     let channel = connect(&session_dir(home, session)?.join("endpoint"))

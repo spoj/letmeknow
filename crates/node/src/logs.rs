@@ -236,8 +236,8 @@ impl Inner {
     /// Before a send: asks the service about the group's current log, and if it moved, or this session holds a commit of
     /// it that it has not applied, as while it waits for what the last one kept, waits until this session caught up with
     /// it, through each epoch a commit moves it to. Fails when the log counts as let go. Within `STALE`, a service that
-    /// does not answer within `SEND_WAIT` holds nothing back: chat goes on while it is down.
-    pub(crate) async fn refresh(self: &Arc<Self>, gid: &[u8]) -> Result<()> {
+    /// does not answer within `SEND_WAIT` holds nothing back unless `strict` is set: pinned sends fail closed.
+    pub(crate) async fn refresh(self: &Arc<Self>, gid: &[u8], strict: bool) -> Result<()> {
         let (id, service, capability, held) = {
             let st = self.lock();
             let id = st.group(gid)?.rec.log.0.clone();
@@ -248,12 +248,18 @@ impl Inner {
             Ok(Ok(mut answers)) => answers.remove(0),
             Ok(Err(error)) => {
                 self.report(&error);
+                if strict {
+                    return Err(SendError::Unverified(format!("membership service did not answer: {error:#}")).into());
+                }
                 if current_stale(&self.lock()) {
                     return Err(error);
                 }
                 return Ok(());
             }
             Err(_) => {
+                if strict {
+                    return Err(SendError::Unverified("membership service did not answer".into()).into());
+                }
                 if current_stale(&self.lock()) {
                     anyhow::bail!("the membership service did not answer");
                 }

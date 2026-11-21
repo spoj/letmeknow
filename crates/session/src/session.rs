@@ -174,6 +174,20 @@ impl Session {
         if let Err(error) = private_file(&self.config.dir.join("groups.json"), serde_json::to_string(&groups).expect("JSON").as_bytes()) {
             self.warn(format!("writing this session's groups: {error:#}"));
         }
+        // Track subgroups separately so `groups.json` keeps the full restart baseline while `delete_stopped` ignores
+        // subgroups when checking whether a stopped session ran last of a group.
+        let subgroups: Vec<String> = self
+            .groups
+            .iter()
+            .filter(|gid| self.node.settings(&gid.0).ok().and_then(|s| s.subgroup).is_some())
+            .map(|gid| b64(&gid.0))
+            .collect();
+        let path = self.config.dir.join("subgroups.json");
+        if subgroups.is_empty() {
+            let _ = std::fs::remove_file(&path);
+        } else if let Err(error) = private_file(&path, serde_json::to_string(&subgroups).expect("JSON").as_bytes()) {
+            self.warn(format!("writing this session's subgroups: {error:#}"));
+        }
     }
 
     pub fn tick(&mut self) {
@@ -356,26 +370,107 @@ impl Session {
                 node.set_intro(&gid.0, intro.clone())?;
                 Ok(json!({ "group": b64(&gid.0), "intro": intro }))
             }),
-            Request::Send { group, to, reply_to, urgent, attach, attach_name, text } => {
-                match self.message(group, to, reply_to, urgent, attach.map(|data| (data, attach_name)), text) {
-                    Ok((gid, payload, reply_to)) => {
-                        _ = self.running.spawn_local(async move { Answered(send(&node, &gid, payload, reply_to).await, Some(reply)) });
+            Request::Send { group, to, only, reply_to, urgent, attach, attach_name, text } => {
+                match self.message(group, to, only, reply_to, urgent, attach.map(|data| (data, attach_name)), text) {
+                    Ok(Prepared { gid, payload, reply_to, pinned }) => {
+                        _ = self.running.spawn_local(async move { Answered(send(&node, &gid, payload, reply_to, pinned).await, Some(reply)) });
                         return;
                     }
                     Err(error) => Err(error),
                 }
+            }
+            Request::SendOnly { group, to, reply_to, urgent, attach, attach_name, text } => {
+                match self.message(group, to, true, reply_to, urgent, attach.map(|data| (data, attach_name)), text) {
+                    Ok(Prepared { gid, payload, reply_to, pinned }) => {
+                        _ = self.running.spawn_local(async move { Answered(send(&node, &gid, payload, reply_to, pinned).await, Some(reply)) });
+                        return;
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Request::Subgroup { group, carry, members } => {
+                let parent = self.resolve(group);
+                let subgroup = async move {
+                    let parent = parent?;
+                    let parent_settings = node.settings(&parent.0)?;
+                    ensure!(parent_settings.subgroup.is_none(), "cannot create a subgroup of a subgroup");
+                    let me = node.key();
+                    let mut keys = Vec::new();
+                    for member in &members {
+                        let resolved = member_by_fp(&node, &parent, member)?;
+                        ensure!(resolved.key != me, "cannot include yourself in subgroup members");
+                        if !keys.contains(&resolved.key) {
+                            keys.push(resolved.key);
+                        }
+                    }
+                    let res = node.subgroup(&parent.0, &keys, carry, parent_settings.membership).await?;
+                    let joined: Vec<String> = res.joined.iter().map(|k| fp(&k.0)).collect();
+                    let failed: Vec<Value> = res.failed.iter().map(|(k, r)| json!({ "member": fp(&k.0), "error": r })).collect();
+                    let mut out = json!({ "group": b64(&res.group.0), "via_group": b64(&parent.0), "joined": joined });
+                    if !failed.is_empty() {
+                        out["failed"] = json!(failed);
+                    }
+                    Ok(out)
+                };
+                _ = self.running.spawn_local(async move { Answered(subgroup.await, Some(reply)) });
+                return;
+            }
+            Request::Dm { group, to, attach, attach_name, text } => {
+                let parent = self.resolve(group);
+                let attachment = attach.map(|data| B64.decode(data).map(|data| Attachment { name: attach_name, data: Bytes(data) })).transpose();
+                let dm = async move {
+                    let parent = parent?;
+                    let attachment = attachment?;
+                    let parent_settings = node.settings(&parent.0)?;
+                    ensure!(parent_settings.subgroup.is_none(), "cannot send a dm scoped to a subgroup; pass the parent --group");
+                    let me = node.key();
+                    let peer = member_by_fp(&node, &parent, &to)?;
+                    ensure!(peer.key != me, "cannot dm yourself");
+                    let mut pair = vec![me.clone(), peer.key.clone()];
+                    pair.sort();
+                    let mut existing: Vec<Bytes> = node
+                        .groups()
+                        .into_iter()
+                        .filter(|gid| {
+                            !node.leaving(&gid.0)
+                                && !node.left(&gid.0, &peer.key.0).unwrap_or(false)
+                                && node.settings(&gid.0).ok().and_then(|s| s.subgroup).is_some_and(|sub| sub.parent == parent && sub.members == pair)
+                                && node.members(&gid.0).ok().is_some_and(|ms| ms.iter().any(|m| m.key == peer.key))
+                        })
+                        .collect();
+                    existing.sort();
+                    let (sub_gid, reused) = match existing.into_iter().next() {
+                        Some(gid) => (gid, true),
+                        None => (node.subgroup(&parent.0, std::slice::from_ref(&peer.key), 1, parent_settings.membership).await?.group, false),
+                    };
+                    let to_fp = Bytes(Sha256::digest(&peer.key.0)[..8].to_vec());
+                    let payload = ChatMessage { content: text, to: vec![to_fp], urgent: false, attachment, sent_at: None };
+                    let mut answer = send(&node, &sub_gid, payload, None, Some(vec![peer.key.clone()])).await?;
+                    answer["group"] = json!(b64(&sub_gid.0));
+                    answer["via_group"] = json!(b64(&parent.0));
+                    if reused {
+                        answer["reused"] = json!(true);
+                    }
+                    Ok(answer)
+                };
+                _ = self.running.spawn_local(async move { Answered(dm.await, Some(reply)) });
+                return;
             }
             Request::Invite { group, for_member, carry, valid } => {
                 let target = for_member.map(|fp| known_member(&node, &fp)).transpose();
                 let gid = match (target, group) {
                     (Err(error), _) => Err(error),
                     (Ok(target), Some(group)) => self.resolve(Some(group)).and_then(|gid| {
+                        if let Some(sub) = node.settings(&gid.0)?.subgroup {
+                            let member = target.as_ref().context("inviting into a subgroup requires --for naming one of its declared members")?;
+                            ensure!(sub.members.contains(&member.key), "{} is not a declared member of this subgroup", fp(&member.key.0));
+                        }
                         if let Some(member) = &target {
                             ensure!(!node.members(&gid.0)?.iter().any(|m| m.key == member.key), "{} is a member of {} already", fp(&member.key.0), b64(&gid.0));
                         }
                         Ok((gid, target))
                     }),
-                    (Ok(target), None) => node.create(Settings { protocol: PROTOCOL, carry, update: UPDATE, membership: self.membership.clone(), admins: vec![], admitted: vec![] }).map(|gid| (gid, target)),
+                    (Ok(target), None) => node.create(Settings { protocol: PROTOCOL, carry, update: UPDATE, membership: self.membership.clone(), admins: vec![], admitted: vec![], subgroup: None }).map(|gid| (gid, target)),
                 };
                 let invite = async move {
                     let (gid, target) = gid?;
@@ -480,16 +575,22 @@ impl Session {
             let only_here: Vec<Value> =
                 self.node.only_here(&gid.0)?.iter().map(|(id, payload)| json!({ "what": payload["type"], "id": hex::encode(&id.0) })).collect();
             let lists = listed_lists(&self.node, &gid)?;
-            groups.push(json!({
+            let mut item = json!({
                 "group": b64(&gid.0), "size": presence.len(), "recent": 1 + presence.iter().filter(|(_, seen)| seen.is_some_and(|seen| now.saturating_sub(seen.at) < RECENT)).count(),
                 "carry": settings.carry, "membership": settings.membership, "epoch": self.node.epoch(&gid.0)?, "only_here": only_here,
                 "admins": lists["admins"], "admitted": lists["admitted"],
-            }));
+            });
+            if let Some(sub) = settings.subgroup {
+                item["via_group"] = json!(b64(&sub.parent.0));
+            }
+            groups.push(item);
         }
         Ok(json!({ "groups": groups }))
     }
 
-    /// The group a request acts on: the one it names by id, or any unique beginning of it, or else the session's one group.
+    /// The group a request acts on: the one it names by id, or any unique beginning of it, or else the session's one
+    /// top-level group (subgroups are excluded from the default so a co-member opening a subgroup never breaks
+    /// commands run without `--group`).
     fn resolve(&self, group: Option<String>) -> Result<Bytes> {
         let gids = self.node.groups();
         match group {
@@ -501,11 +602,14 @@ impl Session {
                     _ => bail!("several groups have ids that begin {group}; give more of it"),
                 }
             }
-            None => match &gids[..] {
-                [gid] => Ok(gid.clone()),
-                [] => bail!("this session is in no group; create one with `invite`, or join one with `join`"),
-                _ => bail!("this session is in several groups; pass --group"),
-            },
+            None => {
+                let top: Vec<Bytes> = gids.into_iter().filter(|gid| self.node.settings(&gid.0).ok().and_then(|s| s.subgroup).is_none()).collect();
+                match &top[..] {
+                    [gid] => Ok(gid.clone()),
+                    [] => bail!("this session is in no group; create one with `invite`, or join one with `join`"),
+                    _ => bail!("this session is in several groups; pass --group"),
+                }
+            }
         }
     }
 
@@ -533,18 +637,23 @@ impl Session {
     }
 
     fn on(&mut self, event: Event) -> Result<()> {
-        let me = self.node.key();
-        let item = match event {
+        let node = self.node.clone();
+        let me = node.key();
+        let mut item = match event {
             Event::Joined { group, member, by } => json!({ "type": "joined", "group": group, "member": describe(&me, &member), "by": describe(&me, &by) }),
             Event::Left { group, member, by } => json!({ "type": "left", "group": group, "member": describe(&me, &member), "by": describe(&me, &by) }),
-            Event::Removed { group, by, not_kept, leave } => {
+            Event::Removed { group, by, not_kept, leave, parent } => {
                 if let Some(leave) = leave
                     && let Err(error) = crate::keep_leave(&self.leaves, &leave)
                 {
                     self.warn(format!("keeping this session's leave: {error:#}"));
                 }
                 let not_kept: Vec<String> = not_kept.iter().map(|id| hex::encode(&id.0)).collect();
-                json!({ "type": "removed", "group": group, "by": by.map(|by| describe(&me, &by)), "not_kept": not_kept })
+                let mut item = json!({ "type": "removed", "group": group, "by": by.map(|by| describe(&me, &by)), "not_kept": not_kept });
+                if let Some(parent) = parent {
+                    item["via_group"] = json!(b64(&parent.0));
+                }
+                item
             }
             Event::Message(message) if message.payload["type"] == "message" => {
                 if !self.taken(&message.id.0)? {
@@ -555,7 +664,7 @@ impl Session {
             // The others are the node's: invites and leaves.
             Event::Message(_) => return Ok(()),
             Event::Lost(lost) => {
-                let members = self.node.members(&lost.group.0).unwrap_or_default();
+                let members = node.members(&lost.group.0).unwrap_or_default();
                 let member = describe_key(&me, &members, &lost.member.key);
                 if member["you"] == true {
                     let messages: Vec<Value> = lost.messages.iter().map(|of| json!({ "from": describe(&me, &of.from), "seqs": of.seqs })).collect();
@@ -571,6 +680,13 @@ impl Session {
             }
             Event::Warning { group, text } => json!({ "type": "warning", "group": group, "text": text }),
         };
+        if item.get("via_group").is_none()
+            && let Some(gid_val) = item.get("group").cloned()
+            && let Ok(gid) = serde_json::from_value::<Bytes>(gid_val)
+            && let Some(sub) = node.settings(&gid.0).ok().and_then(|s| s.subgroup)
+        {
+            item["via_group"] = json!(b64(&sub.parent.0));
+        }
         let wake = wakes(&item, |id| self.mine(id));
         self.out.push((item, wake));
         Ok(())
@@ -591,17 +707,23 @@ impl Session {
 
     // Messages.
 
-    /// A chat message to send, the group it goes to, and the message it answers.
+    /// A chat message to send, the group it goes to, the message it answers, and any pinned recipient keys (`--only`).
+    #[allow(clippy::too_many_arguments)]
     fn message(
         &mut self,
         group: Option<String>,
         to: Vec<String>,
+        only: bool,
         reply_to: Option<String>,
         urgent: bool,
         attach: Option<(String, String)>,
         text: String,
-    ) -> Result<(Bytes, ChatMessage, Option<Bytes>)> {
+    ) -> Result<Prepared> {
         let gid = self.resolve(group)?;
+        let is_subgroup = self.node.settings(&gid.0)?.subgroup.is_some();
+        if is_subgroup && self.node.members(&gid.0)?.len() <= 1 {
+            bail!("no other member is in this subgroup");
+        }
         let reply_to = match reply_to {
             Some(id) => {
                 let target = self.find(&id)?;
@@ -614,6 +736,9 @@ impl Session {
             Some((data, name)) => Some(Attachment { name, data: Bytes(B64.decode(data)?) }),
             None => None,
         };
+        if only {
+            ensure!(!to.is_empty(), "--only requires at least one --to recipient");
+        }
         let mut addressed: Vec<Member> = Vec::new();
         for to in &to {
             let member = member_by_fp(&self.node, &gid, to)?;
@@ -621,8 +746,13 @@ impl Session {
                 addressed.push(member);
             }
         }
+        if addressed.is_empty() && is_subgroup {
+            let me = self.node.key();
+            addressed = self.node.members(&gid.0)?.into_iter().filter(|m| m.key != me).collect();
+        }
+        let pinned = only.then(|| addressed.iter().map(|m| m.key.clone()).collect());
         let to = addressed.iter().map(|m| Bytes(Sha256::digest(&m.key.0)[..8].to_vec())).collect();
-        Ok((gid, ChatMessage { content: text, to, urgent, attachment, sent_at: None }, reply_to))
+        Ok(Prepared { gid, payload: ChatMessage { content: text, to, urgent, attachment, sent_at: None }, reply_to, pinned })
     }
 
     /// Takes in a chat message, in delivery order: printed, with its attachment saved into a file only this user can read.
@@ -683,6 +813,9 @@ impl Session {
         let missing: Vec<Value> = message.missing.iter().map(|seqs| json!({ "from": describe_key(&me, &members, &seqs.key), "seqs": seqs.seqs.iter().collect::<Vec<_>>() })).collect();
         let id = hex::encode(&message.id.0);
         let mut item = json!({ "type": "message", "group": gid, "id": id, "from": describe(&me, &message.sender), "seq": message.seq });
+        if let Some(sub) = self.node.settings(&gid.0).ok().and_then(|s| s.subgroup) {
+            item["via_group"] = json!(b64(&sub.parent.0));
+        }
         if !missing.is_empty() {
             item["missing"] = json!(missing);
         }
@@ -783,11 +916,18 @@ async fn join(node: &Node, joining: &RefCell<HashSet<Vec<u8>>>, leaves: &Path, l
     listed_members(node, &joined?.0, false)
 }
 
+struct Prepared {
+    gid: Bytes,
+    payload: ChatMessage,
+    reply_to: Option<Bytes>,
+    pinned: Option<Vec<Bytes>>,
+}
+
 /// Sends a chat message, a reply to `reply_to` if given, stamped with the time it is sent.
-async fn send(node: &Node, gid: &Bytes, mut payload: ChatMessage, reply_to: Option<Bytes>) -> Result<Value> {
+async fn send(node: &Node, gid: &Bytes, mut payload: ChatMessage, reply_to: Option<Bytes>, pinned: Option<Vec<Bytes>>) -> Result<Value> {
     payload.sent_at = Some(lmk_proto::clock::corrected());
     let to: Vec<String> = payload.to.iter().map(|to| hex::encode(&to.0)).collect();
-    let id = node.send(&gid.0, &serde_json::to_value(payload)?, reply_to.as_ref().map(|id| &id.0[..])).await?;
+    let id = node.send_pinned(&gid.0, &serde_json::to_value(payload)?, reply_to.as_ref().map(|id| &id.0[..]), pinned.as_deref()).await?;
     let mut answer = json!({ "id": hex::encode(&id.0) });
     if !to.is_empty() {
         answer["to"] = json!(to);
@@ -910,6 +1050,9 @@ fn listed_members(node: &Node, gid: &Bytes, all: bool) -> Result<Value> {
         }
     }
     let mut listed = json!({ "group": b64(&gid.0), "members": members });
+    if let Some(sub) = node.settings(&gid.0).ok().and_then(|s| s.subgroup) {
+        listed["via_group"] = json!(b64(&sub.parent.0));
+    }
     if offline > 0 {
         listed["offline"] = json!(offline);
     }

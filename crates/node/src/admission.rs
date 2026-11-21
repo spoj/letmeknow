@@ -13,9 +13,9 @@ use iroh::{EndpointId, RelayUrl};
 use lmk_core::group::{Change, Group, Invited, delete_key_package, key_package_leaf, key_package_reference};
 use lmk_net::Admit;
 use lmk_proto::directory::relay_url;
-use lmk_proto::group::{Control, Leaf, Service};
+use lmk_proto::group::{Control, Leaf, PROTOCOL, Service, Settings, Subgroup, UPDATE};
 use lmk_proto::links::Invite;
-use lmk_proto::peer::{Admitted, Join};
+use lmk_proto::peer::{Admitted, Join, SubgroupAsk};
 use lmk_proto::clock::corrected;
 use lmk_proto::{Answer, Bytes};
 use n0_future::boxed::BoxFuture;
@@ -39,6 +39,25 @@ const JOIN_LIMIT: Duration = Duration::from_secs(300);
 /// How long the inviter, whom a link names first, has to be reached before the other members it names are asked: so the
 /// inviter admits whom it invited when it is online.
 const INVITER_FIRST: Duration = Duration::from_secs(3);
+/// Maximum auto-joined subgroups kept per parent group.
+const MAX_SUBGROUPS_PER_PARENT: usize = 64;
+/// Maximum subgroup offers accepted per inviter per minute.
+const MAX_SUBGROUP_OFFERS_PER_MIN: usize = 8;
+/// How long a subgroup creator waits for a co-member's offer stream to finish.
+const SUBGROUP_OFFER_WAIT: Duration = Duration::from_secs(45);
+/// Receiver's bounded wait for pre-join parent refresh and subgroup join, strictly inside `SUBGROUP_OFFER_WAIT`.
+const SUBGROUP_REFRESH_WAIT: Duration = Duration::from_secs(5);
+const SUBGROUP_JOIN_WAIT: Duration = Duration::from_secs(30);
+/// How long a subgroup's single-use targeted invite stays valid, in milliseconds.
+const SUBGROUP_INVITE_VALID: u64 = 60_000;
+
+/// Result of creating a subgroup of a parent group and inviting co-members to auto-join.
+#[derive(Clone, Debug)]
+pub struct SubgroupResult {
+    pub group: Bytes,
+    pub joined: Vec<Bytes>,
+    pub failed: Vec<(Bytes, String)>,
+}
 
 impl Node {
     /// An invite into a group, valid for `valid` milliseconds: shared with the members as a held message, unless it is
@@ -102,6 +121,93 @@ impl Node {
     /// membership first if it is a member still. Returns the group, and the iroh key of the member that admitted this
     /// session.
     pub async fn join(&self, link: &Invite, leave: Option<Bytes>) -> Result<(Bytes, [u8; 32])> {
+        self.inner.join_link(link, leave, None, JOIN_LIMIT).await
+    }
+
+    /// Creates a subgroup of `parent` locked to `[self, ...peers]` and invites each peer over `Stream::Subgroup` so
+    /// their daemon auto-joins via normal admission. Fails and removes the empty subgroup if no peer joins.
+    pub async fn subgroup(&self, parent: &[u8], peers: &[Bytes], carry: u32, membership: Service) -> Result<SubgroupResult> {
+        ensure!(!peers.is_empty(), "a subgroup needs at least one other member");
+        self.inner.refresh(parent, false).await?;
+        let me = self.key();
+        let targets: Vec<(Bytes, EndpointId, Vec<RelayUrl>)> = {
+            let st = self.inner.lock();
+            let g = st.group(parent)?;
+            ensure!(g.mls.settings().subgroup.is_none(), "cannot create a subgroup of a subgroup");
+            ensure!(g.mls.active() && !g.rec.leaving, "parent group is no longer active");
+            let parent_members = g.mls.members();
+            let mut seen = std::collections::BTreeSet::new();
+            let mut targets = Vec::with_capacity(peers.len());
+            for peer in peers {
+                ensure!(*peer != me, "cannot include yourself in subgroup peers");
+                ensure!(seen.insert(peer.clone()), "duplicate peer in subgroup");
+                let member = parent_members
+                    .iter()
+                    .find(|m| m.key == peer.0)
+                    .with_context(|| format!("{} is not a member of the parent group", crate::fp(&peer.0)))?;
+                let endpoint = endpoint_id(&member.leaf.key.0).context("invalid peer iroh key")?;
+                let relay: RelayUrl = relay_url(&member.leaf.home).parse()?;
+                targets.push((peer.clone(), endpoint, vec![relay]));
+            }
+            targets
+        };
+        let mut members: Vec<Bytes> = std::iter::once(me.clone()).chain(peers.iter().cloned()).collect();
+        members.sort();
+        let settings = Settings {
+            protocol: PROTOCOL,
+            carry,
+            update: UPDATE,
+            membership,
+            admins: vec![],
+            admitted: vec![],
+            subgroup: Some(Subgroup { parent: Bytes(parent.to_vec()), members }),
+        };
+        let sub_gid = self.create(settings)?;
+        let mut offers = FuturesUnordered::new();
+        let mut failed = Vec::new();
+        for (peer_key, endpoint, relays) in targets {
+            match self.invite(&sub_gid.0, SUBGROUP_INVITE_VALID, Some(&peer_key.0)).await {
+                Ok(invite) => {
+                    let net = self.inner.net().clone();
+                    let ask = SubgroupAsk { parent: Bytes(parent.to_vec()), link: invite.link() };
+                    offers.push(async move {
+                        let res = timeout(SUBGROUP_OFFER_WAIT, net.subgroup(endpoint, relays, ask)).await;
+                        (peer_key, res)
+                    });
+                }
+                Err(error) => failed.push((peer_key, format!("{error:#}"))),
+            }
+        }
+        while let Some((peer_key, res)) = offers.next().await {
+            match res {
+                Ok(Ok(Answer::Ok(()))) => {}
+                Ok(Ok(Answer::Refused { refused })) => failed.push((peer_key, refused)),
+                Ok(Err(error)) => failed.push((peer_key, format!("peer unreachable or does not support subgroups (<= 0.26.3): {error:#}"))),
+                Err(_) => failed.push((peer_key, "timed out waiting for peer to join subgroup".into())),
+            }
+        }
+        // Compute actual joined peers from MLS state so a peer admitted right at the offer timeout is never treated as absent.
+        let joined: Vec<Bytes> = {
+            let st = self.inner.lock();
+            st.groups
+                .get(&sub_gid.0)
+                .map(|g| g.mls.members().into_iter().filter(|m| m.key != me.0).map(|m| Bytes(m.key)).collect())
+                .unwrap_or_default()
+        };
+        failed.retain(|(k, _)| !joined.contains(k));
+        if joined.is_empty() {
+            if let Err(error) = self.leave(&sub_gid.0) {
+                tracing::debug!("cleaning up empty subgroup: {error:#}");
+            }
+            let reasons: Vec<String> = failed.iter().map(|(k, r)| format!("{}: {r}", crate::fp(&k.0))).collect();
+            bail!("no peer joined subgroup ({})", reasons.join("; "));
+        }
+        Ok(SubgroupResult { group: sub_gid, joined, failed })
+    }
+}
+
+impl Inner {
+    async fn join_link(self: &Arc<Self>, link: &Invite, leave: Option<Bytes>, expected_parent: Option<&[u8]>, limit: Duration) -> Result<(Bytes, [u8; 32])> {
         // Each member is dialed at the relay of its own service.
         let member = |(key, home): &([u8; 32], String)| -> Result<(EndpointId, Vec<RelayUrl>)> { Ok((EndpointId::from_bytes(key)?, vec![relay_url(home).parse()?])) };
         let members = link.members.iter().map(member).collect::<Result<Vec<_>>>()?;
@@ -110,7 +216,7 @@ impl Node {
         // refuses it: a member that added it asked again answers with the commit entry it kept.
         let joining = [b"node/joining/".as_slice(), &Sha256::digest(&secret.0)].concat();
         let join = {
-            let mut st = self.inner.lock();
+            let mut st = self.lock();
             ensure!(!st.groups.contains_key(link.group.as_slice()), "this session is in that group already");
             let key_package = match get::<Bytes>(&st.provider, &joining)? {
                 Some(kept) => kept,
@@ -129,7 +235,7 @@ impl Node {
             .into_iter()
             .enumerate()
             .map(|(i, (peer, relays))| {
-                let net = self.inner.net().clone();
+                let net = self.net().clone();
                 spawn(async move {
                     // A dial that fails at once, as one from a node that has just started can, is tried again until the wait
                     // is up.
@@ -150,8 +256,8 @@ impl Node {
         let mut refusal = anyhow::anyhow!("no member the invite names is online");
         let mut refused_by_all = true;
         // Members that gave no answer wait until the members reached meanwhile are asked, then are asked again, while
-        // JOIN_LIMIT has not passed.
-        let until = Instant::now() + JOIN_LIMIT;
+        // `limit` has not passed.
+        let until = Instant::now() + limit;
         let mut silent = VecDeque::new();
         loop {
             let (peer, relays) = match dials.next().await {
@@ -169,11 +275,11 @@ impl Node {
                     _ => break,
                 },
             };
-            let answer = timeout(JOIN_WAIT, self.inner.net().join(peer, relays.clone(), join.clone())).await;
+            let answer = timeout(JOIN_WAIT, self.net().join(peer, relays.clone(), join.clone())).await;
             match answer {
-                Ok(Ok(Answer::Ok(admitted))) => match self.inner.welcomed(admitted, &join.key_package.0, link).await {
+                Ok(Ok(Answer::Ok(admitted))) => match self.welcomed(admitted, &join.key_package.0, link, expected_parent).await {
                     Ok(gid) => {
-                        let mut st = self.inner.lock();
+                        let mut st = self.lock();
                         st.joins.retain(|other| other != link);
                         st.provider.delete(&joining)?;
                         return Ok((gid, *peer.as_bytes()));
@@ -196,7 +302,7 @@ impl Node {
                 }
             }
         }
-        let mut st = self.inner.lock();
+        let mut st = self.lock();
         st.joins.retain(|other| other != link);
         if refused_by_all {
             delete_key_package(&st.provider, &join.key_package.0)?;
@@ -205,19 +311,46 @@ impl Node {
         }
         Err(refusal)
     }
-}
 
-impl Inner {
     /// Joins the group a link names from the Add's answer a member sent for this session's KeyPackage.
-    async fn welcomed(self: &Arc<Self>, admitted: Admitted, key_package: &[u8], link: &Invite) -> Result<Bytes> {
+    async fn welcomed(self: &Arc<Self>, admitted: Admitted, key_package: &[u8], link: &Invite, expected_parent: Option<&[u8]>) -> Result<Bytes> {
         let gid = {
             let mut st = self.lock();
             let st = &mut *st;
             let admission = lmk_core::group::Admission { welcome: admitted.welcome.0, cut: admitted.cut, sig: admitted.sig.0 };
             let package = key_package_reference(&st.provider, key_package)?;
             let mls = Group::join(&st.provider, &admitted.commit.0, &admission, &package, &link.group, &link.domain, &link.key)?;
+            let sub = mls.settings().subgroup;
+            if expected_parent.is_some() || sub.is_some() {
+                let valid = (|| -> Result<()> {
+                    let sub = sub.context("Welcome is not for a subgroup")?;
+                    if let Some(expected_parent) = expected_parent {
+                        ensure!(sub.parent.0 == expected_parent, "subgroup parent does not match offer");
+                    }
+                    ensure!(sub.members.iter().any(|k| k.0 == st.me()), "this session is not among subgroup members");
+                    let parent_g = st.groups.get(&sub.parent.0).context("not a member of the subgroup's parent group")?;
+                    ensure!(parent_g.mls.settings().subgroup.is_none(), "cannot join a subgroup of a subgroup");
+                    ensure!(parent_g.mls.active() && !parent_g.rec.leaving, "parent group is no longer active");
+                    let count = st
+                        .groups
+                        .values()
+                        .filter(|g| g.mls.settings().subgroup.as_ref().is_some_and(|s| s.parent == sub.parent))
+                        .count();
+                    ensure!(count < MAX_SUBGROUPS_PER_PARENT, "too many subgroups for this parent group");
+                    let parent_members = parent_g.mls.members();
+                    ensure!(
+                        sub.members.iter().all(|k| parent_members.iter().any(|m| m.key == k.0)),
+                        "subgroup names a member outside the parent group"
+                    );
+                    Ok(())
+                })();
+                if let Err(error) = valid {
+                    let _ = mls.delete(&st.provider);
+                    return Err(error);
+                }
+            }
             // Its Add had no update path: its first update, due at once, merges its leaf into the tree (`merge`).
-            st.add_group(mls, Rec { stirred: true, ..Rec::default() })?
+            st.add_group(mls, Rec { stirred: true, created: crate::now(), ..Rec::default() })?
         };
         if let Err(error) = self.read_group(&gid).await {
             self.warn(Some(&gid), format!("reading the group's log: {error:#}"));
@@ -227,6 +360,53 @@ impl Inner {
             tracing::debug!("merging this session's leaf: {error:#}");
         }
         Ok(Bytes(gid))
+    }
+
+    async fn accept_subgroup(self: &Arc<Self>, peer: EndpointId, ask: SubgroupAsk) -> Result<()> {
+        let invite = Invite::parse(&ask.link)?;
+        {
+            let st = self.lock();
+            let parent_g = st.groups.get(&ask.parent.0).context("not a member of that parent group")?;
+            ensure!(parent_g.mls.settings().subgroup.is_none(), "cannot create a subgroup of a subgroup");
+            ensure!(parent_g.mls.active() && !parent_g.rec.leaving, "parent group is no longer active");
+            let inviter = st.in_leaf(&ask.parent.0, &peer).context("sender is not a member of the parent group")?;
+            ensure!(inviter.key == invite.by, "invite maker does not match sender");
+            ensure!(parent_g.left(&inviter.key).is_none(), "sender left the parent group");
+            let (parent_domain, parent_key) = match parent_g.mls.settings().membership {
+                Service::Serve { domain, key, .. } => (domain, key),
+                Service::Newer(_) => bail!("unsupported membership service"),
+            };
+            ensure!(
+                invite.domain == parent_domain && invite.key == parent_key.0.as_slice(),
+                "subgroup invite must use the parent group's membership service"
+            );
+            ensure!(
+                invite.members.len() == 1
+                    && invite.members[0].0 == *peer.as_bytes()
+                    && invite.members[0].1 == inviter.leaf.home,
+                "subgroup invite must route only through the inviter"
+            );
+            ensure!(!st.groups.contains_key(invite.group.as_slice()), "already in that subgroup");
+            let count = st
+                .groups
+                .values()
+                .filter(|g| g.mls.settings().subgroup.as_ref().is_some_and(|s| s.parent == ask.parent))
+                .count();
+            ensure!(count < MAX_SUBGROUPS_PER_PARENT, "too many subgroups for this parent group");
+            let t = crate::now();
+            let mut offers = self.subgroup_offers.lock().unwrap();
+            let times = offers.entry(inviter.key.clone()).or_default();
+            while times.front().is_some_and(|&at| t.saturating_sub(at) >= 60_000) {
+                times.pop_front();
+            }
+            ensure!(times.len() < MAX_SUBGROUP_OFFERS_PER_MIN, "too many subgroup offers; slow down");
+            times.push_back(t);
+        }
+        if let Err(error) = timeout(SUBGROUP_REFRESH_WAIT, self.refresh(&ask.parent.0, false)).await {
+            tracing::debug!("parent refresh before subgroup join timed out: {error:#}");
+        }
+        self.join_link(&invite, None, Some(&ask.parent.0), SUBGROUP_JOIN_WAIT).await?;
+        Ok(())
     }
 }
 
@@ -349,6 +529,20 @@ impl Admit for Admitter {
                     } else {
                         inner.warn(None, format!("refused a join: {refused}"));
                     }
+                    Answer::Refused { refused }
+                }
+            }
+        })
+    }
+
+    fn subgroup(&self, peer: EndpointId, ask: SubgroupAsk) -> BoxFuture<Answer<()>> {
+        let inner = self.0.clone();
+        Box::pin(async move {
+            match inner.accept_subgroup(peer, ask).await {
+                Ok(()) => Answer::Ok(()),
+                Err(error) => {
+                    let refused = format!("{error:#}");
+                    tracing::debug!("refused a subgroup offer: {refused}");
                     Answer::Refused { refused }
                 }
             }

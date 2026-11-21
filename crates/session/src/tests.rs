@@ -536,7 +536,7 @@ fn a_session_out_of_a_group_by_itself_keeps_its_leave() {
         alice.stop().await;
         let (mut session, _events) = world.open_session(world.config("alice", "alice")).await;
         let leave = lmk_node::Leave { group: lmk_proto::Bytes(vec![1]), key: lmk_proto::Bytes(vec![2; 32]), joined: 3, sig: lmk_proto::Bytes(vec![4; 64]) };
-        session.event(lmk_node::Event::Removed { group: leave.group.clone(), by: None, not_kept: vec![], leave: Some(leave.clone()) });
+        session.event(lmk_node::Event::Removed { group: leave.group.clone(), by: None, not_kept: vec![], leave: Some(leave.clone()), parent: None });
         let kept: Vec<lmk_node::Leave> =
             std::fs::read_dir(alice.home.join("leaves")).unwrap().map(|entry| serde_json::from_slice(&std::fs::read(entry.unwrap().path()).unwrap()).unwrap()).collect();
         assert_eq!(kept, [leave]);
@@ -716,7 +716,7 @@ fn the_command_channel_takes_a_twelve_mib_attachment_and_no_larger_call() {
         let channel = crate::cli::connect(&endpoint).await.unwrap();
         let attach = B64.encode(vec![0; 12 << 20]);
         let request = Request::Send {
-            group: None, to: vec![], reply_to: None, urgent: false, attach: Some(attach.clone()), attach_name: "large.bin".into(), text: "a large file".into(),
+            group: None, to: vec![], only: false, reply_to: None, urgent: false, attach: Some(attach.clone()), attach_name: "large.bin".into(), text: "a large file".into(),
         };
         let calling = tokio::spawn(crate::cli::exchange(channel, request));
         let request = tokio::time::timeout(WAIT, requests.recv()).await.unwrap().unwrap();
@@ -726,7 +726,7 @@ fn the_command_channel_takes_a_twelve_mib_attachment_and_no_larger_call() {
         assert_eq!(calling.await.unwrap().unwrap(), json!({ "id": "sent" }));
         let channel = crate::cli::connect(&endpoint).await.unwrap();
         let request = Request::Send {
-            group: None, to: vec![], reply_to: None, urgent: false, attach: Some(B64.encode(vec![0; 13 << 20])), attach_name: "larger.bin".into(), text: String::new(),
+            group: None, to: vec![], only: false, reply_to: None, urgent: false, attach: Some(B64.encode(vec![0; 13 << 20])), attach_name: "larger.bin".into(), text: String::new(),
         };
         let refused = crate::cli::exchange(channel, request).await.unwrap_err();
         assert!(refused.to_string().starts_with("size: "), "{refused:#}");
@@ -1850,5 +1850,111 @@ fn sessions_starting_at_once_on_different_services_each_pin_their_key() {
     });
     let pinned: std::collections::BTreeMap<String, String> = serde_json::from_slice(&std::fs::read(home.join("membership.json")).unwrap()).unwrap();
     assert_eq!(pinned.len(), 400, "pins lost");
+}
+
+/// `dm`, `subgroup`, and `send --only`: `dm` opens and reuses a 2-member subgroup with `via_group`, does not leak to
+/// other parent members, keeps default `--group`-less commands resolving to the parent group, and excludes subgroups
+/// from `groups.json`.
+#[test]
+fn dm_subgroup_and_send_only_work_end_to_end() {
+    local(async {
+        let world = world("dm-subgroup").await;
+        let (mut alice, mut bob, parent) = pair(&world).await;
+        let mut carol = world.start("carol").await;
+        let link = alice.cmd(&["invite", "--group", &parent]).await.unwrap()["link"].as_str().unwrap().to_owned();
+        carol.cmd(&["join", &link]).await.unwrap();
+        alice.told(&["joined"]).await;
+        bob.told(&["joined"]).await;
+
+        // `send --only` fails in 3-member parent when only Bob is listed, succeeds when both Bob and Carol are listed.
+        assert!(alice.cmd(&["send", "--to", &bob.fp, "--only", "nope"]).await.is_err());
+        alice.cmd(&["send", "--to", &bob.fp, "--to", &carol.fp, "--only", "everyone"]).await.unwrap();
+        assert_eq!(bob.expect("message").await["content"], "everyone");
+        assert_eq!(carol.expect("message").await["content"], "everyone");
+
+        // `dm` creates a 2-member subgroup and wakes Bob with `via_group`.
+        let first = alice.cmd(&["dm", "--to", &bob.fp, "just us"]).await.unwrap();
+        let sub = first["group"].as_str().unwrap().to_owned();
+        assert_eq!(first["via_group"], parent);
+        assert!(first.get("reused").is_none(), "{first}");
+        let msg = bob.expect("message").await;
+        assert_eq!((&msg["group"], &msg["via_group"], &msg["content"]), (&json!(sub), &json!(parent), &json!("just us")));
+
+        // Second `dm` reuses the same subgroup.
+        let second = alice.cmd(&["dm", "--to", &bob.fp, "again"]).await.unwrap();
+        assert_eq!((&second["group"], &second["reused"]), (&json!(sub), &json!(true)));
+        let msg2 = bob.expect("message").await;
+        assert_eq!(msg2["content"], "again");
+
+        // Bob replies in the subgroup without `--to`; subgroup defaults to addressing Alice so Alice wakes up.
+        bob.cmd(&["send", "--group", &sub, "--reply-to", msg2["id"].as_str().unwrap(), "got it"]).await.unwrap();
+        let reply = alice.expect("message").await;
+        assert_eq!((&reply["group"], &reply["via_group"], &reply["content"]), (&json!(sub), &json!(parent), &json!("got it")));
+
+        // Default `--group`-less commands still resolve to the parent group (subgroups excluded from default).
+        let members = alice.cmd(&["members"]).await.unwrap();
+        assert_eq!(members["group"], parent);
+        let bob_members = bob.cmd(&["members"]).await.unwrap();
+        assert_eq!(bob_members["group"], parent);
+
+        // `groups` lists both parent and subgroup (with `via_group`), `groups.json` keeps the full baseline, and
+        // `subgroups.json` lists the subgroup so `delete_stopped` ignores it when deciding who ran last of a group.
+        let listed = alice.cmd(&["groups"]).await.unwrap();
+        assert!(listed["groups"].as_array().unwrap().iter().any(|g| g["group"] == sub && g["via_group"] == parent), "{listed}");
+        let alice_dir = session_dir(&alice.home, &alice.name).unwrap();
+        let alice_groups_file: Vec<String> = serde_json::from_slice(&std::fs::read(alice_dir.join("groups.json")).unwrap()).unwrap();
+        assert!(alice_groups_file.contains(&parent) && alice_groups_file.contains(&sub), "{alice_groups_file:?}");
+        let alice_subs_file: Vec<String> = serde_json::from_slice(&std::fs::read(alice_dir.join("subgroups.json")).unwrap()).unwrap();
+        assert_eq!(alice_subs_file, vec![sub.clone()]);
+        let bob_dir = session_dir(&bob.home, &bob.name).unwrap();
+        let bob_subs_file: Vec<String> = serde_json::from_slice(&std::fs::read(bob_dir.join("subgroups.json")).unwrap()).unwrap();
+        assert_eq!(bob_subs_file, vec![sub.clone()]);
+
+        // Wire compatibility: `Request::SendOnly` uses a distinct `cmd` tag so <=0.26.3 sessions reject it, and
+        // subgroup failure entries survive `short::compact` with their error text intact.
+        let wire = serde_json::to_value(Request::SendOnly {
+            group: None, to: vec![bob.fp.clone()], reply_to: None, urgent: false, attach: None, attach_name: String::new(), text: "hi".into(),
+        })
+        .unwrap();
+        assert_eq!(wire["cmd"], "send_only");
+        let mut failed_sample = json!({ "group": sub, "failed": [{ "member": carol.fp, "error": "offline" }] });
+        crate::short::compact(&mut failed_sample);
+        assert_eq!(failed_sample["failed"][0]["error"], "offline");
+
+        // Carol never joined the subgroup and received no DM.
+        let carol_groups = carol.cmd(&["groups"]).await.unwrap();
+        assert_eq!(carol_groups["groups"].as_array().unwrap().len(), 1);
+    });
+}
+
+/// A stopped session that ran last of a subgroup (listed in `subgroups.json`) is still deleted by `delete_stopped`
+/// when another session ran more recently in the parent group.
+#[tokio::test]
+async fn delete_stopped_ignores_subgroups_when_checking_last() {
+    let home = tempfile::tempdir().unwrap();
+    let old = session_dir(home.path(), "old").unwrap();
+    let kept = session_dir(home.path(), "kept").unwrap();
+    let newer = session_dir(home.path(), "newer").unwrap();
+    for (dir, in_db) in [(&old, "[]"), (&kept, r#"["AAAA","BBBB"]"#), (&newer, r#"["AAAA"]"#)] {
+        std::fs::create_dir_all(dir).unwrap();
+        let db = lmk_core::provider::SqliteProvider::open(&dir.join("session.db")).unwrap();
+        lmk_node::create(&db, "relay.example.com").unwrap();
+        db.put(b"node/groups", in_db.as_bytes()).unwrap();
+        std::fs::write(dir.join("session.lock"), "").unwrap();
+    }
+    std::fs::write(old.join("groups.json"), r#"["AAAA","CCCC"]"#).unwrap();
+    std::fs::write(old.join("subgroups.json"), r#"["CCCC"]"#).unwrap();
+    std::fs::write(kept.join("groups.json"), r#"["AAAA","BBBB"]"#).unwrap();
+    std::fs::write(newer.join("groups.json"), r#"["AAAA"]"#).unwrap();
+    let ago = SystemTime::now() - Duration::from_secs(10 * 24 * 3600);
+    for dir in [&old, &kept] {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            std::fs::File::options().write(true).open(entry.path()).unwrap().set_modified(ago).unwrap();
+        }
+    }
+    assert_eq!(crate::delete_stopped(home.path().to_owned(), session_dir(home.path(), "next").unwrap()).await.unwrap(), Vec::<String>::new());
+    assert!(!old.exists(), "stale session kept alive only by a subgroup must be deleted");
+    assert!(kept.exists(), "stale session that ran last of a top-level group must stay");
+    assert!(newer.exists());
 }
 

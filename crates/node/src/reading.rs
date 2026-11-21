@@ -168,6 +168,13 @@ impl Inner {
         for member in &removed {
             st.events.push(Event::Left { group: group.clone(), member: Member::from(member), by: by.clone() });
         }
+        if !removed.is_empty() {
+            for (child, other) in &st.groups {
+                if other.mls.settings().subgroup.as_ref().is_some_and(|s| s.parent.0 == gid) {
+                    self.work.send(Work::Duties(child.clone())).ok();
+                }
+            }
+        }
         let g = st.group_mut(gid)?;
         let (early, later): (Vec<_>, Vec<_>) = std::mem::take(&mut g.early).into_iter().partition(|(_, ciphertext)| core::claim(gid, ciphertext).is_ok_and(|claim| claim.sealed == current));
         g.early = later;

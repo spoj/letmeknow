@@ -19,7 +19,7 @@ use iroh::{
 use lmk_proto::{
     Answer,
     frame::{self, ALPN, MAX_ASK, Open, Stream},
-    peer::{Admitted, Frame, Join},
+    peer::{Admitted, Frame, Join, SubgroupAsk},
 };
 use n0_future::{
     boxed::BoxFuture,
@@ -45,6 +45,9 @@ pub trait Groups: Send + Sync + 'static {
 /// A member's decision on a joiner's request; it may commit an Add before it answers.
 pub trait Admit: Send + Sync + 'static {
     fn join(&self, peer: EndpointId, join: Join) -> BoxFuture<Answer<Admitted>>;
+    fn subgroup(&self, _peer: EndpointId, _ask: SubgroupAsk) -> BoxFuture<Answer<()>> {
+        Box::pin(async { Answer::Refused { refused: "subgroups are not supported".into() } })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,6 +149,15 @@ impl Net {
         frame::read(&mut recv).await
     }
 
+    /// Asks a co-member, at `relays`, to auto-join a subgroup, on a `subgroup` stream of its own.
+    pub async fn subgroup(&self, peer: EndpointId, relays: Vec<RelayUrl>, ask: SubgroupAsk) -> Result<Answer<()>> {
+        let conn = self.inner.connection(peer, relays).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        frame::write(&mut send, &Open { stream: Stream::Subgroup }).await?;
+        frame::write(&mut send, &ask).await?;
+        frame::read_within(&mut recv, MAX_ASK).await
+    }
+
     /// Closes the connections and the endpoint, in full.
     pub async fn shutdown(&self) -> Result<()> {
         self.router.shutdown().await?;
@@ -237,6 +249,9 @@ impl Inner {
                     Stream::Admission => {
                         spawn(self.clone().admit(peer, send, recv));
                     }
+                    Stream::Subgroup => {
+                        spawn(self.clone().subgroup_stream(peer, send, recv));
+                    }
                 }
             }
             None
@@ -245,8 +260,16 @@ impl Inner {
         if let Ok(Some((send, recv))) = opened {
             spawn(peer::run(self.clone(), conn.clone(), send, recv, out));
             while let Ok((send, mut recv)) = conn.accept_bi().await {
-                if let Ok(Ok(Open { stream: Stream::Admission })) = timeout(ASK, frame::read_within(&mut recv, MAX_ASK)).await {
-                    spawn(self.clone().admit(peer, send, recv));
+                if let Ok(Ok(Open { stream })) = timeout(ASK, frame::read_within(&mut recv, MAX_ASK)).await {
+                    match stream {
+                        Stream::Admission => {
+                            spawn(self.clone().admit(peer, send, recv));
+                        }
+                        Stream::Subgroup => {
+                            spawn(self.clone().subgroup_stream(peer, send, recv));
+                        }
+                        Stream::Peer => {}
+                    }
                 }
             }
         } else {
@@ -264,6 +287,18 @@ impl Inner {
         };
         if let Err(e) = answered.await {
             tracing::debug!("admitting {}: {e:#}", peer.fmt_short());
+        }
+    }
+
+    /// Answers a co-member's subgroup invitation, which it sends within `ASK`.
+    async fn subgroup_stream(self: Arc<Self>, peer: EndpointId, mut send: SendStream, mut recv: RecvStream) {
+        let answered = async {
+            let ask: SubgroupAsk = timeout(ASK, frame::read_within(&mut recv, MAX_ASK)).await??;
+            let answer = self.admit.subgroup(peer, ask).await;
+            frame::write(&mut send, &answer).await
+        };
+        if let Err(e) = answered.await {
+            tracing::debug!("subgroup offer from {}: {e:#}", peer.fmt_short());
         }
     }
 }

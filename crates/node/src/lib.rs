@@ -44,6 +44,7 @@ use tokio::sync::mpsc;
 
 use held::Author;
 
+pub use admission::SubgroupResult;
 pub use lmk_core;
 pub use peering::Heard;
 pub use tasks::{create, groups, leaves};
@@ -159,6 +160,10 @@ pub enum SendError {
     Size(String),
     #[error("let go: the membership service let the group's log go; this session leaves the group unless a member online brings what it missed")]
     LetGo,
+    #[error("pinned: {0}")]
+    Pinned(String),
+    #[error("unverified: {0}")]
+    Unverified(String),
 }
 
 #[derive(Debug)]
@@ -182,6 +187,7 @@ pub enum Event {
         by: Option<Member>,
         not_kept: Vec<Bytes>,
         leave: Option<Leave>,
+        parent: Option<Bytes>,
     },
     /// A held payload, delivered, in causal order; never one of this session's own.
     Message(Message),
@@ -258,6 +264,9 @@ struct Rec {
     resealed: u64,
     /// The epoch this session joined in.
     since: u64,
+    /// When this session created or joined the group, in milliseconds.
+    #[serde(default)]
+    created: u64,
 }
 
 /// An invite, as its inviter shared it with the group, or kept for one member.
@@ -459,6 +468,8 @@ pub(crate) struct Inner {
     contradictions: Mutex<HashSet<Contradicted>>,
     /// The warnings given, each once: a service that signs with another key, or that runs another minor.
     warned: Mutex<HashSet<String>>,
+    /// Recent subgroup offers accepted per inviter session key, for rate limiting.
+    subgroup_offers: Mutex<HashMap<Vec<u8>, VecDeque<u64>>>,
 }
 
 /// One member's session. Clones share it.
@@ -644,7 +655,7 @@ mod tests {
             });
             let config = Config { home: relay.domain.clone(), post, ca: relay.ca(), device: SigningKey::from_bytes(&[9; 32]) };
             let (alice, mut events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap();
-            let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: service.clone(), admins: vec![], admitted: vec![] };
+            let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: service.clone(), admins: vec![], admitted: vec![], subgroup: None };
             let gid = alice.create(settings).unwrap();
             let id: [u8; 32] = alice.log(&gid.0).unwrap().0.try_into().unwrap();
             let start = head::start(key.verifying_key().as_bytes(), &id);
@@ -691,7 +702,7 @@ mod tests {
         let key = SigningKey::from_bytes(&[7; 32]);
         let service = Service::Serve { key: Bytes(key.verifying_key().to_bytes().to_vec()), domain: "foreign.example".into(), rest: Default::default() };
         let alice = node(&relay, relay.post()).await;
-        let gid = alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: service, admins: vec![], admitted: vec![] }).unwrap();
+        let gid = alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: service, admins: vec![], admitted: vec![], subgroup: None }).unwrap();
         let log = alice.log(&gid.0).unwrap();
         let id: [u8; 32] = log.0.as_slice().try_into().unwrap();
         let start = head::start(key.verifying_key().as_bytes(), &id);
@@ -735,7 +746,7 @@ mod tests {
                 Box::pin(async move { Ok(serde_json::to_vec(&answer).unwrap()) })
             });
             let alice = node(&relay, post).await;
-            let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: service.clone(), admins: vec![], admitted: vec![] };
+            let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: service.clone(), admins: vec![], admitted: vec![], subgroup: None };
             let gid = alice.create(settings).unwrap();
             let before = alice.settings(&gid.0).unwrap();
             let epoch = alice.epoch(&gid.0).unwrap();
@@ -796,7 +807,7 @@ mod tests {
         let key = |seed: u8| Bytes::from(ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key().to_bytes());
         let alice = node(&relay, post.clone()).await;
         let bob = node(&relay, post).await;
-        let gid = alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: service, admins: vec![], admitted: vec![] }).unwrap();
+        let gid = alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: service, admins: vec![], admitted: vec![], subgroup: None }).unwrap();
 
         for (i, refusal) in [Refusal::Busy, Refusal::Rate, Refusal::Quota].into_iter().enumerate() {
             faults.lock().unwrap().push_back(Fault::Refuse(refusal));
@@ -887,7 +898,7 @@ mod tests {
             })
         });
         let alice = node(&relay, post).await;
-        let group_on = |membership| alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership, admins: vec![], admitted: vec![] }).unwrap();
+        let group_on = |membership| alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership, admins: vec![], admitted: vec![], subgroup: None }).unwrap();
 
         let foreign_gid = group_on(foreign.clone());
         alice.read_group(&foreign_gid.0).await.unwrap();
@@ -919,7 +930,7 @@ mod tests {
     async fn a_joiners_summary_right_after_its_add_is_kept() {
         let relay = lmk_testing::relay().await;
         let (alice, bob, carol) = (node(&relay, relay.post()).await, node(&relay, relay.post()).await, node(&relay, relay.post()).await);
-        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
         let gid = bob.create(settings.clone()).unwrap();
         alice.join(&bob.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
         // Alice no longer polls.
@@ -953,7 +964,7 @@ mod tests {
 
         let relay = lmk_testing::relay().await;
         let (alice, bob) = (node(&relay, relay.post()).await, node(&relay, relay.post()).await);
-        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
         let gid = alice.create(settings).unwrap();
         bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
         let epoch = bob.epoch(&gid.0).unwrap();
@@ -1010,7 +1021,7 @@ mod tests {
     async fn a_message_whose_memberships_record_is_gone_counts_as_shown() {
         let relay = lmk_testing::relay().await;
         let (alice, bob) = (node(&relay, relay.post()).await, node(&relay, relay.post()).await);
-        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
         let gid = alice.create(settings).unwrap();
         bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
         let first = alice.send(&gid.0, &serde_json::json!({ "type": "message", "content": "hi" }), None).await.unwrap();
@@ -1031,7 +1042,7 @@ mod tests {
     async fn a_rate_refused_send_keeps_the_next_messages_deps() {
         let relay = lmk_testing::relay().await;
         let (alice, bob) = (node(&relay, relay.post()).await, node(&relay, relay.post()).await);
-        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
         let gid = alice.create(settings).unwrap();
         bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
         let text = serde_json::json!({ "type": "message", "content": "hi" });
@@ -1047,7 +1058,7 @@ mod tests {
             let g = st.group_mut(&gid.0).unwrap();
             // No refill during the send, regardless of the wall clock.
             while g.sending.take(0, 1.0, u64::MAX) {}
-            let refused = bob.inner.send(&mut st, &gid.0, &text, None).unwrap_err();
+            let refused = bob.inner.send(&mut st, &gid.0, &text, None, None).unwrap_err();
             assert!(matches!(refused.downcast_ref(), Some(SendError::Rate)), "{refused:#}");
         }
         bob.inner.lock().group_mut(&gid.0).unwrap().sending = held::Bucket::default();
@@ -1073,7 +1084,7 @@ mod tests {
             Node::start(SqliteProvider::open(&db).unwrap(), config).await.unwrap().0
         };
         let (alice, bob) = (node(&relay, relay.post()).await, start().await);
-        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
         let gid = alice.create(settings).unwrap();
         bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
         {
@@ -1104,7 +1115,7 @@ mod tests {
         let (alice, carol, dave) = (node(&relay, relay.post()).await, node(&relay, relay.post()).await, node(&relay, relay.post()).await);
         let config = Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[8; 32]) };
         let bob = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0;
-        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
         let (gid, other) = (alice.create(settings.clone()).unwrap(), alice.create(settings).unwrap());
         for joiner in [&bob, &carol, &dave] {
             joiner.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
@@ -1144,7 +1155,7 @@ mod tests {
         let (alice, carol) = (node(&relay, relay.post()).await, node(&relay, relay.post()).await);
         let config = Config { home: relay.domain.clone(), post: relay.post(), ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[8; 32]) };
         let bob = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0;
-        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
         let gid = alice.create(settings).unwrap();
         for joiner in [&bob, &carol] {
             joiner.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
@@ -1175,7 +1186,7 @@ mod tests {
     async fn an_idle_session_polls_for_nothing() {
         let relay = lmk_testing::relay().await;
         let (alice, bob) = (node(&relay, relay.post()).await, node(&relay, relay.post()).await);
-        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
         let gid = alice.create(settings).unwrap();
         bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
         let text = serde_json::json!({ "type": "message", "content": "hi" });
@@ -1197,7 +1208,7 @@ mod tests {
     async fn a_seq_no_member_holds_is_waited_for_with_no_poll() {
         let relay = lmk_testing::relay().await;
         let (alice, bob) = (node(&relay, relay.post()).await, node(&relay, relay.post()).await);
-        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![] };
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
         let gid = alice.create(settings).unwrap();
         bob.join(&alice.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
         {

@@ -10,7 +10,7 @@ use lmk_proto::Bytes;
 use lmk_proto::clock::now;
 use lmk_proto::directory::check_domain;
 use lmk_proto::entry::{Entry, signed, welcome_signed};
-use lmk_proto::group::{LEAF, LEAF_EXTENSION, LEAVE, Leaf, PROTOCOL, SETTINGS_EXTENSION, Service, Settings, is_key};
+use lmk_proto::group::{LEAF, LEAF_EXTENSION, LEAVE, Leaf, PROTOCOL, SETTINGS_EXTENSION, Service, Settings, Subgroup, is_key};
 use lmk_proto::held::{self, Cut, Header, Ref, SEALING};
 use openmls::prelude::*;
 use openmls::schedule::{ExternalPsk, PreSharedKeyId, Psk};
@@ -403,14 +403,28 @@ fn creator_lifetime() -> Lifetime {
     Lifetime::init(now - 3600, now + 12 * 7 * 86400)
 }
 
+fn check_subgroup(sub: &Subgroup) -> Result<()> {
+    ensure!(sub.parent.0.len() == 16, "a subgroup whose parent id is not 16 bytes");
+    ensure!(sub.members.len() >= 2, "a subgroup needs at least two members");
+    ensure!(sub.members.windows(2).all(|w| w[0] < w[1]), "a subgroup's members must be sorted and unique");
+    ensure!(sub.members.iter().all(|key| is_key(&key.0)), "a subgroup member key is neither Ed25519 nor compressed P-256");
+    Ok(())
+}
+
 impl Group {
     /// A new group, of this session alone, whose admins are this session and the device that certified it, whatever
     /// `settings` name.
     pub fn create(provider: &SqliteProvider, session: &Session, settings: &Settings) -> Result<Self> {
         ensure!(settings.protocol == PROTOCOL, "settings name protocol {}", settings.protocol);
         service_key(settings)?;
-        let device = session.leaf.device.as_ref().map(|device| device.key.clone());
-        let admins = [Bytes(session.key().to_vec())].into_iter().chain(device).collect();
+        let admins = if let Some(sub) = &settings.subgroup {
+            check_subgroup(sub)?;
+            ensure!(sub.members.iter().any(|key| key.0 == session.key()), "a subgroup whose creator is not among its members");
+            sub.members.clone()
+        } else {
+            let device = session.leaf.device.as_ref().map(|device| device.key.clone());
+            [Bytes(session.key().to_vec())].into_iter().chain(device).collect()
+        };
         let settings = Settings { admins, ..settings.clone() };
         let config = MlsGroupCreateConfig::builder()
             .ciphersuite(CIPHERSUITE)
@@ -463,6 +477,9 @@ impl Group {
             );
             service_key(&settings)?;
             ensure!(settings.admins.iter().chain(&settings.admitted).all(|key| is_key(&key.0)), "a group whose settings hold a key that is neither Ed25519 nor compressed P-256");
+            if let Some(sub) = &settings.subgroup {
+                check_subgroup(sub)?;
+            }
             ensure!(staged.group_context().group_id().as_slice() == gid, "a Welcome into another group than the link names");
             ensure!(
                 matches!(&settings.membership, Service::Serve { domain: theirs, key: their_key, .. } if theirs == domain && their_key.0 == key),
@@ -470,6 +487,9 @@ impl Group {
             );
             let mls = staged.into_group(provider)?;
             ensure!(mls.members().all(|m| names_its_key(&m.credential, &m.signature_key)), "a member whose credential names another key");
+            if let Some(sub) = &settings.subgroup {
+                ensure!(mls.members().all(|m| sub.members.iter().any(|key| key.0 == m.signature_key)), "a subgroup with a member outside its declared members");
+            }
             let leaves = mls.members().filter_map(|m| mls.public_group().leaf(m.index)).map(proven).collect::<Result<Vec<_>>>()?;
             let irohs: BTreeSet<&Bytes> = leaves.iter().map(|leaf| &leaf.key).collect();
             ensure!(irohs.len() == leaves.len(), "a group whose leaves name one iroh key twice");
@@ -999,6 +1019,9 @@ fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad, 
                 let key = leaf.signature_key().as_slice();
                 ensure!(names_its_key(leaf.credential(), key), "a credential that names another key");
                 ensure!(!removed.iter().any(|removed| removed == key), "a commit that adds a key it removes");
+                if let Some(sub) = &settings.subgroup {
+                    ensure!(sub.members.iter().any(|m| m.0 == key), "an Add of a session outside the subgroup's declared members");
+                }
                 let leaf = proven(leaf)?;
                 ensure!(admin || admits(&settings, &leaf), "an Add by a member that is no admin, of a session whose device is neither admitted nor an admin");
                 leaves.push(leaf);
@@ -1012,7 +1035,7 @@ fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad, 
                 ensure!(admin, "a settings change by a member that is no admin");
                 let new = settings_of(staged.group_context().extensions())?;
                 ensure!(*staged.group_context().extensions() == context_extensions(&new)?, "a settings change with other context extensions");
-                let fixed = |s: &Settings| (s.protocol, s.carry, s.update, s.membership.clone());
+                let fixed = |s: &Settings| (s.protocol, s.carry, s.update, s.membership.clone(), s.subgroup.clone());
                 ensure!(fixed(&new) == fixed(&settings), "a settings change of more than the admins and admitted devices");
                 ensure!(!new.admins.is_empty(), "a settings change that leaves the group no admin");
                 ensure!(new.admins.iter().chain(&new.admitted).all(|key| is_key(&key.0)), "a settings change with a key that is neither Ed25519 nor compressed P-256");

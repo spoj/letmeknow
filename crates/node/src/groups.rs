@@ -7,7 +7,7 @@ use lmk_membership::{Expired, Refused};
 use lmk_proto::Bytes;
 
 use crate::held::delivered_key;
-use crate::{Event, G, Inner, Leave, Member, State, get, reading, rec_key};
+use crate::{Event, G, Inner, Leave, Member, State, Work, get, reading, rec_key};
 
 const COMMIT_TRIES: u32 = 5;
 
@@ -136,6 +136,7 @@ impl Inner {
     /// kept, which its records still show; and, where it leaves by itself as its log was let go, its leave.
     pub(crate) fn gone(&self, st: &mut State, gid: &[u8], by: Option<Member>) {
         let Some(g) = st.groups.get(gid) else { return };
+        let parent = g.mls.settings().subgroup.map(|s| s.parent);
         let leave = match g.mls.joined(st.me()) {
             Some(joined) if by.is_none() && st.logs[&g.rec.log.0].lapsed.is_some() => {
                 let sig = g.mls.leave(&st.session).expect("a member signs its leave");
@@ -147,8 +148,19 @@ impl Inner {
             Ok(not_kept) => not_kept,
             Err(error) => return self.warn(Some(gid), format!("{error:#}")),
         };
+        let children: Vec<Vec<u8>> = st
+            .groups
+            .iter()
+            .filter(|(_, other)| other.mls.settings().subgroup.as_ref().is_some_and(|s| s.parent.0 == gid))
+            .map(|(child, _)| child.clone())
+            .collect();
         match self.forget(st, gid) {
-            Ok(()) => st.events.push(Event::Removed { group: Bytes(gid.to_vec()), by, not_kept, leave }),
+            Ok(()) => {
+                st.events.push(Event::Removed { group: Bytes(gid.to_vec()), by, not_kept, leave, parent });
+                for child in children {
+                    self.work.send(Work::Duties(child)).ok();
+                }
+            }
             Err(error) => self.warn(Some(gid), format!("{error:#}")),
         }
     }
