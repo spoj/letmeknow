@@ -511,9 +511,15 @@ impl Inner {
         let (key, now) = (*peer.as_bytes(), st.tick());
         if let Frame::Hello { groups } = frame {
             // An `at` of a log this session does not hold, of an epoch it has not reached or has dropped, is taken unchecked.
-            let shown = |at: &At| at.head.as_ref().is_none_or(|head| head.log_ref == at.log && (!st.logs.contains_key(at.log.as_slice()) || self.vouched(st, head, &peer)));
             let (held, early): (Vec<At>, Vec<At>) = groups.into_iter().partition(|at| st.groups.contains_key(&at.group.0));
-            let groups: Vec<At> = held.into_iter().filter(|at| shown(at)).collect();
+            let groups: Vec<At> = held
+                .into_iter()
+                .filter(|at| {
+                    at.head.as_ref().is_none_or(|head| {
+                        head.log_ref == at.log && (!st.logs.contains_key(at.log.as_slice()) || self.vouched(st, head, &peer))
+                    })
+                })
+                .collect();
             for at in &groups {
                 if !st.admitted(&at.group.0, &peer) {
                     continue;
@@ -601,7 +607,7 @@ impl Inner {
 
     /// Whether a head a peer showed of a log this session follows is signed by its service and agrees with this
     /// session's copy; a contradiction is reported.
-    pub(crate) fn vouched(&self, st: &State, head: &Head, peer: &EndpointId) -> bool {
+    pub(crate) fn vouched(&self, st: &mut State, head: &Head, peer: &EndpointId) -> bool {
         let id = head.log_ref.as_slice();
         let Some(log) = st.logs.get(id) else { return false };
         let checked = log.frontier(id).and_then(|frontier| frontier.check(head, st.hash_at(id, head.length)?));

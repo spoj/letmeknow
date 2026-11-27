@@ -2611,6 +2611,7 @@ async fn three_members_chat_in_causal_order() {
     let b1 = bob.node.send(&gid.0, &message("b1 replies to a1"), None).await.unwrap();
     let a2 = alice.node.send(&gid.0, &message("a2"), None).await.unwrap();
     let a3 = alice.node.send(&gid.0, &message("a3"), None).await.unwrap();
+    eventually("Bob holds a2", || bob.node.message(&gid.0, &a2.0).unwrap().is_some()).await;
     let b2 = bob.node.send(&gid.0, &message("b2 is sent after a2 arrived, unshown"), None).await.unwrap();
     assert!(!bob.node.shown(&gid.0, &a2.0).unwrap());
     eventually("Bob holds a3", || bob.node.message(&gid.0, &a3.0).unwrap().is_some()).await;
@@ -2642,10 +2643,11 @@ async fn three_members_chat_in_causal_order() {
     })
     .await;
     bob.node.shutdown().await.unwrap();
-    let sent = record(&db("bob"), &gid, &a1)["header"]["epoch"].as_u64().unwrap();
-    assert_eq!(deps_of(&db("bob"), &gid, &b1), [lmk_proto::held::Ref { key: alice.node.key(), joined: 0, seq: 3, id: a1.clone(), epoch: sent }]);
+    let a1_epoch = record(&db("bob"), &gid, &a1)["header"]["epoch"].as_u64().unwrap();
+    let a3_epoch = record(&db("bob"), &gid, &a3)["header"]["epoch"].as_u64().unwrap();
+    assert_eq!(deps_of(&db("bob"), &gid, &b1), [lmk_proto::held::Ref { key: alice.node.key(), joined: 0, seq: 3, id: a1.clone(), epoch: a1_epoch }]);
     assert_eq!(deps_of(&db("bob"), &gid, &b2), [], "b1 covers a1, and a2 was not shown");
-    assert_eq!(deps_of(&db("bob"), &gid, &b3), [lmk_proto::held::Ref { key: alice.node.key(), joined: 0, seq: 5, id: a3.clone(), epoch: sent }]);
+    assert_eq!(deps_of(&db("bob"), &gid, &b3), [lmk_proto::held::Ref { key: alice.node.key(), joined: 0, seq: 5, id: a3.clone(), epoch: a3_epoch }]);
     carol.node.shutdown().await.unwrap();
     assert_eq!(deps_of(&db("carol"), &gid, &c1).iter().map(|r| r.id.clone()).collect::<Vec<_>>(), [b3], "c1 names only b3");
     alice.node.shutdown().await.unwrap();
@@ -2746,17 +2748,30 @@ async fn chat_works_while_the_service_is_down() {
     let relay = relay().await;
     let dir = folder("service-down");
     let (membership, service) = signing_service(&relay, &dir).await;
-    let mut alice = stored(&relay, &dir.join("alice.db")).await;
+    let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let failed = down.clone();
+    let (asked, post) = counting(failing(relay.post(), move |_| failed.load(std::sync::atomic::Ordering::Relaxed)));
+    let mut alice = stored_with(&relay, &dir.join("alice.db"), post.clone()).await;
     let bob = stored(&relay, &dir.join("bob.db")).await;
     let gid = alice.node.create(Settings { membership, ..settings(&relay) }).unwrap();
     bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    let bob_epoch = bob.node.epoch(&gid.0).unwrap();
+    eventually("Alice enters Bob's update epoch", || alice.node.epoch(&gid.0).unwrap() >= bob_epoch.max(2)).await;
     bob.node.shutdown().await.unwrap();
     drop(bob);
+    alice.node.shutdown().await.unwrap();
+    drop(alice);
 
+    // Restart Alice from disk with the outage already enabled so her cache is explicitly cold.
     drop(service);
+    down.store(true, std::sync::atomic::Ordering::Relaxed);
+    let alice = stored_with(&relay, &dir.join("alice.db"), post).await;
+    let before = asked.load(std::sync::atomic::Ordering::Relaxed);
     let one = alice.node.send(&gid.0, &message("one"), None).await.unwrap();
+    assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), before + 1, "cold start attempted /heads and failed open");
     let two = alice.node.send(&gid.0, &message("two"), None).await.unwrap();
+    assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), before + 2, "failed /heads did not warm cache");
     let mut bob = stored(&relay, &dir.join("bob.db")).await;
     for (id, seq) in [(one, 2), (two, 3)] {
         let got = bob.until(|e| match e {
@@ -3539,14 +3554,23 @@ async fn quiet(requests: &Requests) {
     }
 }
 
-/// A member entering an epoch a peer brought it into asks the service nothing.
+/// A member entering an epoch a peer brought it into asks the service nothing; its first ordinary send in the
+/// successor epoch verifies once with `/heads`, and its second reuses that result. The same holds for a freshly created
+/// one-member group.
 #[tokio::test(flavor = "multi_thread")]
 async fn entering_an_epoch_asks_the_service_nothing() {
     let relay = relay().await;
-    let mut alice = session(&relay).await;
+    let (alice_heads, alice_post) = counting(relay.post());
+    let mut alice = session_with(&relay, alice_post).await;
     let (requests, post) = recording(relay.post());
     let bob = session_with(&relay, post).await;
     let gid = alice.node.create(settings(&relay)).unwrap();
+    let solo_before = alice_heads.load(std::sync::atomic::Ordering::Relaxed);
+    alice.node.send(&gid.0, &message("solo1"), None).await.unwrap();
+    assert_eq!(alice_heads.load(std::sync::atomic::Ordering::Relaxed), solo_before + 1, "first send in created group checks /heads");
+    alice.node.send(&gid.0, &message("solo2"), None).await.unwrap();
+    assert_eq!(alice_heads.load(std::sync::atomic::Ordering::Relaxed), solo_before + 1, "second send in created group reuses cache");
+
     let spares = strangers(&mut alice, &gid, &relay, 1).await;
     bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
     eventually("Alice has Bob", || alice.node.members(&gid.0).unwrap().len() == 3).await;
@@ -3557,6 +3581,16 @@ async fn entering_an_epoch_asks_the_service_nothing() {
     eventually("Bob applied the commit", || bob.node.epoch(&gid.0).unwrap() == epoch).await;
     quiet(&requests).await;
     assert_eq!(requests.lock().unwrap().len(), before);
+
+    bob.node.send(&gid.0, &message("first in successor"), None).await.unwrap();
+    assert_eq!(
+        requests.lock().unwrap()[before..].iter().filter(|(_, route)| *route == "/membership/6/heads").count(),
+        1,
+        "first ordinary send after peer epoch entry checks /heads once"
+    );
+    let after_first = requests.lock().unwrap().len();
+    bob.node.send(&gid.0, &message("second in successor"), None).await.unwrap();
+    assert_eq!(requests.lock().unwrap().len(), after_first, "second ordinary send reuses cached verification");
     alice.node.shutdown().await.unwrap();
     bob.node.shutdown().await.unwrap();
 }
@@ -3604,35 +3638,48 @@ async fn a_send_whose_log_moved_waits_until_the_session_caught_up() {
     bob.node.shutdown().await.unwrap();
 }
 
-/// Each send asks the service about its group's log, and reads on through each epoch a commit moves the group to: a
-/// member that the second of two commits no peer pushed removed gets nothing sealed after the send reads them.
+/// A cold send (as after restart) asks the service about its group's log and reads through each unseen epoch so a
+/// removed member gets nothing sealed after it; the next ordinary send within `REFRESH_TTL` reuses that verification
+/// with zero `/heads` calls, while a pinned (`--only`) send still asks `/heads`.
 #[tokio::test(flavor = "multi_thread")]
 async fn each_send_reads_the_group_first() {
     // Alice reaches peers through one relay only, Carol through another, and Bob through either: Alice and Carol meet
     // only through Bob.
     let (relay, other) = (relay().await, relay().await);
+    let dir = folder("trimmed-check");
+    std::fs::create_dir_all(&dir).unwrap();
+    let carol_db = dir.join("carol.db");
     let mut alice = session(&relay).await;
     let bob = session_trusting(&[&other, &relay]).await;
     let bob_key = bob.node.key();
     let (asked, post) = counting(other.post());
-    let mut carol = session_with(&other, post).await;
+    let carol = stored_with(&other, &carol_db, post.clone()).await;
     let gid = alice.node.create(settings(&relay)).unwrap();
     let spares = strangers(&mut alice, &gid, &relay, 1).await;
     bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
     carol.node.join(&bob.node.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
     eventually("Carol holds the four members", || carol.node.members(&gid.0).unwrap().len() == 4).await;
+    // Wait for Carol's first update to land, then restart Carol so her refresh cache starts cold.
+    let carol_epoch = carol.node.epoch(&gid.0).unwrap();
+    eventually("Alice has Carol's update", || alice.node.epoch(&gid.0).unwrap() >= carol_epoch.max(4)).await;
+    carol.node.shutdown().await.unwrap();
+    drop(carol);
 
     bob.node.shutdown().await.unwrap();
     alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
     alice.node.remove(&gid.0, &[bob.node.key()]).await.unwrap();
+
+    let mut carol = stored_with(&other, &carol_db, post).await;
     let before = asked.load(std::sync::atomic::Ordering::Relaxed);
     carol.node.send(&gid.0, &message("after"), None).await.unwrap();
-    assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), before + 1, "the send asked about the group's log");
+    assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), before + 1, "cold send asked about the group's log");
     assert_eq!(carol.node.members(&gid.0).unwrap().len(), 2, "the message was sealed without Bob");
     carol.until(|e| matches!(&e, Event::Left { member, .. } if member.key == bob_key).then_some(())).await;
     let read = asked.load(std::sync::atomic::Ordering::Relaxed);
     carol.node.send(&gid.0, &message("again"), None).await.unwrap();
-    assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), read + 1, "the next send asks again");
+    assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), read, "ordinary send within TTL reuses cached check");
+    carol.node.send_pinned(&gid.0, &message("pinned"), None, Some(&[alice.node.key()])).await.unwrap();
+    assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), read + 1, "pinned send always checks /heads");
     alice.node.shutdown().await.unwrap();
     carol.node.shutdown().await.unwrap();
 }
@@ -4033,4 +4080,262 @@ async fn subgroup_auto_joins_and_cascades_parent_removal() {
     for session in [alice, bob, carol] {
         session.node.shutdown().await.unwrap();
     }
+}
+
+/// A delayed `/heads` response for an older epoch must not authorize sealing in a successor epoch that a peer delivered
+/// while `/heads` was in flight: the send must re-verify the successor before sealing.
+#[tokio::test(flavor = "multi_thread")]
+async fn delayed_heads_for_old_epoch_does_not_authorize_successor() {
+    let relay = relay().await;
+    let inner = relay.post();
+    let (paused_tx, mut paused_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let is_armed = armed.clone();
+    let heads_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = heads_count.clone();
+    let post: Post = Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
+        let answer = inner(domain, route, body);
+        let paused_tx = paused_tx.clone();
+        let mut release_rx = release_rx.clone();
+        let counted = counted.clone();
+        let is_armed = is_armed.clone();
+        Box::pin(async move {
+            if route == "/membership/6/heads" && is_armed.load(std::sync::atomic::Ordering::SeqCst) {
+                let n = counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n == 1 {
+                    let res = answer.await;
+                    paused_tx.send(()).ok();
+                    release_rx.wait_for(|open| *open).await.unwrap();
+                    return res;
+                }
+            }
+            answer.await
+        })
+    });
+    let mut alice = session_with(&relay, post).await;
+    let bob = session(&relay).await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    let spares = strangers(&mut alice, &gid, &relay, 1).await;
+    bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
+    eventually("both at Bob's update epoch", || alice.node.epoch(&gid.0).unwrap() >= 3 && bob.node.epoch(&gid.0).unwrap() == alice.node.epoch(&gid.0).unwrap()).await;
+    alice.node.change_settings(&gid.0, |s| s.admins.push(bob.node.key())).await.unwrap();
+    eventually("Bob is admin", || bob.node.admin(&gid.0, &bob.node.key().0).unwrap()).await;
+    // Have Bob advance one more epoch so Alice enters via P2P (cold cache) and then we arm pausing Alice's first /heads.
+    let epoch = alice.node.epoch(&gid.0).unwrap();
+    bob.node.remove(&gid.0, &spares[..1]).await.unwrap();
+    eventually("Alice applied Bob's removal", || alice.node.epoch(&gid.0).unwrap() == epoch + 1).await;
+    let epoch = alice.node.epoch(&gid.0).unwrap();
+    armed.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let payload = message("after race");
+    {
+        let send = alice.node.send(&gid.0, &payload, None);
+        tokio::pin!(send);
+        tokio::select! {
+            _ = &mut send => panic!("send should be paused on first /heads"),
+            _ = paused_rx.recv() => {}
+        }
+        // While Alice's /heads for `epoch` is paused, Bob commits `epoch -> epoch + 1` and pushes it via P2P.
+        let extra_device = Bytes(ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes().to_vec());
+        bob.node.change_settings(&gid.0, |s| s.admitted.push(extra_device.clone())).await.unwrap();
+        eventually("Alice moved to successor epoch via P2P", || alice.node.epoch(&gid.0).unwrap() == epoch + 1).await;
+        // Release the stale /heads response for `epoch`: Alice must NOT seal without checking `epoch + 1`.
+        release_tx.send(true).unwrap();
+        send.await.unwrap();
+    }
+    assert_eq!(heads_count.load(std::sync::atomic::Ordering::Relaxed), 2, "must re-check /heads in successor epoch");
+    for session in [alice, bob] {
+        session.node.shutdown().await.unwrap();
+    }
+}
+
+/// Even with a fresh cache or a service outage, a send never seals while a locally held commit is unapplied, and a log
+/// already known to be lapsed never fails open during a subsequent service outage.
+#[test]
+fn held_commit_and_known_lapse_never_bypass_on_cache_or_outage() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        // Part 1: known lapse followed by service outage returns SendError::LetGo rather than failing open.
+        {
+            let relay = relay().await;
+            let dir = folder("lapse-outage");
+            let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let failed = down.clone();
+            let post = failing(relay.post(), move |_| failed.load(std::sync::atomic::Ordering::Relaxed));
+            let mut alice = session(&relay).await;
+            let bob = stored_with(&relay, &dir.join("bob.db"), post.clone()).await;
+            let gid = alice.node.create(settings(&relay)).unwrap();
+            let spares = strangers(&mut alice, &gid, &relay, 1).await;
+            bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
+            alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+            bob.node.shutdown().await.unwrap();
+            alice.node.remove(&gid.0, &spares[..1]).await.unwrap();
+            alice.node.shutdown().await.unwrap();
+
+            SHIFT.store(8 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+            while relay.membership.expire().await {}
+            let bob = stored_with(&relay, &dir.join("bob.db"), post).await;
+            let err = bob.node.send(&gid.0, &message("first"), None).await.unwrap_err();
+            assert!(matches!(err.downcast_ref::<SendError>(), Some(SendError::LetGo)), "{err:#}");
+            down.store(true, std::sync::atomic::Ordering::Relaxed);
+            let err = bob.node.send(&gid.0, &message("during outage"), None).await.unwrap_err();
+            assert!(matches!(err.downcast_ref::<SendError>(), Some(SendError::LetGo)), "known lapse must not fail open: {err:#}");
+            bob.node.shutdown().await.unwrap();
+        }
+
+        // Part 2: fresh cache + held unapplied commit waits on catch-up without sealing (and fails if service is down).
+        SHIFT.store(0, std::sync::atomic::Ordering::Relaxed);
+        use lmk_core::group::{Change, Group, Session as Mls, claim};
+        let relay = relay().await;
+        let dir = folder("held-outage");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bob_db = dir.join("bob.db");
+        let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let failed = down.clone();
+        let (open_read, opened_read) = tokio::sync::watch::channel(true);
+        let heads_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = heads_count.clone();
+        let inner = relay.post();
+        let post: Post = Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
+            if route == "/membership/6/heads" {
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if failed.load(std::sync::atomic::Ordering::Relaxed) {
+                return Box::pin(async { anyhow::bail!("down") });
+            }
+            let answer = inner(domain, route, body);
+            let mut opened = opened_read.clone();
+            Box::pin(async move {
+                if route == "/membership/6/read" {
+                    opened.wait_for(|open| *open).await.unwrap();
+                }
+                answer.await
+            })
+        });
+        let alice = session_with(&relay, post).await;
+        let gid = alice.node.create(settings(&relay)).unwrap();
+        let bob = Node::start(SqliteProvider::open(&bob_db).unwrap(), config(&relay)).await.unwrap().0;
+        bob.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
+        eventually("both at epoch 2", || alice.node.epoch(&gid.0).unwrap() == 2 && bob.epoch(&gid.0).unwrap() == 2).await;
+        bob.shutdown().await.unwrap();
+        drop(bob);
+
+        let provider = SqliteProvider::open(&bob_db).unwrap();
+        let mls = Mls::load(&provider).unwrap();
+        let mut group = Group::load(&provider, &gid.0).unwrap();
+        let client = ServeClient::for_service(relay.post(), &relay.service, false).unwrap();
+        let mut cut = group.cut().to_vec();
+        let own = cut.iter_mut().find(|r| r.key.0 == mls.key()).unwrap();
+        let header = lmk_proto::held::Header { group: gid.clone(), author: own.key.clone(), joined: own.joined, seq: own.seq + 1, epoch: group.epoch(), prev: None, deps: vec![], reply_to: None, payload: message("unheld") };
+        *own = claim(&gid.0, &group.seal(&provider, &mls, &header.encode()).unwrap()).unwrap();
+        let capability = group.capability(&provider).unwrap();
+        let first = group.commit(&provider, &mls, Change { cut, ..Change::default() }).unwrap();
+        client.append(&capability, from_ref(&first.entry)).await.unwrap();
+        group.apply(&provider, &first.entry).unwrap();
+        let capability = group.capability(&provider).unwrap();
+        let cut = group.cut().to_vec();
+        let second = group.commit(&provider, &mls, Change { cut, ..Change::default() }).unwrap();
+        client.append(&capability, from_ref(&second.entry)).await.unwrap();
+        drop(group);
+        drop(provider);
+
+        // `read_group` warms Alice's in-memory verification for epoch 3's log while holding `second` unapplied.
+        alice.node.read_group(&gid.0).await.unwrap();
+        assert_eq!(alice.node.epoch(&gid.0).unwrap(), 3, "Alice waits before Bob's second commit");
+
+        // While service is down, a send cannot seal behind the held commit.
+        down.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(alice.node.send(&gid.0, &message("blocked"), None).await.is_err(), "cannot seal while held commit awaits catch-up");
+        assert!(alice.node.messages(&gid.0).unwrap().iter().all(|m| m.payload != message("blocked")));
+        down.store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // With service up and read gated, the fresh cache still blocks on caught_up without sealing until epoch 4.
+        let heads_before = heads_count.load(std::sync::atomic::Ordering::Relaxed);
+        open_read.send(false).unwrap();
+        let after = message("after held");
+        {
+            let send = alice.node.send(&gid.0, &after, None);
+            tokio::pin!(send);
+            assert!(tokio::time::timeout(Duration::from_secs(2), &mut send).await.is_err(), "fresh cache must still wait for held commit");
+            assert!(alice.node.messages(&gid.0).unwrap().iter().all(|m| m.payload != after), "nothing sealed while waiting");
+            assert_eq!(heads_count.load(std::sync::atomic::Ordering::Relaxed), heads_before, "fresh cache entered caught_up directly");
+            open_read.send(true).unwrap();
+            send.await.unwrap();
+        }
+        assert_eq!(alice.node.epoch(&gid.0).unwrap(), 4, "sealed only after held commit applied");
+        alice.node.shutdown().await.unwrap();
+    });
+}
+
+/// If a strict check discovers a newer signed head on `/heads` while the old epoch's cache is warm and `/read` is
+/// still in flight, a concurrent ordinary send must not reuse the old cache to seal in the pre-removal epoch.
+#[tokio::test(flavor = "multi_thread")]
+async fn warm_cache_blocked_when_newer_head_seen_during_pending_catch_up() {
+    let (relay, other) = (relay().await, relay().await);
+    let alice = session(&relay).await;
+    let bob = session_trusting(&[&other, &relay]).await;
+    let (read_paused_tx, mut read_paused_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (open_read, opened_read) = tokio::sync::watch::channel(true);
+    let inner = other.post();
+    let post: Post = Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
+        let answer = inner(domain, route, body);
+        let read_paused_tx = read_paused_tx.clone();
+        let mut opened = opened_read.clone();
+        Box::pin(async move {
+            if route == "/membership/6/read" && !*opened.borrow() {
+                read_paused_tx.send(()).ok();
+                opened.wait_for(|open| *open).await.unwrap();
+            }
+            answer.await
+        })
+    });
+    let carol = session_with(&other, post).await;
+    let gid = alice.node.create(settings(&relay)).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
+    carol.node.join(&bob.node.invite(&gid.0, INVITE_VALID, None).await.unwrap(), None).await.unwrap();
+    eventually("Carol holds 3 members", || carol.node.members(&gid.0).unwrap().len() == 3).await;
+    let epoch = carol.node.epoch(&gid.0).unwrap();
+    eventually("Alice at Carol's epoch", || alice.node.epoch(&gid.0).unwrap() >= epoch.max(4)).await;
+
+    // Warm Carol's cache on the current epoch, then isolate Carol from Alice and have Alice remove Bob.
+    carol.node.send(&gid.0, &message("warm"), None).await.unwrap();
+    let pre_epoch = carol.node.epoch(&gid.0).unwrap();
+    bob.node.shutdown().await.unwrap();
+    alice.node.remove(&gid.0, &[bob.node.key()]).await.unwrap();
+
+    // Pause `/read`, then launch a strict send so `/heads` discovers Alice's newer head while `/read` blocks.
+    open_read.send(false).unwrap();
+    let strict_msg = message("strict");
+    let ordinary_msg = message("ordinary");
+    let alice_key = alice.node.key();
+    {
+        let pinned_list = vec![alice_key.clone()];
+        let strict_send = carol.node.send_pinned(&gid.0, &strict_msg, None, Some(&pinned_list));
+        tokio::pin!(strict_send);
+        tokio::select! {
+            _ = &mut strict_send => panic!("strict send should block on paused /read"),
+            _ = read_paused_rx.recv() => {}
+        }
+        // While catch-up is paused, an ordinary send MUST NOT reuse the old warm cache to seal in `pre_epoch`.
+        let ordinary_send = carol.node.send(&gid.0, &ordinary_msg, None);
+        tokio::pin!(ordinary_send);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut ordinary_send).await.is_err(),
+            "ordinary send must not reuse stale warm cache once a newer signed head was observed"
+        );
+        assert!(carol.node.messages(&gid.0).unwrap().iter().all(|m| m.payload != ordinary_msg));
+
+        open_read.send(true).unwrap();
+        let (r1, r2) = tokio::join!(strict_send, ordinary_send);
+        r1.unwrap();
+        r2.unwrap();
+    }
+    assert!(carol.node.epoch(&gid.0).unwrap() > pre_epoch, "both sealed only after catching up past Bob's removal");
+    assert_eq!(carol.node.members(&gid.0).unwrap().len(), 2, "Bob removed before ordinary send sealed");
+    alice.node.shutdown().await.unwrap();
+    carol.node.shutdown().await.unwrap();
 }

@@ -2,9 +2,11 @@
 //! the earlier epochs' logs it still reads. A capability names each at its membership service, which keeps it under the
 //! reference `head::reference` derives from it, the log's id here. Each is read from its service, chained, held entry by
 //! entry, shown to peers by its newest signed head and caught up from them, and handed to its group once held. A
-//! session asks a service about its logs only before it sends and as it commits: online members bring it the rest.
+//! session asks a service about its logs on pinned sends, as it commits, and when a normal send's in-memory verification
+//! of the current log is missing or older than `REFRESH_TTL`: online members bring it the rest.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, ensure};
@@ -17,7 +19,7 @@ use lmk_proto::group::Service;
 use lmk_proto::head::{self, Head};
 use lmk_proto::membership::STALE;
 use lmk_proto::clock::corrected;
-use n0_future::time::{Duration, timeout};
+use n0_future::time::{Duration, Instant, timeout};
 use serde::{Deserialize, Serialize};
 
 use crate::{Inner, SendError, State, Work, get, hex, put};
@@ -26,6 +28,28 @@ pub(crate) const NOT_FOLLOWED: &str = "this session does not follow that log";
 
 /// How long a send waits for the service: chat works while it is down.
 const SEND_WAIT: Duration = Duration::from_secs(5);
+/// How long an in-memory service verification of a group's current log stays reusable for ordinary sends.
+pub(crate) const REFRESH_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// How strictly `refresh` checks a group's current log against its membership service.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Check {
+    /// Ordinary send: reuse a direct service observation of the current log within `REFRESH_TTL` while not stale,
+    /// lapsed, or behind locally held entries; fail open within `STALE` if unreachable.
+    Cached,
+    /// Rare membership check (e.g. subgroup setup): always ask `/heads`, fail open within `STALE` if unreachable.
+    BestEffort,
+    /// Pinned send (`--only` / `dm`): always ask `/heads` and fail closed (`SendError::Unverified`) if unreachable.
+    Strict,
+}
+
+/// The log cleared by `refresh`, and whether clearance came from a direct service check in this call (vs. cache hit or
+/// fail-open).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Cleared {
+    pub log: Vec<u8>,
+    pub direct: bool,
+}
 
 /// One membership client per service, sharing the session's post; only the home's service sets the clock.
 pub(crate) struct Clients {
@@ -74,11 +98,46 @@ pub(crate) struct Log {
     /// When the service first answered that it let the log go, or this session took it as let go, and the length held
     /// then.
     pub lapsed: Option<(u64, u64)>,
+    /// Monotonic time captured just before the most recent direct service observation confirming this log's frontier.
+    /// In-memory only: a restarted session always starts cold.
+    #[serde(skip)]
+    pub verified: Option<Instant>,
+    /// Valid signed heads observed from `/heads` ahead of our locally stored frontier, keyed by length with the
+    /// monotonic instant each was recorded. Retained until entries verify consistency through each checkpoint.
+    #[serde(skip)]
+    pub seen_heads: BTreeMap<u64, (Head, Instant)>,
+    /// Whether a signed contradiction was observed on this log in this process; blocks cache reuse.
+    #[serde(skip)]
+    pub contradicted: bool,
 }
 
 impl Log {
     pub fn new(group: Bytes, service: Service) -> Self {
-        Log { group, service, head: None, at: 0, since: corrected(), lapsed: None }
+        Log {
+            group,
+            service,
+            head: None,
+            at: 0,
+            since: corrected(),
+            lapsed: None,
+            verified: None,
+            seen_heads: BTreeMap::new(),
+            contradicted: false,
+        }
+    }
+
+    /// Whether this session has observed any signed head ahead of its locally stored entries for this log.
+    pub fn behind_seen(&self) -> bool {
+        self.seen_heads.keys().next_back().is_some_and(|&len| self.length() < len)
+    }
+
+    /// Whether a direct service observation of this log is still within `REFRESH_TTL` at `now` and free of adverse
+    /// state (lapsed, contradicted, or behind a newer signed head).
+    pub fn fresh(&self, now: Instant) -> bool {
+        !self.contradicted
+            && !self.behind_seen()
+            && self.lapsed.is_none()
+            && self.verified.is_some_and(|at| now.checked_duration_since(at).is_some_and(|age| age < REFRESH_TTL))
     }
 
     /// The entries held, positions 1 to this.
@@ -137,6 +196,18 @@ impl State {
         let Some(log) = self.logs.get_mut(id) else { return Ok(()) };
         log.at = log.at.max(at);
         self.save_log(id)
+    }
+
+    /// Records an in-memory monotonic timestamp of a direct service observation confirming `id`, unless `id` is lapsed,
+    /// contradicted, or behind a newer signed head.
+    pub(crate) fn mark_verified(&mut self, id: &[u8], asked: Instant) {
+        if let Some(log) = self.logs.get_mut(id)
+            && !log.contradicted
+            && !log.behind_seen()
+            && log.lapsed.is_none()
+        {
+            log.verified = Some(log.verified.map_or(asked, |prev| prev.max(asked)));
+        }
     }
 
     fn save_logs(&self) -> Result<()> {
@@ -233,49 +304,182 @@ impl State {
 }
 
 impl Inner {
-    /// Before a send: asks the service about the group's current log, and if it moved, or this session holds a commit of
-    /// it that it has not applied, as while it waits for what the last one kept, waits until this session caught up with
-    /// it, through each epoch a commit moves it to. Fails when the log counts as let go. Within `STALE`, a service that
-    /// does not answer within `SEND_WAIT` holds nothing back unless `strict` is set: pinned sends fail closed.
-    pub(crate) async fn refresh(self: &Arc<Self>, gid: &[u8], strict: bool) -> Result<()> {
-        let (id, service, capability, held) = {
-            let st = self.lock();
-            let id = st.group(gid)?.rec.log.0.clone();
-            (id.clone(), st.log(&id)?.service.clone(), st.capability(&id)?, st.log(&id)?.length())
-        };
-        let current_stale = |st: &State| st.group(gid).and_then(|g| st.log(&g.rec.log.0)).is_ok_and(Log::stale);
-        let answer = match timeout(SEND_WAIT, async { self.clients.client(&service)?.heads(&[capability]).await }).await {
-            Ok(Ok(mut answers)) => answers.remove(0),
-            Ok(Err(error)) => {
-                self.report(&error);
-                if strict {
-                    return Err(SendError::Unverified(format!("membership service did not answer: {error:#}")).into());
+    /// Checks the group's current log against its membership service according to `check` and returns the id of the
+    /// log cleared for sending.
+    ///
+    /// For `Check::Cached`, reuses an in-memory service verification within `REFRESH_TTL` while the log is neither
+    /// stale nor lapsed; if locally held commits have not been applied yet, waits via `caught_up`. For
+    /// `Check::BestEffort` and `Check::Strict`, always queries `/heads`; `Check::Strict` fails closed with
+    /// `SendError::Unverified` if the service does not answer, while non-strict modes fail open within `STALE` only
+    /// when the log is not known lapsed and has no unapplied held commits.
+    pub(crate) async fn refresh(self: &Arc<Self>, gid: &[u8], check: Check) -> Result<Cleared> {
+        loop {
+            let (id, service, capability, cache_hit, at_head) = {
+                let st = self.lock();
+                let id = st.group(gid)?.rec.log.0.clone();
+                let log = st.log(&id)?;
+                let cache_hit = check == Check::Cached && log.fresh(Instant::now()) && !log.stale();
+                (id.clone(), log.service.clone(), st.capability(&id)?, cache_hit, st.at_head(gid))
+            };
+            if cache_hit {
+                if at_head {
+                    return Ok(Cleared { log: id, direct: false });
                 }
-                if current_stale(&self.lock()) {
-                    return Err(error);
+                self.caught_up(gid).await.map_err(|e| if e.is::<Expired>() { SendError::LetGo.into() } else { e })?;
+                continue;
+            }
+            let asked = Instant::now();
+            let answer = match timeout(SEND_WAIT, async { self.clients.client(&service)?.heads(&[capability]).await }).await {
+                Ok(Ok(mut answers)) => answers.remove(0),
+                failed => {
+                    let error = match failed {
+                        Ok(Err(error)) => {
+                            self.report(&error);
+                            Some(error)
+                        }
+                        _ => None,
+                    };
+                    if check == Check::Strict {
+                        let message = match error {
+                            Some(error) => format!("membership service did not answer: {error:#}"),
+                            None => "membership service did not answer".into(),
+                        };
+                        return Err(SendError::Unverified(message).into());
+                    }
+                    let (moved, lapsed, stale, contradicted, behind) = {
+                        let st = self.lock();
+                        let cur = st.group(gid)?.rec.log.0.clone();
+                        let log = st.log(&cur)?;
+                        (cur != id, log.lapsed.is_some(), log.stale(), log.contradicted, !st.at_head(gid) || log.behind_seen())
+                    };
+                    if moved {
+                        continue;
+                    }
+                    if lapsed {
+                        return Err(SendError::LetGo.into());
+                    }
+                    if stale || contradicted {
+                        return match error {
+                            Some(error) => Err(error),
+                            None => Err(anyhow::anyhow!("the membership service did not answer")),
+                        };
+                    }
+                    if behind {
+                        self.caught_up(gid).await.map_err(|e| if e.is::<Expired>() { SendError::LetGo.into() } else { e })?;
+                        continue;
+                    }
+                    return Ok(Cleared { log: id, direct: false });
                 }
-                return Ok(());
+            };
+            enum Outcome {
+                Cleared(Cleared),
+                CatchUp,
+                Retry,
             }
-            Err(_) => {
-                if strict {
-                    return Err(SendError::Unverified("membership service did not answer".into()).into());
+            let outcome = {
+                let mut st = self.lock();
+                if st.group(gid)?.rec.log.0 != id {
+                    Outcome::Retry
+                } else {
+                    let stale = st.log(&id)?.stale();
+                    let lapsed = st.log(&id)?.lapsed.is_some();
+                    let held = st.log(&id)?.length();
+                    match answer {
+                        Ok(head) => {
+                            let hash_at = if head.length < held { st.hash_at(&id, head.length)? } else { None };
+                            if let Err(error) = st.log(&id)?.frontier(&id)?.check(&head, hash_at) {
+                                if let Some(contradiction) = error.downcast_ref::<Contradiction>() {
+                                    self.contradicted(&mut st, &id, contradiction, "this session");
+                                }
+                                return Err(error);
+                            }
+                            if let Some((seen, _)) = st.log(&id)?.seen_heads.get(&head.length)
+                                && seen.hash != head.hash
+                            {
+                                let contradiction = Contradiction { ours: seen.clone(), theirs: head };
+                                self.contradicted(&mut st, &id, &contradiction, "this session");
+                                return Err(contradiction.into());
+                            }
+                            // Any longer checkpoint already recorded before this request began proves rollback;
+                            // an overlapping shorter response merely raced with an append, but if it is ahead of
+                            // `held` we still retain it as a checkpoint before catching up.
+                            if let Some(seen) = st
+                                .log(&id)?
+                                .seen_heads
+                                .range((Bound::Excluded(head.length), Bound::Unbounded))
+                                .find_map(|(_, (h, obs))| (asked >= *obs).then_some(h.clone()))
+                            {
+                                let contradiction = Contradiction { ours: seen, theirs: head };
+                                self.contradicted(&mut st, &id, &contradiction, "this session");
+                                return Err(contradiction.into());
+                            }
+                            let has_longer = st
+                                .log(&id)?
+                                .seen_heads
+                                .range((Bound::Excluded(head.length), Bound::Unbounded))
+                                .next()
+                                .is_some();
+                            if head.length > held {
+                                let observed = Instant::now();
+                                let log = st.logs.get_mut(&id).unwrap();
+                                log.seen_heads.entry(head.length).or_insert((head, observed));
+                                log.verified = None;
+                                Outcome::CatchUp
+                            } else if has_longer {
+                                Outcome::CatchUp
+                            } else if head.length == held {
+                                if lapsed {
+                                    return Err(SendError::LetGo.into());
+                                }
+                                if stale {
+                                    self.lapse(&mut st, &id)?;
+                                    return Err(SendError::LetGo.into());
+                                }
+                                st.read_as_of(&id, head.time)?;
+                                st.mark_verified(&id, asked);
+                                if st.at_head(gid) && !st.log(&id)?.behind_seen() {
+                                    Outcome::Cleared(Cleared { log: id, direct: true })
+                                } else {
+                                    Outcome::CatchUp
+                                }
+                            } else if !stale && !lapsed {
+                                Outcome::CatchUp
+                            } else {
+                                if !lapsed {
+                                    self.lapse(&mut st, &id)?;
+                                }
+                                return Err(SendError::LetGo.into());
+                            }
+                        }
+                        Err(_) => {
+                            self.lapse(&mut st, &id)?;
+                            return Err(SendError::LetGo.into());
+                        }
+                    }
                 }
-                if current_stale(&self.lock()) {
-                    anyhow::bail!("the membership service did not answer");
+            };
+            match outcome {
+                Outcome::Cleared(cleared) => return Ok(cleared),
+                Outcome::Retry => continue,
+                Outcome::CatchUp => {
+                    self.caught_up(gid).await.map_err(|e| if e.is::<Expired>() { SendError::LetGo.into() } else { e })?;
+                    let cleared = {
+                        let st = self.lock();
+                        let cur = st.group(gid)?.rec.log.0.clone();
+                        let log = st.log(&cur)?;
+                        (st.at_head(gid)
+                            && !log.stale()
+                            && log.lapsed.is_none()
+                            && !log.behind_seen()
+                            && !log.contradicted
+                            && log.verified.is_some_and(|at| at >= asked))
+                        .then_some(Cleared { log: cur, direct: true })
+                    };
+                    if let Some(cleared) = cleared {
+                        return Ok(cleared);
+                    }
                 }
-                return Ok(());
             }
-        };
-        let stale = self.lock().log(&id).is_ok_and(Log::stale);
-        match answer {
-            Ok(head) if head.length == held && !stale => {
-                self.lock().read_as_of(&id, head.time)?;
-                if self.lock().at_head(gid) { Ok(()) } else { self.caught_up(gid).await }
-            }
-            Ok(head) if !stale || head.length > held => {
-                self.caught_up(gid).await.map_err(|e| if e.is::<Expired>() { SendError::LetGo.into() } else { e })
-            }
-            _ => self.lapse(&mut self.lock(), &id).and(Err(SendError::LetGo.into())),
         }
     }
 
@@ -297,11 +501,12 @@ impl Inner {
                 let log = st.log(id)?;
                 (capability, log.service.clone(), log.frontier(id)?)
             };
+            let asked = Instant::now();
             let page = match self.clients.client(&service)?.read(&capability, &frontier).await {
                 Ok(page) => page,
                 Err(error) => {
                     if let Some(contradiction) = error.downcast_ref::<Contradiction>() {
-                        self.contradicted(&self.lock(), id, contradiction, "this session");
+                        self.contradicted(&mut self.lock(), id, contradiction, "this session");
                     }
                     if matches!(error.downcast_ref::<Refused>(), Some(Refused(code)) if code == "policy")
                         && self.lock().log(id).is_ok_and(Log::stale)
@@ -316,17 +521,57 @@ impl Inner {
                 }
             };
             let more = !page.entries.is_empty();
-            if !more && self.lock().log(id).is_ok_and(Log::stale) {
-                let expired = Expired(id.try_into()?);
-                return self.lapse(&mut self.lock(), id).and(Err(expired.into()));
-            }
-            let end = page.head.length;
             let mut st = self.lock();
-            self.take_entries(&mut st, id, page.after, page.entries, page.head)?;
-            if st.log(id).is_ok_and(|log| log.length() >= end) {
-                st.read_as_of(id, corrected())?;
+            let was_stale = st.log(id).is_ok_and(Log::stale);
+            if !more && was_stale {
+                let expired = Expired(id.try_into()?);
+                self.lapse(&mut st, id)?;
+                return Err(expired.into());
+            }
+            if !more
+                && let Some((seen, _)) = st.logs.get(id).and_then(|log| log.seen_heads.get(&page.head.length))
+                && seen.hash != page.head.hash
+            {
+                let contradiction = Contradiction { ours: seen.clone(), theirs: page.head };
+                self.contradicted(&mut st, id, &contradiction, "this session");
+                return Err(contradiction.into());
             }
             if !more {
+                let above = (Bound::Excluded(page.head.length), Bound::Unbounded);
+                if let Some(seen) = st
+                    .logs
+                    .get(id)
+                    .and_then(|log| log.seen_heads.range(above).find_map(|(_, (h, obs))| (asked >= *obs).then_some(h.clone())))
+                {
+                    let contradiction = Contradiction { ours: seen, theirs: page.head };
+                    self.contradicted(&mut st, id, &contradiction, "this session");
+                    return Err(contradiction.into());
+                }
+                if st.logs.get(id).is_some_and(|log| log.seen_heads.range(above).next().is_some()) {
+                    // This empty read started before every longer checkpoint was recorded; retry for the newer entries.
+                    continue;
+                }
+            }
+            let (end, head_time, head_hash) = (page.head.length, page.head.time, page.head.hash);
+            self.take_entries(&mut st, id, page.after, page.entries, page.head)?;
+            let exact_match = !was_stale
+                && st.log(id).is_ok_and(|log| log.length() == end)
+                && st.hash_at(id, end)? == Some(head_hash);
+            if exact_match {
+                st.read_as_of(id, head_time)?;
+            }
+            if !more {
+                let current_matching = exact_match
+                    && st.logs.get(id).is_some_and(|log| {
+                        st.groups.get(&log.group.0).is_some_and(|g| g.rec.log.0 == id)
+                            && !log.stale()
+                            && log.lapsed.is_none()
+                            && !log.contradicted
+                            && !log.behind_seen()
+                    });
+                if current_matching {
+                    st.mark_verified(id, asked);
+                }
                 return Ok(());
             }
         }
@@ -354,13 +599,35 @@ impl Inner {
             self.contradicted(st, id, &Contradiction { ours, theirs: head }, "this session");
             return Ok(());
         }
+        // Verify every retained checkpoint covered by `head` before writing entries or advancing the group.
+        let checkpoints: Vec<(u64, Head)> = st
+            .log(id)?
+            .seen_heads
+            .range(..=head.length)
+            .map(|(&pos, (h, _))| (pos, h.clone()))
+            .collect();
+        for (pos, seen) in &checkpoints {
+            let hash = if *pos <= length {
+                st.hash_at(id, *pos)?
+            } else {
+                Some(hashes[(*pos - after) as usize])
+            };
+            if hash != Some(seen.hash) {
+                let contradiction = Contradiction { ours: seen.clone(), theirs: head };
+                self.contradicted(st, id, &contradiction, "this session");
+                return Err(contradiction.into());
+            }
+        }
         let fresh = head.length > length;
         for position in length + 1..=head.length {
             let index = (position - after) as usize;
             st.provider.put(&entry_key(id, position), &[hashes[index].as_slice(), &entries[index - 1].0].concat())?;
         }
         let log = st.logs.get_mut(id).unwrap();
-        log.at = log.at.max(head.time);
+        log.seen_heads.retain(|&pos, _| pos > head.length);
+        if head.length >= length {
+            log.at = log.at.max(head.time);
+        }
         if fresh {
             log.head = Some(head);
         }
@@ -378,6 +645,7 @@ impl Inner {
     fn lapse(&self, st: &mut State, id: &[u8]) -> Result<()> {
         let now = crate::now();
         let log = st.logs.get_mut(id).context(NOT_FOLLOWED)?;
+        log.verified = None;
         let length = log.length();
         let since = match log.lapsed {
             Some((since, held)) if held == length => since,
@@ -402,8 +670,12 @@ impl Inner {
 
 impl Inner {
     /// Reports a log that its service showed differently, here and at `there`, unless it reported those two heads of it
-    /// already.
-    pub(crate) fn contradicted(&self, st: &State, log: &[u8], contradiction: &Contradiction, there: &str) {
+    /// already. Also invalidates in-memory refresh verification on `log`.
+    pub(crate) fn contradicted(&self, st: &mut State, log: &[u8], contradiction: &Contradiction, there: &str) {
+        if let Some(entry) = st.logs.get_mut(log) {
+            entry.contradicted = true;
+            entry.verified = None;
+        }
         let Contradiction { ours, theirs } = contradiction;
         let mut heads = [(ours.length, ours.hash.to_vec()), (theirs.length, theirs.hash.to_vec())];
         heads.sort();

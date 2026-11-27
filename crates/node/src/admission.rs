@@ -11,6 +11,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{EndpointId, RelayUrl};
 use lmk_core::group::{Change, Group, Invited, delete_key_package, key_package_leaf, key_package_reference};
+use lmk_membership::Contradiction;
 use lmk_net::Admit;
 use lmk_proto::directory::relay_url;
 use lmk_proto::group::{Control, Leaf, PROTOCOL, Service, Settings, Subgroup, UPDATE};
@@ -24,8 +25,9 @@ use n0_future::{FuturesUnordered, StreamExt};
 use n0_future::time::{Duration, Instant, sleep, sleep_until, timeout};
 use sha2::{Digest, Sha256};
 
+use crate::logs::Check;
 use crate::reading::commit_key;
-use crate::{G, Inner, MEMBER_WAIT, Member, Node, Rec, Rule, State, endpoint_id, get, put};
+use crate::{G, Inner, MEMBER_WAIT, Member, Node, Rec, Rule, SendError, State, endpoint_id, get, put};
 
 /// How many members besides the inviter a link names, of those connected to it that hold the invite's message.
 const LINK_MEMBERS: usize = 3;
@@ -128,7 +130,7 @@ impl Node {
     /// their daemon auto-joins via normal admission. Fails and removes the empty subgroup if no peer joins.
     pub async fn subgroup(&self, parent: &[u8], peers: &[Bytes], carry: u32, membership: Service) -> Result<SubgroupResult> {
         ensure!(!peers.is_empty(), "a subgroup needs at least one other member");
-        self.inner.refresh(parent, false).await?;
+        let _ = self.inner.refresh(parent, Check::BestEffort).await?;
         let me = self.key();
         let targets: Vec<(Bytes, EndpointId, Vec<RelayUrl>)> = {
             let st = self.inner.lock();
@@ -402,8 +404,37 @@ impl Inner {
             ensure!(times.len() < MAX_SUBGROUP_OFFERS_PER_MIN, "too many subgroup offers; slow down");
             times.push_back(t);
         }
-        if let Err(error) = timeout(SUBGROUP_REFRESH_WAIT, self.refresh(&ask.parent.0, false)).await {
-            tracing::debug!("parent refresh before subgroup join timed out: {error:#}");
+        match timeout(SUBGROUP_REFRESH_WAIT, self.refresh(&ask.parent.0, Check::BestEffort)).await {
+            Ok(Ok(_)) => {}
+            outcome => {
+                let err = match outcome {
+                    Ok(Err(error)) => Some(error),
+                    _ => None,
+                };
+                if let Some(error) = &err
+                    && (error.is::<SendError>() || error.is::<Contradiction>())
+                {
+                    return Err(err.unwrap());
+                }
+                let adverse = {
+                    let st = self.lock();
+                    match st.groups.get(&ask.parent.0).filter(|g| g.mls.active()) {
+                        None => Some("parent group is no longer active"),
+                        Some(g) => match st.logs.get(&g.rec.log.0) {
+                            Some(log) if log.lapsed.is_some() => Some("parent group's log was let go"),
+                            Some(log) if log.contradicted => Some("parent group's log showed a contradiction"),
+                            _ => None,
+                        },
+                    }
+                };
+                if let Some(reason) = adverse {
+                    return Err(err.unwrap_or_else(|| anyhow::anyhow!("{reason}")));
+                }
+                match err {
+                    Some(error) => tracing::debug!("parent refresh before subgroup join failed: {error:#}"),
+                    None => tracing::debug!("parent refresh before subgroup join timed out"),
+                }
+            }
         }
         self.join_link(&invite, None, Some(&ask.parent.0), SUBGROUP_JOIN_WAIT).await?;
         Ok(())

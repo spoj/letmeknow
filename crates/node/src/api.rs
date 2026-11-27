@@ -5,13 +5,15 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, ensure};
 use iroh::RelayUrl;
 use lmk_core::group::{Change, Group};
+use lmk_membership::Expired;
 use lmk_net::Net;
 use lmk_proto::directory::relay_url;
 use lmk_proto::group::{Control, Settings};
 use lmk_proto::Bytes;
 use serde_json::Value;
 
-use crate::{G, Leave, Member, Message, Node, Rec, Seen, State, Work, now};
+use crate::logs::Check;
+use crate::{G, Leave, Member, Message, Node, Rec, Seen, SendError, State, Work, now};
 
 /// What a member that is no admin is told as it asks what only admins do.
 const NOT_ADMIN: &str = "this session is no admin of the group: only its admins (`admins` lists them) remove members, and change its admins and admitted devices";
@@ -205,21 +207,45 @@ impl Node {
         Ok(ended)
     }
 
-    /// Sends a held payload, a reply to the delivered message `reply_to` if given. The node first asks the membership
-    /// service about the group's log, waiting at most 5 seconds for its answer, and if it moved, waits until this session
-    /// caught up with it: back from a while away, until the members online brought what it missed, or its wait for them
-    /// gave up. Then it seals the payload to the members as of then, keeps it, delivers it to this session and pushes it to
-    /// the members online, and seals it again in each epoch until a cut keeps it. Answers its id. Fails with `SendError`
-    /// when this session sends faster than members take, the message is too large, or the service let the log go.
+    /// Sends a held payload, a reply to the delivered message `reply_to` if given. When this session has not verified
+    /// the group's current log with the membership service within `REFRESH_TTL` (or the log is stale or lapsed), the
+    /// node first asks the service, waiting at most 5 seconds for its answer, and catches up if it moved or if locally
+    /// held commits are waiting to apply. Then it seals the payload to the members as of then, keeps it, delivers it to
+    /// this session and pushes it to the members online, and seals it again in each epoch until a cut keeps it. Answers
+    /// its id. Fails with `SendError` when this session sends faster than members take, the message is too large, or
+    /// the service let the log go.
     pub async fn send(&self, gid: &[u8], payload: &Value, reply_to: Option<&[u8]>) -> Result<Bytes> {
         self.send_pinned(gid, payload, reply_to, None).await
     }
 
-    /// Sends a held payload; when `pinned` is set, refreshes strictly against the membership service (failing closed if
-    /// unreachable) and aborts before sealing if any member outside `pinned` is in the group or none of `pinned` remain.
+    /// Sends a held payload; when `pinned` is set, refreshes strictly against the membership service (bypassing the
+    /// `REFRESH_TTL` cache and failing closed if unreachable) and aborts before sealing if any member outside `pinned`
+    /// is in the group or none of `pinned` remain.
     pub async fn send_pinned(&self, gid: &[u8], payload: &Value, reply_to: Option<&[u8]>, pinned: Option<&[Bytes]>) -> Result<Bytes> {
-        self.inner.refresh(gid, pinned.is_some()).await?;
-        self.inner.send(&mut self.inner.lock(), gid, payload, reply_to, pinned)
+        let check = if pinned.is_some() { Check::Strict } else { Check::Cached };
+        loop {
+            let cleared = self.inner.refresh(gid, check).await?;
+            let retry_behind = {
+                let mut st = self.inner.lock();
+                let id = st.group(gid)?.rec.log.0.clone();
+                let log = st.log(&id)?;
+                if log.lapsed.is_some() {
+                    return Err(SendError::LetGo.into());
+                }
+                if id == cleared.log
+                    && st.at_head(gid)
+                    && !log.stale()
+                    && !log.behind_seen()
+                    && (cleared.direct || !log.contradicted)
+                {
+                    return self.inner.send(&mut st, gid, payload, reply_to, pinned);
+                }
+                id == cleared.log && (!st.at_head(gid) || log.behind_seen())
+            };
+            if retry_behind {
+                self.inner.caught_up(gid).await.map_err(|e| if e.is::<Expired>() { SendError::LetGo.into() } else { e })?;
+            }
+        }
     }
 
     /// A held message of the group this session delivered.

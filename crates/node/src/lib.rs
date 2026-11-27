@@ -676,7 +676,7 @@ mod tests {
                     alice.inner.take_entries(&mut alice.inner.lock(), &id, 0, vec![Bytes(b"theirs".to_vec())], theirs.clone()).unwrap();
                 }
             }
-            alice.inner.contradicted(&alice.inner.lock(), &id, &Contradiction { ours: theirs.clone(), theirs: ours.clone() }, "a peer");
+            alice.inner.contradicted(&mut alice.inner.lock(), &id, &Contradiction { ours: theirs.clone(), theirs: ours.clone() }, "a peer");
             let Event::Warning { group, text } = events.try_recv().unwrap() else { panic!("a fork must warn") };
             assert_eq!(group, Some(gid));
             assert_eq!(text, format!(
@@ -1229,5 +1229,410 @@ mod tests {
         for node in [alice, bob] {
             node.shutdown().await.unwrap();
         }
+    }
+
+    /// `Log::fresh` enforces the exact `REFRESH_TTL` boundary without renewing on hits, and a cold/expired cache queries
+    /// `/heads` while a warm cache reuses its result without extending its timestamp.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refresh_cache_ttl_boundary_and_no_renewal_on_hit() {
+        use n0_future::time::Instant;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let t0 = Instant::now();
+        let mut log = logs::Log::new(Bytes(vec![1; 32]), Service::Serve { key: Bytes(vec![2; 32]), domain: "h.example".into(), rest: Default::default() });
+        assert!(!log.fresh(t0));
+        log.verified = Some(t0);
+        assert!(log.fresh(t0));
+        assert!(log.fresh(t0 + logs::REFRESH_TTL - Duration::from_millis(1)));
+        assert!(!log.fresh(t0 + logs::REFRESH_TTL));
+        assert!(!log.fresh(t0 + logs::REFRESH_TTL + Duration::from_secs(1)));
+        if let Some(earlier) = t0.checked_sub(Duration::from_secs(1)) {
+            assert!(!log.fresh(earlier));
+        }
+
+        let relay = lmk_testing::relay().await;
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = asked.clone();
+        let inner = relay.post();
+        let post: Post = Arc::new(move |domain, route, body| {
+            if route == "/membership/6/heads" {
+                counted.fetch_add(1, Ordering::Relaxed);
+            }
+            inner(domain, route, body)
+        });
+        let alice = node(&relay, post).await;
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
+        let gid = alice.create(settings).unwrap();
+        let id = alice.log(&gid.0).unwrap().0;
+        assert!(alice.inner.lock().log(&id).unwrap().verified.is_none(), "create does not pre-warm cache");
+
+        let msg = |s: &str| serde_json::json!({ "type": "message", "content": s });
+        alice.send(&gid.0, &msg("first"), None).await.unwrap();
+        assert_eq!(asked.load(Ordering::Relaxed), 1, "first ordinary send checks /heads");
+        let stamped = alice.inner.lock().log(&id).unwrap().verified.expect("verified stamped");
+
+        alice.send(&gid.0, &msg("second"), None).await.unwrap();
+        assert_eq!(asked.load(Ordering::Relaxed), 1, "second ordinary send reuses cache");
+        assert_eq!(alice.inner.lock().log(&id).unwrap().verified, Some(stamped), "cache hit must not extend verified");
+
+        if let Some(just_under) = Instant::now().checked_sub(logs::REFRESH_TTL - Duration::from_secs(30)) {
+            alice.inner.lock().logs.get_mut(&id).unwrap().verified = Some(just_under);
+            alice.send(&gid.0, &msg("still fresh"), None).await.unwrap();
+            assert_eq!(asked.load(Ordering::Relaxed), 1, "just before TTL still hits cache");
+            assert_eq!(alice.inner.lock().log(&id).unwrap().verified, Some(just_under), "hit before TTL does not renew");
+        }
+
+        if let Some(at_boundary) = Instant::now().checked_sub(logs::REFRESH_TTL) {
+            alice.inner.lock().logs.get_mut(&id).unwrap().verified = Some(at_boundary);
+            alice.send(&gid.0, &msg("expired"), None).await.unwrap();
+            assert_eq!(asked.load(Ordering::Relaxed), 2, "at exact TTL boundary misses cache");
+            let refreshed = alice.inner.lock().log(&id).unwrap().verified.unwrap();
+            assert!(refreshed > at_boundary, "cache miss updates verified");
+        }
+        alice.shutdown().await.unwrap();
+    }
+
+    /// A signed `/heads` answer at the same length with a conflicting hash is rejected as a contradiction, warns once,
+    /// and never warms the refresh cache.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn conflicting_same_length_head_on_refresh_is_rejected_and_not_cached() {
+        use ed25519_dalek::SigningKey;
+        use lmk_membership::Contradiction;
+        use lmk_proto::head::{self, Head};
+        use lmk_proto::membership::{Answer, Heads, Moved};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let relay = lmk_testing::relay().await;
+        let key = SigningKey::from_bytes(&[9; 32]);
+        let service = Service::Serve { key: Bytes(key.verifying_key().to_bytes().to_vec()), domain: "fork.example".into(), rest: Default::default() };
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = asked.clone();
+        let signing = key.clone();
+        let post: Post = Arc::new(move |_domain, route, body| {
+            let signing = signing.clone();
+            let counted = counted.clone();
+            Box::pin(async move {
+                assert_eq!(route, "/membership/6/heads");
+                counted.fetch_add(1, Ordering::Relaxed);
+                let req: Heads = serde_json::from_slice(&body)?;
+                let cap = req.logs[0].0;
+                let id = head::reference(signing.verifying_key().as_bytes(), &cap);
+                let start = head::start(signing.verifying_key().as_bytes(), &id);
+                let theirs = Head::sign(&signing, &id, 1, head::next(&start, b"theirs"), now());
+                Ok(serde_json::to_vec(&Answer::Ok(Moved { heads: vec![theirs], expired: vec![] }))?)
+            })
+        });
+        let config = Config { home: relay.domain.clone(), post, ca: relay.ca(), device: ed25519_dalek::SigningKey::from_bytes(&[7; 32]) };
+        let (alice, mut events) = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap();
+        let gid = alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: service, admins: vec![], admitted: vec![], subgroup: None }).unwrap();
+        let id: [u8; 32] = alice.log(&gid.0).unwrap().0.try_into().unwrap();
+        let start = head::start(key.verifying_key().as_bytes(), &id);
+        let ours = Head::sign(&key, &id, 1, head::next(&start, b"ours"), now());
+        {
+            let mut st = alice.inner.lock();
+            st.provider.put(&logs::entry_key(&id, 1), &[ours.hash.as_slice(), b"ours"].concat()).unwrap();
+            st.logs.get_mut(id.as_slice()).unwrap().head = Some(ours.clone());
+            st.save_log(&id).unwrap();
+        }
+        let msg = serde_json::json!({ "type": "message", "content": "blocked" });
+        let err = alice.send(&gid.0, &msg, None).await.unwrap_err();
+        assert!(err.is::<Contradiction>(), "{err:#}");
+        assert!(alice.inner.lock().log(&id).unwrap().verified.is_none(), "contradiction must not warm cache");
+        assert!(alice.messages(&gid.0).unwrap().is_empty(), "nothing sealed on contradiction");
+        assert!(matches!(events.try_recv().unwrap(), Event::Warning { group: Some(g), .. } if g == gid));
+        // A second send still hits /heads (was not cached) and fails again.
+        let err = alice.send(&gid.0, &msg, None).await.unwrap_err();
+        assert!(err.is::<Contradiction>(), "{err:#}");
+        assert_eq!(asked.load(Ordering::Relaxed), 2);
+        alice.shutdown().await.unwrap();
+    }
+
+    /// A confirmed contradiction invalidates an already-warm refresh cache so a subsequent ordinary send cannot reuse
+    /// the pre-fork stamp, and an older in-flight observation cannot reinstate it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warm_cache_invalidated_by_contradiction_and_not_reinstated() {
+        use ed25519_dalek::SigningKey;
+        use lmk_membership::Contradiction;
+        use lmk_proto::head::{self, Head};
+        use lmk_proto::membership::{Answer, Heads, Moved};
+        use n0_future::time::Instant;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let relay = lmk_testing::relay().await;
+        let key = SigningKey::from_bytes(&[11; 32]);
+        let service = Service::Serve { key: Bytes(key.verifying_key().to_bytes().to_vec()), domain: "fork2.example".into(), rest: Default::default() };
+        let fork = Arc::new(AtomicBool::new(false));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let (is_fork, counted, signing) = (fork.clone(), asked.clone(), key.clone());
+        let post: Post = Arc::new(move |_domain, route, body| {
+            let (is_fork, counted, signing) = (is_fork.clone(), counted.clone(), signing.clone());
+            Box::pin(async move {
+                assert_eq!(route, "/membership/6/heads");
+                counted.fetch_add(1, Ordering::Relaxed);
+                let req: Heads = serde_json::from_slice(&body)?;
+                let id = head::reference(signing.verifying_key().as_bytes(), &req.logs[0].0);
+                let start = head::start(signing.verifying_key().as_bytes(), &id);
+                let payload = if is_fork.load(Ordering::SeqCst) { b"theirs".as_slice() } else { b"ours".as_slice() };
+                let head = Head::sign(&signing, &id, 1, head::next(&start, payload), now());
+                Ok(serde_json::to_vec(&Answer::Ok(Moved { heads: vec![head], expired: vec![] }))?)
+            })
+        });
+        let config = Config { home: relay.domain.clone(), post, ca: relay.ca(), device: SigningKey::from_bytes(&[7; 32]) };
+        let alice = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0;
+        let gid = alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: service, admins: vec![], admitted: vec![], subgroup: None }).unwrap();
+        let id: [u8; 32] = alice.log(&gid.0).unwrap().0.try_into().unwrap();
+        let start = head::start(key.verifying_key().as_bytes(), &id);
+        let ours = Head::sign(&key, &id, 1, head::next(&start, b"ours"), now());
+        {
+            let mut st = alice.inner.lock();
+            st.provider.put(&logs::entry_key(&id, 1), &[ours.hash.as_slice(), b"ours"].concat()).unwrap();
+            st.logs.get_mut(id.as_slice()).unwrap().head = Some(ours);
+            st.group_mut(&gid.0).unwrap().rec.position = 1;
+            st.save_log(&id).unwrap();
+            st.save(&gid.0).unwrap();
+        }
+        let msg = serde_json::json!({ "type": "message", "content": "ok" });
+        alice.send(&gid.0, &msg, None).await.unwrap();
+        assert_eq!(asked.load(Ordering::Relaxed), 1);
+        assert!(alice.inner.lock().log(&id).unwrap().verified.is_some(), "cache is warm");
+
+        // Trigger contradiction via a strict refresh while the cache is warm.
+        fork.store(true, Ordering::SeqCst);
+        let err = alice.inner.refresh(&gid.0, logs::Check::Strict).await.unwrap_err();
+        assert!(err.is::<Contradiction>(), "{err:#}");
+        {
+            let mut st = alice.inner.lock();
+            assert!(st.log(&id).unwrap().verified.is_none(), "contradiction cleared cache");
+            assert!(st.log(&id).unwrap().contradicted);
+            st.mark_verified(&id, Instant::now());
+            assert!(st.log(&id).unwrap().verified.is_none(), "in-flight observation cannot reinstate cache");
+        }
+        // Subsequent ordinary send must NOT reuse the pre-fork cache.
+        let err = alice.send(&gid.0, &msg, None).await.unwrap_err();
+        assert!(err.is::<Contradiction>(), "{err:#}");
+        assert_eq!(asked.load(Ordering::Relaxed), 3);
+        alice.shutdown().await.unwrap();
+    }
+
+    /// If `/heads` reports a signed newer length and the subsequent `/read` returns a shorter terminal empty page,
+    /// the send fails with `Contradiction` and never seals.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shorter_terminal_read_after_newer_heads_fails_contradiction() {
+        use ed25519_dalek::SigningKey;
+        use lmk_membership::Contradiction;
+        use lmk_proto::head::{self, Head};
+        use lmk_proto::membership::{Answer, Heads, Moved, Page, Read};
+
+        let relay = lmk_testing::relay().await;
+        let key = SigningKey::from_bytes(&[12; 32]);
+        let service = Service::Serve { key: Bytes(key.verifying_key().to_bytes().to_vec()), domain: "rollback.example".into(), rest: Default::default() };
+        let signing = key.clone();
+        let post: Post = Arc::new(move |_domain, route, body| {
+            let signing = signing.clone();
+            Box::pin(async move {
+                let s = signing.verifying_key().to_bytes();
+                if route == "/membership/6/heads" {
+                    let req: Heads = serde_json::from_slice(&body)?;
+                    let id = head::reference(&s, &req.logs[0].0);
+                    let start = head::start(&s, &id);
+                    let newer = Head::sign(&signing, &id, 1, head::next(&start, b"entry1"), now());
+                    Ok(serde_json::to_vec(&Answer::Ok(Moved { heads: vec![newer], expired: vec![] }))?)
+                } else {
+                    assert_eq!(route, "/membership/6/read");
+                    let req: Read = serde_json::from_slice(&body)?;
+                    let id = head::reference(&s, &req.capability);
+                    let empty = Head::sign(&signing, &id, 0, head::start(&s, &id), now());
+                    Ok(serde_json::to_vec(&Answer::Ok(Page { after: req.after, entries: vec![], head: empty }))?)
+                }
+            })
+        });
+        let config = Config { home: relay.domain.clone(), post, ca: relay.ca(), device: SigningKey::from_bytes(&[7; 32]) };
+        let alice = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0;
+        let gid = alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: service, admins: vec![], admitted: vec![], subgroup: None }).unwrap();
+        let msg = serde_json::json!({ "type": "message", "content": "must fail" });
+        let err = alice.send_pinned(&gid.0, &msg, None, Some(&[alice.key()])).await.unwrap_err();
+        assert!(err.is::<Contradiction>(), "{err:#}");
+        assert!(alice.messages(&gid.0).unwrap().is_empty(), "nothing sealed after shorter terminal read");
+        let id = alice.log(&gid.0).unwrap().0;
+        assert!(alice.inner.lock().log(&id).unwrap().verified.is_none());
+        alice.shutdown().await.unwrap();
+    }
+
+    /// A delayed empty `/read` page ending behind the local frontier must not advance `log.at` or stamp `verified`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delayed_read_behind_local_frontier_does_not_advance_at_or_verify() {
+        use ed25519_dalek::SigningKey;
+        use lmk_proto::head::{self, Head};
+        use lmk_proto::membership::{Answer, Page, Read};
+
+        let relay = lmk_testing::relay().await;
+        let key = SigningKey::from_bytes(&[13; 32]);
+        let service = Service::Serve { key: Bytes(key.verifying_key().to_bytes().to_vec()), domain: "delayed.example".into(), rest: Default::default() };
+        let (paused_tx, mut paused_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let t1 = now();
+        let t2 = t1 + 60_000;
+        let signing = key.clone();
+        let post: Post = Arc::new(move |_domain, route, body| {
+            let signing = signing.clone();
+            let paused_tx = paused_tx.clone();
+            let mut release_rx = release_rx.clone();
+            Box::pin(async move {
+                assert_eq!(route, "/membership/6/read");
+                let req: Read = serde_json::from_slice(&body)?;
+                let s = signing.verifying_key().to_bytes();
+                let id = head::reference(&s, &req.capability);
+                let empty = Head::sign(&signing, &id, 0, head::start(&s, &id), t2);
+                paused_tx.send(()).ok();
+                release_rx.wait_for(|open| *open).await.unwrap();
+                Ok(serde_json::to_vec(&Answer::Ok(Page { after: req.after, entries: vec![], head: empty }))?)
+            })
+        });
+        let config = Config { home: relay.domain.clone(), post, ca: relay.ca(), device: SigningKey::from_bytes(&[7; 32]) };
+        let alice = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0;
+        let gid = alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: service, admins: vec![], admitted: vec![], subgroup: None }).unwrap();
+        let id: [u8; 32] = alice.log(&gid.0).unwrap().0.try_into().unwrap();
+
+        let read_fut = alice.inner.read(&id);
+        tokio::pin!(read_fut);
+        tokio::select! {
+            _ = &mut read_fut => panic!("read should pause"),
+            _ = paused_rx.recv() => {}
+        }
+        // Advance the local frontier to length 1 at `t1` while the length-0 read response is still in flight.
+        let start = head::start(key.verifying_key().as_bytes(), &id);
+        let head1 = Head::sign(&key, &id, 1, head::next(&start, b"entry1"), t1);
+        alice.inner.take_entries(&mut alice.inner.lock(), &id, 0, vec![Bytes(b"entry1".to_vec())], head1).unwrap();
+        assert_eq!(alice.inner.lock().log(&id).unwrap().at, t1);
+
+        release_tx.send(true).unwrap();
+        read_fut.await.unwrap();
+        {
+            let st = alice.inner.lock();
+            let log = st.log(&id).unwrap();
+            assert_eq!(log.at, t1, "delayed length-0 page must not advance log.at past local length-1 head");
+            assert!(log.verified.is_none(), "delayed length-0 page must not stamp verified");
+        }
+        alice.shutdown().await.unwrap();
+    }
+
+    /// An overlapping shorter `/read` that started before a newer `/heads` checkpoint was recorded must retry rather
+    /// than falsely marking an honest log as contradicted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn overlapping_shorter_read_retries_without_false_contradiction() {
+        use ed25519_dalek::SigningKey;
+        use lmk_proto::head::{self, Head};
+        use lmk_proto::membership::{Answer, Heads, Moved, Page, Read};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let relay = lmk_testing::relay().await;
+        let key = SigningKey::from_bytes(&[14; 32]);
+        let service = Service::Serve { key: Bytes(key.verifying_key().to_bytes().to_vec()), domain: "overlap.example".into(), rest: Default::default() };
+        let (paused_tx, mut paused_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (signing, reads_c) = (key.clone(), reads.clone());
+        let post: Post = Arc::new(move |_domain, route, body| {
+            let (signing, reads_c) = (signing.clone(), reads_c.clone());
+            let paused_tx = paused_tx.clone();
+            let mut release_rx = release_rx.clone();
+            Box::pin(async move {
+                let s = signing.verifying_key().to_bytes();
+                if route == "/membership/6/heads" {
+                    let req: Heads = serde_json::from_slice(&body)?;
+                    let id = head::reference(&s, &req.logs[0].0);
+                    let start = head::start(&s, &id);
+                    let head1 = Head::sign(&signing, &id, 1, head::next(&start, b"skipped"), now());
+                    Ok(serde_json::to_vec(&Answer::Ok(Moved { heads: vec![head1], expired: vec![] }))?)
+                } else {
+                    assert_eq!(route, "/membership/6/read");
+                    let req: Read = serde_json::from_slice(&body)?;
+                    let id = head::reference(&s, &req.capability);
+                    let start = head::start(&s, &id);
+                    let n = reads_c.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n == 1 {
+                        // Started before /heads recorded length 1; returns empty length 0 after release.
+                        paused_tx.send(()).ok();
+                        release_rx.wait_for(|open| *open).await.unwrap();
+                        let head0 = Head::sign(&signing, &id, 0, start, now());
+                        Ok(serde_json::to_vec(&Answer::Ok(Page { after: req.after, entries: vec![], head: head0 }))?)
+                    } else if req.after == 0 {
+                        let head1 = Head::sign(&signing, &id, 1, head::next(&start, b"skipped"), now());
+                        Ok(serde_json::to_vec(&Answer::Ok(Page { after: 0, entries: vec![Bytes(b"skipped".to_vec())], head: head1 }))?)
+                    } else {
+                        let head1 = Head::sign(&signing, &id, 1, head::next(&start, b"skipped"), now());
+                        Ok(serde_json::to_vec(&Answer::Ok(Page { after: 1, entries: vec![], head: head1 }))?)
+                    }
+                }
+            })
+        });
+        let config = Config { home: relay.domain.clone(), post, ca: relay.ca(), device: SigningKey::from_bytes(&[7; 32]) };
+        let alice = Node::start(SqliteProvider::open(":memory:".as_ref()).unwrap(), config).await.unwrap().0;
+        let gid = alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: service, admins: vec![], admitted: vec![], subgroup: None }).unwrap();
+        let id: [u8; 32] = alice.log(&gid.0).unwrap().0.try_into().unwrap();
+
+        let read_fut = alice.inner.read(&id);
+        tokio::pin!(read_fut);
+        tokio::select! {
+            _ = &mut read_fut => panic!("read should pause"),
+            _ = paused_rx.recv() => {}
+        }
+        // Record a signed length-1 checkpoint after `read_fut` already started.
+        let start = head::start(key.verifying_key().as_bytes(), &id);
+        let head1 = Head::sign(&key, &id, 1, head::next(&start, b"skipped"), now());
+        {
+            let mut st = alice.inner.lock();
+            st.logs.get_mut(id.as_slice()).unwrap().seen_heads.insert(1, (head1, n0_future::time::Instant::now()));
+        }
+        release_tx.send(true).unwrap();
+        read_fut.await.unwrap();
+        {
+            let st = alice.inner.lock();
+            let log = st.log(&id).unwrap();
+            assert!(!log.contradicted, "overlapping shorter read must not trigger false contradiction");
+            assert_eq!(log.length(), 1, "retried read caught up to length 1");
+            assert!(!log.behind_seen());
+        }
+        alice.shutdown().await.unwrap();
+    }
+
+    /// Retaining every outstanding checkpoint catches a conflicting longer chain before any conflicting entry is
+    /// written or applied.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retained_checkpoint_rejects_conflicting_longer_chain_before_writing() {
+        use ed25519_dalek::SigningKey;
+        use lmk_membership::Contradiction;
+        use lmk_proto::head::{self, Head};
+
+        let relay = lmk_testing::relay().await;
+        let key = SigningKey::from_bytes(&[15; 32]);
+        let service = Service::Serve { key: Bytes(key.verifying_key().to_bytes().to_vec()), domain: "ckpt.example".into(), rest: Default::default() };
+        let alice = node(&relay, relay.post()).await;
+        let gid = alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: service, admins: vec![], admitted: vec![], subgroup: None }).unwrap();
+        let id: [u8; 32] = alice.log(&gid.0).unwrap().0.try_into().unwrap();
+        let start = head::start(key.verifying_key().as_bytes(), &id);
+        let h1_a = Head::sign(&key, &id, 1, head::next(&start, b"e1_a"), now());
+        let h1_b = head::next(&start, b"e1_b");
+        let h2_b = Head::sign(&key, &id, 2, head::next(&h1_b, b"e2"), now());
+        {
+            let mut st = alice.inner.lock();
+            let log = st.logs.get_mut(id.as_slice()).unwrap();
+            let t = n0_future::time::Instant::now();
+            log.seen_heads.insert(1, (h1_a, t));
+            log.seen_heads.insert(2, (h2_b.clone(), t));
+        }
+        let err = alice
+            .inner
+            .take_entries(&mut alice.inner.lock(), &id, 0, vec![Bytes(b"e1_b".to_vec()), Bytes(b"e2".to_vec())], h2_b)
+            .unwrap_err();
+        assert!(err.is::<Contradiction>(), "{err:#}");
+        {
+            let st = alice.inner.lock();
+            let log = st.log(&id).unwrap();
+            assert!(log.contradicted);
+            assert_eq!(log.length(), 0, "conflicting entries must not be written");
+            assert!(st.entry(&id, 1).unwrap().is_none());
+        }
+        alice.shutdown().await.unwrap();
     }
 }
