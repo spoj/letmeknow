@@ -1493,7 +1493,7 @@ mod tests {
         let gid = alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: service, admins: vec![], admitted: vec![], subgroup: None }).unwrap();
         let id: [u8; 32] = alice.log(&gid.0).unwrap().0.try_into().unwrap();
 
-        let read_fut = alice.inner.read(&id);
+        let read_fut = alice.inner.read_log(&id, true);
         tokio::pin!(read_fut);
         tokio::select! {
             _ = &mut read_fut => panic!("read should pause"),
@@ -1571,7 +1571,7 @@ mod tests {
         let gid = alice.create(Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: service, admins: vec![], admitted: vec![], subgroup: None }).unwrap();
         let id: [u8; 32] = alice.log(&gid.0).unwrap().0.try_into().unwrap();
 
-        let read_fut = alice.inner.read(&id);
+        let read_fut = alice.inner.read_log(&id, true);
         tokio::pin!(read_fut);
         tokio::select! {
             _ = &mut read_fut => panic!("read should pause"),
@@ -1633,6 +1633,41 @@ mod tests {
             assert_eq!(log.length(), 0, "conflicting entries must not be written");
             assert!(st.entry(&id, 1).unwrap().is_none());
         }
+        alice.shutdown().await.unwrap();
+    }
+
+    /// Committing a group change or calling `read_group` must not pre-warm the new epoch's refresh cache; the first
+    /// ordinary send in the new epoch still checks `/heads`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_and_read_group_do_not_prewarm_refresh_cache() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let relay = lmk_testing::relay().await;
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = asked.clone();
+        let inner = relay.post();
+        let post: Post = Arc::new(move |domain, route, body| {
+            if route == "/membership/6/heads" {
+                counted.fetch_add(1, Ordering::Relaxed);
+            }
+            inner(domain, route, body)
+        });
+        let alice = node(&relay, post).await;
+        let settings = Settings { protocol: PROTOCOL, carry: 7, update: UPDATE, membership: relay.service.clone(), admins: vec![], admitted: vec![], subgroup: None };
+        let gid = alice.create(settings).unwrap();
+        let id0 = alice.log(&gid.0).unwrap().0;
+        alice.read_group(&gid.0).await.unwrap();
+        assert!(alice.inner.lock().log(&id0).unwrap().verified.is_none(), "read_group must not pre-warm cache");
+
+        // Commit a settings change to advance to epoch 1; the new epoch's log must start cold.
+        alice.change_settings(&gid.0, |s| s.admitted.push(Bytes(vec![42; 32]))).await.unwrap();
+        let id1 = alice.log(&gid.0).unwrap().0;
+        assert_ne!(id1, id0);
+        assert!(alice.inner.lock().log(&id1).unwrap().verified.is_none(), "commit must not pre-warm new epoch cache");
+
+        let before = asked.load(Ordering::Relaxed);
+        alice.send(&gid.0, &serde_json::json!({ "type": "message", "content": "first after commit" }), None).await.unwrap();
+        assert_eq!(asked.load(Ordering::Relaxed), before + 1, "first ordinary send after commit queries /heads");
         alice.shutdown().await.unwrap();
     }
 }

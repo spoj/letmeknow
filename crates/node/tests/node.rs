@@ -1899,6 +1899,8 @@ async fn back_with_no_holder(test: &str, missed: usize) -> (Duration, Vec<u64>) 
         bob.node.send(&gid.0, &message("only Alice and Bob hold this"), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
         alice.node.remove(&gid.0, from_ref(spare)).await.unwrap();
+        let epoch = alice.node.epoch(&gid.0).unwrap();
+        eventually("Bob reads Alice's remove", || bob.node.epoch(&gid.0).unwrap() == epoch).await;
     }
     bob.node.shutdown().await.unwrap();
     alice.node.shutdown().await.unwrap();
@@ -4236,6 +4238,13 @@ fn held_commit_and_known_lapse_never_bypass_on_cache_or_outage() {
         let first = group.commit(&provider, &mls, Change { cut, ..Change::default() }).unwrap();
         client.append(&capability, from_ref(&first.entry)).await.unwrap();
         group.apply(&provider, &first.entry).unwrap();
+
+        // Advance Alice to epoch 3 and warm her in-memory verification for epoch 3 via an ordinary send BEFORE Bob
+        // appends `second` (which will wait unapplied because Alice lacks Bob's kept message from epoch 2).
+        alice.node.read_group(&gid.0).await.unwrap();
+        assert_eq!(alice.node.epoch(&gid.0).unwrap(), 3);
+        alice.node.send(&gid.0, &message("warm epoch 3"), None).await.unwrap();
+
         let capability = group.capability(&provider).unwrap();
         let cut = group.cut().to_vec();
         let second = group.commit(&provider, &mls, Change { cut, ..Change::default() }).unwrap();
@@ -4243,7 +4252,7 @@ fn held_commit_and_known_lapse_never_bypass_on_cache_or_outage() {
         drop(group);
         drop(provider);
 
-        // `read_group` warms Alice's in-memory verification for epoch 3's log while holding `second` unapplied.
+        // `read_group` fetches `second` into epoch 3's log (held unapplied) while epoch 3's cache remains warm.
         alice.node.read_group(&gid.0).await.unwrap();
         assert_eq!(alice.node.epoch(&gid.0).unwrap(), 3, "Alice waits before Bob's second commit");
 

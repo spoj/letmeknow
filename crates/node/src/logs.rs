@@ -325,7 +325,7 @@ impl Inner {
                 if at_head {
                     return Ok(Cleared { log: id, direct: false });
                 }
-                self.caught_up(gid).await.map_err(|e| if e.is::<Expired>() { SendError::LetGo.into() } else { e })?;
+                self.caught_up_with(gid, true).await.map_err(|e| if e.is::<Expired>() { SendError::LetGo.into() } else { e })?;
                 continue;
             }
             let asked = Instant::now();
@@ -365,7 +365,7 @@ impl Inner {
                         };
                     }
                     if behind {
-                        self.caught_up(gid).await.map_err(|e| if e.is::<Expired>() { SendError::LetGo.into() } else { e })?;
+                        self.caught_up_with(gid, true).await.map_err(|e| if e.is::<Expired>() { SendError::LetGo.into() } else { e })?;
                         continue;
                     }
                     return Ok(Cleared { log: id, direct: false });
@@ -462,7 +462,7 @@ impl Inner {
                 Outcome::Cleared(cleared) => return Ok(cleared),
                 Outcome::Retry => continue,
                 Outcome::CatchUp => {
-                    self.caught_up(gid).await.map_err(|e| if e.is::<Expired>() { SendError::LetGo.into() } else { e })?;
+                    self.caught_up_with(gid, true).await.map_err(|e| if e.is::<Expired>() { SendError::LetGo.into() } else { e })?;
                     let cleared = {
                         let st = self.lock();
                         let cur = st.group(gid)?.rec.log.0.clone();
@@ -494,6 +494,12 @@ impl Inner {
 
     /// Reads a log from its service, through its end, while its group is in its epoch.
     pub(crate) async fn read(&self, id: &[u8]) -> Result<()> {
+        self.read_log(id, false).await
+    }
+
+    /// Reads a log from its service through its end; when `verify` is true (during `refresh` catch-up), stamps the
+    /// in-memory refresh cache on a clean terminal empty page of the group's current log.
+    pub(crate) async fn read_log(&self, id: &[u8], verify: bool) -> Result<()> {
         loop {
             let (capability, service, frontier) = {
                 let st = self.lock();
@@ -561,7 +567,8 @@ impl Inner {
                 st.read_as_of(id, head_time)?;
             }
             if !more {
-                let current_matching = exact_match
+                let current_matching = verify
+                    && exact_match
                     && st.logs.get(id).is_some_and(|log| {
                         st.groups.get(&log.group.0).is_some_and(|g| g.rec.log.0 == id)
                             && !log.stale()

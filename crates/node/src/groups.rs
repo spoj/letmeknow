@@ -75,6 +75,12 @@ impl Inner {
 
     /// Reads the group's logs, and waits until this session applied them to the head it read.
     pub(crate) async fn caught_up(&self, gid: &[u8]) -> Result<()> {
+        self.caught_up_with(gid, false).await
+    }
+
+    /// Reads the group's logs and waits until applied; when `verify` is true, stamps the refresh cache on the terminal
+    /// read of the current epoch's log.
+    pub(crate) async fn caught_up_with(&self, gid: &[u8], verify: bool) -> Result<()> {
         let mut read = Vec::new();
         loop {
             let advanced = self.advanced.notified();
@@ -85,7 +91,7 @@ impl Inner {
                 (g.rec.log.0.clone(), st.at_head(gid))
             };
             if log != read {
-                self.read(&log).await?;
+                self.read_log(&log, verify).await?;
                 read = log;
             } else if at_head {
                 return Ok(());
